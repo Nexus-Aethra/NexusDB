@@ -1,0 +1,25 @@
+# NexusDB 服务配置 (所有字段可省略, 缺省用默认值)
+
+[server]
+listen_addr = "0.0.0.0:5433"
+worker_count = 2
+redis_addr = "0.0.0.0:6379"     # RESP (Redis 兼容) 监听地址, 空 = 禁用
+redis_password = ""             # RESP AUTH 密码, 空 = 不启用认证
+max_key_bytes = 1024            # key 长度上限 (协议层拦截)
+max_value_bytes = 3000          # value 长度上限 (key+value <= 4000, page 编码限制)
+
+[storage]
+block_root = "./data"
+num_shards = 6
+io_backend = "io_uring"        # "stdfs" | "io_uring"
+chunk_cache_size = 16
+create_if_missing = true
+default_db = "default"
+default_table = "default"
+
+[log]
+level = "info"                 # error|warn|info|debug|trace
+dir = "./logs"                 # 空 = 仅 stderr
+buffer_kb = 64                 # 累积量阈值 (KB)
+flush_interval_ms = 500        # 时间阈值 (ms)
+stderr = true                  # Error/Warn 直通 stderr

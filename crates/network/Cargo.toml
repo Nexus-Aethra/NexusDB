@@ -1,0 +1,18 @@
+[package]
+name = "network"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+scheduler = { path = "../scheduler" }
+shard_manager = { path = "../shard_manager" }
+storage = { path = "../storage" }
+nlog = { path = "../logging" }
+crossbeam-channel = "0.5"
+libc = "0.2"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+storage = { path = "../storage" }
