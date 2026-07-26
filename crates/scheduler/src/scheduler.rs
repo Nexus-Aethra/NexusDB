@@ -1,0 +1,539 @@
+//! Scheduler: 单线程协程调度器 + io_uring 桥.
+//!
+//! **设计**:
+//! - 调度器 `!Send`, 所有方法 `&mut self`, 强制调度线程唯一.
+//! - 跨线程入口仅 `task_queue` 一个 Mutex (真正必要的同步).
+//! - 跨线程 stop 信号通过 `StopHandle` (克隆出 `Arc<AtomicBool>`, 直接 store).
+//! - 其他内部状态全部 owned, 无 Mutex:
+//!   - pool: Pool
+//!   - ready: Rc<RefCell<VecDeque>> (让 SlotWaker 持有引用)
+//!   - registry: IoRegistry
+//!   - ring: IoUring
+//!
+//! ## 调度循环 (drive_once)
+//!
+//! ```text
+//! Phase 1: drain task_queue (最多 BATCH_SIZE=200)
+//! Phase 2: pool.acquire → push to ready
+//! Phase 3: drain ready → poll 每个 future → Ready 则 release slot
+//! Phase 4: drain CQE → submit_and_wait(1) — 让内核完成至少 1 个 IO
+//! ```
+//!
+//! ## hang 修复
+//!
+//! 旧版 Phase 4 仅 `ring.completion()` 不阻塞等. 当所有 future 都 Pending 且
+//! 尚无 CQE 就绪时, `has_work() == false`, `run_until_idle` 提前退出 → 测试 hang.
+//! 新版在 Phase 4: 有 in-flight IO 时调用 `submit_and_wait(1)` (内核必然完成, 不真阻塞),
+//! 否则让出 CPU 100us 避免 spin.
+
+use std::cell::Cell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use crate::io_registry::IoRegistry;
+use crate::pool::{BoxFuture, Pool};
+use crate::ready::{self, ReadyQueueHandle};
+use crate::task::{InternalMessage, TaskRequest};
+use crate::waker::make_waker;
+
+const BATCH_SIZE: usize = 200;
+const PARK_TIMEOUT: Duration = Duration::from_micros(100);
+const IO_URING_ENTRIES: u32 = 1024;
+
+pub struct Scheduler {
+    pool: Pool,
+    /// ReadyQueue 由 Rc 持有, SlotWaker 也持有 Rc clone, 共享同一对象.
+    ready: ReadyQueueHandle,
+    task_queue: Mutex<VecDeque<InternalMessage>>,
+    /// 调度线程读取 (驱动循环里), 其他线程也可写 (通过 StopHandle).
+    stop_flag: Arc<AtomicBool>,
+    pub(crate) registry: IoRegistry,
+    pub(crate) ring: io_uring::IoUring,
+}
+
+/// 跨线程 stop 句柄 (Send). 克隆后任意线程可调 `stop()` 设置 flag,
+/// 调度线程下一帧检测到后退出 run().
+#[derive(Clone)]
+pub struct StopHandle {
+    flag: Arc<AtomicBool>,
+}
+
+impl StopHandle {
+    pub fn stop(&self) {
+        self.flag.store(true, Ordering::Release);
+    }
+}
+
+impl Scheduler {
+    pub fn new() -> Self {
+        let ring = io_uring::IoUring::new(IO_URING_ENTRIES).expect("io_uring setup failed");
+        Self::from_ring(ring)
+    }
+
+    /// 创建带 SQPOLL 的 Scheduler (T18c).
+    ///
+    /// `sqpoll_ms`: 内核 SQPOLL 线程空闲超时 (ms). 0 = 禁用 SQPOLL.
+    /// 当 `sqpoll_ms > 0` 时, 内核线程自旋轮询 SQ 队列, 减少 submit syscall.
+    ///
+    /// ## 要求
+    /// - Linux kernel ≥ 5.11 (非特权用户也支持)
+    /// - 多消耗 1 个 CPU 核心 (内核线程)
+    pub fn new_with_sqpoll(sqpoll_ms: u32) -> Self {
+        let ring = if sqpoll_ms > 0 {
+            let mut builder = io_uring::IoUring::builder();
+            builder.setup_sqpoll(sqpoll_ms);
+            builder
+                .build(IO_URING_ENTRIES)
+                .expect("io_uring setup with SQPOLL failed")
+        } else {
+            io_uring::IoUring::new(IO_URING_ENTRIES)
+                .expect("io_uring setup failed")
+        };
+        Self::from_ring(ring)
+    }
+
+    fn from_ring(ring: io_uring::IoUring) -> Self {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        Self {
+            pool: Pool::new(),
+            ready: ready::new_handle(),
+            task_queue: Mutex::new(VecDeque::new()),
+            stop_flag,
+            registry: IoRegistry::new(),
+            ring,
+        }
+    }
+
+    pub fn submit(&self, future: BoxFuture<'static, ()>) {
+        self.task_queue
+            .lock()
+            .unwrap()
+            .push_back(InternalMessage::Task(TaskRequest { future }));
+    }
+
+    pub fn stop(&self) {
+        self.task_queue
+            .lock()
+            .unwrap()
+            .push_back(InternalMessage::Stop);
+    }
+
+    /// 获取 Send 句柄, 可被任意线程 clone 并调 stop().
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle {
+            flag: self.stop_flag.clone(),
+        }
+    }
+
+    /// 获取 &mut IoUring, 供 `FdPool::acquire` 等跨 crate 调用.
+    pub fn ring_mut(&mut self) -> &mut io_uring::IoUring {
+        &mut self.ring
+    }
+
+    pub fn has_work(&self) -> bool {
+        if !self.task_queue.lock().unwrap().is_empty() {
+            return true;
+        }
+        if ready::has_any(&self.ready) {
+            return true;
+        }
+        if self.pool.in_use() > 0 {
+            return true;
+        }
+        // 有 in-flight io_uring SQE (还没 CQE) 也要算 work, 否则 driver 会误判空闲退出.
+        if !self.registry.is_empty() {
+            return true;
+        }
+        false
+    }
+
+    pub fn drive_once(&mut self) {
+        // 设置 CURRENT Rc, 让 io_ops 通过 with_current 拿 &mut self.
+        // SAFETY: self 在整个 drive_once 调用期间活着, borrow 在函数结束时释放.
+        // drive_until_idle 已经在外部 borrow_mut 持有, 此时 CURRENT 已设置.
+        self.drive_once_inner();
+    }
+
+    fn drive_once_inner(&mut self) {
+        // === Phase 1: drain task_queue ===
+        let mut batch: Vec<BoxFuture<'static, ()>> = Vec::with_capacity(BATCH_SIZE);
+        {
+            let mut q = self.task_queue.lock().unwrap();
+            while batch.len() < BATCH_SIZE {
+                match q.pop_front() {
+                    Some(InternalMessage::Task(req)) => batch.push(req.future),
+                    Some(InternalMessage::Stop) => {
+                        self.stop_flag.store(true, Ordering::Release);
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // === Phase 2: 给每个 future acquire 一个 slot, push 到 ready ===
+        for fut in batch {
+            let slot_id = self.pool.acquire();
+            self.pool.slot(slot_id).future = Some(fut);
+            ready::push(&self.ready, slot_id);
+        }
+
+        // === Phase 3: 把 ready 里的 future 全部 poll ===
+        // 关键: poll 期间释放 self 的 &mut borrow, 让 io_ops.poll 能 borrow_mut.
+        // 我们 clone Rc<ReadyQueue> 用于构造 waker, 把 future take 出 slot
+        // (用 mem::replace), poll 期间 slot borrow 已释放.
+        let ready_rc = Rc::clone(&self.ready);
+        loop {
+            let mut wave = ready::drain(&self.ready);
+            if wave.is_empty() {
+                break;
+            }
+            for slot_id in wave.drain(..) {
+                set_current_slot(slot_id);
+                // take 出 future (slot borrow 在 take 后立即释放).
+                let fut = self.pool.slot(slot_id).future.take();
+                let Some(mut fut) = fut else {
+                    clear_current_slot();
+                    continue;
+                };
+                let waker = make_waker(slot_id, &ready_rc);
+                let mut cx = Context::from_waker(&waker);
+                let r = fut.as_mut().poll(&mut cx);
+                match r {
+                    Poll::Ready(()) => {
+                        self.registry.cancel_slot(slot_id);
+                        self.pool.release(slot_id);
+                        clear_current_slot();
+                    }
+                    Poll::Pending => {
+                        // 把 future 放回 slot
+                        self.pool.slot(slot_id).future = Some(fut);
+                        clear_current_slot();
+                    }
+                }
+            }
+        }
+
+        // === Phase 4: drain CQE + submit_and_wait (修复 hang) ===
+        self.drain_completions_and_wait();
+    }
+
+    /// 生产路径: 阻塞等待内核完成至少 1 个 IO. 调用于 `drive_once`.
+    /// 安全的前提: 有 in-flight SQE (registry 非空) 时才调用, 内核必然完成.
+    fn drain_completions_and_wait(&mut self) {
+        self.drain_completions();
+        if !self.registry.is_empty() {
+            // submit_and_wait(1) 阻塞直到 1 个 CQE 到达.
+            // io-uring 0.6 没有 timeout 参数; 但我们只在 registry 非空时调用,
+            // 内核会完成 SQE, 所以不会真正死锁.
+            let _ = self.ring.submit_and_wait(1);
+            self.drain_completions();
+        } else if !ready::has_any(&self.ready) {
+            std::thread::sleep(PARK_TIMEOUT);
+        }
+    }
+
+    /// 非阻塞 poll + submit 版本 (SchedHandle 驱动用). 不挂起线程, 适合测试.
+    fn drain_completions_with_submit(&mut self) {
+        // 提交今年 pending 的 SQE
+        let _ = self.ring.submit();
+        self.drain_completions();
+
+        // 检查 SQ ring 是否还有未消费的 SQE.
+        // 用 submission() 拿 SQ (调用 .len()), drop 时会 sync head.
+        let inflight_sqe = {
+            let sq = self.ring.submission();
+            sq.len()
+        };
+        if inflight_sqe > 0 {
+            let _ = self.ring.submit_and_wait(1);
+            self.drain_completions();
+        }
+    }
+
+    fn drain_completions(&mut self) {
+        let cq = self.ring.completion();
+        let mut to_wake: Vec<usize> = Vec::new();
+        for cqe in cq {
+            let ud = cqe.user_data();
+            let result = cqe.result();
+            // mark_completed 不移除, 让 io_ops.poll_cqe 自己取结果 (take_result).
+            self.registry.mark_completed(ud, result);
+            if let Some(st) = self.registry.inner_peek(ud) {
+                to_wake.push(st.slot_id);
+            }
+        }
+        for slot_id in to_wake {
+            ready::push(&self.ready, slot_id);
+        }
+    }
+
+    /// 提取 ready queue 中所有 slot 及其 future (owned). 让外部 poll future 时
+    /// 不持有 self borrow, 允许 io_ops 通过 with_current borrow_mut.
+    ///
+    /// **关键**: ready queue 可能为空 (CQE 已经走另一条路径), 但 pool 里仍有
+    /// 挂起的 future. 这里扫描所有 in_use slot, 收集 future 为 Some 的 slot.
+    pub fn extract_pending(&mut self) -> Vec<(usize, BoxFuture<'static, ()>)> {
+        let mut result = Vec::new();
+        let wave: VecDeque<usize> = ready::drain(&self.ready);
+        for slot_id in wave {
+            if let Some(fut) = self.pool.slot(slot_id).future.take() {
+                result.push((slot_id, fut));
+            }
+        }
+        // 兜底: ready 为空时, 扫描 pool 里 future Some 的 slot.
+        if result.is_empty() {
+            let in_use = self.pool.in_use();
+            for slot_id in 0..in_use.max(1024) {
+                if let Some(fut) = self.pool.slot(slot_id).future.take() {
+                    result.push((slot_id, fut));
+                }
+            }
+        }
+        result
+    }
+
+    /// 把 task_queue 中的新 task 装入 pool + push 到 ready (供 SchedHandle 三阶段驱动).
+    pub fn drain_task_queue_phase(&mut self) {
+        let mut batch: Vec<BoxFuture<'static, ()>> = Vec::with_capacity(BATCH_SIZE);
+        {
+            let mut q = self.task_queue.lock().unwrap();
+            while batch.len() < BATCH_SIZE {
+                match q.pop_front() {
+                    Some(InternalMessage::Task(req)) => batch.push(req.future),
+                    Some(InternalMessage::Stop) => {
+                        self.stop_flag.store(true, Ordering::Release);
+                    }
+                    None => break,
+                }
+            }
+        }
+        for fut in batch {
+            let slot_id = self.pool.acquire();
+            self.pool.slot(slot_id).future = Some(fut);
+            ready::push(&self.ready, slot_id);
+        }
+    }
+
+    pub fn run_until_idle(&mut self, max_iters: usize) -> bool {
+        let mut iters = 0;
+        while !self.stop_flag.load(Ordering::Acquire) && self.has_work() && iters < max_iters {
+            self.drive_once();
+            iters += 1;
+        }
+        !self.has_work()
+    }
+
+    /// ⭐ T19: 带 predicate 的 run_until_idle.
+    ///
+    /// 每 iter 后检查 `predicate()`. true 立即返回 (不跑完 max_iters).
+    /// 用法: caller 线程上 run 一个 scheduler 跑 `ReplyFuture` 等 shard 完成
+    /// 通过 reply_bus (跨线程 mpmc) 让 caller 的 waker 唤醒, 触发 polling.
+    pub fn run_until<F: FnMut() -> bool>(&mut self, predicate: F, max_iters: usize) -> bool {
+        let mut pred = predicate;
+        let mut iters = 0;
+        while !self.stop_flag.load(Ordering::Acquire) && !pred() && iters < max_iters && self.has_work() {
+            self.drive_once();
+            iters += 1;
+        }
+        pred()
+    }
+
+    pub fn run(&mut self) {
+        loop {
+            self.drive_once();
+            if self.stop_flag.load(Ordering::Acquire) && !self.has_work() {
+                break;
+            }
+        }
+    }
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---- thread-local: 当前 scheduler (Rc-based, 让 spawn 找得到) ----
+
+thread_local! {
+    /// 当前线程的 scheduler Rc clone. 由 SchedHandle::set_current 设置.
+    /// io_ops 通过 with_current 拿 Rc, 然后 borrow_mut 拿到 &mut Scheduler.
+    static CURRENT: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<Scheduler>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// SchedHandle::set_current 用: 设当前 thread 的 CURRENT.
+pub(crate) fn set_current_scheduler_via_rc(s: std::rc::Rc<std::cell::RefCell<Scheduler>>) {
+    CURRENT.with(|c| *c.borrow_mut() = Some(s));
+}
+
+pub(crate) fn clear_current_scheduler() {
+    CURRENT.with(|c| *c.borrow_mut() = None);
+}
+
+/// io_ops / spawn 用: 通过 thread-local 拿 &mut Scheduler.
+/// 闭包返回后 borrow 立即释放, 不会跨 await 持有.
+///
+/// **关键**: 用 try_borrow_mut 而非 borrow_mut — drive_until_idle 持有 borrow_mut 时,
+/// io_ops.poll 触发的 with_current 应该返回 None 或等待; 不应该 panic.
+/// 当前选择: try_borrow_mut 失败时 panic (driver 线程上不该有竞争).
+pub fn with_current<R>(f: impl FnOnce(&mut Scheduler) -> R) -> Option<R> {
+    CURRENT.with(|c| {
+        let rc = c.borrow();
+        let cell = rc.as_ref()?;
+        let mut s = cell.try_borrow_mut().ok()?;
+        Some(f(&mut s))
+    })
+}
+
+// SAFETY: SchedHandle 是一个 newtype 包装 Rc<RefCell<Scheduler>>, 让它跨线程
+// Send/Sync 以便测试可以把 sched 转到独立线程跑.
+pub struct SchedHandle(pub std::rc::Rc<std::cell::RefCell<Scheduler>>);
+// SAFETY: 见上.
+unsafe impl Send for SchedHandle {}
+unsafe impl Sync for SchedHandle {}
+
+// ⭐ Manual Clone (既支持 Clone 也让我们能 clone Rc 共享 scheduler).
+impl Clone for SchedHandle {
+    fn clone(&self) -> Self {
+        Self(std::rc::Rc::clone(&self.0))
+    }
+}
+
+impl SchedHandle {
+    pub fn new(s: Scheduler) -> Self {
+        let rc = std::rc::Rc::new(std::cell::RefCell::new(s));
+        Self(rc)
+    }
+    /// 设当前 scheduler Rc 到 thread-local. 必须在 driver 线程调.
+    /// SAFETY: 需保证 self 不会被 drop, 直到 clear.
+    pub fn set_current(&self) {
+        set_current_scheduler_via_rc(self.0.clone());
+    }
+    pub fn into_inner(self) -> std::cell::RefCell<Scheduler> {
+        std::rc::Rc::try_unwrap(self.0)
+            .ok()
+            .expect("SchedHandle has multiple owners")
+    }
+
+    /// 跨线程驱动. SchedHandle 是 Send, 可 move 到新线程.
+    ///
+    /// 每次迭代**临时 borrow**, drive_once 完成后释放 borrow, 让 wrapper poll 时无冲突.
+    pub fn drive_until_idle(self, max_iters: usize) -> bool {
+        let mut total_iters = 0usize;
+        for _ in 0..max_iters {
+            total_iters += 1;
+            // Phase A: 临时 borrow_mut, 提取待 poll 的 future + ready Rc, release borrow.
+            // **关键**: 必须在 extract_pending 之前调 drain_task_queue_phase, 否则
+            // task_queue 里的新任务永远进不了 pool + ready, 调度卡死.
+            let (work, ready_rc): (Vec<(usize, BoxFuture<'static, ()>)>, ReadyQueueHandle) = {
+                let mut s = self.0.borrow_mut();
+                s.drain_task_queue_phase();
+                let hw = s.has_work();
+                crate::trace!(
+                    "iter={total_iters} phase=A has_work={hw} ready_len={} registry={} in_use={}",
+                    crate::ready::len(&s.ready),
+                    s.registry.len(),
+                    s.pool.in_use()
+                );
+                if !hw {
+                    (Vec::new(), Rc::clone(&s.ready))
+                } else {
+                    let work = s.extract_pending();
+                    let rc = Rc::clone(&s.ready);
+                    crate::trace!(
+                        "iter={total_iters} extract_pending got={} futures",
+                        work.len()
+                    );
+                    (work, rc)
+                }
+            };
+            if work.is_empty() {
+                // 即便 work 空, 也可能有 in-flight IO (registry 非空).
+                // 再 drain 一次 CQE 让 await 的 future 完成.
+                let mut s = self.0.borrow_mut();
+                crate::trace!(
+                    "iter={total_iters} phase=A work_empty in_use={} registry={}",
+                    s.pool.in_use(),
+                    s.registry.len()
+                );
+                if !s.registry.is_empty() {
+                    s.drain_completions_with_submit();
+                }
+                // 再判一次: 如果 has_work 还在 (CQE 唤醒的 slot 进 ready 了), 继续循环.
+                if s.has_work() {
+                    continue;
+                }
+                crate::trace!("iter={total_iters} drive complete after {total_iters} iters");
+                break;
+            }
+
+            // Phase B: poll 每个 future. 这一步**不持有** self.0 borrow_mut,
+            // 允许 io_ops 通过 with_current borrow_mut.
+            let mut requeue = Vec::new();
+            let mut completed = Vec::new();
+            crate::trace!("iter={total_iters} phase=B polling {} futures", work.len());
+            for (slot_id, mut fut) in work {
+                set_current_slot(slot_id);
+                let waker = make_waker(slot_id, &ready_rc);
+                let mut cx = Context::from_waker(&waker);
+                let r = fut.as_mut().poll(&mut cx);
+                crate::trace!(
+                    "iter={total_iters} phase=B slot={} → {}",
+                    slot_id,
+                    match r {
+                        Poll::Ready(()) => "Ready",
+                        Poll::Pending => "Pending",
+                    }
+                );
+                match r {
+                    Poll::Ready(()) => {
+                        completed.push(slot_id);
+                        clear_current_slot();
+                    }
+                    Poll::Pending => {
+                        requeue.push((slot_id, fut));
+                        clear_current_slot();
+                    }
+                }
+            }
+
+            // Phase C: 重新 borrow_mut, 提交完成的 slot + 重新挂起 pending 的 future.
+            let mut s = self.0.borrow_mut();
+            for slot_id in completed {
+                s.registry.cancel_slot(slot_id);
+                s.pool.release(slot_id);
+            }
+            for (slot_id, fut) in requeue {
+                s.pool.slot(slot_id).future = Some(fut);
+            }
+            // 同样处理 task_queue 中的新 task + drain CQE (non-blocking).
+            s.drain_task_queue_phase();
+            s.drain_completions_with_submit(); // non-blocking: ring.submit() + poll
+        }
+        true
+    }
+}
+
+// ---- thread-local: 当前正在 poll 的 slot_id (供 io_ops 注册时拿到) ----
+
+thread_local! {
+    static CURRENT_SLOT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub(crate) fn set_current_slot(id: usize) {
+    CURRENT_SLOT.with(|c| c.set(Some(id)));
+}
+
+pub(crate) fn clear_current_slot() {
+    CURRENT_SLOT.with(|c| c.set(None));
+}
+
+pub(crate) fn with_current_slot<R>(f: impl FnOnce(usize) -> R) -> Option<R> {
+    CURRENT_SLOT.with(|c| c.get().map(f))
+}

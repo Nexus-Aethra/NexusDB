@@ -1,0 +1,21 @@
+[package]
+name = "storage"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+page = { path = "../page" }
+scheduler = { path = "../scheduler" }
+thiserror = "2"
+pollster = "0.4"
+io-uring = "0.6"
+libc = "0.2"
+
+[dev-dependencies]
+shard_manager = { path = "../shard_manager" }
+tempfile = "3"
+
+[[test]]
+name = "repro_verify_storage"
+path = "tests/repro_verify_storage.rs"

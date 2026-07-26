@@ -1,0 +1,29 @@
+[package]
+name = "scheduler"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# 启用调度器内部 trace 日志.
+#
+# 默认关闭 (零开销). 开启后, 调度器在每个 phase 打印以下事件:
+#   - drive_once Phase A/B/C 入口 + ready 长度 + 进出 pending 数量
+#   - task_queue drain 批次大小
+#   - CQE 到达 (user_data + result)
+#   - slot acquire / release
+#   - has_work 状态
+#
+# 启用方式:
+#   cargo test -p scheduler --features scheduler-trace
+# 或 workspace 级:
+#   cargo test --features scheduler-trace -p scheduler
+default = []
+scheduler-trace = []
+
+[dependencies]
+io-uring = "0.6"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+pollster = "0.4"
