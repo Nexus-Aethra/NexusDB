@@ -1,0 +1,22 @@
+[package]
+name = "shard_manager"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+storage = { path = "../storage" }
+scheduler = { path = "../scheduler" }
+page = { path = "../page" }
+nlog = { path = "../logging" }
+thiserror = "2"
+pollster = "0.4"
+crossbeam-queue = "0.3"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "stress"
+path = "examples/stress.rs"

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scheduler",
+    "crates/page",
+    "crates/storage",
+    "crates/shard_manager",
+    "crates/network",
+    "crates/config",
+    "crates/logging",
+]
+
+[package]
+name = "NexusDB"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+config = { path = "crates/config" }
+nlog = { path = "crates/logging" }
+storage = { path = "crates/storage" }
+shard_manager = { path = "crates/shard_manager" }
+network = { path = "crates/network" }
+libc = "0.2"

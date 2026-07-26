@@ -1,0 +1,19 @@
+# smoke 配置
+[server]
+listen_addr = "127.0.0.1:15433"
+worker_count = 2
+redis_addr = "127.0.0.1:16379"
+redis_password = "smokepass"
+
+[storage]
+block_root = "./smoke_tmp/data"
+num_shards = 3
+io_backend = "io_uring"
+chunk_cache_size = 8
+
+[log]
+level = "debug"
+dir = "./smoke_tmp/logs"
+buffer_kb = 4
+flush_interval_ms = 300
+stderr = true
