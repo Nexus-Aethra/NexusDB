@@ -355,6 +355,13 @@ impl DbRegistry {
 /// - 存在 → `btree_update` (原地替换 value, 不触发 split)
 /// - 不存在 → `btree_insert` (可能触发 split + 内部节点创建)
 ///
+/// **⭐ 大 value**: `key.len + value.len > INLINE_LIMIT` 时 value 切成
+/// 溢出页, leaf item 只存 13B 描述符. **防泄漏不变量**:
+/// - 覆盖写成功 → 释放旧链 (旧值是描述符时)
+/// - 新链已写但 leaf 提交失败 → 回滚释放新链
+///
+/// 两个方向都不留孤儿页.
+///
 /// **PageWriteBatch**: 走 btree 路由的 PageWriteBatch 一次提交.
 ///
 /// **⭐ T15 返回值**: 返回 `Option<new_root_vpid>`. 如果 table BTree root split
@@ -368,42 +375,88 @@ pub async fn table_put(
     value: &[u8],
 ) -> Result<Option<Vpid>, RegistryError> {
     use crate::btree::{btree_insert, btree_lookup, btree_update};
+    use crate::overflow;
 
-    // 1. 检查 key 是否已存在
-    if btree_lookup(pager, table_root_vpid, key).await?.is_some() {
-        // 已存在: 用 btree_update 替换 value (不触发 split)
-        btree_update(pager, table_root_vpid, key, value).await?;
-        Ok(None)
+    // 1. 查旧值 (存在性判定 + 旧溢出链释放依据)
+    let old_stored = btree_lookup(pager, table_root_vpid, key).await?;
+
+    // 2. 编码 stored value: 大 value → 溢出链 + 13B 描述符
+    let descriptor;
+    let stored: &[u8] = if overflow::needs_overflow(key.len(), value.len()) {
+        descriptor = overflow::write_overflow(pager, value).await?;
+        &descriptor
     } else {
-        // 不存在: insert 新 key-value (可能触发多层 split + root 新建)
-        let new_root = btree_insert(pager, table_root_vpid, key, value).await?;
-        Ok(new_root)
+        value
+    };
+
+    // 3. 提交 leaf item; 失败时回滚新溢出链 (防泄漏: 新链无人引用)
+    let commit = if old_stored.is_some() {
+        btree_update(pager, table_root_vpid, key, stored)
+            .await
+            .map(|_| None)
+    } else {
+        btree_insert(pager, table_root_vpid, key, stored).await
+    };
+    let new_root = match commit {
+        Ok(r) => r,
+        Err(e) => {
+            if overflow::is_indirect(stored) {
+                overflow::free_overflow(pager, stored).await?;
+            }
+            return Err(e.into());
+        }
+    };
+
+    // 4. 覆盖写成功: 释放旧溢出链 (防泄漏: 旧链已不被 leaf 引用)
+    if let Some(old) = &old_stored
+        && overflow::is_indirect(old)
+    {
+        overflow::free_overflow(pager, old).await?;
     }
+    Ok(new_root)
 }
 
 /// 读 key 对应的 value. 返回 None 表示 key 不存在.
 ///
 /// **T15**: 走 btree_lookup (travel 跨多层 BTree).
+/// **⭐ 大 value**: stored 是 13B 描述符时展开溢出链返回完整 value.
 pub async fn table_get(
     pager: &mut Pager,
     table_root_vpid: Vpid,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, RegistryError> {
     use crate::btree::btree_lookup;
-    Ok(btree_lookup(pager, table_root_vpid, key).await?)
+    use crate::overflow;
+    match btree_lookup(pager, table_root_vpid, key).await? {
+        Some(stored) if overflow::is_indirect(&stored) => {
+            Ok(Some(overflow::read_overflow(pager, &stored).await?))
+        }
+        other => Ok(other),
+    }
 }
 
 /// 删除 key. 返回 true 表示 key 存在并删除, false 表示不存在.
 ///
 /// **T15**: 走 btree_delete (travel 跨多层 BTree).
 /// **暂不实现 merge**: 删后 leaf 可能空, 留 polish.
+/// **⭐ 大 value**: 删除成功且旧值是描述符 → 释放溢出链 (防泄漏).
 pub async fn table_delete(
     pager: &mut Pager,
     table_root_vpid: Vpid,
     key: &[u8],
 ) -> Result<bool, RegistryError> {
-    use crate::btree::btree_delete;
-    Ok(btree_delete(pager, table_root_vpid, key).await?)
+    use crate::btree::{btree_delete, btree_lookup};
+    use crate::overflow;
+    // 先取旧值 (删除后取不到了)
+    let old_stored = btree_lookup(pager, table_root_vpid, key).await?;
+    let existed = btree_delete(pager, table_root_vpid, key).await?;
+    if existed
+        && let Some(old) = &old_stored
+        && overflow::is_indirect(old)
+    {
+        overflow::free_overflow(pager, old).await?;
+    }
+    Ok(existed)
 }
 
 // =====================================================================

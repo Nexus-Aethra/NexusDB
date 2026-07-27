@@ -42,6 +42,8 @@ use crate::waker::make_waker;
 
 const BATCH_SIZE: usize = 200;
 const PARK_TIMEOUT: Duration = Duration::from_micros(100);
+/// ⭐ G0: 每个调度 wave 至多 poll 的低优先级协程数 (后台任务限额).
+const LOW_PRIO_BUDGET: usize = 1;
 const IO_URING_ENTRIES: u32 = 1024;
 
 pub struct Scheduler {
@@ -109,10 +111,19 @@ impl Scheduler {
     }
 
     pub fn submit(&self, future: BoxFuture<'static, ()>) {
+        self.submit_with_priority(future, false);
+    }
+
+    /// ⭐ G0: 带优先级提交. low_priority=true 的协程在每个 wave 内
+    /// 排在普通协程之后, 且每 wave 至多 poll `LOW_PRIO_BUDGET` 个.
+    pub fn submit_with_priority(&self, future: BoxFuture<'static, ()>, low_priority: bool) {
         self.task_queue
             .lock()
             .unwrap()
-            .push_back(InternalMessage::Task(TaskRequest { future }));
+            .push_back(InternalMessage::Task(TaskRequest {
+                future,
+                low_priority,
+            }));
     }
 
     pub fn stop(&self) {
@@ -160,12 +171,12 @@ impl Scheduler {
 
     fn drive_once_inner(&mut self) {
         // === Phase 1: drain task_queue ===
-        let mut batch: Vec<BoxFuture<'static, ()>> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch: Vec<(BoxFuture<'static, ()>, bool)> = Vec::with_capacity(BATCH_SIZE);
         {
             let mut q = self.task_queue.lock().unwrap();
             while batch.len() < BATCH_SIZE {
                 match q.pop_front() {
-                    Some(InternalMessage::Task(req)) => batch.push(req.future),
+                    Some(InternalMessage::Task(req)) => batch.push((req.future, req.low_priority)),
                     Some(InternalMessage::Stop) => {
                         self.stop_flag.store(true, Ordering::Release);
                     }
@@ -175,9 +186,11 @@ impl Scheduler {
         }
 
         // === Phase 2: 给每个 future acquire 一个 slot, push 到 ready ===
-        for fut in batch {
+        for (fut, low) in batch {
             let slot_id = self.pool.acquire();
-            self.pool.slot(slot_id).future = Some(fut);
+            let slot = self.pool.slot(slot_id);
+            slot.future = Some(fut);
+            slot.low_priority = low;
             ready::push(&self.ready, slot_id);
         }
 
@@ -186,12 +199,16 @@ impl Scheduler {
         // 我们 clone Rc<ReadyQueue> 用于构造 waker, 把 future take 出 slot
         // (用 mem::replace), poll 期间 slot borrow 已释放.
         let ready_rc = Rc::clone(&self.ready);
+        // ⭐ G0: 本次 drive 内被限额推迟的低优先级 slot (循环结束后才回 ready,
+        // 避免同一次 drive 内 drain→回填→drain 死循环).
+        let mut deferred_low: Vec<usize> = Vec::new();
         loop {
-            let mut wave = ready::drain(&self.ready);
+            let wave = ready::drain(&self.ready);
             if wave.is_empty() {
                 break;
             }
-            for slot_id in wave.drain(..) {
+            let run = self.partition_wave(wave, &mut deferred_low);
+            for slot_id in run {
                 set_current_slot(slot_id);
                 // take 出 future (slot borrow 在 take 后立即释放).
                 let fut = self.pool.slot(slot_id).future.take();
@@ -216,9 +233,38 @@ impl Scheduler {
                 }
             }
         }
+        // 推迟的低优先级 slot 回 ready, 下次 drive 再跑
+        for slot_id in deferred_low {
+            ready::push(&self.ready, slot_id);
+        }
 
         // === Phase 4: drain CQE + submit_and_wait (修复 hang) ===
         self.drain_completions_and_wait();
+    }
+
+    /// ⭐ G0: wave 分区 — 普通协程在前; 低优先级排后且至多取
+    /// `LOW_PRIO_BUDGET` 个, 超额的进 `deferred` (caller 负责回 ready).
+    /// 无低优先级协程时行为与分区前完全一致 (no-op).
+    fn partition_wave(&mut self, wave: VecDeque<usize>, deferred: &mut Vec<usize>) -> Vec<usize> {
+        let mut run: Vec<usize> = Vec::with_capacity(wave.len());
+        let mut lows: Vec<usize> = Vec::new();
+        for slot_id in wave {
+            if self.pool.slot(slot_id).low_priority {
+                lows.push(slot_id);
+            } else {
+                run.push(slot_id);
+            }
+        }
+        let mut budget = LOW_PRIO_BUDGET;
+        for slot_id in lows {
+            if budget > 0 {
+                budget -= 1;
+                run.push(slot_id);
+            } else {
+                deferred.push(slot_id);
+            }
+        }
+        run
     }
 
     /// 生产路径: 阻塞等待内核完成至少 1 个 IO. 调用于 `drive_once`.
@@ -279,7 +325,15 @@ impl Scheduler {
     pub fn extract_pending(&mut self) -> Vec<(usize, BoxFuture<'static, ()>)> {
         let mut result = Vec::new();
         let wave: VecDeque<usize> = ready::drain(&self.ready);
-        for slot_id in wave {
+        // ⭐ G0: 分区 + 低优先级限额; 超额的直接回 ready (下轮 iter 再取,
+        // budget 重置). budget >= 1 保证 wave 非空时 run 非空, 兜底扫描不会
+        // 被 deferred 误触发.
+        let mut deferred: Vec<usize> = Vec::new();
+        let run = self.partition_wave(wave, &mut deferred);
+        for slot_id in deferred {
+            ready::push(&self.ready, slot_id);
+        }
+        for slot_id in run {
             if let Some(fut) = self.pool.slot(slot_id).future.take() {
                 result.push((slot_id, fut));
             }
@@ -298,12 +352,12 @@ impl Scheduler {
 
     /// 把 task_queue 中的新 task 装入 pool + push 到 ready (供 SchedHandle 三阶段驱动).
     pub fn drain_task_queue_phase(&mut self) {
-        let mut batch: Vec<BoxFuture<'static, ()>> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch: Vec<(BoxFuture<'static, ()>, bool)> = Vec::with_capacity(BATCH_SIZE);
         {
             let mut q = self.task_queue.lock().unwrap();
             while batch.len() < BATCH_SIZE {
                 match q.pop_front() {
-                    Some(InternalMessage::Task(req)) => batch.push(req.future),
+                    Some(InternalMessage::Task(req)) => batch.push((req.future, req.low_priority)),
                     Some(InternalMessage::Stop) => {
                         self.stop_flag.store(true, Ordering::Release);
                     }
@@ -311,9 +365,11 @@ impl Scheduler {
                 }
             }
         }
-        for fut in batch {
+        for (fut, low) in batch {
             let slot_id = self.pool.acquire();
-            self.pool.slot(slot_id).future = Some(fut);
+            let slot = self.pool.slot(slot_id);
+            slot.future = Some(fut);
+            slot.low_priority = low;
             ready::push(&self.ready, slot_id);
         }
     }

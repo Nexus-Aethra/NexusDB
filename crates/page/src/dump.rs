@@ -85,6 +85,8 @@ fn dump_header(ctx: &mut DumpCtx<'_>) {
             PageType::Meta => "Meta",
             PageType::Internal => "Internal",
             PageType::Leaf => "Leaf",
+            PageType::Overflow => "Overflow",
+            PageType::OverflowIndex => "OverflowIndex",
         },
         pt_byte
     );

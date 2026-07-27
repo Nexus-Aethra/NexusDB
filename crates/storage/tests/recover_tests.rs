@@ -189,11 +189,11 @@ fn recover_no_block_files_empty_state() {
 }
 
 // =====================================================================
-// ⭐ MetaCache union 语义: stale mate + .block 覆盖
+// ⭐ G3 主源切换: mate 有记录以 mate 为准, 扫描仅补缺失 vpid
 // =====================================================================
 
 #[test]
-fn recover_handles_stale_mate() {
+fn recover_meta_is_primary_scan_fills_missing() {
     run_async(async move {
         let tmp = tempfile::tempdir().unwrap();
         let block_path = tmp.path().join("000001.block");
@@ -206,21 +206,31 @@ fn recover_handles_stale_mate() {
         make_empty_mate(tmp.path());
         let mate_path = tmp.path().join("page.mate");
 
-        // mate 写 vpid 0..2 (用错误 pid, 模拟 stale)
+        // mate 记录 vpid 0..2 指向 chunk 1 (与磁盘扫描位置 chunk 0 不同).
+        // ⭐ G3 语义: chunk 可复用后 "pid 大=新" 不成立, mate 是主源 —
+        // 这些 vpid 必须保持 mate 的映射, 不被扫描覆盖.
         for v in 0..3u64 {
-            let fake_pid: [u8; 8] = [0xFF; 8];
-            write_mate_entry(&mate_path, v, fake_pid);
+            let mate_pid = storage::PidLocation {
+                file_id: 0,
+                chunk_idx: 1,
+                page_idx: v as u16,
+                flags: storage::PID_ALIVE,
+            };
+            write_mate_entry(&mate_path, v, mate_pid.to_bytes());
         }
 
         let mut state = recover(tmp.path()).expect("recover ok");
 
+        // mate 有记录的 vpid: 以 mate 为准 (chunk 1)
         for v in 0..3u64 {
             let pid = state.meta.read(v).unwrap_or_else(|| panic!("vpid {}", v));
-            assert_eq!(pid.file_id(), 0, "vpid {} 应来自 .block, file_id=0", v);
+            assert_eq!(pid.chunk_idx(), 1, "vpid {} 以 mate 为准 (主源)", v);
         }
+        // mate 缺失的 vpid: 扫描补缺 (chunk 0, crash 窗口新写场景)
         for v in 3..5u64 {
             let pid = state.meta.read(v).unwrap_or_else(|| panic!("vpid {}", v));
             assert_eq!(pid.file_id(), 0);
+            assert_eq!(pid.chunk_idx(), 0, "vpid {} 由扫描补缺", v);
         }
         assert!(state.meta.read(5).is_none());
     });

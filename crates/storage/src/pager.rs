@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use crate::pager_io::PagerIo;
 
 use crate::alloc::{PidAllocator, VpidAllocator};
+use crate::chunk_liveness::ChunkLiveness;
 use crate::chunk_lock::{AcquireResult, ChunkLockMap};
 use crate::chunk_lru::{ChunkKey, ChunkList};
 use crate::chunk_writer::{ChunkWriter, NowChunks, WriteQueue};
@@ -29,7 +30,7 @@ use crate::meta_page::{META_PID, META_VPID};
 use crate::page_pool;
 use crate::types::{
     CHUNK_SIZE, CHUNKS_PER_BLOCK, DEFAULT_DB_ID, DEFAULT_DB_NAME, DEFAULT_SHARD_ID, PAGE_SIZE,
-    PageKey, PidLocation, ShardId,
+    PAGES_PER_CHUNK, PageKey, PidLocation, ShardId,
 };
 
 // =====================================================================
@@ -91,6 +92,21 @@ pub struct Pager {
     /// ⭐ Phase M3: data backlog 排空后置位, 下轮 drive 取 meta window 快照
     /// 异步写盘 (不再在收割路径同步 fsync page.mate).
     meta_flush_due: bool,
+    /// ⭐ G1: chunk/block 活性统计 (GC 基础, 纯内存, 重启从 meta 反推).
+    liveness: ChunkLiveness,
+    /// ⭐ G2: compact 在飞标志 (同时至多 1 个).
+    compact_inflight: bool,
+    /// ⭐ G3: bump 高水位 — 下一个从未分配过的 chunk (file, chunk).
+    /// free-chunk 复用不推进此水位, 保证 bump 区永不回退/重叠.
+    pid_bump_next: (u32, u8),
+    /// ⭐ G3: 当前写入位置是否在复用 chunk (pid.state 写 bump 水位而非 current).
+    on_reused_chunk: bool,
+    /// ⭐ G5: 上次 compact 发起时间 (节流).
+    last_compact_time: std::time::Instant,
+    /// ⭐ B-drain: 正在排空的目标 block (Some = 排空模式).
+    /// 状态机分片: 每轮只迁移一个 chunk (低优先级协程 + 节流),
+    /// 天然多次让出运行时, 不长占 CPU.
+    drain_block_target: Option<u32>,
 }
 
 /// ⭐ 异步落盘作业 (Phase C: 按 file_id 分组批量): 零 Pager 借用,
@@ -108,6 +124,86 @@ pub struct MetaFlushBatch {
     pub windows: Vec<(u32, Vec<u8>)>,
     pub mate_path: PathBuf,
     pub io: Rc<PagerIo>,
+}
+
+/// ⭐ G2: compact 读作业 (阶段 1 → 2): 协程读 dst+src 两个 chunk 字节.
+pub struct CompactReadJob {
+    pub dst: PageKey,
+    pub src: PageKey,
+    /// ⭐ B-drain: dst 是全新 bump chunk (磁盘无内容, 协程跳过读 dst
+    /// 传全零字节 — 全零无 magic → analyze 判全部 64 槽为死槽).
+    pub dst_fresh: bool,
+    pub dir: PathBuf,
+    pub io: Rc<PagerIo>,
+}
+
+/// ⭐ G2: compact 写作业 (阶段 2 → 3): 协程把 src 活页写进 dst 死槽.
+pub struct CompactWriteJob {
+    pub dst: PageKey,
+    pub src: PageKey,
+    /// ⭐ B-drain: dst 是全新 bump chunk → 整 chunk 写 (部分页写会让
+    /// chunk 尾部无数据, 后续整 chunk 读 EOF).
+    pub dst_fresh: bool,
+    /// (dst 死槽 page_idx, 16KB 页字节)
+    pub items: Vec<(u8, Vec<u8>)>,
+    /// (vpid, src_pid, dst 死槽 page_idx) — 提交段 CAS 用
+    pub moves: Vec<(u64, PidLocation, u8)>,
+    pub dir: PathBuf,
+    pub io: Rc<PagerIo>,
+}
+
+impl CompactWriteJob {
+    /// ⭐ 执行写盘 (协程内调用, 零 Pager 借用):
+    /// - fresh dst: 拼整 1MB chunk (空槽全零) 一次写 + fsync
+    /// - 常规 dst: 死槽 16KB 粒度批量写 + 单次 fsync
+    pub async fn execute(&self) -> io::Result<()> {
+        if self.dst_fresh {
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            for (slot, bytes) in &self.items {
+                let off = *slot as usize * PAGE_SIZE;
+                buf[off..off + PAGE_SIZE].copy_from_slice(bytes);
+            }
+            self.io.write_page_chunk_slice(&self.dir, self.dst, &buf).await
+        } else {
+            let items: Vec<(u8, &[u8])> =
+                self.items.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+            self.io.write_pages_batch(&self.dir, self.dst, &items).await
+        }
+    }
+}
+
+/// ⭐ G2: compact victim 阈值 — 活页 < 阈值的 chunk 才参与 (垃圾率 > 50%).
+const COMPACT_LIVE_THRESHOLD: u8 = 32;
+
+/// ⭐ G5: compact 最小触发间隔 — 限制后台搜寻频率 (空闲时免每轮全扫).
+/// 10ms ≈ 每秒至多 100 次搬运 (回收带宽 ≥ 100MB/s), 写重负载下实测可跟上
+/// 垃圾生成速率; 更长间隔 (200ms) 实测回收积压 (block 文件数 ×26).
+const COMPACT_MIN_INTERVAL_MS: u64 = 10;
+
+/// ⭐ B-drain: block 排空触发阈值 — 活跃 chunk 数 <= 阈值的 block
+/// 值得主动搬空 (腾出整个 10MB block 文件).
+const BLOCK_DRAIN_ACTIVE_THRESHOLD: u16 = 3;
+
+/// ⭐ G3: bump 区 chunk 推进 (跨 block 进位).
+fn next_bump_chunk(file_id: u32, chunk_idx: u8) -> (u32, u8) {
+    if chunk_idx as usize + 1 >= CHUNKS_PER_BLOCK {
+        (file_id + 1, 0)
+    } else {
+        (file_id, chunk_idx + 1)
+    }
+}
+
+/// ⭐ G2: 从 chunk 字节解析第 i 页的 vpid (page 自描述: magic "LCBP" +
+/// vpid 在 [0x18..0x20]). 无 magic → None (从未写过).
+/// 与 recover 扫描同约定: 所有落盘页头部含 magic.
+fn parse_page_vpid(chunk_bytes: &[u8], i: usize) -> Option<u64> {
+    let off = i * PAGE_SIZE;
+    if chunk_bytes.len() < off + PAGE_SIZE || &chunk_bytes[off..off + 4] != b"LCBP" {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        chunk_bytes[off + 0x18..off + 0x20].try_into().expect("8B"),
+    ))
 }
 
 /// ⭐ 异步落盘: in-flight + pending 总数上限 (背压阈值).
@@ -183,6 +279,9 @@ impl Pager {
         writer: ChunkWriter,
         io: PagerIo,
     ) -> Self {
+        // ⭐ G3: bump 高水位初始 = 当前 active chunk 的下一个
+        let cur = pid_alloc.current();
+        let pid_bump_next = next_bump_chunk(cur.0, cur.1);
         Self {
             block_root: block_dir.clone(),
             db_name: DEFAULT_DB_NAME.to_string(),
@@ -202,6 +301,15 @@ impl Pager {
             last_flush_time: std::time::Instant::now(),
             in_flight: HashMap::new(),
             meta_flush_due: false,
+            liveness: ChunkLiveness::new(),
+            compact_inflight: false,
+            pid_bump_next,
+            on_reused_chunk: false,
+            // 初始回拨一个间隔: 启动后首个空闲窗口即可触发 compact
+            last_compact_time: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(COMPACT_MIN_INTERVAL_MS))
+                .unwrap_or_else(std::time::Instant::now),
+            drain_block_target: None,
         }
     }
 
@@ -256,6 +364,9 @@ impl Pager {
         io: PagerIo,
     ) -> Self {
         let block_dir = crate::recover::shard_dir_path(&block_root, &db_name, shard_id);
+        // ⭐ G3: bump 高水位初始 = 当前 active chunk 的下一个
+        let cur = pid_alloc.current();
+        let pid_bump_next = next_bump_chunk(cur.0, cur.1);
         Self {
             block_root,
             db_name,
@@ -275,6 +386,45 @@ impl Pager {
             last_flush_time: std::time::Instant::now(),
             in_flight: HashMap::new(),
             meta_flush_due: false,
+            liveness: ChunkLiveness::new(),
+            compact_inflight: false,
+            pid_bump_next,
+            on_reused_chunk: false,
+            // 初始回拨一个间隔: 启动后首个空闲窗口即可触发 compact
+            last_compact_time: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(COMPACT_MIN_INTERVAL_MS))
+                .unwrap_or_else(std::time::Instant::now),
+            drain_block_target: None,
+        }
+    }
+
+    /// ⭐ G1: 从全量平坦 meta 反推重建活性统计 (open/recover 后调一次).
+    pub fn rebuild_liveness(&mut self) {
+        self.liveness.rebuild_from_meta(&self.meta);
+    }
+
+    /// G1: 活性统计只读访问 (测试/观测).
+    pub fn liveness(&self) -> &ChunkLiveness {
+        &self.liveness
+    }
+
+    /// 测试/调试: 遍历 meta 已分配映射.
+    pub fn meta_debug_iter(&self) -> Vec<(u64, PidLocation)> {
+        self.meta.iter_allocated().collect()
+    }
+
+    /// ⭐ 大 value: 释放溢出页 vpid (覆盖写/删除时防存储泄漏).
+    ///
+    /// 链路: 活性递减 (chunk 可被 compact/drain 回收) → meta 写墓碑
+    /// (PID_FREED, read 此后 None; recover 扫描凭墓碑**不回填** — 否则磁盘
+    /// 残留的旧页 header 会把死页复活) → 置 meta_flush_due 推动墓碑持久化.
+    ///
+    /// 幂等: vpid 未分配 / 已是墓碑 → no-op.
+    pub fn free_overflow_vpid(&mut self, vpid: u64) {
+        if let Some(pid) = self.meta.peek(vpid) {
+            self.liveness.on_page_dead(pid);
+            self.meta.free_slot(vpid);
+            self.meta_flush_due = true;
         }
     }
 
@@ -639,11 +789,13 @@ impl Pager {
     }
 
     /// ⭐ Phase M3: 含 meta 的全部异步 backlog (drain/close 判空用).
-    /// data in-flight/pending + meta due/dirty/in-flight 全部排空才算真正空闲.
+    /// data in-flight/pending + meta due/dirty/in-flight + compact 在飞
+    /// 全部排空才算真正空闲.
     pub fn total_async_backlog(&self) -> usize {
         self.flush_backlog()
             + self.meta.in_flight_window_count()
             + (self.meta_flush_due && self.meta.has_unflushed()) as usize
+            + self.compact_inflight as usize
     }
 
     /// ⭐ Phase M3: 取 meta window 异步刷盘批.
@@ -662,7 +814,14 @@ impl Pager {
             self.meta_flush_due = true;
         }
         if windows.is_empty() {
-            return None; // 无脏 window (或全在飞), 不发空批
+            // ⭐ G2/G4: 无脏 window 且无在飞 → meta 已是持久状态
+            // (同步 flush 路径已刷过): 确认点语义同样成立,
+            // 延迟释放可直接 promote + 回收全空 block.
+            if !self.meta.has_unflushed() {
+                self.liveness.promote_pending_free();
+                self.maybe_drop_free_blocks();
+            }
+            return None; // 不发空批
         }
         Some(MetaFlushBatch {
             windows,
@@ -684,7 +843,300 @@ impl Pager {
         }
         if !self.meta.has_unflushed() {
             self.persist_pid_state();
+            // ⭐ G2: meta 已全部持久 → compact 延迟释放的 src chunk 可复用
+            self.liveness.promote_pending_free();
+            // ⭐ G4: 全空 block 回收 (unlink, 低频)
+            self.maybe_drop_free_blocks();
         }
+    }
+
+    /// ⭐ G4: 回收全空 block 文件.
+    ///
+    /// 候选 = free_chunks 中出现过的 file 且 block_active == 0 (无任何活页,
+    /// 隐含无 nowchunks/pending/in_flight 项 — 驻留页在 alloc 时已计活);
+    /// 排除当前写入 file 与 bump 预定 file. 顺序: 清 free list → 逐出 fd
+    /// (fd_cache + FdPool 固定槽) → unlink → 清活性位.
+    /// unlink 失败仅 warn (下轮重试); META block (file 0) 因 MetaPage 永活天然不会全空.
+    fn maybe_drop_free_blocks(&mut self) {
+        let (cur_file, _, _) = self.pid_alloc.current();
+        for file_id in self.liveness.free_files() {
+            if file_id == cur_file || file_id == self.pid_bump_next.0 {
+                continue;
+            }
+            if !self.liveness.block_fully_free(file_id) {
+                continue;
+            }
+            let path = self.io.block_path(&self.block_dir, file_id);
+            if !path.exists() {
+                // 文件不存在 (从未落盘过): 只清内存状态
+                self.liveness.drain_free_chunks_of_file(file_id);
+                self.liveness.forget_block(file_id);
+                continue;
+            }
+            // 不再复用该 file 的 chunk → 逐出 fd → unlink
+            self.liveness.drain_free_chunks_of_file(file_id);
+            self.io.evict_path(&path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    self.liveness.forget_block(file_id);
+                }
+                Err(e) => {
+                    eprintln!("[pager] drop block {} failed (retry next round): {e}", path.display());
+                }
+            }
+        }
+    }
+
+    // =================================================================
+    // ⭐ G2: chunk compact — 死槽填充 + CAS 提交 (两阶段协程)
+    // =================================================================
+
+    /// ⭐ G2 阶段 1 (同步): 选 victim, 构造读作业 (协程读 src+dst chunk 字节).
+    ///
+    /// 触发条件由 caller 保证 (data backlog == 0); 同时至多 1 个 compact 在飞.
+    /// victim 排除: 当前 active chunk / nowchunks 驻留 / write_queue pending /
+    /// data in-flight / MetaPage 固定 chunk (file 0, chunk 0).
+    pub fn start_compact(&mut self) -> Option<CompactReadJob> {
+        if self.compact_inflight {
+            return None;
+        }
+        // ⭐ G5: 节流 — 后台回收对实时性不敏感, 限频避免与前台抢 IO 带宽
+        if self.last_compact_time.elapsed().as_millis() < COMPACT_MIN_INTERVAL_MS as u128 {
+            return None;
+        }
+        self.last_compact_time = std::time::Instant::now();
+        let (cur_file, cur_chunk, _) = self.pid_alloc.current();
+        let mut excluded: std::collections::HashSet<PageKey> =
+            self.write_queue.pending_keys().into_iter().collect();
+        excluded.extend(self.in_flight.keys().copied());
+        excluded.extend(self.nowchunks.resident_keys());
+        excluded.insert(PageKey { file_id: cur_file, chunk_idx: cur_chunk });
+        excluded.insert(PageKey { file_id: 0, chunk_idx: 0 }); // META 固定位置
+
+        // ⭐ G4: 顺带收割自然死光的 chunk (COW 减到全死不经 compact 的).
+        // 排除未分配区: tuple >= bump 水位的 chunk 从未分配过 (live 数组懒
+        // 扩容的 0 项), 误收割会与未来 bump 分配重叠.
+        let bump = self.pid_bump_next;
+        let dead: Vec<PageKey> = self.liveness.collect_dead_chunks(&|k| {
+            excluded.contains(&k) || (k.file_id, k.chunk_idx) >= bump
+        });
+        if !dead.is_empty() {
+            for key in dead {
+                self.chunk_list.invalidate(&key.into());
+                self.liveness.stage_pending_free(key);
+            }
+            self.meta_flush_due = true; // 推动 meta 确认 → promote
+        }
+
+        // ⭐ B-drain: 排空模式优先 — 目标 block 内逐 chunk 迁出
+        // (无视 live 阈值: 为腾空整个 block, 中等活度 chunk 也搬).
+        // 每轮只迁一个 chunk (状态机分片), 不长占运行时.
+        if let Some(f) = self.drain_block_target {
+            if self.liveness.block_fully_free(f) {
+                // 目标达成: 全死 block 由确认点的 maybe_drop_free_blocks 回收
+                self.drain_block_target = None;
+            } else if let Some(src) = self
+                .liveness
+                .pick_src_in_block(f, &|k| excluded.contains(&k))
+            {
+                let need = self.liveness.live_pages(src) as usize;
+                // dst: 优先全局死槽宿主 (排除目标 block 自身); 无宿主兑底
+                // 开 bump 新 chunk (fresh: 磁盘无内容, 64 槽全可用)
+                let (dst, dst_fresh) = match self.liveness.pick_dst_for(need, &|k| {
+                    excluded.contains(&k) || k.file_id == f
+                }) {
+                    Some(d) => (d, false),
+                    None => {
+                        let t = self.pid_bump_next;
+                        self.pid_bump_next = next_bump_chunk(t.0, t.1);
+                        (PageKey { file_id: t.0, chunk_idx: t.1 }, true)
+                    }
+                };
+                self.compact_inflight = true;
+                return Some(CompactReadJob {
+                    dst,
+                    src,
+                    dst_fresh,
+                    dir: self.block_dir.clone(),
+                    io: self.io.clone(),
+                });
+            }
+            // src 全被排除 (驻留/在飞): 保留 target 下轮再试, 本轮走普通 pick
+        }
+
+        let (dst, src) = self
+            .liveness
+            .pick_compact_victims(COMPACT_LIVE_THRESHOLD, &|k| excluded.contains(&k))?;
+        self.compact_inflight = true;
+        Some(CompactReadJob {
+            dst,
+            src,
+            dst_fresh: false,
+            dir: self.block_dir.clone(),
+            io: self.io.clone(),
+        })
+    }
+
+    /// ⭐ G2 阶段 2 (同步, 收割读完成后): meta 判活, 组装写作业.
+    ///
+    /// **判活 = header vpid 候选 + meta 点查确认** (O(128) 点查, 零 meta
+    /// 全扫 — 全扫在 1TB/512MB meta 规模下每次 compact 扫数十 ms 不可接受):
+    /// - src 活页 = header vpid 在 meta 中仍指向该槽
+    /// - dst 死槽 = 非活槽 (含无 magic 的从未写槽)
+    /// - 无 magic 页 = 未写 (与 recover 扫描同约定)
+    /// - src 已全死 → 无需搬运, 直接入延迟释放
+    /// - 读失败 / 死槽不足 → 放弃本轮 (无副作用)
+    ///
+    /// 页字节原样搬运 (header 内只有 vpid 无 pid, 位置变更不需改写).
+    pub fn analyze_compact_read(
+        &mut self,
+        dst: PageKey,
+        src: PageKey,
+        dst_fresh: bool,
+        read_result: io::Result<(Vec<u8>, Vec<u8>)>, // (dst_bytes, src_bytes)
+    ) -> Option<CompactWriteJob> {
+        let Ok((dst_bytes, src_bytes)) = read_result else {
+            self.compact_inflight = false;
+            return None; // 读失败: 无副作用, 下轮重试
+        };
+        if src_bytes.len() != CHUNK_SIZE || dst_bytes.len() != CHUNK_SIZE {
+            self.compact_inflight = false;
+            return None;
+        }
+        // src 活页: header vpid 候选 + meta 点查确认
+        let mut src_live: Vec<(u64, PidLocation, usize)> = Vec::new();
+        for i in 0..PAGES_PER_CHUNK {
+            if let Some(vpid) = parse_page_vpid(&src_bytes, i)
+                && let Some(pid) = self.meta.peek(vpid)
+                && pid.file_id() == src.file_id
+                && pid.chunk_idx() == src.chunk_idx
+                && pid.page_idx() as usize == i
+            {
+                src_live.push((vpid, pid, i));
+            }
+        }
+        if src_live.is_empty() {
+            // src 已全死 (并发 COW 减到位): 直接延迟释放, 无需写盘
+            self.compact_inflight = false;
+            self.chunk_list.invalidate(&src.into());
+            self.liveness.stage_pending_free(src);
+            self.meta_flush_due = true; // 推动 meta 确认 → promote
+            return None;
+        }
+        // dst 死槽: 非活槽 (header/meta 点查同法)
+        let mut dead_slots: Vec<u8> = Vec::new();
+        for i in 0..PAGES_PER_CHUNK {
+            let alive = parse_page_vpid(&dst_bytes, i)
+                .and_then(|vpid| self.meta.peek(vpid))
+                .map(|pid| {
+                    pid.file_id() == dst.file_id
+                        && pid.chunk_idx() == dst.chunk_idx
+                        && pid.page_idx() as usize == i
+                })
+                .unwrap_or(false);
+            if !alive {
+                dead_slots.push(i as u8);
+            }
+        }
+        if dead_slots.len() < src_live.len() {
+            // liveness 阈值下不该发生; 防御性放弃
+            self.compact_inflight = false;
+            return None;
+        }
+        let mut moves: Vec<(u64, PidLocation, u8)> = Vec::new();
+        let mut items: Vec<(u8, Vec<u8>)> = Vec::new();
+        for ((vpid, src_pid, src_slot), dst_slot) in src_live.into_iter().zip(dead_slots) {
+            let off = src_slot * PAGE_SIZE;
+            items.push((dst_slot, src_bytes[off..off + PAGE_SIZE].to_vec()));
+            moves.push((vpid, src_pid, dst_slot));
+        }
+        Some(CompactWriteJob {
+            dst,
+            src,
+            dst_fresh,
+            items,
+            moves,
+            dir: self.block_dir.clone(),
+            io: self.io.clone(),
+        })
+    }
+
+    /// ⭐ G2 阶段 3 (同步, 收割写完成后): CAS 提交.
+    ///
+    /// 逐 vpid 校验 `meta 仍指向 src_pid` 才改写 (防回滚 IO 期间的并发 COW 写);
+    /// miss 跳过 (页已死, live 已由 COW 路径递减). 提交后 src 入延迟释放,
+    /// meta window 确认后才可复用 (data→meta 顺序同构).
+    pub fn complete_compact(
+        &mut self,
+        dst: PageKey,
+        src: PageKey,
+        moves: Vec<(u64, PidLocation, u8)>,
+        result: io::Result<()>,
+    ) {
+        self.compact_inflight = false;
+        if result.is_err() {
+            return; // A 死槽半写无害 (meta 未指向), 下轮重试
+        }
+        let mut migrated = 0usize;
+        for (vpid, src_pid, dst_slot) in moves {
+            // CAS: IO 期间被用户 COW 覆盖的页跳过
+            if self.meta.read(vpid) != Some(src_pid) {
+                continue;
+            }
+            let dst_pid = PidLocation {
+                file_id: dst.file_id,
+                chunk_idx: dst.chunk_idx,
+                page_idx: dst_slot as u16,
+                flags: src_pid.flags(), // 保留原 flags (不改变页状态语义)
+            };
+            self.meta.write(vpid, dst_pid);
+            self.liveness.on_page_dead(src_pid);
+            self.liveness.on_page_alloc(dst_pid);
+            migrated += 1;
+        }
+        // 旧缓存副本失效: dst 缺迁入页, src 即将释放
+        self.chunk_list.invalidate(&dst.into());
+        self.chunk_list.invalidate(&src.into());
+        if self.liveness.live_pages(src) == 0 {
+            self.liveness.stage_pending_free(src);
+        }
+        if migrated > 0 || self.meta.dirty_count() > 0 {
+            self.meta_flush_due = true;
+        }
+        // ⭐ B-drain: chunk compact 完成后验收 — 无在进行目标时,
+        // 全扫 block_active (“最小堆”惰性实现) 选活跃度最低的半空 block
+        // 进入排空模式 (排除 active/bump/META file).
+        if self.drain_block_target.is_none() {
+            let (cur_file, _, _) = self.pid_alloc.current();
+            let bump_file = self.pid_bump_next.0;
+            self.drain_block_target = self.liveness.pick_block_drain_candidate(
+                BLOCK_DRAIN_ACTIVE_THRESHOLD,
+                &|file| file == cur_file || file == bump_file || file == 0,
+            );
+        }
+    }
+
+    /// G2: 是否有 compact 在飞 (drain/观测用).
+    pub fn compact_inflight(&self) -> bool {
+        self.compact_inflight
+    }
+
+    /// G5: 测试 helper — 重置节流窗口 (让下一次 start_compact 立即可触发).
+    pub fn reset_compact_throttle(&mut self) {
+        self.last_compact_time = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(COMPACT_MIN_INTERVAL_MS))
+            .unwrap_or_else(std::time::Instant::now);
+    }
+
+    /// ⭐ B-drain: 显式请求排空指定 block (测试/未来管理命令用;
+    /// 自动路径由 complete_compact 尾部的候选选择触发).
+    pub fn request_block_drain(&mut self, file_id: u32) {
+        self.drain_block_target = Some(file_id);
+    }
+
+    /// B-drain: 当前排空目标 (观测用).
+    pub fn drain_block_target(&self) -> Option<u32> {
+        self.drain_block_target
     }
 
     /// ⭐ 自动持久化: 驱动 WriteQueue 落盘.
@@ -773,7 +1225,14 @@ impl Pager {
     /// 交给 page cache 回写即可. 8B 小写用同步 std fs (不值得走 io_uring).
     fn persist_pid_state(&self) {
         use std::io::Write;
-        let (file_id, chunk_idx, page_idx) = self.pid_alloc.current();
+        // ⭐ G3: 复用 chunk 上写入时 current 低于 bump 高水位, pid.state 必须写
+        // bump 水位 (重启后从未分配区起分配, 复用机会由 liveness 重建恢复);
+        // bump 区写入时 current 即精确水位.
+        let (file_id, chunk_idx, page_idx) = if self.on_reused_chunk {
+            (self.pid_bump_next.0, self.pid_bump_next.1, 0u8)
+        } else {
+            self.pid_alloc.current()
+        };
         let pid = PidLocation {
             file_id,
             chunk_idx,
@@ -966,6 +1425,10 @@ impl PageWriteBatch {
             //    dirty 而 chunk 已不在内存 (旧版靠 reinsert_clean 兜底)。去掉 reinsert
             //    后 dirty 不再等价"chunk 驻留", 必须直接问 nowchunks (meta 是 SoT)。
             let pid = if vpid == META_VPID {
+                // ⭐ G1 liveness: MetaPage 首写计一次活 (固定位置覆盖不重复计)
+                if pager.meta.read(META_VPID).is_none() {
+                    pager.liveness.on_page_alloc(META_PID);
+                }
                 META_PID
             } else if let Some(old_pid) = pager.meta.read(vpid)
                 && pager.nowchunks.peek_chunk(PageKey {
@@ -977,19 +1440,35 @@ impl PageWriteBatch {
                 old_pid
             } else {
                 // COW: alloc 新 pid
-                loop {
+                let old_pid_opt = pager.meta.read(vpid);
+                let new_pid = loop {
                     if let Some(p) = pager.pid_alloc.alloc() {
                         break p;
                     }
-                    // chunk 满: rotate
-                    let (file_id, chunk_idx, _) = pager.pid_alloc.current();
-                    let (next_file, next_chunk) = if chunk_idx as usize + 1 >= CHUNKS_PER_BLOCK {
-                        (file_id + 1, 0u8)
-                    } else {
-                        (file_id, chunk_idx + 1)
-                    };
+                    // chunk 满: rotate. ⭐ G3: 优先复用 free chunk (compact
+                    // 释放 + meta 已确认), 无 free 才 bump 高水位.
+                    // 复用 chunk 预先插入空视图 (磁盘历史内容全死,
+                    // 驻留兜底不得加载旧死页).
+                    let (next_file, next_chunk) =
+                        if let Some(free) = pager.liveness.pop_free_chunk() {
+                            pager.nowchunks.insert_empty(free);
+                            pager.on_reused_chunk = true;
+                            (free.file_id, free.chunk_idx)
+                        } else {
+                            let t = pager.pid_bump_next;
+                            pager.pid_bump_next = next_bump_chunk(t.0, t.1);
+                            pager.on_reused_chunk = false;
+                            t
+                        };
                     pager.pid_alloc.rotate_to(next_file, next_chunk);
+                };
+                // ⭐ G1 liveness: COW 路径 — 旧页死 (若存在), 新页活.
+                // 复用分支 pid 不变不计; 读路径不影响活性.
+                if let Some(old) = old_pid_opt {
+                    pager.liveness.on_page_dead(old);
                 }
+                pager.liveness.on_page_alloc(new_pid);
+                new_pid
             };
 
             // 2. memcpy 到 nowchunks (user data 完整保留, 不构造 header)

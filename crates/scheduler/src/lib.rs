@@ -31,7 +31,7 @@ pub use park::{
 pub use pool::Pool;
 pub use ready::{ReadyQueueHandle, new_handle as new_ready_queue};
 pub use scheduler::{SchedHandle, Scheduler, with_current};
-pub use task::{JoinError, JoinHandle, spawn, spawn_on};
+pub use task::{JoinError, JoinHandle, spawn, spawn_on, spawn_on_low};
 pub use yield_now::yield_now;
 
 // 测试帮助模块

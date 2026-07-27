@@ -269,6 +269,8 @@ impl StorageEngine {
 
         // 5. ⭐ 加载 DbRegistry
         let mut pager_for_registry = pager;
+        // ⭐ G1: 从全量平坦 meta 反推重建 chunk/block 活性统计 (GC 基础)
+        pager_for_registry.rebuild_liveness();
         let registry = DbRegistry::load(&mut pager_for_registry)
             .await
             .map_err(|e| {

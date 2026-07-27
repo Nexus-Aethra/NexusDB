@@ -6,7 +6,7 @@ worker_count = 2
 redis_addr = "0.0.0.0:6379"     # RESP (Redis 兼容) 监听地址, 空 = 禁用
 redis_password = ""             # RESP AUTH 密码, 空 = 不启用认证
 max_key_bytes = 1024            # key 长度上限 (协议层拦截)
-max_value_bytes = 3000          # value 长度上限 (key+value <= 4000, page 编码限制)
+max_value_bytes = 1048576       # value 长度上限 (>~4000B 自动走溢出页, 上限 1MB)
 
 [storage]
 block_root = "./data"

@@ -32,8 +32,8 @@ pub struct ServerConfig {
     pub redis_password: String,
     /// key 长度上限 (字节). 超限请求在协议层拦截.
     pub max_key_bytes: usize,
-    /// value 长度上限 (字节). 受 page 编码缓冲限制:
-    /// max_key_bytes + max_value_bytes 必须 <= 4060 (4096 栈缓冲 - 编码开销).
+    /// value 长度上限 (字节). ⭐ 大 value: 超过 inline 阈值 (~4000B) 的
+    /// value 由存储层自动切溢出页 (单层间接), 上限 1MB.
     pub max_value_bytes: usize,
 }
 
@@ -45,7 +45,7 @@ impl Default for ServerConfig {
             redis_addr: "0.0.0.0:6379".to_string(),
             redis_password: String::new(),
             max_key_bytes: 1024,
-            max_value_bytes: 3000,
+            max_value_bytes: 1024 * 1024,
         }
     }
 }
@@ -153,10 +153,14 @@ impl NexusConfig {
         if self.server.max_key_bytes == 0 || self.server.max_value_bytes == 0 {
             return Err("server.max_key_bytes / max_value_bytes must be >= 1".to_string());
         }
-        // page crate 编码路径 4096B 栈缓冲: key+value+tag+varint 开销必须装得下
-        if self.server.max_key_bytes + self.server.max_value_bytes > 4060 {
+        // key 参与 page item 比较/分裂/internal 路由, 维持 inline 上限
+        if self.server.max_key_bytes > 1024 {
+            return Err("server.max_key_bytes must be <= 1024 (page item routing limit)".to_string());
+        }
+        // ⭐ 大 value: 超 inline 阈值走溢出页 (单层间接), 上限 1MB
+        if self.server.max_value_bytes > 1024 * 1024 {
             return Err(
-                "server.max_key_bytes + max_value_bytes must be <= 4060 (page item encode limit)"
+                "server.max_value_bytes must be <= 1048576 (overflow single-level limit)"
                     .to_string(),
             );
         }

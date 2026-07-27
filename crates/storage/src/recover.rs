@@ -138,17 +138,40 @@ pub fn recover_for_shard(
         });
     }
 
-    // 1. 加载 page.mate 进 MetaCache 作为初值 (可能 stale)
+    // 1. 加载 page.mate 进 MetaCache (⭐ G3: mate 是主源 — meta 异步刷盘后
+    //    最多落后一轮, 且 free-chunk 延迟复用保证 mate 未确认前旧位置数据仍有效)
     let mut meta = MetaCache::open(&mate_path)?;
 
-    // 2. 收集 .block 文件, 按 file_id 升序
+    // 2. 收集 .block 文件, 按 file_id 升序 (G4 后可能有 file_id 空洞, 天然兼容)
     let block_files = collect_block_files(&block_dir)?;
 
-    // 3. ⭐ 扫描 .block 文件, 从 page header 提取 vpid, 填 MetaCache (union 覆盖)
-    let (max_vpid, last_pid, seen_any) = scan_block_files(&block_files, &mut meta)?;
+    // 3. ⭐ 扫描 .block 文件提取 (vpid → pid) 候选.
+    //    ⭐ G3 主源切换: chunk 复用后 "pid 越大越新" 不再成立, 扫描 union
+    //    覆盖 meta 会把死页当新数据. 改为: **meta 有记录的 vpid 以 meta 为准**,
+    //    扫描仅补 meta 缺失的 vpid (crash 窗口内首次写入、mate 尚未记录的页).
+    //    丢失窗口 = 上次 meta 刷盘以来的更新 (≤ 一个刷盘周期, 与周期持久化承诺一致).
+    let mut fill: std::collections::HashMap<u64, PidLocation> = std::collections::HashMap::new();
+    let (max_vpid, last_pid, seen_any) = scan_block_files(&block_files, &mut fill)?;
+    for (vpid, pid) in fill {
+        // ⭐ 大 value: has_record 含墓碑 (PID_FREED) — 已释放的溢出页 vpid
+        // 磁盘上仍残留旧 header, 回填会把死页"复活"为活页 (存储泄漏).
+        if !meta.has_record(vpid) {
+            meta.write(vpid, pid);
+        }
+        // meta 已有记录 (活或墓碑): 扫描候选可能是历史死页或复用后新写
+        // (无法区分), 以 meta 一致点为准, 跳过.
+    }
 
-    // 4. 推导 alloc 起点
-    let next_vpid = if seen_any { max_vpid + 1 } else { 0 };
+    // 4. 推导 alloc 起点 (vpid 水位取扫描与 mate 两者较大 — mate 可能含
+    //    扫描不信任的 Internal 页 vpid; 注意用已分配 slot 而非数组水位,
+    //    mate 文件可能预分配全零区)
+    let scan_next_vpid = if seen_any { max_vpid + 1 } else { 0 };
+    let mate_next_vpid = meta
+        .iter_allocated()
+        .map(|(v, _)| v + 1)
+        .max()
+        .unwrap_or(0);
+    let next_vpid = scan_next_vpid.max(mate_next_vpid);
     let next_file_id = if seen_any { last_pid.0 + 1 } else { 0 };
     let mut pid_alloc = if seen_any {
         PidAllocator::new(last_pid.0, last_pid.1, last_pid.2 + 1)
@@ -240,14 +263,14 @@ fn collect_block_files(block_dir: &Path) -> io::Result<Vec<(u32, std::path::Path
 /// - seen_any: 是否有任何非空 page (true → 非空库)
 fn scan_block_files(
     files: &[(u32, std::path::PathBuf)],
-    meta: &mut MetaCache,
+    fill: &mut std::collections::HashMap<u64, PidLocation>,
 ) -> io::Result<(u64, (u32, u8, u8), bool)> {
     let mut max_vpid: u64 = 0;
     let mut last_pid: (u32, u8, u8) = (0, 0, 0);
     let mut seen_any = false;
 
     for (file_id, path) in files {
-        let (block_max_vpid, block_last_pid, block_seen) = scan_block_file(*file_id, path, meta)?;
+        let (block_max_vpid, block_last_pid, block_seen) = scan_block_file(*file_id, path, fill)?;
         if block_max_vpid > max_vpid {
             max_vpid = block_max_vpid;
         }
@@ -274,7 +297,7 @@ fn scan_block_files(
 fn scan_block_file(
     file_id: u32,
     path: &Path,
-    meta: &mut MetaCache,
+    fill: &mut std::collections::HashMap<u64, PidLocation>,
 ) -> io::Result<(u64, (u32, u8, u8), bool)> {
     let f = std::fs::File::open(path)?;
     let mut buf = [0u8; PAGE_SIZE];
@@ -307,9 +330,9 @@ fn scan_block_file(
                 continue;
             }
 
-            // 校验 page_type
+            // 校验 page_type (1=Meta 2=Internal 3=Leaf 4=Overflow 5=OverflowIndex)
             let page_type_byte = buf[4];
-            if page_type_byte != 1 && page_type_byte != 2 && page_type_byte != 3 {
+            if !(1..=5).contains(&page_type_byte) {
                 // corrupted page → 跳过
                 continue;
             }
@@ -341,8 +364,9 @@ fn scan_block_file(
             };
 
             if trust_vpid_field {
-                // 写回 MetaCache (union 覆盖 mate 同 vpid)
-                meta.write(vpid, pid);
+                // ⭐ G3: 收集到本地 map (同 vpid 多处出现时靠后者覆盖);
+                // 是否写入 meta 由 recover 主流程决定 (meta 为主, 扫描仅补缺).
+                fill.insert(vpid, pid);
 
                 // 更新 max (用 vpid 字段值, 因为对 Leaf/Meta 这就是 page 自己的 vpid)
                 if vpid > max_vpid {
@@ -429,21 +453,12 @@ mod tests {
         f.set_len(BLOCK_FILE_SIZE).unwrap();
         drop(f);
 
-        let mut meta = MetaCache::open(
-            &tmp.path()
-                .join("page.mate")
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::temp_dir().join("nexus_test_meta.mate")),
-        )
-        .unwrap_or_else(|_| {
-            // 实在不行就跳过
-            panic!("need page.mate for test");
-        });
-
-        let (max_vpid, last_pid, seen_any) = scan_block_file(0, &path, &mut meta).unwrap();
+        let mut fill = std::collections::HashMap::new();
+        let (max_vpid, last_pid, seen_any) = scan_block_file(0, &path, &mut fill).unwrap();
         assert_eq!(max_vpid, 0);
         assert_eq!(last_pid, (0, 0, 0));
         assert!(!seen_any);
+        assert!(fill.is_empty());
     }
 
     // =================================================================
