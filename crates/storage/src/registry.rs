@@ -374,13 +374,25 @@ pub async fn table_put(
     key: &[u8],
     value: &[u8],
 ) -> Result<Option<Vpid>, RegistryError> {
-    use crate::btree::{btree_insert, btree_lookup, btree_update};
+    use crate::btree::{btree_insert, travel_to_leaf_ro};
     use crate::overflow;
+    use page::{leaf_get_with, leaf_update};
 
-    // 1. 查旧值 (存在性判定 + 旧溢出链释放依据)
-    let old_stored = btree_lookup(pager, table_root_vpid, key).await?;
+    // 1. ⭐ 单 travel: 直达 leaf, 同一份 leaf 字节完成 旧值窥视 + 原地更新
+    //    (旧实现 lookup + update 各 travel 一次, 且旧值整值物化只为判存在).
+    let (leaf_vpid, mut leaf_bytes) = travel_to_leaf_ro(pager, table_root_vpid, key).await?;
 
-    // 2. 编码 stored value: 大 value → 溢出链 + 13B 描述符
+    // 2. 旧值窥视: 只取存在性 + 溢出描述符 (13B), 不物化 inline 大值
+    let old_desc: Option<Option<[u8; overflow::DESCRIPTOR_LEN]>> =
+        leaf_get_with(&leaf_bytes[..], key, |v| {
+            if overflow::is_indirect(v) {
+                Some(v.try_into().expect("13B descriptor"))
+            } else {
+                None
+            }
+        });
+
+    // 3. 编码 stored value: 大 value → 溢出链 + 13B 描述符
     let descriptor;
     let stored: &[u8] = if overflow::needs_overflow(key.len(), value.len()) {
         descriptor = overflow::write_overflow(pager, value).await?;
@@ -389,12 +401,26 @@ pub async fn table_put(
         value
     };
 
-    // 3. 提交 leaf item; 失败时回滚新溢出链 (防泄漏: 新链无人引用)
-    let commit = if old_stored.is_some() {
-        btree_update(pager, table_root_vpid, key, stored)
-            .await
-            .map(|_| None)
+    // 4. 提交 leaf item; 失败时回滚新溢出链 (防泄漏: 新链无人引用)
+    let commit: Result<Option<Vpid>, crate::btree::BTreeError> = if old_desc.is_some() {
+        // 已存在: 原地 leaf_update + 写回 (无第二次 travel)
+        match leaf_update(&mut *leaf_bytes, key, stored) {
+            Ok(_) => {
+                let mut batch = pager.new_write_batch();
+                batch.add(leaf_vpid, leaf_bytes);
+                match batch.submit(pager).await {
+                    Ok(_) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Err(e) => {
+                crate::page_pool::recycle(leaf_bytes);
+                Err(e.into())
+            }
+        }
     } else {
+        // 不存在: insert (可能 split 传播, 低频路径, 复用现有 btree_insert)
+        crate::page_pool::recycle(leaf_bytes);
         btree_insert(pager, table_root_vpid, key, stored).await
     };
     let new_root = match commit {
@@ -407,11 +433,9 @@ pub async fn table_put(
         }
     };
 
-    // 4. 覆盖写成功: 释放旧溢出链 (防泄漏: 旧链已不被 leaf 引用)
-    if let Some(old) = &old_stored
-        && overflow::is_indirect(old)
-    {
-        overflow::free_overflow(pager, old).await?;
+    // 5. 覆盖写成功: 释放旧溢出链 (防泄漏: 旧链已不被 leaf 引用)
+    if let Some(Some(old)) = old_desc {
+        overflow::free_overflow(pager, &old).await?;
     }
     Ok(new_root)
 }
@@ -457,6 +481,170 @@ pub async fn table_delete(
         overflow::free_overflow(pager, old).await?;
     }
     Ok(existed)
+}
+
+// =====================================================================
+// ⭐ 批量 API: MGET/MSET (LeafGuide 区间复用, 同 leaf 免重复 travel)
+// =====================================================================
+
+/// ⭐ 批量读: `btree_lookup_many` (区间复用) + 溢出描述符逐个展开.
+/// 结果按原输入顺序.
+pub async fn table_get_many(
+    pager: &mut Pager,
+    table_root_vpid: Vpid,
+    keys: &[&[u8]],
+) -> Result<Vec<Option<Vec<u8>>>, RegistryError> {
+    use crate::btree::btree_lookup_many;
+    use crate::overflow;
+    let (mut results, _travels) = btree_lookup_many(pager, table_root_vpid, keys).await?;
+    for slot in results.iter_mut() {
+        if let Some(stored) = slot
+            && overflow::is_indirect(stored)
+        {
+            *slot = Some(overflow::read_overflow(pager, stored).await?);
+        }
+    }
+    Ok(results)
+}
+
+/// ⭐ 批量写: 排序迭代 + LeafGuide 区间复用 — 同 leaf 的多个 key 在
+/// 同一份 leaf 字节上连续 update/insert, 一次 batch 提交.
+///
+/// **防泄漏不变量** (与单 key table_put 一致):
+/// - 旧溢出链: 记入 pending 列表, **所在 leaf 提交成功后**才释放
+///   (提交前释放 → 盘上 leaf 仍指向已墓碑的链 = 丢数据)
+/// - 新溢出链: 所在 leaf 提交失败 → 全部回滚释放
+///
+/// **guide 失效保守处理**: PageFull / miss → 提交当前累积 leaf, 退化
+/// 单 key `table_put` (可能 split, root 变化则后续用新 root), guide 丢弃重建.
+///
+/// 同 key 批内重复: 稳定排序保持原相对顺序, 后者覆盖前者 (Redis MSET 语义).
+pub async fn table_put_many(
+    pager: &mut Pager,
+    table_root_vpid: Vpid,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+) -> Result<Option<Vpid>, RegistryError> {
+    use crate::btree::{LeafGuide, travel_to_leaf_guided};
+    use crate::overflow;
+    use page::{PAGE_SIZE, leaf_get_with, leaf_insert, leaf_update};
+
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    let mut order: Vec<usize> = (0..pairs.len()).collect();
+    order.sort_by(|&a, &b| pairs[a].0.cmp(&pairs[b].0)); // stable: 同 key 保持原序
+
+    let mut cur_root = table_root_vpid;
+    let mut root_changed = false;
+
+    // 当前累积 leaf: (guide, bytes, dirty)
+    let mut cur: Option<(LeafGuide, Box<[u8; PAGE_SIZE]>, bool)> = None;
+    // 本 leaf 提交成功后待释放的旧链 / 失败时待回滚的新链
+    let mut pending_free_old: Vec<[u8; overflow::DESCRIPTOR_LEN]> = Vec::new();
+    let mut uncommitted_new: Vec<[u8; overflow::DESCRIPTOR_LEN]> = Vec::new();
+
+    // 提交当前累积 leaf. Ok → 释放旧链; Err → 回滚新链.
+    async fn flush_cur(
+        pager: &mut Pager,
+        cur: &mut Option<(LeafGuide, Box<[u8; PAGE_SIZE]>, bool)>,
+        pending_free_old: &mut Vec<[u8; overflow::DESCRIPTOR_LEN]>,
+        uncommitted_new: &mut Vec<[u8; overflow::DESCRIPTOR_LEN]>,
+    ) -> Result<(), RegistryError> {
+        let Some((guide, bytes, dirty)) = cur.take() else {
+            return Ok(());
+        };
+        if !dirty {
+            crate::page_pool::recycle(bytes);
+            debug_assert!(pending_free_old.is_empty() && uncommitted_new.is_empty());
+            return Ok(());
+        }
+        let mut batch = pager.new_write_batch();
+        batch.add(guide.leaf_vpid, bytes);
+        match batch.submit(pager).await {
+            Ok(_) => {
+                uncommitted_new.clear(); // 新链已被持久 leaf 引用
+                for old in pending_free_old.drain(..) {
+                    overflow::free_overflow(pager, &old).await?;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // 回滚: 未提交 leaf 引用的新链全部释放 (防泄漏)
+                for d in uncommitted_new.drain(..) {
+                    overflow::free_overflow(pager, &d).await?;
+                }
+                pending_free_old.clear();
+                Err(e.into())
+            }
+        }
+    }
+
+    for &i in &order {
+        let (key, value) = &pairs[i];
+
+        // guide miss → 提交当前 leaf, travel 新 leaf
+        let hit = matches!(&cur, Some((g, _, _)) if g.contains(key));
+        if !hit {
+            flush_cur(pager, &mut cur, &mut pending_free_old, &mut uncommitted_new).await?;
+            let (g, b) = travel_to_leaf_guided(pager, cur_root, key).await?;
+            cur = Some((g, b, false));
+        }
+
+        // 编码 stored (大 value → 溢出链)
+        let descriptor;
+        let stored: &[u8] = if overflow::needs_overflow(key.len(), value.len()) {
+            descriptor = overflow::write_overflow(pager, value).await?;
+            &descriptor
+        } else {
+            value
+        };
+
+        let (_, leaf_bytes, dirty) = cur.as_mut().expect("cur filled above");
+        // 旧值窥视 (只物化 13B 描述符)
+        let old_desc: Option<Option<[u8; overflow::DESCRIPTOR_LEN]>> =
+            leaf_get_with(&leaf_bytes[..], key, |v| {
+                if overflow::is_indirect(v) {
+                    Some(v.try_into().expect("13B descriptor"))
+                } else {
+                    None
+                }
+            });
+
+        let apply = if old_desc.is_some() {
+            leaf_update(&mut leaf_bytes[..], key, stored).map(|_| ())
+        } else {
+            leaf_insert(&mut leaf_bytes[..], key, stored)
+        };
+        match apply {
+            Ok(()) => {
+                *dirty = true;
+                if overflow::is_indirect(stored) {
+                    uncommitted_new.push(stored.try_into().expect("13B"));
+                }
+                if let Some(Some(old)) = old_desc {
+                    pending_free_old.push(old);
+                }
+            }
+            Err(_page_full) => {
+                // 退化: 提交累积 leaf 后走单 key 路径 (split 传播),
+                // root 可能变化; guide 已在 flush_cur 丢弃.
+                flush_cur(pager, &mut cur, &mut pending_free_old, &mut uncommitted_new)
+                    .await?;
+                // stored 若为新溢出链, 交给单 key路径? 单 key table_put 会重新
+                // write_overflow → 先回滚本次新链, 避免双写泄漏.
+                if overflow::is_indirect(stored) {
+                    overflow::free_overflow(pager, stored).await?;
+                }
+                if let Some(new_root) = table_put(pager, cur_root, key, value).await? {
+                    cur_root = new_root;
+                    root_changed = true;
+                }
+            }
+        }
+    }
+    flush_cur(pager, &mut cur, &mut pending_free_old, &mut uncommitted_new).await?;
+
+    Ok(if root_changed { Some(cur_root) } else { None })
 }
 
 // =====================================================================

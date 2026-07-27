@@ -81,12 +81,12 @@ cargo test --workspace --no-fail-fast    # ~30s, 0 failed 预期
 
 `memtier_benchmark --ratio=1:1 --pipeline=16 --threads=4 --clients=8 --data-size=64 --test-time=30`
 
-| 指标 | 当前 | 上轮基线 (block drain 启用前) | GC 启用前 |
+| 指标 | 当前 (String 命令集 + 热路径优化后) | 热路径优化前 (同机 A/B) | GC 启用前 |
 |---|---|---|---|
-| 吞吐 | **275K ops/s** | 218K | 198K |
-| p50 | **1.76ms** | 2.42ms | 2.5ms |
-| p99 | **3.78ms** | 5.06ms | 5.4ms |
-| p99.9 | **4.80ms** | 6.24ms | 7.2ms |
+| 吞吐 | **240-310K ops/s** (运行间波动) | 201K | 198K |
+| p50 | **1.8-2.0ms** | 2.46ms | 2.5ms |
+| p99 | **3.4-4.7ms** | 5.34ms | 5.4ms |
+| MSET (10 keys, redis-benchmark -P 16) | **107-132K cmd/s ≈ 1.1-1.3M key/s** | - | - |
 
 ### 表 2 — 热路径延迟分布 (`NLOG_PROBE=1` 启动, SIGTERM dump)
 
@@ -259,7 +259,7 @@ Overflow 数据页:
 
 | 协议 | 端口 | 状态 | 说明 |
 |---|---|---|---|
-| RESP2 (Redis 兼容) | 6379 | ✅ 完整 | PING/AUTH/SET/GET/DEL/MGET/MSET/INFO; 大 value 溢出页自动走 |
+| RESP2 (Redis 兼容) | 6379 | ✅ 完整 | PING/AUTH/SET/GET/DEL/**MGET/MSET** (跨 shard 分组聚合 + leaf 区间复用)/**INCR/DECR/INCRBY/DECRBY/APPEND/SETNX** (shard 端原子 RMW)/**EXISTS/STRLEN/TYPE**; 大 value 溢出页自动走 |
 | Binary (自研) | 5433 | ✅ 完整 | Request/Response + BatchOp (Put/Get/Delete 同 key) + TravelTree; 多客户端 + ReplyBus |
 | PostgreSQL (wire) | - | 🚧 设计路线 | 见 [DESIGN.md §10](./DESIGN.md) |
 | MySQL (wire) | - | 🚧 设计路线 | 同上 |

@@ -169,6 +169,7 @@ pub async fn travel_to_leaf(
         let pt = page_type(&page[..]);
         match pt {
             PageType::Leaf => {
+                crate::page_pool::recycle(page);
                 return Ok((current_vpid, path));
             }
             PageType::Internal => {
@@ -179,6 +180,8 @@ pub async fn travel_to_leaf(
                     sep_key: key.to_vec(),
                     child_vpid,
                 });
+                // ⭐ 热路径优化: 中间页用完归还页池
+                crate::page_pool::recycle(page);
                 current_vpid = child_vpid;
                 depth += 1;
             }
@@ -190,6 +193,143 @@ pub async fn travel_to_leaf(
             }
         }
     }
+}
+
+/// ⭐ 只读/原地更新版 travel: 无 TravelPath (免每层 sep_key 拷贝),
+/// 且直接返回 leaf 字节 (省 caller 的第二次 pager.read = 16KB copy).
+///
+/// lookup / update / delete 用 (它们丢弃 path); insert 的 split 传播
+/// 仍走 `travel_to_leaf`.
+pub async fn travel_to_leaf_ro(
+    pager: &mut Pager,
+    root_vpid: Vpid,
+    key: &[u8],
+) -> Result<(Vpid, Box<[u8; page::PAGE_SIZE]>), BTreeError> {
+    let (guide, bytes) = travel_to_leaf_guided(pager, root_vpid, key).await?;
+    Ok((guide.leaf_vpid, bytes))
+}
+
+/// ⭐ leaf 覆盖区间指南 (批量操作的 travel 复用凭据).
+///
+/// travel 每层用 `internal_child_with_bounds` 收窄 running bounds,
+/// 最终 `[lower, upper)` 即该 leaf 的 key 覆盖区间 (None 边不设限).
+/// 批内排序后的下一个 key `contains` 命中 → 同一 leaf, 免回 root travel.
+#[derive(Debug, Clone)]
+pub struct LeafGuide {
+    pub leaf_vpid: Vpid,
+    pub lower: Option<Vec<u8>>,
+    pub upper: Option<Vec<u8>>,
+}
+
+impl LeafGuide {
+    /// key 是否落在本 leaf 覆盖区间 `[lower, upper)` 内.
+    pub fn contains(&self, key: &[u8]) -> bool {
+        if let Some(lo) = &self.lower
+            && key < lo.as_slice()
+        {
+            return false;
+        }
+        if let Some(hi) = &self.upper
+            && key >= hi.as_slice()
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// ⭐ 区间版 travel: 返回 (LeafGuide, leaf 字节).
+///
+/// 与 `travel_to_leaf_ro` 同骨架, 每层收窄 running bounds
+/// (B+ 嵌套性质: 子层区间 ⊆ 父层区间; 边界槽 sep=None 时保留父层 bound).
+pub async fn travel_to_leaf_guided(
+    pager: &mut Pager,
+    root_vpid: Vpid,
+    key: &[u8],
+) -> Result<(LeafGuide, Box<[u8; page::PAGE_SIZE]>), BTreeError> {
+    use page::internal_child_with_bounds;
+
+    let mut current_vpid = root_vpid;
+    let mut depth = 0usize;
+    let mut lower: Option<Vec<u8>> = None;
+    let mut upper: Option<Vec<u8>> = None;
+    const MAX_DEPTH: usize = 16;
+
+    loop {
+        if depth > MAX_DEPTH {
+            return Err(BTreeError::SplitExhausted);
+        }
+        let page = pager.read(current_vpid).await?;
+        match page_type(&page[..]) {
+            PageType::Leaf => {
+                return Ok((
+                    LeafGuide {
+                        leaf_vpid: current_vpid,
+                        lower,
+                        upper,
+                    },
+                    page,
+                ));
+            }
+            PageType::Internal => {
+                let (child_vpid, lo, hi) = internal_child_with_bounds(&page[..], key)
+                    .ok_or(BTreeError::InternalChildNone(current_vpid))?;
+                // 收窄 running bounds (Some 才收窄; 嵌套性质下子层 bound 更紧)
+                if lo.is_some() {
+                    lower = lo;
+                }
+                if hi.is_some() {
+                    upper = hi;
+                }
+                crate::page_pool::recycle(page);
+                current_vpid = child_vpid;
+                depth += 1;
+            }
+            other => {
+                return Err(BTreeError::BadPageType {
+                    vpid: current_vpid,
+                    page_type: other,
+                });
+            }
+        }
+    }
+}
+
+/// ⭐ 批量 lookup: 排序迭代 + LeafGuide 区间复用 (同 leaf 的 key 免重复 travel).
+///
+/// 结果按**原输入顺序**返回. 返回值附带 travel 次数 (观测/测试用).
+pub async fn btree_lookup_many(
+    pager: &mut Pager,
+    root_vpid: Vpid,
+    keys: &[&[u8]],
+) -> Result<(Vec<Option<Vec<u8>>>, usize), BTreeError> {
+    let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+    if keys.is_empty() {
+        return Ok((results, 0));
+    }
+    // 排序索引 (原顺序回填)
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by(|&a, &b| keys[a].cmp(keys[b]));
+
+    let mut travels = 0usize;
+    let mut cur: Option<(LeafGuide, Box<[u8; page::PAGE_SIZE]>)> = None;
+    for &i in &order {
+        let key = keys[i];
+        let hit = matches!(&cur, Some((g, _)) if g.contains(key));
+        if !hit {
+            if let Some((_, old)) = cur.take() {
+                crate::page_pool::recycle(old);
+            }
+            cur = Some(travel_to_leaf_guided(pager, root_vpid, key).await?);
+            travels += 1;
+        }
+        let (_, leaf_bytes) = cur.as_ref().expect("just filled");
+        results[i] = leaf_get(&leaf_bytes[..], key);
+    }
+    if let Some((_, old)) = cur.take() {
+        crate::page_pool::recycle(old);
+    }
+    Ok((results, travels))
 }
 
 // =====================================================================
@@ -405,9 +545,10 @@ pub async fn btree_lookup(
     root_vpid: Vpid,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, BTreeError> {
-    let (leaf_vpid, _path) = travel_to_leaf(pager, root_vpid, key).await?;
-    let leaf_bytes = pager.read(leaf_vpid).await?;
-    Ok(leaf_get(&leaf_bytes[..], key))
+    let (_leaf_vpid, leaf_bytes) = travel_to_leaf_ro(pager, root_vpid, key).await?;
+    let out = leaf_get(&leaf_bytes[..], key);
+    crate::page_pool::recycle(leaf_bytes);
+    Ok(out)
 }
 
 // =====================================================================
@@ -423,13 +564,14 @@ pub async fn btree_delete(
     key: &[u8],
 ) -> Result<bool, BTreeError> {
     use page::leaf_delete;
-    let (leaf_vpid, _path) = travel_to_leaf(pager, root_vpid, key).await?;
-    let mut leaf_bytes = pager.read(leaf_vpid).await?;
+    let (leaf_vpid, mut leaf_bytes) = travel_to_leaf_ro(pager, root_vpid, key).await?;
     let existed = leaf_delete(&mut *leaf_bytes, key)?;
     if existed {
         let mut batch = pager.new_write_batch();
         batch.add(leaf_vpid, leaf_bytes);
-        batch.submit(pager).await?;
+        batch.submit(pager).await?; // submit 内 memcpy 后归还页池
+    } else {
+        crate::page_pool::recycle(leaf_bytes);
     }
     Ok(existed)
 }
@@ -452,13 +594,14 @@ pub async fn btree_update(
     new_value: &[u8],
 ) -> Result<bool, BTreeError> {
     use page::leaf_update;
-    let (leaf_vpid, _path) = travel_to_leaf(pager, root_vpid, key).await?;
-    let mut leaf_bytes = pager.read(leaf_vpid).await?;
+    let (leaf_vpid, mut leaf_bytes) = travel_to_leaf_ro(pager, root_vpid, key).await?;
     let updated = leaf_update(&mut *leaf_bytes, key, new_value)?;
     if updated {
         let mut batch = pager.new_write_batch();
         batch.add(leaf_vpid, leaf_bytes);
-        batch.submit(pager).await?;
+        batch.submit(pager).await?; // submit 内 memcpy 后归还页池
+    } else {
+        crate::page_pool::recycle(leaf_bytes);
     }
     Ok(updated)
 }

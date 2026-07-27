@@ -205,11 +205,11 @@ impl NowChunks {
         key: PageKey,
         page_idx: u8,
         vpid: u64,
-        data: [u8; PAGE_SIZE],
+        data: &[u8; PAGE_SIZE],
     ) {
         self.file_mut_or_insert(key.file_id)
             .slot_mut_or_insert(key.chunk_idx)
-            .write_page_with_header(page_idx, vpid, &data);
+            .write_page_with_header(page_idx, vpid, data);
     }
 
     /// ⭐ 读 peek: 返回 `Some(&[u8; CHUNK_SIZE])` if chunk 在 nowchunks 内存中, 否则 None.

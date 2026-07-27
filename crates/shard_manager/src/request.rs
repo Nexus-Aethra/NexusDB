@@ -148,12 +148,31 @@ pub enum ShardRequest {
 }
 
 /// 单个 batch 操作 (不带 reply, batch 整体回复).
+///
+/// ⭐ 热路径优化: db/table 用 `Arc<str>` — worker 每 op 仅引用计数,
+/// 不再每请求两次 String 堆分配 (275K ops/s 下省 550K allocs/s).
 #[derive(Debug, Clone)]
 pub enum BatchOp {
-    Put { db: String, table: String, key: Vec<u8>, val: Vec<u8> },
-    Get { db: String, table: String, key: Vec<u8> },
-    Delete { db: String, table: String, key: Vec<u8> },
+    Put { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, val: Vec<u8> },
+    Get { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8> },
+    Delete { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8> },
+    /// ⭐ MGET (单 shard 分片): worker 已按 key 路由分好组,
+    /// shard 内走 LeafGuide 区间复用批量读.
+    MultiGet { db: std::sync::Arc<str>, table: std::sync::Arc<str>, keys: Vec<Vec<u8>> },
+    /// ⭐ MSET (单 shard 分片): shard 内批量写 (同 leaf 一次提交).
+    MultiPut { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pairs: Vec<(Vec<u8>, Vec<u8>)> },
+    /// ⭐ INCR/DECR/INCRBY: shard 端 RMW (单线程 shard 内天然原子).
+    /// stored value 按 `[type_tag][payload]` 约定 (tag 见 VALUE_TAG_RAW).
+    Incr { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, delta: i64 },
+    /// ⭐ APPEND: shard 端 RMW, 返回追加后长度.
+    Append { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, suffix: Vec<u8> },
+    /// ⭐ SETNX: 不存在才写 (val 已带 tag). 返回是否写入.
+    SetNx { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, val: Vec<u8> },
 }
+
+/// ⭐ value type tag: 与 network::value_codec::TAG_RAW 对齐 (协议门面写入的
+/// stored value = `[tag][payload]`). shard 端 RMW (Incr/Append) 需剥/加 tag.
+pub const VALUE_TAG_RAW: u8 = 0x01;
 
 /// 单个 batch 操作的结果.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +180,12 @@ pub enum BatchResult {
     PutOk,
     GetValue(Option<Vec<u8>>),
     DeleteExisted(bool),
+    /// ⭐ MultiGet 结果 (与请求 keys 同序).
+    Values(Vec<Option<Vec<u8>>>),
+    /// ⭐ MultiPut 全部成功.
+    MultiPutOk,
+    /// ⭐ 整数结果 (INCR 新值 / APPEND 新长度 / SETNX 0|1).
+    Integer(i64),
     Error(String),
 }
 
@@ -178,6 +203,9 @@ pub struct ShardTask {
     pub req_id: u64,
     /// worker ID (用于确定 reply 回哪个 worker 的 bus).
     pub worker_id: u32,
+    /// ⭐ 组号 (MGET/MSET 跨 shard 分组聚合用; 单 op 填 0).
+    /// shard 原样回传, worker 据此把 Values 回填到原始索引槽.
+    pub group: u32,
     /// 具体操作.
     pub op: BatchOp,
 }
@@ -189,6 +217,8 @@ pub struct TaskResult {
     pub conn_id: u64,
     /// 请求 ID.
     pub req_id: u64,
+    /// ⭐ 组号 (ShardTask::group 原样回传).
+    pub group: u32,
     /// 执行结果.
     pub result: BatchResult,
 }

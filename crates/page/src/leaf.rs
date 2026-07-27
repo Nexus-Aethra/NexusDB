@@ -73,6 +73,14 @@ fn init_sentinel(page: &mut [u8]) -> Result<(), PageError> {
 
 /// 读取 leaf page 中 key 对应的 value.
 pub fn leaf_get(page: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    leaf_get_with(page, key, |v| v.to_vec())
+}
+
+/// ⭐ 借用回调版 leaf_get: 命中时以 `&[u8]` 借用回调, 零 value 拷贝.
+///
+/// 热路径用 (存在性判定 / 前缀窥视 / 直接编码进回复帧), 避免
+/// `leaf_get` 的整值 `to_vec` 物化.
+pub fn leaf_get_with<R>(page: &[u8], key: &[u8], f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     if page_type(page) != PageType::Leaf {
         return None;
     }
@@ -151,7 +159,7 @@ pub fn leaf_get(page: &[u8], key: &[u8]) -> Option<Vec<u8>> {
             std::str::from_utf8(key).unwrap_or("?")
         );
         if cur_key == key {
-            return Some(ptr.value().to_vec());
+            return Some(f(ptr.value()));
         }
         if cur_key > key {
             dprintln!(leaf, "[LEAF_GET] cur_key > key, return None");

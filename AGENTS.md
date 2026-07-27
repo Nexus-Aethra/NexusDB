@@ -24,6 +24,14 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 
 ## 当前进度
 
+### 2026-07-27 会话总览 (F42-F44, 细节见 CHANGELOG)
+
+- **⭐ F42 GC 静默数据丢失修复 (最重要)**: compact 判活曾用 page header vpid 自描述, 但 Internal 页该字段是 first_child → 误判死页 → 高压写后早期 key 静默丢失 (GET nil 不报错). 修复: 判活以 meta 平坦数组全扫为 SoT. **gotcha: compact/GC 判活禁止依赖页头自描述**. 排查探针 `NLOG_GC_DEBUG=1` 保留
+- **F43 热路径 9 项优化** (同机 A/B +19%): page_pool 归还闭环 + travel_to_leaf_ro (免 path 分配) + table_put 单 travel + BatchOp Arc<str> + Put.value 预置 tag 免二次拷贝 + 解析游标化. **约定: `Request::Put.value` / `BatchOp::Put.val` 统一 `[TAG_RAW][payload]` 布局 (decode 时预置)**
+- **F44 String 命令集**: MGET/MSET (跨 shard 分组聚合 + `LeafGuide` 区间复用批量, `ShardTask.group` 字段) + INCR/DECR/INCRBY/DECRBY/APPEND/SETNX (shard 端原子 RMW) + EXISTS/STRLEN/TYPE; 大 value 溢出页 (~1MB, 13B 描述符, PID_FREED 墓碑防复活)
+- **区间 travel 基建**: `internal_child_with_bounds` → `travel_to_leaf_guided` → `LeafGuide [lower, upper)` — range scan / cursor 的直接前置
+- 测试快照: **75 suites / 708 passed / 0 failed**, clippy 0
+
 ### 2026-07-25/26 会话总览 (F33-F41, 细节见 CHANGELOG)
 
 - **三个关键正确性修复**:

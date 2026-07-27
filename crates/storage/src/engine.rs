@@ -491,6 +491,51 @@ impl StorageEngine {
         crate::registry::table_get(&mut self.pager, table_vpid, key).await
     }
 
+    /// ⭐ 批量读 (MGET): LeafGuide 区间复用, 结果按输入顺序.
+    pub async fn table_get_many(
+        &mut self,
+        db: &str,
+        table: &str,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, RegistryError> {
+        let db_handle = self.registry.open_db(db)?;
+        let table_vpid = db_handle
+            .open_table(&mut self.pager, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+        crate::registry::table_get_many(&mut self.pager, table_vpid, keys).await
+    }
+
+    /// ⭐ 批量写 (MSET): LeafGuide 区间复用, 同 leaf 一次 batch 提交.
+    /// root split 时同步 TableDirectory (与 table_put 同逻辑).
+    pub async fn table_put_many(
+        &mut self,
+        db: &str,
+        table: &str,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), RegistryError> {
+        let db_handle = self.registry.open_db(db)?;
+        let table_vpid = db_handle
+            .open_table(&mut self.pager, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+
+        let new_root =
+            crate::registry::table_put_many(&mut self.pager, table_vpid, pairs).await?;
+
+        if let Some(new_root) = new_root {
+            let db_handle = self.registry.open_db(db)?;
+            db_handle
+                .table_dir_mut()
+                .update_table(&mut self.pager, table, new_root)
+                .await
+                .map_err(RegistryError::from)?;
+            let db_handle = self.registry.open_db(db)?;
+            db_handle.update_table_root(table, new_root);
+        }
+        Ok(())
+    }
+
     /// 删 key. 返回 true 表示存在并删除, false 表示不存在.
     pub async fn table_delete(
         &mut self,
