@@ -315,8 +315,8 @@ impl ShardManager {
         let ops: Vec<BatchOp> = entries
             .iter()
             .map(|(k, v)| BatchOp::Put {
-                db: db.to_string(),
-                table: table.to_string(),
+                db: std::sync::Arc::from(db),
+                table: std::sync::Arc::from(table),
                 key: k.to_vec(),
                 val: v.to_vec(),
             })
@@ -342,8 +342,8 @@ impl ShardManager {
         let ops: Vec<BatchOp> = keys
             .iter()
             .map(|k| BatchOp::Get {
-                db: db.to_string(),
-                table: table.to_string(),
+                db: std::sync::Arc::from(db),
+                table: std::sync::Arc::from(table),
                 key: k.to_vec(),
             })
             .collect();
@@ -373,9 +373,24 @@ impl ShardManager {
         let mut shard_groups: Vec<Vec<(usize, BatchOp)>> = vec![Vec::new(); self.num_shards];
         for (i, op) in ops.iter().enumerate() {
             let (db, table, key) = match op {
-                BatchOp::Put { db, table, key, .. } => (db.as_str(), table.as_str(), key.as_slice()),
-                BatchOp::Get { db, table, key } => (db.as_str(), table.as_str(), key.as_slice()),
-                BatchOp::Delete { db, table, key } => (db.as_str(), table.as_str(), key.as_slice()),
+                BatchOp::Put { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::Get { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::Delete { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                // ⭐ Multi op: 直连 API 按第一个 key 路由 (caller 应保证
+                // 批内 key 同 shard; 网络门面由 worker 预分组, 不经此路径)
+                BatchOp::MultiGet { db, table, keys } => (
+                    db.as_ref(),
+                    table.as_ref(),
+                    keys.first().map(|k| k.as_slice()).unwrap_or(&[]),
+                ),
+                BatchOp::MultiPut { db, table, pairs } => (
+                    db.as_ref(),
+                    table.as_ref(),
+                    pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
+                ),
+                BatchOp::Incr { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::Append { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
             };
             let shard_id = self.route_db_table_key(db, table, key);
             shard_groups[shard_id].push((i, op.clone()));
@@ -444,15 +459,31 @@ impl ShardManager {
         let mut expected_count = 0usize;
         for (i, op) in ops.iter().enumerate() {
             let (db, table, key) = match op {
-                BatchOp::Put { db, table, key, .. } => (db.as_str(), table.as_str(), key.as_slice()),
-                BatchOp::Get { db, table, key } => (db.as_str(), table.as_str(), key.as_slice()),
-                BatchOp::Delete { db, table, key } => (db.as_str(), table.as_str(), key.as_slice()),
+                BatchOp::Put { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::Get { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::Delete { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                // ⭐ Multi op: 直连 API 按第一个 key 路由 (caller 应保证
+                // 批内 key 同 shard; 网络门面由 worker 预分组, 不经此路径)
+                BatchOp::MultiGet { db, table, keys } => (
+                    db.as_ref(),
+                    table.as_ref(),
+                    keys.first().map(|k| k.as_slice()).unwrap_or(&[]),
+                ),
+                BatchOp::MultiPut { db, table, pairs } => (
+                    db.as_ref(),
+                    table.as_ref(),
+                    pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
+                ),
+                BatchOp::Incr { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::Append { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
             };
             let shard_id = self.route_db_table_key(db, table, key);
             self.shards[shard_id].task_inbox.push_spin(ShardTask {
                 conn_id,
                 req_id: i as u64,
                 worker_id,
+                group: 0,
                 op: op.clone(),
             });
             expected_count += 1;
@@ -1038,6 +1069,103 @@ impl ShardManager {
 // shard 线程主函数
 // =====================================================================
 
+/// ⭐ String RMW: INCR/DECR (shard 单线程内天然原子).
+/// stored = `[tag][payload]`, payload 按十进制 i64 解析.
+fn exec_incr(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    delta: i64,
+) -> crate::request::BatchResult {
+    use crate::request::{BatchResult, VALUE_TAG_RAW};
+    let old = match block_on_io(e.table_get(db, table, key)) {
+        Ok(v) => v,
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+    let cur: i64 = match &old {
+        None => 0,
+        Some(stored) => {
+            let payload = match stored.first() {
+                Some(&VALUE_TAG_RAW) => &stored[1..],
+                _ => &stored[..],
+            };
+            match std::str::from_utf8(payload)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                Some(n) => n,
+                None => {
+                    return BatchResult::Error(
+                        "value is not an integer or out of range".to_string(),
+                    );
+                }
+            }
+        }
+    };
+    let Some(newv) = cur.checked_add(delta) else {
+        return BatchResult::Error("increment or decrement would overflow".to_string());
+    };
+    let mut stored = Vec::with_capacity(21);
+    stored.push(VALUE_TAG_RAW);
+    stored.extend_from_slice(newv.to_string().as_bytes());
+    match block_on_io(e.table_put(db, table, key, &stored)) {
+        Ok(_) => BatchResult::Integer(newv),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ String RMW: APPEND. 返回追加后 payload 长度.
+fn exec_append(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    suffix: &[u8],
+) -> crate::request::BatchResult {
+    use crate::request::{BatchResult, VALUE_TAG_RAW};
+    let old = match block_on_io(e.table_get(db, table, key)) {
+        Ok(v) => v,
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+    let mut stored = match old {
+        Some(s) if s.first() == Some(&VALUE_TAG_RAW) => s,
+        Some(s) => {
+            // 直连 API 写入的无 tag 值: 补 tag 归一
+            let mut t = Vec::with_capacity(1 + s.len());
+            t.push(VALUE_TAG_RAW);
+            t.extend_from_slice(&s);
+            t
+        }
+        None => vec![VALUE_TAG_RAW],
+    };
+    stored.extend_from_slice(suffix);
+    let new_len = (stored.len() - 1) as i64;
+    match block_on_io(e.table_put(db, table, key, &stored)) {
+        Ok(_) => BatchResult::Integer(new_len),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ SETNX: 不存在才写. 返回 1=写入, 0=已存在.
+fn exec_setnx(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    val: &[u8],
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    match block_on_io(e.table_get(db, table, key)) {
+        Ok(Some(_)) => BatchResult::Integer(0),
+        Ok(None) => match block_on_io(e.table_put(db, table, key, val)) {
+            Ok(_) => BatchResult::Integer(1),
+            Err(err) => BatchResult::Error(err.to_string()),
+        },
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
 /// shard 线程专用 block_on: 重复 poll 直到就绪, **不依赖 waker 唤醒**.
 ///
 /// ⚠️ 不能用 pollster: IoUring 后端下 io_ops future 首次 poll 提交 SQE 后返回
@@ -1483,6 +1611,29 @@ fn shard_thread_main(
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
+                                BatchOp::MultiGet { db, table, keys } => {
+                                    let refs: Vec<&[u8]> =
+                                        keys.iter().map(|k| k.as_slice()).collect();
+                                    match block_on_io(e.table_get_many(&db, &table, &refs)) {
+                                        Ok(vs) => BatchResult::Values(vs),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::MultiPut { db, table, pairs } => {
+                                    match block_on_io(e.table_put_many(&db, &table, &pairs)) {
+                                        Ok(_) => BatchResult::MultiPutOk,
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::Incr { db, table, key, delta } => {
+                                    exec_incr(e, &db, &table, &key, delta)
+                                }
+                                BatchOp::Append { db, table, key, suffix } => {
+                                    exec_append(e, &db, &table, &key, &suffix)
+                                }
+                                BatchOp::SetNx { db, table, key, val } => {
+                                    exec_setnx(e, &db, &table, &key, &val)
+                                }
                             };
                             results.push(r);
                         }
@@ -1532,10 +1683,35 @@ fn shard_thread_main(
                                 Err(err) => crate::request::BatchResult::Error(err.to_string()),
                             }
                         }
+                        // ⭐ MGET/MSET 分片: shard 内 LeafGuide 区间复用批量执行
+                        crate::request::BatchOp::MultiGet { ref db, ref table, ref keys } => {
+                            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+                            match block_on_io(e.table_get_many(db, table, &refs)) {
+                                Ok(vs) => crate::request::BatchResult::Values(vs),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::MultiPut { ref db, ref table, ref pairs } => {
+                            match block_on_io(e.table_put_many(db, table, pairs)) {
+                                Ok(_) => crate::request::BatchResult::MultiPutOk,
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        // ⭐ String RMW (shard 单线程内天然原子)
+                        crate::request::BatchOp::Incr { ref db, ref table, ref key, delta } => {
+                            exec_incr(e, db, table, key, delta)
+                        }
+                        crate::request::BatchOp::Append { ref db, ref table, ref key, ref suffix } => {
+                            exec_append(e, db, table, key, suffix)
+                        }
+                        crate::request::BatchOp::SetNx { ref db, ref table, ref key, ref val } => {
+                            exec_setnx(e, db, table, key, val)
+                        }
                     };
                     reply_bus_set.get(task.worker_id).push(crate::request::TaskResult {
                         conn_id: task.conn_id,
                         req_id: task.req_id,
+                        group: task.group,
                         result,
                     });
                 }

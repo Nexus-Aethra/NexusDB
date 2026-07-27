@@ -480,3 +480,70 @@ fn block_drain_evicts_mid_live_chunks_and_unlinks() {
         }
     });
 }
+
+/// ⭐ 回归 (数据丢失 bug, 2026-07-24): **Internal 页必须被 compact 搬运**.
+///
+/// Internal 页的 header vpid 字段是 first_child (page crate 约定), 旧判活
+/// 逻辑用 header 自描述 → Internal 页被误判死页:
+/// - src 侧: 不搬运, chunk 释放后 Internal 页物理销毁 → 子树路由断
+/// - dst 侧: 活 Internal 页被当死槽覆盖
+///
+/// 修复后判活以 meta 全扫为 SoT. 现象: 30s memtier 压测后早期 key GET nil.
+#[test]
+fn compact_must_migrate_internal_pages() {
+    run_async(async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pager = setup_pager(&tmp);
+
+        // 造一个 "Internal" 页: header vpid 字段 = first_child (≠ 自身 vpid)
+        let mut internal = Box::new([0u8; PAGE_SIZE]);
+        internal[0..4].copy_from_slice(b"LCBP");
+        internal[4] = 2; // Internal
+        // first_child 指向一个不存在的 vpid (模拟真实 internal 的 child 引用)
+        internal[0x18..0x20].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+        let internal_vpid = pager.create(internal).await.unwrap();
+
+        // 填满该 chunk 其余槽 + 更多页, 然后稀疏化 (internal 保活)
+        let keep = [internal_vpid];
+        let _ = fill_and_sparsify(&mut pager, 192, &keep).await;
+
+        // 驱动 compact 直到 internal 所在 chunk 成为 src 被搬运, 或无 victim
+        let mut migrated_internal = false;
+        for _ in 0..64 {
+            pager.reset_compact_throttle();
+            let Some(rj) = pager.start_compact() else {
+                break;
+            };
+            let (dst, src) = (rj.dst, rj.src);
+            let dst_bytes = if rj.dst_fresh {
+                vec![0u8; storage::CHUNK_SIZE]
+            } else {
+                rj.io.read_page_chunk(&rj.dir, dst).await.unwrap()
+            };
+            let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
+            let Some(wj) =
+                pager.analyze_compact_read(dst, src, rj.dst_fresh, Ok((dst_bytes, src_bytes)))
+            else {
+                continue;
+            };
+            if wj.moves.iter().any(|(v, _, _)| *v == internal_vpid) {
+                migrated_internal = true;
+            }
+            wj.execute().await.unwrap();
+            pager.complete_compact(wj.dst, wj.src, wj.moves, Ok(()));
+        }
+
+        // 无论是否被搬运过, internal 页必须始终可读且字节完好
+        // (被搬运过 = 修复生效; 未被选为 victim 也不能被覆盖/丢弃)
+        let page = pager.read(internal_vpid).await.unwrap();
+        assert_eq!(&page[0..4], b"LCBP", "internal 页 magic 完好");
+        assert_eq!(page[4], 2, "internal 页类型完好");
+        assert_eq!(
+            u64::from_le_bytes(page[0x18..0x20].try_into().unwrap()),
+            0xDEAD_BEEF,
+            "internal 页 first_child 字段完好 (未被 compact 覆盖/重写)"
+        );
+        // 记录: 本测试构造下 internal 所在 chunk 通常会成为 victim
+        eprintln!("migrated_internal={migrated_internal}");
+    });
+}

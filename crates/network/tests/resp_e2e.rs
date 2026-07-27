@@ -258,8 +258,8 @@ fn resp_kv_limits_rejected() {
     let (server, mgr) = start_server(None);
     let mut s = connect(&server);
 
-    // 5KB value 超默认 3000 上限 → -ERR value too long (不进 shard)
-    let big = vec![b'x'; 5 * 1024];
+    // ⭐ 大 value 支持后默认上限 1MB: 1MB+1 value → -ERR value too long (不进 shard)
+    let big = vec![b'x'; 1024 * 1024 + 1];
     s.write_all(&cmd(&[b"SET", b"bigv", &big])).unwrap();
     let r = read_replies(&mut s, 1);
     assert!(
@@ -314,6 +314,127 @@ fn resp_misc_commands() {
     s.write_all(&cmd(&[b"FLUSHALL"])).unwrap();
     let r = read_replies(&mut s, 1);
     assert!(r[0].starts_with(b"-ERR unknown command"), "{:?}", String::from_utf8_lossy(&r[0]));
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ MSET/MGET: 跨 shard 分组聚合 (3 shard 下 8 key 必跨), 顺序与 nil 语义.
+#[test]
+fn resp_mset_mget_cross_shard() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // MSET 8 对 (3 shard 下必然跨 shard 分组)
+    let mut args: Vec<Vec<u8>> = vec![b"MSET".to_vec()];
+    for i in 0..8u32 {
+        args.push(format!("mk{i}").into_bytes());
+        args.push(format!("mv{i}").into_bytes());
+    }
+    let refs: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+    s.write_all(&cmd(&refs)).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+
+    // MGET: 乱序 + 混入 miss key, 断言按请求顺序返回
+    s.write_all(&cmd(&[b"MGET", b"mk7", b"nope", b"mk0", b"mk3"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert_eq!(
+        r[0],
+        b"*4\r\n$3\r\nmv7\r\n$-1\r\n$3\r\nmv0\r\n$3\r\nmv3\r\n".to_vec(),
+        "got {:?}",
+        String::from_utf8_lossy(&r[0])
+    );
+
+    // MSET 同 key 重复: 后者覆盖 (Redis 语义)
+    s.write_all(&cmd(&[b"MSET", b"dup", b"first", b"dup", b"second"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", b"dup"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$6\r\nsecond\r\n");
+
+    // MSET 奇数参数 → WrongArity
+    s.write_all(&cmd(&[b"MSET", b"k", b"v", b"orphan"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"-ERR wrong number"), "{:?}", String::from_utf8_lossy(&r[0]));
+
+    // 与 pipeline 的单 op 混排 (seq 重排缓冲正确性)
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&cmd(&[b"SET", b"pipek", b"pv"]));
+    buf.extend_from_slice(&cmd(&[b"MGET", b"mk1", b"pipek"]));
+    buf.extend_from_slice(&cmd(&[b"GET", b"mk2"]));
+    s.write_all(&buf).unwrap();
+    let r = read_replies(&mut s, 3);
+    assert_eq!(r[0], b"+OK\r\n");
+    assert_eq!(r[1], b"*2\r\n$3\r\nmv1\r\n$2\r\npv\r\n".to_vec());
+    assert_eq!(r[2], b"$3\r\nmv2\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ String 命令补全: INCR/DECR/INCRBY/APPEND/SETNX/EXISTS/STRLEN/TYPE.
+#[test]
+fn resp_string_commands() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // INCR: miss → 1, 再 INCR → 2, DECR → 1, INCRBY 10 → 11, DECRBY 5 → 6
+    s.write_all(&cmd(&[b"INCR", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"INCR", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"DECR", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"INCRBY", b"cnt", b"10"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":11\r\n");
+    s.write_all(&cmd(&[b"DECRBY", b"cnt", b"5"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":6\r\n");
+    // GET 读回字符串形式
+    s.write_all(&cmd(&[b"GET", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\n6\r\n");
+    // 非数字 value → error
+    s.write_all(&cmd(&[b"SET", b"strk", b"abc"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"INCR", b"strk"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"-ERR value is not an integer"), "{:?}", String::from_utf8_lossy(&r[0]));
+    // INCRBY 非法数字参数 → error
+    s.write_all(&cmd(&[b"INCRBY", b"cnt", b"xyz"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"-ERR value is not an integer"), "{:?}", String::from_utf8_lossy(&r[0]));
+
+    // APPEND: miss → 创建, 返回新长度
+    s.write_all(&cmd(&[b"APPEND", b"app", b"Hello"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
+    s.write_all(&cmd(&[b"APPEND", b"app", b" World"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":11\r\n");
+    s.write_all(&cmd(&[b"GET", b"app"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$11\r\nHello World\r\n");
+
+    // SETNX: 首次 1, 再次 0 (不覆盖)
+    s.write_all(&cmd(&[b"SETNX", b"nx", b"v1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"SETNX", b"nx", b"v2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"GET", b"nx"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\nv1\r\n");
+
+    // EXISTS: 多 key + 重复 key 重复计 (Redis 语义)
+    s.write_all(&cmd(&[b"EXISTS", b"nx", b"missing", b"nx", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+
+    // STRLEN: 命中/未命中
+    s.write_all(&cmd(&[b"STRLEN", b"app"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":11\r\n");
+    s.write_all(&cmd(&[b"STRLEN", b"missing"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // TYPE: string / none
+    s.write_all(&cmd(&[b"TYPE", b"app"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+string\r\n");
+    s.write_all(&cmd(&[b"TYPE", b"missing"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+none\r\n");
 
     drop(s);
     server.shutdown().unwrap();

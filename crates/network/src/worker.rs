@@ -25,9 +25,9 @@ use shard_manager::{BatchOp, BatchResult, SharedTaskInbox, SharedTaskReplyBus, S
 use crate::acceptor::NewConn;
 use crate::protocol::{
     BinaryProtocol, DecodeOutcome, KvLimits, Protocol, Request, RespCodec, RespCommand, Response,
-    validate_request,
+    validate_kv, validate_request,
 };
-use crate::value_codec::{TAG_RAW, decode_value, encode_value};
+use crate::value_codec::decode_value;
 
 /// 特殊 epoll token: reply bus eventfd.
 const REPLY_TOKEN: u64 = u64::MAX;
@@ -91,6 +91,36 @@ struct DelAgg {
     count: i64,
 }
 
+/// ⭐ MGET 跨 shard 聚合: 每 shard 一组, Values 按组内索引表回填原始槽.
+struct MGetAgg {
+    remaining: usize,
+    /// 原始请求顺序的结果槽 (None = miss 或未回).
+    slots: Vec<Option<Vec<u8>>>,
+    /// group 号 → 该组 keys 的原始索引 (与 MultiGet keys 同序).
+    groups: Vec<Vec<usize>>,
+    /// 任一组失败: 记首个错误 (仍等全部组回齐再回复).
+    error: Option<String>,
+}
+
+/// ⭐ MSET 跨 shard 聚合: 全部组 MultiPutOk → +OK.
+struct MSetAgg {
+    remaining: usize,
+    error: Option<String>,
+}
+
+/// ⭐ EXISTS 多 key 聚合 (DEL 同构: 计数存在数).
+struct ExistsAgg {
+    remaining: usize,
+    count: i64,
+}
+
+/// ⭐ 单 op Get 的回复语义转换 (STRLEN/TYPE 复用 Get 任务).
+#[derive(Clone, Copy)]
+enum GetKind {
+    Strlen,
+    TypeOf,
+}
+
 /// 单个连接状态.
 struct ConnState {
     fd: RawFd,
@@ -107,6 +137,14 @@ struct ConnState {
     pending: BTreeMap<u64, Vec<u8>>,
     /// RESP: DEL 多 key 聚合 (seq → 状态).
     del_agg: HashMap<u64, DelAgg>,
+    /// RESP: MGET 聚合 (seq → 状态).
+    mget_agg: HashMap<u64, MGetAgg>,
+    /// RESP: MSET 聚合 (seq → 状态).
+    mset_agg: HashMap<u64, MSetAgg>,
+    /// RESP: EXISTS 聚合 (seq → 状态).
+    exists_agg: HashMap<u64, ExistsAgg>,
+    /// RESP: STRLEN/TYPE 的 Get 语义转换 (seq → kind).
+    get_kind: HashMap<u64, GetKind>,
     /// RESP: QUIT/协议错误后, 待 pending 清空即关连接.
     close_after_flush: bool,
 }
@@ -127,6 +165,10 @@ impl ConnState {
             next_to_send: 0,
             pending: BTreeMap::new(),
             del_agg: HashMap::new(),
+            mget_agg: HashMap::new(),
+            mset_agg: HashMap::new(),
+            exists_agg: HashMap::new(),
+            get_kind: HashMap::new(),
             close_after_flush: false,
         }
     }
@@ -213,8 +255,9 @@ fn worker_main_epoll(cfg: WorkerConfig) {
     let shard_inboxes = cfg.shard_inboxes;
     let reply_bus = cfg.reply_bus;
     let worker_id = cfg.worker_id;
-    let db = cfg.default_db;
-    let table = cfg.default_table;
+    // ⭐ 热路径优化: db/table 一次性转 Arc<str>, 每 op 仅引用计数 clone
+    let db: std::sync::Arc<str> = std::sync::Arc::from(cfg.default_db.as_str());
+    let table: std::sync::Arc<str> = std::sync::Arc::from(cfg.default_table.as_str());
     let inbox = cfg.inbox;
     let conn_eventfd = cfg.conn_eventfd;
     let proto_kind = cfg.protocol;
@@ -283,7 +326,7 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                                 conn.send_binary_response(r.req_id, &resp);
                             }
                             ProtocolKind::Resp => {
-                                handle_resp_shard_result(conn, r.req_id, &r.result);
+                                handle_resp_shard_result(conn, r.req_id, r.group, &r.result);
                                 close_conn = conn.resp_should_close();
                             }
                         }
@@ -363,18 +406,21 @@ fn process_binary_input(
     conn: &mut ConnState,
     conn_id: u64,
     worker_id: u32,
-    db: &str,
-    table: &str,
+    db: &std::sync::Arc<str>,
+    table: &std::sync::Arc<str>,
     limits: &KvLimits,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
 ) {
     let proto = BinaryProtocol::new();
+    // ⭐ 热路径优化: 游标推进, 循环末一次 drain — 消 pipeline 下
+    // 每帧 memmove 尾部字节的 O(n²).
+    let mut cursor = 0usize;
     loop {
-        match proto.decode_request(&conn.read_buf) {
+        match proto.decode_request(&conn.read_buf[cursor..]) {
             Ok(DecodeOutcome::Complete { consumed, value }) => {
-                let req_id = peek_req_id(&conn.read_buf[..consumed]);
-                conn.read_buf.drain(..consumed);
+                let req_id = peek_req_id(&conn.read_buf[cursor..cursor + consumed]);
+                cursor += consumed;
                 // ⭐ 长度校验: 超限不进 shard, 直接回 error 帧
                 if let Err(msg) = validate_request(&value, limits) {
                     conn.send_binary_response(req_id, &Response::Error(msg));
@@ -386,18 +432,22 @@ fn process_binary_input(
                     conn_id,
                     req_id,
                     worker_id,
+                    group: 0,
                     op,
                 });
             }
             Ok(DecodeOutcome::NeedMore) => break,
             Err(_) => {
-                if !conn.read_buf.is_empty() {
-                    conn.read_buf.drain(..1);
+                if cursor < conn.read_buf.len() {
+                    cursor += 1; // 重同步: 跳过 1 字节
                 } else {
                     break;
                 }
             }
         }
+    }
+    if cursor > 0 {
+        conn.read_buf.drain(..cursor);
     }
 }
 
@@ -408,23 +458,26 @@ fn process_resp_input(
     conn: &mut ConnState,
     conn_id: u64,
     worker_id: u32,
-    db: &str,
-    table: &str,
+    db: &std::sync::Arc<str>,
+    table: &std::sync::Arc<str>,
     limits: &KvLimits,
     auth_password: &Option<String>,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
 ) {
     let codec = RespCodec::new();
+    // ⭐ 热路径优化: 游标推进, 循环末一次 drain (pipeline 下免每命令 memmove)
+    let mut cursor = 0usize;
     loop {
         if conn.close_after_flush {
             // QUIT/协议错误后不再解析后续输入
             conn.read_buf.clear();
+            cursor = 0;
             break;
         }
-        match codec.decode_command(&conn.read_buf) {
+        match codec.decode_command(&conn.read_buf[cursor..]) {
             Ok(DecodeOutcome::Complete { consumed, value }) => {
-                conn.read_buf.drain(..consumed);
+                cursor += consumed;
                 dispatch_resp_command(
                     conn, conn_id, worker_id, db, table, limits, auth_password,
                     shard_inboxes, num_shards, value,
@@ -439,9 +492,13 @@ fn process_resp_input(
                 conn.resp_complete(seq, bytes);
                 conn.close_after_flush = true;
                 conn.read_buf.clear();
+                cursor = 0;
                 break;
             }
         }
+    }
+    if cursor > 0 {
+        conn.read_buf.drain(..cursor);
     }
 }
 
@@ -451,8 +508,8 @@ fn dispatch_resp_command(
     conn: &mut ConnState,
     conn_id: u64,
     worker_id: u32,
-    db: &str,
-    table: &str,
+    db: &std::sync::Arc<str>,
+    table: &std::sync::Arc<str>,
     limits: &KvLimits,
     auth_password: &Option<String>,
     shard_inboxes: &[SharedTaskInbox],
@@ -476,28 +533,36 @@ fn dispatch_resp_command(
 
     match cmd {
         RespCommand::Set { key, value } => {
-            let req = Request::Put { key, value };
-            if let Err(msg) = validate_request(&req, limits) {
+            // ⭐ value 已是 [TAG_RAW][payload] 布局 (decode 时预置),
+            // 校验扣 1B tag; 直构 BatchOp 免 Request 中转/二次拷贝.
+            if let Err(msg) = validate_kv(&key, value.len().saturating_sub(1), limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = request_to_batch_op(req, db, table);
+            let op = BatchOp::Put {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                val: value,
+            };
             push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::Get { key } => {
-            let req = Request::Get { key };
-            if let Err(msg) = validate_request(&req, limits) {
+            if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = request_to_batch_op(req, db, table);
+            let op = BatchOp::Get {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
             push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::Del { keys } => {
-            // 逐 key 校验; 任一超限整条命令拒绝 (不部分执行)
+            // 逐 key 校验 (借用版, 免 clone); 任一超限整条命令拒绝 (不部分执行)
             for key in &keys {
-                let req = Request::Delete { key: key.clone() };
-                if let Err(msg) = validate_request(&req, limits) {
+                if let Err(msg) = validate_kv(key, 0, limits) {
                     conn.resp_complete(seq, codec.encode_error(&msg));
                     return;
                 }
@@ -512,11 +577,84 @@ fn dispatch_resp_command(
             );
             for key in keys {
                 let op = BatchOp::Delete {
-                    db: db.to_string(),
-                    table: table.to_string(),
+                    db: db.clone(),
+                    table: table.clone(),
                     key,
                 };
                 push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            }
+        }
+        RespCommand::MGet { keys } => {
+            for key in &keys {
+                if let Err(msg) = validate_kv(key, 0, limits) {
+                    conn.resp_complete(seq, codec.encode_error(&msg));
+                    return;
+                }
+            }
+            // ⭐ 按 shard 分组: 每 shard 一个 MultiGet (shard 内区间复用),
+            // group 号回传后按索引表回填原始槽
+            let n = keys.len();
+            let mut by_shard: Vec<(usize, Vec<Vec<u8>>, Vec<usize>)> = Vec::new();
+            for (i, key) in keys.into_iter().enumerate() {
+                let sid = hash_route_key(db.as_ref(), table.as_ref(), &key, num_shards);
+                match by_shard.iter_mut().find(|(s, _, _)| *s == sid) {
+                    Some((_, ks, idxs)) => {
+                        ks.push(key);
+                        idxs.push(i);
+                    }
+                    None => by_shard.push((sid, vec![key], vec![i])),
+                }
+            }
+            let groups: Vec<Vec<usize>> = by_shard.iter().map(|(_, _, idxs)| idxs.clone()).collect();
+            conn.mget_agg.insert(
+                seq,
+                MGetAgg {
+                    remaining: by_shard.len(),
+                    slots: vec![None; n],
+                    groups,
+                    error: None,
+                },
+            );
+            for (gidx, (sid, ks, _)) in by_shard.into_iter().enumerate() {
+                let op = BatchOp::MultiGet {
+                    db: db.clone(),
+                    table: table.clone(),
+                    keys: ks,
+                };
+                push_task_grouped(conn_id, seq, worker_id, gidx as u32, sid, op, shard_inboxes);
+            }
+        }
+        RespCommand::MSet { pairs } => {
+            // value 已带 1B tag, 校验扣除
+            for (key, value) in &pairs {
+                if let Err(msg) = validate_kv(key, value.len().saturating_sub(1), limits) {
+                    conn.resp_complete(seq, codec.encode_error(&msg));
+                    return;
+                }
+            }
+            type ShardPairs = (usize, Vec<(Vec<u8>, Vec<u8>)>);
+            let mut by_shard: Vec<ShardPairs> = Vec::new();
+            for (key, value) in pairs {
+                let sid = hash_route_key(db.as_ref(), table.as_ref(), &key, num_shards);
+                match by_shard.iter_mut().find(|(s, _)| *s == sid) {
+                    Some((_, ps)) => ps.push((key, value)),
+                    None => by_shard.push((sid, vec![(key, value)])),
+                }
+            }
+            conn.mset_agg.insert(
+                seq,
+                MSetAgg {
+                    remaining: by_shard.len(),
+                    error: None,
+                },
+            );
+            for (gidx, (sid, ps)) in by_shard.into_iter().enumerate() {
+                let op = BatchOp::MultiPut {
+                    db: db.clone(),
+                    table: table.clone(),
+                    pairs: ps,
+                };
+                push_task_grouped(conn_id, seq, worker_id, gidx as u32, sid, op, shard_inboxes);
             }
         }
         RespCommand::Ping(msg) => {
@@ -525,6 +663,102 @@ fn dispatch_resp_command(
                 Some(m) => codec.encode_bulk(&m),
             };
             conn.resp_complete(seq, bytes);
+        }
+        RespCommand::Incr { key, delta } => {
+            if let Err(msg) = validate_kv(&key, 0, limits) {
+                conn.resp_complete(seq, codec.encode_error(&msg));
+                return;
+            }
+            let op = BatchOp::Incr {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                delta,
+            };
+            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+        }
+        RespCommand::Append { key, suffix } => {
+            // suffix 不带 tag (RMW 端拼接); 校验按追加段长度上限保守拦截
+            if let Err(msg) = validate_kv(&key, suffix.len(), limits) {
+                conn.resp_complete(seq, codec.encode_error(&msg));
+                return;
+            }
+            let op = BatchOp::Append {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                suffix,
+            };
+            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+        }
+        RespCommand::SetNx { key, value } => {
+            if let Err(msg) = validate_kv(&key, value.len().saturating_sub(1), limits) {
+                conn.resp_complete(seq, codec.encode_error(&msg));
+                return;
+            }
+            let op = BatchOp::SetNx {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                val: value,
+            };
+            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+        }
+        RespCommand::Exists { keys } => {
+            for key in &keys {
+                if let Err(msg) = validate_kv(key, 0, limits) {
+                    conn.resp_complete(seq, codec.encode_error(&msg));
+                    return;
+                }
+            }
+            // N 个 Get 共用 seq, 聚合计数 (Redis EXISTS: 重复 key 重复计)
+            conn.exists_agg.insert(
+                seq,
+                ExistsAgg {
+                    remaining: keys.len(),
+                    count: 0,
+                },
+            );
+            for key in keys {
+                let op = BatchOp::Get {
+                    db: db.clone(),
+                    table: table.clone(),
+                    key,
+                };
+                push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            }
+        }
+        RespCommand::Strlen { key } => {
+            if let Err(msg) = validate_kv(&key, 0, limits) {
+                conn.resp_complete(seq, codec.encode_error(&msg));
+                return;
+            }
+            conn.get_kind.insert(seq, GetKind::Strlen);
+            let op = BatchOp::Get {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
+            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+        }
+        RespCommand::TypeOf { key } => {
+            if let Err(msg) = validate_kv(&key, 0, limits) {
+                conn.resp_complete(seq, codec.encode_error(&msg));
+                return;
+            }
+            conn.get_kind.insert(seq, GetKind::TypeOf);
+            let op = BatchOp::Get {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
+            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+        }
+        RespCommand::InvalidInt(_) => {
+            conn.resp_complete(
+                seq,
+                codec.encode_error("value is not an integer or out of range"),
+            );
         }
         RespCommand::Echo(m) => {
             conn.resp_complete(seq, codec.encode_bulk(&m));
@@ -608,13 +842,128 @@ fn push_task(
         conn_id,
         req_id,
         worker_id,
+        group: 0,
         op,
     });
 }
 
-/// RESP: 处理 shard 回来的单条结果 (含 DEL 聚合).
-fn handle_resp_shard_result(conn: &mut ConnState, seq: u64, result: &BatchResult) {
+/// ⭐ MGET/MSET: 定向 push 到指定 shard, 带组号 (聚合回填用).
+fn push_task_grouped(
+    conn_id: u64,
+    req_id: u64,
+    worker_id: u32,
+    group: u32,
+    shard_id: usize,
+    op: BatchOp,
+    shard_inboxes: &[SharedTaskInbox],
+) {
+    shard_inboxes[shard_id].push_spin(ShardTask {
+        conn_id,
+        req_id,
+        worker_id,
+        group,
+        op,
+    });
+}
+
+/// key 级路由 (与 hash_route_op 同 hash 逻辑, 分组场景用).
+fn hash_route_key(db: &str, table: &str, key: &[u8], num_shards: usize) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    db.hash(&mut h);
+    table.hash(&mut h);
+    key.hash(&mut h);
+    (h.finish() as usize) % num_shards
+}
+
+/// RESP: 处理 shard 回来的单条结果 (含 DEL/MGET/MSET 聚合).
+fn handle_resp_shard_result(conn: &mut ConnState, seq: u64, group: u32, result: &BatchResult) {
     let codec = RespCodec::new();
+    // ⭐ MGET 聚合: Values 按组索引表回填原始槽, 全组回齐拼 *N 数组
+    if let Some(agg) = conn.mget_agg.get_mut(&seq) {
+        match result {
+            BatchResult::Values(vs) => {
+                if let Some(idxs) = agg.groups.get(group as usize) {
+                    for (v, &orig) in vs.iter().zip(idxs.iter()) {
+                        agg.slots[orig] = v.clone();
+                    }
+                }
+            }
+            BatchResult::Error(e) if agg.error.is_none() => {
+                agg.error = Some(e.clone());
+            }
+            _ => {}
+        }
+        agg.remaining -= 1;
+        if agg.remaining == 0 {
+            let agg = conn.mget_agg.remove(&seq).expect("just checked");
+            let bytes = if let Some(e) = agg.error {
+                codec.encode_error(&e)
+            } else {
+                let mut out = format!("*{}\r\n", agg.slots.len()).into_bytes();
+                for slot in &agg.slots {
+                    match slot {
+                        Some(stored) => {
+                            let (_tag, payload) = decode_value(stored);
+                            out.extend_from_slice(&codec.encode_bulk(payload));
+                        }
+                        None => out.extend_from_slice(b"$-1\r\n"),
+                    }
+                }
+                out
+            };
+            conn.resp_complete(seq, bytes);
+        }
+        return;
+    }
+    // ⭐ MSET 聚合: 全组 MultiPutOk → +OK
+    if let Some(agg) = conn.mset_agg.get_mut(&seq) {
+        if let BatchResult::Error(e) = result
+            && agg.error.is_none()
+        {
+            agg.error = Some(e.clone());
+        }
+        agg.remaining -= 1;
+        if agg.remaining == 0 {
+            let agg = conn.mset_agg.remove(&seq).expect("just checked");
+            let bytes = match agg.error {
+                Some(e) => codec.encode_error(&e),
+                None => codec.encode_ok(),
+            };
+            conn.resp_complete(seq, bytes);
+        }
+        return;
+    }
+    // ⭐ EXISTS 聚合: GetValue(Some) 计数, 全部回齐回 :n
+    if let Some(agg) = conn.exists_agg.get_mut(&seq) {
+        if let BatchResult::GetValue(Some(_)) = result {
+            agg.count += 1;
+        }
+        agg.remaining -= 1;
+        if agg.remaining == 0 {
+            let count = agg.count;
+            conn.exists_agg.remove(&seq);
+            conn.resp_complete(seq, codec.encode_integer(count));
+        }
+        return;
+    }
+    // ⭐ STRLEN/TYPE: Get 结果语义转换
+    if let Some(kind) = conn.get_kind.remove(&seq) {
+        let bytes = match (kind, result) {
+            (GetKind::Strlen, BatchResult::GetValue(None)) => codec.encode_integer(0),
+            (GetKind::Strlen, BatchResult::GetValue(Some(stored))) => {
+                let (_tag, payload) = decode_value(stored);
+                codec.encode_integer(payload.len() as i64)
+            }
+            (GetKind::TypeOf, BatchResult::GetValue(None)) => codec.encode_simple("none"),
+            (GetKind::TypeOf, BatchResult::GetValue(Some(_))) => codec.encode_simple("string"),
+            (_, BatchResult::Error(e)) => codec.encode_error(e),
+            _ => codec.encode_error("unexpected result"),
+        };
+        conn.resp_complete(seq, bytes);
+        return;
+    }
     // DEL 聚合路径
     if let Some(agg) = conn.del_agg.get_mut(&seq) {
         match result {
@@ -638,7 +987,7 @@ fn handle_resp_shard_result(conn: &mut ConnState, seq: u64, result: &BatchResult
     }
 
     let bytes = match result {
-        BatchResult::PutOk => codec.encode_ok(),
+        BatchResult::PutOk | BatchResult::MultiPutOk => codec.encode_ok(),
         BatchResult::GetValue(None) => codec.encode_nil(),
         BatchResult::GetValue(Some(stored)) => {
             // ⭐ 剥 value type tag
@@ -646,6 +995,9 @@ fn handle_resp_shard_result(conn: &mut ConnState, seq: u64, result: &BatchResult
             codec.encode_bulk(payload)
         }
         BatchResult::DeleteExisted(existed) => codec.encode_integer(*existed as i64),
+        BatchResult::Integer(n) => codec.encode_integer(*n),
+        // Values 只应命中 mget_agg 路径; 兜底防御
+        BatchResult::Values(_) => codec.encode_error("unexpected multi result"),
         BatchResult::Error(e) => codec.encode_error(e),
     };
     conn.resp_complete(seq, bytes);
@@ -677,29 +1029,32 @@ fn peek_req_id(frame: &[u8]) -> u64 {
     u64::from_be_bytes(frame[4..12].try_into().unwrap())
 }
 
-/// Request → BatchOp. ⭐ Put 时统一附加 value type tag (TAG_RAW).
-fn request_to_batch_op(req: Request, db: &str, table: &str) -> BatchOp {
+/// Request → BatchOp. ⭐ `Request::Put.value` 已是 `[tag][payload]` 布局
+/// (decode 时预置), 直接 move — 零二次拷贝.
+fn request_to_batch_op(req: Request, db: &std::sync::Arc<str>, table: &std::sync::Arc<str>) -> BatchOp {
     match req {
         Request::Put { key, value } => BatchOp::Put {
-            db: db.to_string(),
-            table: table.to_string(),
+            db: db.clone(),
+            table: table.clone(),
             key,
-            val: encode_value(TAG_RAW, &value),
+            val: value,
         },
         Request::Get { key } => BatchOp::Get {
-            db: db.to_string(),
-            table: table.to_string(),
+            db: db.clone(),
+            table: table.clone(),
             key,
         },
         Request::Delete { key } => BatchOp::Delete {
-            db: db.to_string(),
-            table: table.to_string(),
+            db: db.clone(),
+            table: table.clone(),
             key,
         },
     }
 }
 
 /// BatchResult → Binary Response. ⭐ Get 命中时剥 value type tag.
+/// (注: payload.to_vec 是 Response::Get(Option<Vec>) 结构所需;
+/// Binary 非 benchmark 主路径, 借用化需改 Protocol trait, 收益不值 — 记录保留.)
 fn batch_result_to_response(result: &BatchResult) -> Response {
     match result {
         BatchResult::PutOk => Response::PutOk,
@@ -709,21 +1064,26 @@ fn batch_result_to_response(result: &BatchResult) -> Response {
             Response::Get(Some(payload.to_vec()))
         }
         BatchResult::DeleteExisted(_) => Response::DeleteOk,
+        // Multi/RMW op 是 RESP 专属 (Binary 门面不会产生)
+        BatchResult::Values(_) | BatchResult::MultiPutOk | BatchResult::Integer(_) => {
+            Response::Error("multi ops unsupported on binary protocol".into())
+        }
         BatchResult::Error(e) => Response::Error(e.clone()),
     }
 }
 
 fn hash_route_op(op: &BatchOp, num_shards: usize) -> usize {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let (db, table, key) = match op {
-        BatchOp::Put { db, table, key, .. } => (db.as_str(), table.as_str(), key.as_slice()),
-        BatchOp::Get { db, table, key } => (db.as_str(), table.as_str(), key.as_slice()),
-        BatchOp::Delete { db, table, key } => (db.as_str(), table.as_str(), key.as_slice()),
+        BatchOp::Put { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+        BatchOp::Get { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+        BatchOp::Delete { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+        BatchOp::Incr { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+        BatchOp::Append { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+        BatchOp::SetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+        // Multi op 不经此路径 (dispatch 已按 key 分组定向 push)
+        BatchOp::MultiGet { .. } | BatchOp::MultiPut { .. } => {
+            unreachable!("Multi ops are pre-routed by dispatch")
+        }
     };
-    let mut hasher = DefaultHasher::new();
-    db.hash(&mut hasher);
-    table.hash(&mut hasher);
-    key.hash(&mut hasher);
-    (hasher.finish() as usize) % num_shards
+    hash_route_key(db, table, key, num_shards)
 }

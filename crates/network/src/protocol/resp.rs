@@ -17,6 +17,23 @@ pub enum RespCommand {
     Get { key: Vec<u8> },
     /// DEL key [key ...] → 多个 BatchOp::Delete, 回复 :N
     Del { keys: Vec<Vec<u8>> },
+    /// ⭐ MGET key [key ...] → 按 shard 分组 MultiGet, 聚合回 *N 数组
+    MGet { keys: Vec<Vec<u8>> },
+    /// ⭐ MSET key value [key value ...] → 按 shard 分组 MultiPut, 回 +OK
+    /// (value 已预置 type tag, 与 Set 一致)
+    MSet { pairs: Vec<(Vec<u8>, Vec<u8>)> },
+    /// ⭐ INCR/DECR/INCRBY/DECRBY → BatchOp::Incr (shard 端 RMW), 回 :n
+    Incr { key: Vec<u8>, delta: i64 },
+    /// ⭐ APPEND key value → BatchOp::Append (suffix 不带 tag), 回 :len
+    Append { key: Vec<u8>, suffix: Vec<u8> },
+    /// ⭐ SETNX key value → BatchOp::SetNx (value 带 tag), 回 :0|:1
+    SetNx { key: Vec<u8>, value: Vec<u8> },
+    /// ⭐ EXISTS key [key ...] → N 个 Get 聚合计数, 回 :n
+    Exists { keys: Vec<Vec<u8>> },
+    /// ⭐ STRLEN key → Get 转长度, 回 :len (miss → :0)
+    Strlen { key: Vec<u8> },
+    /// ⭐ TYPE key → Get 转类型, 回 +string / +none
+    TypeOf { key: Vec<u8> },
     /// PING [msg] → 本地回 +PONG / $msg
     Ping(Option<Vec<u8>>),
     /// ECHO msg → 本地回 $msg
@@ -38,6 +55,8 @@ pub enum RespCommand {
     Unknown(String),
     /// 命令参数个数错误 → -ERR wrong number of arguments
     WrongArity(String),
+    /// ⭐ 整数参数非法 (INCRBY/DECRBY) → -ERR value is not an integer
+    InvalidInt(String),
 }
 
 /// RESP2 编解码器 (无状态).
@@ -81,7 +100,7 @@ impl RespCodec {
             return Err(format!("protocol error: invalid multibulk length {argc}"));
         }
 
-        let mut args: Vec<Vec<u8>> = Vec::with_capacity(argc as usize);
+        let mut args: Vec<(usize, usize)> = Vec::with_capacity(argc as usize);
         for _ in 0..argc {
             if pos >= buf.len() {
                 return Ok(DecodeOutcome::NeedMore);
@@ -107,13 +126,15 @@ impl RespCodec {
             if &buf[data_start + blen..data_start + blen + 2] != b"\r\n" {
                 return Err("protocol error: bulk string missing CRLF".to_string());
             }
-            args.push(buf[data_start..data_start + blen].to_vec());
+            // ⭐ 热路径优化: 只记 span, 由 args_to_command 按需物化
+            // (SET 的 value 物化时直接预置 type tag, 免 worker 二次全值拷贝)
+            args.push((data_start, blen));
             pos = data_start + blen + 2;
         }
 
         Ok(DecodeOutcome::Complete {
             consumed: pos,
-            value: args_to_command(args),
+            value: args_to_command(buf, &args),
         })
     }
 
@@ -215,9 +236,18 @@ fn parse_int_line(buf: &[u8], start: usize) -> Result<Option<(i64, usize)>, Stri
     Ok(None)
 }
 
-/// args → RespCommand (命令名大小写不敏感).
-fn args_to_command(mut args: Vec<Vec<u8>>) -> RespCommand {
-    let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+/// args (span 形式) → RespCommand (命令名大小写不敏感).
+///
+/// ⭐ 热路径优化: 每个参数只在此处按需物化一次;
+/// **SET 的 value 物化时直接预置 1B type tag** (`[TAG_RAW][payload]`),
+/// worker 层零二次拷贝 (`RespCommand::Set.value` 即存储层 stored 布局).
+fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespCommand {
+    let arg = |i: usize| -> &[u8] {
+        let (off, len) = args[i];
+        &buf[off..off + len]
+    };
+    let owned = |i: usize| -> Vec<u8> { arg(i).to_vec() };
+    let name = String::from_utf8_lossy(arg(0)).to_ascii_uppercase();
     let arity = args.len();
     match name.as_str() {
         "SET" => {
@@ -225,59 +255,145 @@ fn args_to_command(mut args: Vec<Vec<u8>>) -> RespCommand {
                 return RespCommand::WrongArity("set".into());
             }
             // 忽略 SET 的扩展参数 (EX/PX/NX/XX...) — 后续版本支持
-            let value = args.swap_remove(2);
-            let key = args.swap_remove(1);
-            RespCommand::Set { key, value }
+            let payload = arg(2);
+            let mut value = Vec::with_capacity(1 + payload.len());
+            value.push(crate::value_codec::TAG_RAW);
+            value.extend_from_slice(payload);
+            RespCommand::Set {
+                key: owned(1),
+                value,
+            }
         }
         "GET" => {
             if arity != 2 {
                 return RespCommand::WrongArity("get".into());
             }
-            RespCommand::Get {
-                key: args.swap_remove(1),
-            }
+            RespCommand::Get { key: owned(1) }
         }
         "DEL" => {
             if arity < 2 {
                 return RespCommand::WrongArity("del".into());
             }
             RespCommand::Del {
-                keys: args.drain(1..).collect(),
+                keys: (1..arity).map(owned).collect(),
             }
+        }
+        "MGET" => {
+            if arity < 2 {
+                return RespCommand::WrongArity("mget".into());
+            }
+            RespCommand::MGet {
+                keys: (1..arity).map(owned).collect(),
+            }
+        }
+        "MSET" => {
+            if arity < 3 || !(arity - 1).is_multiple_of(2) {
+                return RespCommand::WrongArity("mset".into());
+            }
+            let pairs = (1..arity)
+                .step_by(2)
+                .map(|i| {
+                    let payload = arg(i + 1);
+                    let mut value = Vec::with_capacity(1 + payload.len());
+                    value.push(crate::value_codec::TAG_RAW);
+                    value.extend_from_slice(payload);
+                    (owned(i), value)
+                })
+                .collect();
+            RespCommand::MSet { pairs }
         }
         "PING" => match arity {
             1 => RespCommand::Ping(None),
-            2 => RespCommand::Ping(Some(args.swap_remove(1))),
+            2 => RespCommand::Ping(Some(owned(1))),
             _ => RespCommand::WrongArity("ping".into()),
         },
+        "INCR" | "DECR" => {
+            if arity != 2 {
+                return RespCommand::WrongArity(name.to_ascii_lowercase());
+            }
+            RespCommand::Incr {
+                key: owned(1),
+                delta: if name == "INCR" { 1 } else { -1 },
+            }
+        }
+        "INCRBY" | "DECRBY" => {
+            if arity != 3 {
+                return RespCommand::WrongArity(name.to_ascii_lowercase());
+            }
+            let Some(n) = std::str::from_utf8(arg(2))
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+            else {
+                // 非法数字参数 → -ERR value is not an integer
+                return RespCommand::InvalidInt(name.to_ascii_lowercase());
+            };
+            RespCommand::Incr {
+                key: owned(1),
+                delta: if name == "INCRBY" { n } else { n.wrapping_neg() },
+            }
+        }
+        "APPEND" => {
+            if arity != 3 {
+                return RespCommand::WrongArity("append".into());
+            }
+            RespCommand::Append {
+                key: owned(1),
+                suffix: owned(2),
+            }
+        }
+        "SETNX" => {
+            if arity != 3 {
+                return RespCommand::WrongArity("setnx".into());
+            }
+            let payload = arg(2);
+            let mut value = Vec::with_capacity(1 + payload.len());
+            value.push(crate::value_codec::TAG_RAW);
+            value.extend_from_slice(payload);
+            RespCommand::SetNx {
+                key: owned(1),
+                value,
+            }
+        }
+        "EXISTS" => {
+            if arity < 2 {
+                return RespCommand::WrongArity("exists".into());
+            }
+            RespCommand::Exists {
+                keys: (1..arity).map(owned).collect(),
+            }
+        }
+        "STRLEN" => {
+            if arity != 2 {
+                return RespCommand::WrongArity("strlen".into());
+            }
+            RespCommand::Strlen { key: owned(1) }
+        }
+        "TYPE" => {
+            if arity != 2 {
+                return RespCommand::WrongArity("type".into());
+            }
+            RespCommand::TypeOf { key: owned(1) }
+        }
         "ECHO" => {
             if arity != 2 {
                 return RespCommand::WrongArity("echo".into());
             }
-            RespCommand::Echo(args.swap_remove(1))
+            RespCommand::Echo(owned(1))
         }
         "AUTH" => match arity {
             2 => RespCommand::Auth {
                 user: None,
-                pass: args.swap_remove(1),
+                pass: owned(1),
             },
-            3 => {
-                let pass = args.swap_remove(2);
-                let user = args.swap_remove(1);
-                RespCommand::Auth {
-                    user: Some(user),
-                    pass,
-                }
-            }
+            3 => RespCommand::Auth {
+                user: Some(owned(1)),
+                pass: owned(2),
+            },
             _ => RespCommand::WrongArity("auth".into()),
         },
         "QUIT" => RespCommand::Quit,
         "COMMAND" => RespCommand::Command,
-        "HELLO" => RespCommand::Hello(if arity >= 2 {
-            Some(args.swap_remove(1))
-        } else {
-            None
-        }),
+        "HELLO" => RespCommand::Hello(if arity >= 2 { Some(owned(1)) } else { None }),
         "SELECT" => RespCommand::Select,
         other => RespCommand::Unknown(other.to_ascii_lowercase()),
     }
@@ -298,11 +414,14 @@ mod tests {
     fn parse_set_get_del() {
         let (n, cmd) = decode_full(b"*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$5\r\nhello\r\n");
         assert_eq!(n, 32);
+        // ⭐ SET 的 value 在 decode 时预置 1B type tag ([TAG_RAW][payload])
+        let mut tagged = vec![crate::value_codec::TAG_RAW];
+        tagged.extend_from_slice(b"hello");
         assert_eq!(
             cmd,
             RespCommand::Set {
                 key: b"k1".to_vec(),
-                value: b"hello".to_vec()
+                value: tagged
             }
         );
 
