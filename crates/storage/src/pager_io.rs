@@ -658,6 +658,50 @@ impl PagerIo {
             PagerIo::IoUring(b) => b.write_plain_file_batch(mate_path, &group).await,
         }
     }
+
+    /// ⭐ G2: 同 chunk 的 N 个 page (16KB 粒度) 批量写 + 单次 fsync.
+    ///
+    /// compact 死槽填充专用: 只写 dst chunk 的死页槽位, 活页不动 —
+    /// crash 半写死槽无害 (meta 未指向). off = chunk×1MB + page×16KB.
+    pub async fn write_pages_batch(
+        &self,
+        block_dir: &Path,
+        key: PageKey,
+        items: &[(u8, &[u8])], // (page_idx, 16KB page 字节)
+    ) -> io::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let path = self.block_path(block_dir, key.file_id);
+        let base = (key.chunk_idx as u64) * CHUNK_SIZE as u64;
+        let group: Vec<(u64, &[u8])> = items
+            .iter()
+            .map(|(p, d)| (base + (*p as u64) * crate::types::PAGE_SIZE as u64, *d))
+            .collect();
+        match self {
+            PagerIo::StdFs(b) => b.write_chunks_file_batch(&path, &group).await,
+            PagerIo::IoUring(b) => b.write_chunks_file_batch(&path, &group).await,
+        }
+    }
+
+    /// ⭐ G4: 逐出 path 的全部 fd 缓存 (block 文件 unlink 前必调,
+    /// 否则 fd 泄漏且后续写打到已删除的 inode 上).
+    ///
+    /// - fd_cache: 移除 entry (File drop 即 close)
+    /// - FdPool fixed-file 槽: 表项置 -1 + close (需 scheduler 上下文;
+    ///   无上下文时仅清 fd_cache, 槽由 close_all 兑底)
+    pub fn evict_path(&self, path: &Path) {
+        match self {
+            PagerIo::StdFs(_) => {}
+            PagerIo::IoUring(b) => {
+                b.fd_cache.borrow_mut().remove(path);
+                let _ = scheduler::with_current(|s| {
+                    // 拆借: ring 与 fd_pool 均在 scheduler/backend 内部
+                    b.fd_pool.borrow_mut().release_path(s.ring_mut(), path);
+                });
+            }
+        }
+    }
 }
 
 impl Default for PagerIo {

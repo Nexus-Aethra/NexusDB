@@ -96,8 +96,23 @@ impl MetaCache {
     /// ⭐ vpid-only API: 读 vpid → PidLocation. 纯内存索引.
     /// 越界 / 未分配 (flags=0) → None.
     pub fn read(&mut self, vpid: u64) -> Option<PidLocation> {
+        self.peek(vpid)
+    }
+
+    /// 不可变读 (G1: ChunkLiveness::rebuild_from_meta 等遍历场景用).
+    pub fn peek(&self, vpid: u64) -> Option<PidLocation> {
         let slot = self.slots.get(vpid as usize)?;
         if slot.flags() == 0 { None } else { Some(*slot) }
+    }
+
+    /// ⭐ G2: 遍历全部已分配 slot (vpid, pid). compact 判活等全扫场景用
+    /// (meta 是存活性的 source of truth, 不依赖 page header 自描述).
+    pub fn iter_allocated(&self) -> impl Iterator<Item = (u64, PidLocation)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.flags() != 0)
+            .map(|(i, s)| (i as u64, *s))
     }
 
     /// ⭐ vpid-only API: 写 vpid → PidLocation. 懒扩容 + 标 window dirty.

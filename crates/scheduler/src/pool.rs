@@ -12,6 +12,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub struct Slot {
     pub future: Option<BoxFuture<'static, ()>>,
     pub cancel_requested: AtomicBool,
+    /// ⭐ G0: 低优先级标记 (后台任务如 compact). wave 内排在普通协程之后
+    /// 且每 wave 限额 poll, 不占前台请求名额.
+    pub low_priority: bool,
 }
 
 impl Default for Slot {
@@ -19,6 +22,7 @@ impl Default for Slot {
         Self {
             future: None,
             cancel_requested: AtomicBool::new(false),
+            low_priority: false,
         }
     }
 }
@@ -55,6 +59,7 @@ impl Pool {
     pub fn release(&mut self, idx: usize) {
         debug_assert!(idx < POOL_SIZE);
         self.slots[idx].future = None;
+        self.slots[idx].low_priority = false;
         self.free.push_back(idx);
         self.in_use -= 1;
     }

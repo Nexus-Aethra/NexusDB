@@ -131,6 +131,8 @@ impl<T> JoinInner<T> {
 
 pub(crate) struct TaskRequest {
     pub(crate) future: BoxFuture<'static, ()>,
+    /// ⭐ G0: 低优先级 (后台任务). 装 pool 时写入 slot.low_priority.
+    pub(crate) low_priority: bool,
 }
 
 pub(crate) enum InternalMessage {
@@ -166,6 +168,30 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
+    spawn_on_with_priority(handle, future, false)
+}
+
+/// ⭐ G0: 低优先级 spawn (后台任务: compact/统计/预热).
+///
+/// 与 `spawn_on` 同构, 但协程在每个调度 wave 内排在普通协程之后,
+/// 且每 wave 至多 poll `LOW_PRIO_BUDGET` 个 — 不影响前台请求延迟.
+pub fn spawn_on_low<F>(handle: &crate::scheduler::SchedHandle, future: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    spawn_on_with_priority(handle, future, true)
+}
+
+fn spawn_on_with_priority<F>(
+    handle: &crate::scheduler::SchedHandle,
+    future: F,
+    low_priority: bool,
+) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
     let inner = Arc::new(JoinInner::<F::Output>::new());
     let join = JoinHandle {
         inner: inner.clone(),
@@ -175,7 +201,7 @@ where
         inner.set_result(Ok(r));
     });
     // 通过 handle.0 直接 borrow_mut 提交.
-    handle.0.borrow().submit(wrapper);
+    handle.0.borrow().submit_with_priority(wrapper, low_priority);
     join
 }
 

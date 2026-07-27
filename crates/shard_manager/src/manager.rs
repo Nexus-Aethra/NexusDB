@@ -1066,10 +1066,24 @@ fn block_on_io<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-/// ⭐ 异步落盘完成事件: data chunk / meta window 两类 (Phase M3).
+/// ⭐ 异步落盘完成事件: data chunk / meta window / compact 两阶段 (G2).
 enum FlushDone {
     Data(storage::PageKey, std::io::Result<()>),
     Meta(u32, std::io::Result<()>),
+    /// G2 阶段 1 完成: (dst, src, dst_fresh, 读结果 (dst_bytes, src_bytes))
+    CompactRead(
+        storage::PageKey,
+        storage::PageKey,
+        bool,
+        std::io::Result<(Vec<u8>, Vec<u8>)>,
+    ),
+    /// G2 阶段 2 完成: (dst, src, moves, 写结果)
+    CompactWrite(
+        storage::PageKey,
+        storage::PageKey,
+        Vec<(u64, storage::PidLocation, u8)>,
+        std::io::Result<()>,
+    ),
 }
 
 /// ⭐ 异步落盘完成槽: 落盘协程 push 完成事件, 主循环收割 (单线程 Rc, 无锁).
@@ -1103,6 +1117,31 @@ fn drive_async_flush(
                             nlog::error!("shard", "meta window {window_idx} flush failed (will retry): {err}");
                         }
                         e.pager_mut().complete_meta_flush(window_idx, result);
+                    }
+                    // ⭐ G2 阶段 2 (同步): meta 判活 → 组装写作业 → 低优先级协程写盘
+                    FlushDone::CompactRead(dst, src, dst_fresh, read_result) => {
+                        if let Some(wj) =
+                            e.pager_mut().analyze_compact_read(dst, src, dst_fresh, read_result)
+                        {
+                            let done = flush_done.clone();
+                            scheduler::spawn_on_low(
+                                rt,
+                                Box::pin(async move {
+                                    // fresh dst 整 chunk 写 / 常规 dst 死槽批写
+                                    let r = wj.execute().await;
+                                    done.borrow_mut().push(FlushDone::CompactWrite(
+                                        wj.dst, wj.src, wj.moves, r,
+                                    ));
+                                }),
+                            );
+                        }
+                    }
+                    // ⭐ G2 阶段 3 (同步): CAS 提交 (防回滚并发 COW 写)
+                    FlushDone::CompactWrite(dst, src, moves, result) => {
+                        if let Err(ref err) = result {
+                            nlog::warn!("shard", "compact write failed (will retry): {err}");
+                        }
+                        e.pager_mut().complete_compact(dst, src, moves, result);
                     }
                 }
                 if crate::PROBE.is_enabled() {
@@ -1184,6 +1223,37 @@ fn drive_async_flush(
                                 }
                             }
                         }
+                    }),
+                );
+            }
+            // b3. ⭐ G2: 空闲段发起 chunk compact (低优先级协程读 dst+src 字节;
+            // 判活用 header 候选 + meta 点查, 零全扫).
+            // 触发条件: data backlog == 0; start_compact 内部节流 + 至多 1 个在飞.
+            if e.pager_mut().flush_backlog() == 0
+                && let Some(rj) = e.pager_mut().start_compact()
+            {
+                let done = flush_done.clone();
+                scheduler::spawn_on_low(
+                    rt,
+                    Box::pin(async move {
+                        // ⭐ B-drain: fresh dst (全新 bump chunk) 磁盘无内容,
+                        // 跳过读直接传全零 (analyze 判 64 槽全死槽)
+                        let dst_r = if rj.dst_fresh {
+                            Ok(vec![0u8; storage::CHUNK_SIZE])
+                        } else {
+                            rj.io.read_page_chunk(&rj.dir, rj.dst).await
+                        };
+                        let r = match dst_r {
+                            Ok(dst_bytes) => rj
+                                .io
+                                .read_page_chunk(&rj.dir, rj.src)
+                                .await
+                                .map(|src_bytes| (dst_bytes, src_bytes)),
+                            Err(e) => Err(e),
+                        };
+                        done.borrow_mut().push(FlushDone::CompactRead(
+                            rj.dst, rj.src, rj.dst_fresh, r,
+                        ));
                     }),
                 );
             }

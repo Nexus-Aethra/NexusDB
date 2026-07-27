@@ -188,6 +188,23 @@ impl FdPool {
         Ok(new_slot)
     }
 
+    /// ⭐ G4: 释放 path 对应的 fixed-file 槽 (block 文件 unlink 前调用).
+    ///
+    /// 表项置 -1 (内核不再持有该 fd) + close; slot 号不复用 (next_slot 单调,
+    /// unlink 后同 path 不会重现 — file_id 不复用). path 未注册时 no-op.
+    pub fn release_path(&mut self, ring: &mut IoUring, path: &Path) {
+        let Some(slot) = self.path_to_slot.remove(path) else {
+            return;
+        };
+        // 表项置 -1; 失败仅忽略 (槽泄漏一个, 不阻断 unlink)
+        let _ = ring.submitter().register_files_update(slot as u32, &[-1]);
+        if let Some(fd) = self.slot_to_fd.remove(&slot) {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+
     /// Pager::drop 时批量 close 所有 fd. ring 本身由 IoUring drop 时 OS 清理.
     pub fn close_all(&mut self) {
         for fd in self.slot_to_fd.values() {

@@ -26,6 +26,7 @@
 
 pub mod alloc;
 pub mod btree;
+pub mod chunk_liveness;
 pub mod chunk_lock;
 pub mod chunk_lru;
 pub mod chunk_writer;

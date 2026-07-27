@@ -306,6 +306,20 @@ impl NowChunks {
         self.take_chunk_box(key).map(|b| b.to_vec())
     }
 
+    /// ⭐ G3: 为复用的 free chunk 创建空视图占位.
+    ///
+    /// 复用 chunk 的磁盘历史内容全部无效 (全死 + meta 已确认), submit 的
+    /// 驻留兜底不应从 disk 加载旧死页视图 (否则 page_count 立刻满 →
+    /// 新写无槽可用). 空 ChunkBuf 从零开始增量写.
+    pub fn insert_empty(&mut self, key: PageKey) {
+        let file = self.file_mut_or_insert(key.file_id);
+        let idx = key.chunk_idx as usize;
+        if file.chunks.len() <= idx {
+            file.chunks.resize_with(idx + 1, || None);
+        }
+        file.chunks[idx] = Some(ChunkBuf::new());
+    }
+
     /// ⭐ reopen 兜底: 加载磁盘上半满 chunk 的完整视图, 供后续增量写.
     ///
     /// 扫描 64 个 page header (magic "LCBP" + vpid 字段) 重建 vpids/page_count,
