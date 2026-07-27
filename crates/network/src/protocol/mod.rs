@@ -53,9 +53,10 @@ pub enum Response {
 ///
 /// 超限请求在 worker parse 后、进 shard 前被拦截, 直接返回协议级 error.
 ///
-/// 上限依据: page crate 编码路径用 `[0u8; 4096]` 栈缓冲,
-/// 单条 item (key + value + tag + varint 开销) 硬上限 4096B.
-/// 默认 key 1024 + value 3000 + 1B type tag + 编码开销 < 4096, 任意组合安全.
+/// ⭐ 大 value: 超过存储层 inline 阈值 (~4000B) 的 value 由存储层自动
+/// 切溢出页 (13B 描述符入 leaf item), page crate 4096B 编码缓冲只约束
+/// inline 路径. value 上限 1MB (溢出单层间接); key 维持 1024B
+/// (参与比较/分裂/internal 路由, 不走溢出).
 #[derive(Debug, Clone, Copy)]
 pub struct KvLimits {
     pub max_key_bytes: usize,
@@ -66,7 +67,7 @@ impl Default for KvLimits {
     fn default() -> Self {
         Self {
             max_key_bytes: 1024,
-            max_value_bytes: 3000,
+            max_value_bytes: 1024 * 1024,
         }
     }
 }

@@ -413,6 +413,21 @@ impl Pager {
         self.meta.iter_allocated().collect()
     }
 
+    /// ⭐ 大 value: 释放溢出页 vpid (覆盖写/删除时防存储泄漏).
+    ///
+    /// 链路: 活性递减 (chunk 可被 compact/drain 回收) → meta 写墓碑
+    /// (PID_FREED, read 此后 None; recover 扫描凭墓碑**不回填** — 否则磁盘
+    /// 残留的旧页 header 会把死页复活) → 置 meta_flush_due 推动墓碑持久化.
+    ///
+    /// 幂等: vpid 未分配 / 已是墓碑 → no-op.
+    pub fn free_overflow_vpid(&mut self, vpid: u64) {
+        if let Some(pid) = self.meta.peek(vpid) {
+            self.liveness.on_page_dead(pid);
+            self.meta.free_slot(vpid);
+            self.meta_flush_due = true;
+        }
+    }
+
     /// 读 page. **核心四源查找** (nowchunks + WriteQueue + chunk_list + disk):
     /// 1. peek nowchunks (有 → 立即返回 owned bytes)
     /// 2. WriteQueue peek (pending 或 completed 中的 chunk 对读路径可见)

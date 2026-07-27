@@ -34,6 +34,7 @@ pub mod db_name_resolver;
 pub mod engine;
 pub mod meta_cache;
 pub mod meta_page;
+pub mod overflow;
 pub mod page_pool;
 pub mod pager;
 pub mod pager_io;
@@ -54,6 +55,7 @@ pub use db_name_resolver::{DbNameResolver, RESOLVER_HEADER_SIZE, ResolverError};
 pub use engine::{OpenOptions, StorageEngine, StorageError};
 pub use meta_cache::{META_WINDOW_SIZE, MetaCache, SLOTS_PER_WINDOW};
 pub use meta_page::{MetaError, MetaPage};
+pub use overflow::{INLINE_LIMIT, MAX_OVERFLOW_VALUE, needs_overflow};
 pub use registry::RegistryError;
 pub use table_directory::{TableDirError, TableDirectory};
 pub use types::{

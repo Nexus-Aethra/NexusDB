@@ -46,6 +46,10 @@ pub enum PageType {
     Internal = 2,
     /// B+Tree 叶子节点, 存 [key, value].
     Leaf = 3,
+    /// ⭐ 大 value 溢出数据页: header + 原始 payload 切片 (storage 层管理).
+    Overflow = 4,
+    /// ⭐ 大 value 溢出索引页: header + count + vpid 数组 (storage 层管理).
+    OverflowIndex = 5,
 }
 
 impl PageType {
@@ -54,6 +58,8 @@ impl PageType {
             1 => Some(PageType::Meta),
             2 => Some(PageType::Internal),
             3 => Some(PageType::Leaf),
+            4 => Some(PageType::Overflow),
+            5 => Some(PageType::OverflowIndex),
             _ => None,
         }
     }

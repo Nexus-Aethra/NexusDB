@@ -153,11 +153,13 @@ pub fn recover_for_shard(
     let mut fill: std::collections::HashMap<u64, PidLocation> = std::collections::HashMap::new();
     let (max_vpid, last_pid, seen_any) = scan_block_files(&block_files, &mut fill)?;
     for (vpid, pid) in fill {
-        if meta.peek(vpid).is_none() {
+        // ⭐ 大 value: has_record 含墓碑 (PID_FREED) — 已释放的溢出页 vpid
+        // 磁盘上仍残留旧 header, 回填会把死页"复活"为活页 (存储泄漏).
+        if !meta.has_record(vpid) {
             meta.write(vpid, pid);
         }
-        // meta 已有记录: 扫描候选可能是历史死页或复用后新写 (无法区分),
-        // 以 meta 一致点为准, 跳过.
+        // meta 已有记录 (活或墓碑): 扫描候选可能是历史死页或复用后新写
+        // (无法区分), 以 meta 一致点为准, 跳过.
     }
 
     // 4. 推导 alloc 起点 (vpid 水位取扫描与 mate 两者较大 — mate 可能含
@@ -328,9 +330,9 @@ fn scan_block_file(
                 continue;
             }
 
-            // 校验 page_type
+            // 校验 page_type (1=Meta 2=Internal 3=Leaf 4=Overflow 5=OverflowIndex)
             let page_type_byte = buf[4];
-            if page_type_byte != 1 && page_type_byte != 2 && page_type_byte != 3 {
+            if !(1..=5).contains(&page_type_byte) {
                 // corrupted page → 跳过
                 continue;
             }

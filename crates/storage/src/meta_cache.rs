@@ -100,9 +100,44 @@ impl MetaCache {
     }
 
     /// 不可变读 (G1: ChunkLiveness::rebuild_from_meta 等遍历场景用).
+    /// 墓碑 slot (PID_FREED, 溢出页已释放) 同样返回 None — 页已死.
     pub fn peek(&self, vpid: u64) -> Option<PidLocation> {
         let slot = self.slots.get(vpid as usize)?;
-        if slot.flags() == 0 { None } else { Some(*slot) }
+        if slot.flags() == 0 || slot.flags() & crate::types::PID_FREED != 0 {
+            None
+        } else {
+            Some(*slot)
+        }
+    }
+
+    /// ⭐ 大 value: slot 是否有过记录 (含墓碑). recover 扫描回填判据 —
+    /// 有记录 (活或墓碑) 的 vpid 以 meta 为准, 扫描不得覆盖;
+    /// 否则已释放溢出页会被磁盘残留 header "复活" (存储泄漏).
+    pub fn has_record(&self, vpid: u64) -> bool {
+        self.slots
+            .get(vpid as usize)
+            .is_some_and(|s| s.flags() != 0)
+    }
+
+    /// ⭐ 大 value: 释放 vpid — 写墓碑 (保留原位置字节, flags 置 PID_FREED).
+    /// 持久化随 dirty window 走; read/peek 此后返回 None.
+    /// no-op 条件: 越界 / 从未分配 / 已是墓碑.
+    pub fn free_slot(&mut self, vpid: u64) {
+        let idx = vpid as usize;
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        if slot.flags() == 0 || slot.flags() & crate::types::PID_FREED != 0 {
+            return;
+        }
+        let tomb = PidLocation {
+            file_id: slot.file_id,
+            chunk_idx: slot.chunk_idx,
+            page_idx: slot.page_idx,
+            flags: crate::types::PID_FREED,
+        };
+        self.slots[idx] = tomb;
+        self.dirty_windows[idx / SLOTS_PER_WINDOW] = true;
     }
 
     /// ⭐ G2: 遍历全部已分配 slot (vpid, pid). compact 判活等全扫场景用

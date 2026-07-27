@@ -132,6 +132,10 @@ pub type PidLocation = PagePidLocation;
 pub const PID_ALIVE: u8 = 0b0000_0001;
 pub const PID_IN_TXN: u8 = 0b0000_0010;
 pub const PID_DIRTY: u8 = 0b0000_0100; // 已被 write 但未 fsync (mark in nowchunks)
+/// ⭐ 大 value 溢出页释放墓碑: slot 有记录但页已死 (read 返回 None).
+/// 与 flags=0 (从未分配) 区分 — recover 扫描**不回填**墓碑 vpid,
+/// 否则磁盘上残留的旧溢出页 header 会把已释放页"复活"为活页 (存储泄漏).
+pub const PID_FREED: u8 = 0b0000_1000;
 
 /// VpidLogEntry: chunk 末尾的 vpid 变更日志条目 (来自 DESIGN §4.3.10).
 /// 16B 固定: vpid[8] + PidLocation[8] = 16B.
