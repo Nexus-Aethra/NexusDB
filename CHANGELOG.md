@@ -1,13 +1,49 @@
-# Ne
-## 完整测试状态快照历史索引
-
-7-24 / 7-20 / 7-19 三个旧快照完整保留于 `git log CHANGELOG.md` 任意历史版本; 与本快照差异仅在测试计数 (随会话累积), 测试文件清单同步见代码目录.
-xusDB — Changelog & Hindsight
+# NexusDB — Changelog & Hindsight
 
 > 详细修复历史 + 测试进度快照 + 环境 gotchas + 测试文件清单.
 > 本文件由 `AGENTS.md` 拆分而来 (2026-07-20), AGENTS.md 只保留项目入口与设计原则摘要.
+>
+> 完整测试状态快照历史索引: 7-24 / 7-20 / 7-19 三个旧快照完整保留于 `git log CHANGELOG.md`
+> 任意历史版本; 与本快照差异仅在测试计数 (随会话累积), 测试文件清单同步见代码目录.
 
 **逆序时间线 (最新在上).**
+
+---
+
+## 2026-07-28 会话 (Redis 数据结构体系: 五大类型 + 统一 meta + Geo/Bitmap)
+
+### 修复/交付总览
+
+| # | 交付 | 文件 |
+|---|------|------|
+| F45 | 复合数据结构体系: keyspace 编码 + 范围扫描 + Hash/Set/List/ZSet 全命令 | `storage/keyspace.rs+collections.rs+btree.rs`, `page/leaf.rs` (`leaf_scan_from`), `shard_manager`, `network` |
+| F46 | 统一类型 meta: SET 覆盖孤儿行泄漏 + 全类型 WRONGTYPE + crash 计数重建 | `storage/keyspace.rs+collections.rs+engine.rs` |
+| F47 | 命令面补全: 空洞/List 中段/*STORE/Geospatial/Bitmap | `storage/geo.rs+collections.rs`, `shard_manager`, `network` |
+
+### F45: Redis 复合数据结构体系 (Hash/Set/List/ZSet)
+
+- **统一 key 命名空间编码** (`keyspace.rs`): data 行 `[kind][1][varint klen][key][suffix]` (kind=S/H/L/T/Z); 长度前缀二进制安全消歧 + 顺带解决 `user:1`/`user:10` 前缀包含; 集合子行共享精确前缀天然连续. 编码只在存储边界 (engine/collections), 协议层/路由仍用裸 key
+- **范围扫描游标**: `leaf_scan_from` (段内有序遍历) + `btree_scan` (`travel_to_leaf_guided` + `LeafGuide.upper` 跨 leaf 续, 前缀越界早停) — F44 区间 travel 基建的直接变现
+- **复合 key 展开** (非胖 value): 每 field/member/元素一行 + meta 行存 count; **ZSet 双索引** member→score (点查) + score→member (`encode_f64_ordered` 保序 8B, 正数翻符号位/负数全翻); List 用保序 i64 idx (XOR 符号位) + head/tail meta
+- **RESP 命令**: String 范围类 (GETRANGE/SETRANGE/GETDEL/GETSET/MSETNX) + Hash/Set/List/ZSet 全套; Set 代数 (SINTER/SUNION/SDIFF) worker 端 `SetAlgAgg` 跨 shard 聚合
+- **性能回退排查**: GET miss 探全部 4 种 meta 致 127K (基线 218K) → 收窄后由 F46 统一 meta 彻底解决
+
+### F46: 统一类型 meta (`[#][klen][key]` 每 key 唯一行)
+
+- **动机**: 每类型独立 meta 行导致类型检查 5 次点查 + SET 覆盖复合 key 留孤儿行 (空间泄漏) + GET 只探 hash 的 WRONGTYPE 不完整
+- **方案**: meta 收敛为 `[#][klen][key]` → value `[kind_byte][count u64]` (List 额外 head/tail) — 1 次探测即知类型; data 行编码不变
+- **收益**: `kind_of` 5→2 探测; SET/MSET 写前 `purge_composite_if_any` 清异类旧行 (Redis 语义, 无孤儿); GET miss 1 探测覆盖全类型 WRONGTYPE; `key_delete_any` 1 探测定位 kind 后 purge; 开库 `rebuild_composite_counts` 从 data 行重算 count 修复 crash 漂移
+- **性能**: memtier 203K/p99 5.4ms — 不降反升 (复合 op 类型检查减半)
+
+### F47: 命令面补全 (空洞 + List 中段 + *STORE + Geo + Bitmap)
+
+- **C1 空洞**: ZCOUNT/ZMSCORE/ZPOPMIN/ZPOPMAX; SMISMEMBER (新 `BatchResult::IntList`)/SINTERCARD (复用 SetAlgAgg 回 card)/SPOP·SRANDMEMBER count; HSTRLEN (复用 HGet+Strlen 转换, 零新 op)/HRANDFIELD
+- **C2 List 中段** (语义改造): **放弃 idx 连续假设** — LINDEX/LSET 改扫描序第 pos 个 (O(n) 符合 Redis), LPOP 容忍空洞收缩重试; LREM (±count)/LTRIM/LPOS (RANK/COUNT)/LINSERT (优先复用空洞 O(1), 无隙搬较小一侧; 搬行必须先物化完整 value 防溢出链被删旧行释放)
+- **C3 *STORE**: SINTERSTORE/SUNIONSTORE/SDIFFSTORE + ZINTERSTORE/ZUNIONSTORE (无 weights, SUM); worker 聚合完成点向 dst shard 发 Delete+SAdd/ZAdd 二阶段 (`StoreFinishAgg`, 同 inbox FIFO 保序); 跨 shard 非原子记 gap
+- **Geo** (几乎零 shard 层改动): `storage/geo.rs` 52-bit morton geohash (roundtrip <1m) + haversine; GEOADD 解析期直接转 ZAdd (score=geohash, <2^52 f64 精确); GEOPOS/GEODIST 复用 ZMScore、GEOSEARCH 复用 ZRange, worker `GeoCtx` 钩子渲染; GEODIST 京↔沪 1069km (误差 0.2%)
+- **Bitmap** (复用 String): SETBIT shard 端 RMW 零扩展 (offset 受 max_value_bytes 保护); GETBIT/BITCOUNT/BITPOS = Get + worker `BitCtx` 位运算 (含全 1 找 0 回越界位等 Redis 边界语义)
+- **本轮明确遗留**: BITOP/SMOVE/LMOVE/BLPOP·BRPOP/ZSTORE weights/TTL/Stream/HyperLogLog
+- 验证: **75 suites / 736 passed / 0 failed** + clippy 0; redis-cli 全命令实机对齐; kill -9 后 List 中段/STORE dst/Geo/Bitmap 全恢复; memtier 184-203K (基线噪声区间内, 新命令不碰热路径)
 
 ---
 

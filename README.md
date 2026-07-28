@@ -88,6 +88,16 @@ cargo test --workspace --no-fail-fast    # ~30s, 0 failed 预期
 | p99 | **3.4-4.7ms** | 5.34ms | 5.4ms |
 | MSET (10 keys, redis-benchmark -P 16) | **107-132K cmd/s ≈ 1.1-1.3M key/s** | - | - |
 
+### 表 1b — 多场景快照 (2026-07-28, 五大结构落地后; 4线程×25连接 pipeline=16)
+
+| 场景 | 吞吐 | 备注 |
+|---|---|---|
+| GET (预热后) | **395K ops/s** | 读路径三源查找 |
+| SET pipeline=1 | 174K, **p50 0.51ms** | 单请求延迟视角 |
+| 混合 1:9 (读多) | 315K | |
+| 混合 1:1 | 249K | 五大结构接入后 String 热路径无回退 |
+| HSET/SADD/ZADD/LPUSH (百万 key 分散) | 44-97K | 复合 op 多次 BTree 遍历 (类型检查+meta 维护), 优化方向已识别 |
+
 ### 表 2 — 热路径延迟分布 (`NLOG_PROBE=1` 启动, SIGTERM dump)
 
 | 阶段 | 1-10μs 桶占比 | 2-5ms 桶占比 | 说明 |
@@ -259,11 +269,26 @@ Overflow 数据页:
 
 | 协议 | 端口 | 状态 | 说明 |
 |---|---|---|---|
-| RESP2 (Redis 兼容) | 6379 | ✅ 完整 | PING/AUTH/SET/GET/DEL/**MGET/MSET** (跨 shard 分组聚合 + leaf 区间复用)/**INCR/DECR/INCRBY/DECRBY/APPEND/SETNX** (shard 端原子 RMW)/**EXISTS/STRLEN/TYPE**; 大 value 溢出页自动走 |
+| RESP2 (Redis 兼容) | 6379 | ✅ 完整 | **五大数据结构 + Geo + Bitmap** 全命令面, 清单见下表; 大 value 溢出页自动走 |
 | Binary (自研) | 5433 | ✅ 完整 | Request/Response + BatchOp (Put/Get/Delete 同 key) + TravelTree; 多客户端 + ReplyBus |
 | PostgreSQL (wire) | - | 🚧 设计路线 | 见 [DESIGN.md §10](./DESIGN.md) |
 | MySQL (wire) | - | 🚧 设计路线 | 同上 |
 | MongoDB (BSON) | - | 🚧 设计路线 | 同上 |
+
+### RESP 命令面 (2026-07-28)
+
+| 结构 | 命令 |
+|---|---|
+| String | SET/GET/DEL/EXISTS/STRLEN/TYPE, MGET/MSET/MSETNX (跨 shard 分组聚合 + leaf 区间复用), INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT/APPEND/SETNX (shard 端原子 RMW), GETRANGE/SETRANGE/GETDEL/GETSET |
+| Hash | HSET/HMSET/HSETNX/HGET/HMGET/HDEL/HEXISTS/HLEN/HGETALL/HKEYS/HVALS/HSCAN/HINCRBY/HINCRBYFLOAT/HSTRLEN/HRANDFIELD |
+| Set | SADD/SREM/SISMEMBER/SMISMEMBER/SCARD/SMEMBERS/SSCAN/SPOP/SRANDMEMBER (含 count), SINTER/SUNION/SDIFF/SINTERCARD/SINTERSTORE/SUNIONSTORE/SDIFFSTORE |
+| List | LPUSH/RPUSH/LPOP/RPOP (含 count)/LLEN/LRANGE/LINDEX/LSET, LREM/LTRIM/LPOS/LINSERT (中段操作) |
+| ZSet | ZADD/ZREM/ZSCORE/ZMSCORE/ZCARD/ZCOUNT/ZINCRBY, ZRANGE/ZREVRANGE/ZRANGEBYSCORE/ZRANK/ZREVRANK (双索引), ZPOPMIN/ZPOPMAX, ZINTERSTORE/ZUNIONSTORE (SUM, 无 weights) |
+| Geo | GEOADD/GEOPOS/GEODIST/GEOSEARCH (FROMLONLAT+BYRADIUS; 52-bit geohash 复用 ZSet 双索引) |
+| Bitmap | SETBIT/GETBIT/BITCOUNT/BITPOS (BYTE 粒度; 复用 String 字节) |
+| 连接 | PING/ECHO/AUTH/QUIT/HELLO/SELECT/COMMAND (pipeline FIFO 重排, TCP_NODELAY) |
+
+> 未支持 (记录在案): TTL 族 (EXPIRE/SET EX·PX·NX·XX)、跨 key 原子 (BITOP/SMOVE/LMOVE/BLPOP)、ZSTORE 的 WEIGHTS/AGGREGATE、Stream、HyperLogLog; MSETNX/Set 代数/*STORE 跨 shard 非原子.
 
 设计哲学: **统一记录编码 + value type tag** 已预留 (`TAG_RAW/TAG_I64/TAG_F64/TAG_STR/TAG_DOC`), 新协议接入**无需改 storage 层**, 只需添加 `crates/network/src/protocol/<x>/` parser + adapter.
 
