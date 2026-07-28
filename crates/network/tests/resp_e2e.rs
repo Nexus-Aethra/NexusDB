@@ -258,8 +258,8 @@ fn resp_kv_limits_rejected() {
     let (server, mgr) = start_server(None);
     let mut s = connect(&server);
 
-    // 5KB value 超默认 3000 上限 → -ERR value too long (不进 shard)
-    let big = vec![b'x'; 5 * 1024];
+    // ⭐ 大 value 支持后默认上限 1MB: 1MB+1 value → -ERR value too long (不进 shard)
+    let big = vec![b'x'; 1024 * 1024 + 1];
     s.write_all(&cmd(&[b"SET", b"bigv", &big])).unwrap();
     let r = read_replies(&mut s, 1);
     assert!(
@@ -314,6 +314,899 @@ fn resp_misc_commands() {
     s.write_all(&cmd(&[b"FLUSHALL"])).unwrap();
     let r = read_replies(&mut s, 1);
     assert!(r[0].starts_with(b"-ERR unknown command"), "{:?}", String::from_utf8_lossy(&r[0]));
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ MSET/MGET: 跨 shard 分组聚合 (3 shard 下 8 key 必跨), 顺序与 nil 语义.
+#[test]
+fn resp_mset_mget_cross_shard() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // MSET 8 对 (3 shard 下必然跨 shard 分组)
+    let mut args: Vec<Vec<u8>> = vec![b"MSET".to_vec()];
+    for i in 0..8u32 {
+        args.push(format!("mk{i}").into_bytes());
+        args.push(format!("mv{i}").into_bytes());
+    }
+    let refs: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+    s.write_all(&cmd(&refs)).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+
+    // MGET: 乱序 + 混入 miss key, 断言按请求顺序返回
+    s.write_all(&cmd(&[b"MGET", b"mk7", b"nope", b"mk0", b"mk3"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert_eq!(
+        r[0],
+        b"*4\r\n$3\r\nmv7\r\n$-1\r\n$3\r\nmv0\r\n$3\r\nmv3\r\n".to_vec(),
+        "got {:?}",
+        String::from_utf8_lossy(&r[0])
+    );
+
+    // MSET 同 key 重复: 后者覆盖 (Redis 语义)
+    s.write_all(&cmd(&[b"MSET", b"dup", b"first", b"dup", b"second"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", b"dup"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$6\r\nsecond\r\n");
+
+    // MSET 奇数参数 → WrongArity
+    s.write_all(&cmd(&[b"MSET", b"k", b"v", b"orphan"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"-ERR wrong number"), "{:?}", String::from_utf8_lossy(&r[0]));
+
+    // 与 pipeline 的单 op 混排 (seq 重排缓冲正确性)
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&cmd(&[b"SET", b"pipek", b"pv"]));
+    buf.extend_from_slice(&cmd(&[b"MGET", b"mk1", b"pipek"]));
+    buf.extend_from_slice(&cmd(&[b"GET", b"mk2"]));
+    s.write_all(&buf).unwrap();
+    let r = read_replies(&mut s, 3);
+    assert_eq!(r[0], b"+OK\r\n");
+    assert_eq!(r[1], b"*2\r\n$3\r\nmv1\r\n$2\r\npv\r\n".to_vec());
+    assert_eq!(r[2], b"$3\r\nmv2\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ String 命令补全: INCR/DECR/INCRBY/APPEND/SETNX/EXISTS/STRLEN/TYPE.
+#[test]
+fn resp_string_commands() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // INCR: miss → 1, 再 INCR → 2, DECR → 1, INCRBY 10 → 11, DECRBY 5 → 6
+    s.write_all(&cmd(&[b"INCR", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"INCR", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"DECR", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"INCRBY", b"cnt", b"10"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":11\r\n");
+    s.write_all(&cmd(&[b"DECRBY", b"cnt", b"5"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":6\r\n");
+    // GET 读回字符串形式
+    s.write_all(&cmd(&[b"GET", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\n6\r\n");
+    // 非数字 value → error
+    s.write_all(&cmd(&[b"SET", b"strk", b"abc"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"INCR", b"strk"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"-ERR value is not an integer"), "{:?}", String::from_utf8_lossy(&r[0]));
+    // INCRBY 非法数字参数 → error
+    s.write_all(&cmd(&[b"INCRBY", b"cnt", b"xyz"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"-ERR value is not an integer"), "{:?}", String::from_utf8_lossy(&r[0]));
+
+    // APPEND: miss → 创建, 返回新长度
+    s.write_all(&cmd(&[b"APPEND", b"app", b"Hello"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
+    s.write_all(&cmd(&[b"APPEND", b"app", b" World"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":11\r\n");
+    s.write_all(&cmd(&[b"GET", b"app"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$11\r\nHello World\r\n");
+
+    // SETNX: 首次 1, 再次 0 (不覆盖)
+    s.write_all(&cmd(&[b"SETNX", b"nx", b"v1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"SETNX", b"nx", b"v2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"GET", b"nx"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\nv1\r\n");
+
+    // EXISTS: 多 key + 重复 key 重复计 (Redis 语义)
+    s.write_all(&cmd(&[b"EXISTS", b"nx", b"missing", b"nx", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+
+    // STRLEN: 命中/未命中
+    s.write_all(&cmd(&[b"STRLEN", b"app"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":11\r\n");
+    s.write_all(&cmd(&[b"STRLEN", b"missing"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // TYPE: string / none
+    s.write_all(&cmd(&[b"TYPE", b"app"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+string\r\n");
+    s.write_all(&cmd(&[b"TYPE", b"missing"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+none\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 数值原生存储 + 门面渲染: INCR 后底层是 8B 二进制, RESP GET 渲染字符串.
+#[test]
+fn resp_typed_num_render() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // INCR → 底层 TAG_I64 二进制; GET 渲染 "1"
+    s.write_all(&cmd(&[b"INCR", b"tn"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"GET", b"tn"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\n1\r\n");
+    // STRLEN = 渲染后长度 (1), 不是底层 8B
+    s.write_all(&cmd(&[b"STRLEN", b"tn"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+
+    // INCRBYFLOAT: Redis 文档用例 SET 3.0e3 → INCRBYFLOAT 200 → "3200"
+    s.write_all(&cmd(&[b"SET", b"tf", b"3.0e3"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"INCRBYFLOAT", b"tf", b"200"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$4\r\n3200\r\n");
+    s.write_all(&cmd(&[b"GET", b"tf"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$4\r\n3200\r\n");
+    // 小数渲染
+    s.write_all(&cmd(&[b"INCRBYFLOAT", b"tf", b"0.25"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$7\r\n3200.25\r\n");
+
+    // F64 上 INCR → not an integer
+    s.write_all(&cmd(&[b"INCR", b"tf"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"-ERR value is not an integer"), "{:?}", String::from_utf8_lossy(&r[0]));
+
+    // INCRBYFLOAT 非法参数
+    s.write_all(&cmd(&[b"INCRBYFLOAT", b"tf", b"abc"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"-ERR value is not a valid float"), "{:?}", String::from_utf8_lossy(&r[0]));
+
+    // MGET 混合渲染: RAW + I64 + F64
+    s.write_all(&cmd(&[b"SET", b"traw", b"hello"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"MGET", b"traw", b"tn", b"tf"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$5\r\nhello\r\n$1\r\n1\r\n$7\r\n3200.25\r\n".to_vec()
+    );
+
+    // APPEND 到 I64: 渲染字符串化再拼, 类型退回 RAW
+    s.write_all(&cmd(&[b"APPEND", b"tn", b"x"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n"); // "1x"
+    s.write_all(&cmd(&[b"GET", b"tn"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\n1x\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ Phase S: String 范围/杂项命令 (GETRANGE/SETRANGE/GETDEL/GETSET/MSETNX).
+#[test]
+fn resp_string_range_and_misc() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // GETSET: 旧值 nil (新 key), 返回 nil 并写入
+    s.write_all(&cmd(&[b"GETSET", b"gs", b"v1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    s.write_all(&cmd(&[b"GETSET", b"gs", b"v2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\nv1\r\n");
+    s.write_all(&cmd(&[b"GET", b"gs"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\nv2\r\n");
+
+    // GETDEL: 返回旧值并删除
+    s.write_all(&cmd(&[b"GETDEL", b"gs"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\nv2\r\n");
+    s.write_all(&cmd(&[b"GET", b"gs"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    // GETDEL miss → nil
+    s.write_all(&cmd(&[b"GETDEL", b"nope"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+
+    // GETRANGE: Redis 文档用例 "This is a string"
+    s.write_all(&cmd(&[b"SET", b"gr", b"This is a string"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"0", b"3"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$4\r\nThis\r\n");
+    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"-3", b"-1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\ning\r\n");
+    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"0", b"-1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$16\r\nThis is a string\r\n");
+    // start > end → 空
+    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"10", b"2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$0\r\n\r\n");
+
+    // SETRANGE: 覆盖写 + 返回新长度; Redis 文档用例
+    s.write_all(&cmd(&[b"SET", b"sr", b"Hello World"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"SETRANGE", b"sr", b"6", b"Redis"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":11\r\n");
+    s.write_all(&cmd(&[b"GET", b"sr"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$11\r\nHello Redis\r\n");
+    // SETRANGE 零扩展 (新 key, offset 5)
+    s.write_all(&cmd(&[b"SETRANGE", b"sr2", b"5", b"abc"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":8\r\n");
+    s.write_all(&cmd(&[b"GET", b"sr2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$8\r\n\x00\x00\x00\x00\x00abc\r\n");
+
+    // MSETNX: 全不存在 → :1; 任一存在 → :0 (且不覆盖已存在的)
+    s.write_all(&cmd(&[b"MSETNX", b"nx1", b"a", b"nx2", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"MSETNX", b"nx2", b"x", b"nx3", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"GET", b"nx1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\na\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ Phase H: Hash 全命令面 (HSET/HGET/HMGET/HDEL/HGETALL/HINCRBY/WRONGTYPE...).
+#[test]
+fn resp_hash_commands() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // HSET 多 field → 新增数; 重复 HSET 更新 → :0
+    s.write_all(&cmd(&[b"HSET", b"h1", b"f1", b"v1", b"f2", b"v2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"HSET", b"h1", b"f1", b"v1x"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // HGET / miss / HEXISTS / HLEN
+    s.write_all(&cmd(&[b"HGET", b"h1", b"f1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\nv1x\r\n");
+    s.write_all(&cmd(&[b"HGET", b"h1", b"nope"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    s.write_all(&cmd(&[b"HEXISTS", b"h1", b"f2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"HEXISTS", b"h1", b"nope"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"HLEN", b"h1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+
+    // HMGET 按输入序 (含 miss)
+    s.write_all(&cmd(&[b"HMGET", b"h1", b"f2", b"nope", b"f1"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$2\r\nv2\r\n$-1\r\n$3\r\nv1x\r\n"
+    );
+
+    // HGETALL (field 按 BTree 字典序) / HKEYS / HVALS
+    s.write_all(&cmd(&[b"HGETALL", b"h1"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*4\r\n$2\r\nf1\r\n$3\r\nv1x\r\n$2\r\nf2\r\n$2\r\nv2\r\n"
+    );
+    s.write_all(&cmd(&[b"HKEYS", b"h1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$2\r\nf1\r\n$2\r\nf2\r\n");
+    s.write_all(&cmd(&[b"HVALS", b"h1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$3\r\nv1x\r\n$2\r\nv2\r\n");
+
+    // HSCAN v1: 单次全量, cursor "0"
+    s.write_all(&cmd(&[b"HSCAN", b"h1", b"0"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*2\r\n$1\r\n0\r\n*4\r\n$2\r\nf1\r\n$3\r\nv1x\r\n$2\r\nf2\r\n$2\r\nv2\r\n"
+    );
+
+    // HSETNX: 已存在 :0, 新 field :1
+    s.write_all(&cmd(&[b"HSETNX", b"h1", b"f1", b"zzz"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"HSETNX", b"h1", b"f3", b"v3"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+
+    // HINCRBY / HINCRBYFLOAT (原生二进制数值, 渲染回字符串)
+    s.write_all(&cmd(&[b"HINCRBY", b"h1", b"cnt", b"5"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
+    s.write_all(&cmd(&[b"HINCRBY", b"h1", b"cnt", b"-2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"HGET", b"h1", b"cnt"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\n3\r\n");
+    s.write_all(&cmd(&[b"HINCRBYFLOAT", b"h1", b"fl", b"1.5"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\n1.5\r\n");
+
+    // HMSET → +OK
+    s.write_all(&cmd(&[b"HMSET", b"h2", b"a", b"1", b"b", b"2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+
+    // HDEL 多 field (含 miss) → 实删数; count 归 0 后 HLEN=0
+    s.write_all(&cmd(&[b"HDEL", b"h2", b"a", b"nope", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"HLEN", b"h2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // WRONGTYPE 双向: String key 上 HSET; Hash key 上 GET
+    s.write_all(&cmd(&[b"SET", b"str1", b"v"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"HSET", b"str1", b"f", b"v"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-WRONGTYPE"));
+    s.write_all(&cmd(&[b"GET", b"h1"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-WRONGTYPE"));
+
+    // DEL 整 hash → :1; 之后 HGETALL 空、HLEN 0
+    s.write_all(&cmd(&[b"DEL", b"h1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"HGETALL", b"h1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*0\r\n");
+    s.write_all(&cmd(&[b"HLEN", b"h1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ Phase Set: Set 命令面 (SADD/SREM/SISMEMBER/SMEMBERS/SCARD/SPOP + 代数).
+#[test]
+fn resp_set_commands() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // SADD 去重: 新增 2, 重复 0
+    s.write_all(&cmd(&[b"SADD", b"s1", b"a", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"SADD", b"s1", b"a", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+
+    // SISMEMBER / SCARD / SMEMBERS (BTree 序)
+    s.write_all(&cmd(&[b"SISMEMBER", b"s1", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"SISMEMBER", b"s1", b"zz"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"SCARD", b"s1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"SMEMBERS", b"s1"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+    );
+
+    // SSCAN v1
+    s.write_all(&cmd(&[b"SSCAN", b"s1", b"0"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*2\r\n$1\r\n0\r\n*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+    );
+
+    // SREM (含 miss)
+    s.write_all(&cmd(&[b"SREM", b"s1", b"a", b"zz"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"SCARD", b"s1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+
+    // SPOP: 弹出后 card-1; SRANDMEMBER 不删
+    s.write_all(&cmd(&[b"SRANDMEMBER", b"s1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nb\r\n"); // BTree 序首个
+    s.write_all(&cmd(&[b"SPOP", b"s1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nb\r\n");
+    s.write_all(&cmd(&[b"SCARD", b"s1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    // 空集 SPOP → nil
+    s.write_all(&cmd(&[b"SPOP", b"empty"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+
+    // 代数: SINTER / SUNION / SDIFF (跨 shard 聚合)
+    s.write_all(&cmd(&[b"SADD", b"x1", b"a", b"b", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"SADD", b"x2", b"b", b"c", b"d"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"SINTER", b"x1", b"x2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    s.write_all(&cmd(&[b"SDIFF", b"x1", b"x2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*1\r\n$1\r\na\r\n");
+    s.write_all(&cmd(&[b"SUNION", b"x1", b"x2"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*4\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n"
+    );
+
+    // WRONGTYPE: String key 上 SADD; Set key 与 Hash 互斥
+    s.write_all(&cmd(&[b"SET", b"strk", b"v"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"SADD", b"strk", b"m"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-WRONGTYPE"));
+    s.write_all(&cmd(&[b"HSET", b"s1", b"f", b"v"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-WRONGTYPE"));
+
+    // DEL 整 set → :1, 之后空
+    s.write_all(&cmd(&[b"DEL", b"s1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"SCARD", b"s1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ Phase L: List 命令面 (LPUSH/RPUSH/LPOP/RPOP/LRANGE/LINDEX/LSET/LLEN).
+#[test]
+fn resp_list_commands() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // RPUSH a b c → [a,b,c]; LPUSH x y → [y,x,a,b,c]
+    s.write_all(&cmd(&[b"RPUSH", b"l1", b"a", b"b", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"LPUSH", b"l1", b"x", b"y"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n"); // [y,x,a,b,c]
+
+    // LLEN / LRANGE 全量 / 负索引
+    s.write_all(&cmd(&[b"LLEN", b"l1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
+    s.write_all(&cmd(&[b"LRANGE", b"l1", b"0", b"-1"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*5\r\n$1\r\ny\r\n$1\r\nx\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+    );
+    s.write_all(&cmd(&[b"LRANGE", b"l1", b"1", b"3"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$1\r\nx\r\n$1\r\na\r\n$1\r\nb\r\n"
+    );
+
+    // LINDEX 正/负/越界
+    s.write_all(&cmd(&[b"LINDEX", b"l1", b"0"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\ny\r\n");
+    s.write_all(&cmd(&[b"LINDEX", b"l1", b"-1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nc\r\n");
+    s.write_all(&cmd(&[b"LINDEX", b"l1", b"99"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+
+    // LSET + 越界报错
+    s.write_all(&cmd(&[b"LSET", b"l1", b"0", b"Y"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"LINDEX", b"l1", b"0"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nY\r\n");
+    s.write_all(&cmd(&[b"LSET", b"l1", b"99", b"z"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
+
+    // LPOP / RPOP 单个
+    s.write_all(&cmd(&[b"LPOP", b"l1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nY\r\n");
+    s.write_all(&cmd(&[b"RPOP", b"l1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nc\r\n");
+    s.write_all(&cmd(&[b"LLEN", b"l1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n"); // [x,a,b]
+
+    // LPOP count → 数组
+    s.write_all(&cmd(&[b"LPOP", b"l1", b"2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\nx\r\n$1\r\na\r\n");
+
+    // 空 list LPOP → nil
+    s.write_all(&cmd(&[b"RPOP", b"l1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nb\r\n");
+    s.write_all(&cmd(&[b"LPOP", b"l1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    s.write_all(&cmd(&[b"LLEN", b"l1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // WRONGTYPE: String key 上 LPUSH
+    s.write_all(&cmd(&[b"SET", b"lk", b"v"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"LPUSH", b"lk", b"m"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-WRONGTYPE"));
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ Phase Z: ZSet 命令面 (ZADD/ZSCORE/ZRANGE/ZRANGEBYSCORE/ZRANK/ZINCRBY...).
+#[test]
+fn resp_zset_commands() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // ZADD 3 成员 (乱序 score); 更新已存在成员 score → 新增 0
+    s.write_all(&cmd(&[b"ZADD", b"z1", b"3", b"c", b"1", b"a", b"2", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"ZADD", b"z1", b"5", b"a"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // ZCARD / ZSCORE (整数 score 渲染无 .0)
+    s.write_all(&cmd(&[b"ZCARD", b"z1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"ZSCORE", b"z1", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\n2\r\n");
+    s.write_all(&cmd(&[b"ZSCORE", b"z1", b"nope"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+
+    // 现在 score: b=2, c=3, a=5 → 按 score 升序 [b,c,a]
+    s.write_all(&cmd(&[b"ZRANGE", b"z1", b"0", b"-1"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\na\r\n"
+    );
+    // WITHSCORES
+    s.write_all(&cmd(&[b"ZRANGE", b"z1", b"0", b"1", b"WITHSCORES"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*4\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n"
+    );
+    // ZREVRANGE
+    s.write_all(&cmd(&[b"ZREVRANGE", b"z1", b"0", b"-1"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$1\r\na\r\n$1\r\nc\r\n$1\r\nb\r\n"
+    );
+
+    // ZRANGEBYSCORE
+    s.write_all(&cmd(&[b"ZRANGEBYSCORE", b"z1", b"2", b"3"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    s.write_all(&cmd(&[b"ZRANGEBYSCORE", b"z1", b"-inf", b"+inf"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\na\r\n"
+    );
+
+    // ZRANK / ZREVRANK (b 排名 0, a 排名 2)
+    s.write_all(&cmd(&[b"ZRANK", b"z1", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"ZRANK", b"z1", b"a"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"ZREVRANK", b"z1", b"a"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"ZRANK", b"z1", b"nope"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+
+    // ZINCRBY: b 2 → 4.5
+    s.write_all(&cmd(&[b"ZINCRBY", b"z1", b"2.5", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\n4.5\r\n");
+    s.write_all(&cmd(&[b"ZSCORE", b"z1", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\n4.5\r\n");
+
+    // ZREM
+    s.write_all(&cmd(&[b"ZREM", b"z1", b"c", b"nope"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"ZCARD", b"z1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+
+    // WRONGTYPE: String key 上 ZADD
+    s.write_all(&cmd(&[b"SET", b"zstr", b"v"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"ZADD", b"zstr", b"1", b"m"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-WRONGTYPE"));
+
+    // DEL 整 zset (清 member 索引 + score 索引 + meta)
+    s.write_all(&cmd(&[b"DEL", b"z1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"ZCARD", b"z1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"ZRANGE", b"z1", b"0", b"-1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*0\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ C1: 命令空洞补齐 e2e (ZCOUNT/ZMSCORE/ZPOP + SMISMEMBER/SINTERCARD/SPOP count + HSTRLEN/HRANDFIELD).
+#[test]
+fn resp_c1_command_holes() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // ---- ZSet ----
+    s.write_all(&cmd(&[b"ZADD", b"cz", b"1", b"a", b"2", b"b", b"3", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"ZCOUNT", b"cz", b"2", b"+inf"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"ZMSCORE", b"cz", b"a", b"nope", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n");
+    // ZPOPMIN 弹最小 (member+score)
+    s.write_all(&cmd(&[b"ZPOPMIN", b"cz"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\na\r\n$1\r\n1\r\n");
+    // ZPOPMAX 2 个
+    s.write_all(&cmd(&[b"ZPOPMAX", b"cz", b"2"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*4\r\n$1\r\nc\r\n$1\r\n3\r\n$1\r\nb\r\n$1\r\n2\r\n"
+    );
+    s.write_all(&cmd(&[b"ZCARD", b"cz"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // ---- Set ----
+    s.write_all(&cmd(&[b"SADD", b"cs1", b"a", b"b", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"SMISMEMBER", b"cs1", b"a", b"x", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n:1\r\n:0\r\n:1\r\n");
+    s.write_all(&cmd(&[b"SADD", b"cs2", b"b", b"c", b"d"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"SINTERCARD", b"2", b"cs1", b"cs2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"SINTERCARD", b"2", b"cs1", b"cs2", b"LIMIT", b"1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    // SRANDMEMBER count (不删) + SPOP count (删)
+    s.write_all(&cmd(&[b"SRANDMEMBER", b"cs1", b"2"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"*2\r\n"), "SRANDMEMBER 2 应回 2 项: {:?}", r[0]);
+    s.write_all(&cmd(&[b"SCARD", b"cs1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"SPOP", b"cs1", b"2"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"*2\r\n"), "SPOP 2 应回 2 项: {:?}", r[0]);
+    s.write_all(&cmd(&[b"SCARD", b"cs1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+
+    // ---- Hash ----
+    s.write_all(&cmd(&[b"HSET", b"ch", b"f1", b"hello", b"f2", b"world!"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"HSTRLEN", b"ch", b"f2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":6\r\n");
+    s.write_all(&cmd(&[b"HSTRLEN", b"ch", b"nope"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    // HRANDFIELD 无 count → 单 bulk; count 2 → *2; WITHVALUES → *4
+    s.write_all(&cmd(&[b"HRANDFIELD", b"ch"])).unwrap();
+    let r = read_replies(&mut s, 1);
+    assert!(r[0].starts_with(b"$2\r\nf"), "单 field bulk: {:?}", r[0]);
+    s.write_all(&cmd(&[b"HRANDFIELD", b"ch", b"2"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"*2\r\n"));
+    s.write_all(&cmd(&[b"HRANDFIELD", b"ch", b"2", b"WITHVALUES"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"*4\r\n"));
+    // 不存在 key: HRANDFIELD → nil / *0
+    s.write_all(&cmd(&[b"HRANDFIELD", b"nokey"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ C2: List 中段操作 e2e (LREM/LTRIM/LPOS/LINSERT).
+#[test]
+fn resp_c2_list_mid_ops() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // [a, b, a, c, a]
+    s.write_all(&cmd(&[b"RPUSH", b"ml", b"a", b"b", b"a", b"c", b"a"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
+
+    // LPOS
+    s.write_all(&cmd(&[b"LPOS", b"ml", b"a"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"LPOS", b"ml", b"a", b"COUNT", b"0"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n:0\r\n:2\r\n:4\r\n");
+    s.write_all(&cmd(&[b"LPOS", b"ml", b"a", b"RANK", b"-1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":4\r\n");
+    s.write_all(&cmd(&[b"LPOS", b"ml", b"nope"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+
+    // LREM 从尾删 1 个 a → [a, b, a, c]
+    s.write_all(&cmd(&[b"LREM", b"ml", b"-1", b"a"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"LRANGE", b"ml", b"0", b"-1"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*4\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n"
+    );
+
+    // LINSERT AFTER b → [a, b, x, a, c]
+    s.write_all(&cmd(&[b"LINSERT", b"ml", b"AFTER", b"b", b"x"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
+    s.write_all(&cmd(&[b"LINSERT", b"ml", b"BEFORE", b"nope", b"y"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":-1\r\n");
+
+    // LTRIM 1..=3 → [b, x, a]
+    s.write_all(&cmd(&[b"LTRIM", b"ml", b"1", b"3"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"LRANGE", b"ml", b"0", b"-1"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$1\r\nb\r\n$1\r\nx\r\n$1\r\na\r\n"
+    );
+    // 空洞后 LINDEX/LPOP 正确
+    s.write_all(&cmd(&[b"LINDEX", b"ml", b"-1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\na\r\n");
+    s.write_all(&cmd(&[b"LPOP", b"ml"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nb\r\n");
+    s.write_all(&cmd(&[b"LLEN", b"ml"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ C3: *STORE 变体 e2e (SINTERSTORE/SUNIONSTORE/SDIFFSTORE/ZINTERSTORE/ZUNIONSTORE).
+#[test]
+fn resp_c3_store_variants() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    s.write_all(&cmd(&[b"SADD", b"st1", b"a", b"b", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"SADD", b"st2", b"b", b"c", b"d"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+
+    // SINTERSTORE → {b, c}
+    s.write_all(&cmd(&[b"SINTERSTORE", b"sti", b"st1", b"st2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"SMEMBERS", b"sti"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
+
+    // SUNIONSTORE 覆盖旧 dst → {a,b,c,d}
+    s.write_all(&cmd(&[b"SUNIONSTORE", b"sti", b"st1", b"st2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":4\r\n");
+    s.write_all(&cmd(&[b"SCARD", b"sti"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":4\r\n");
+
+    // SDIFFSTORE → {a}
+    s.write_all(&cmd(&[b"SDIFFSTORE", b"std", b"st1", b"st2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"SMEMBERS", b"std"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*1\r\n$1\r\na\r\n");
+
+    // 空结果 → dst 被清空
+    s.write_all(&cmd(&[b"SDIFFSTORE", b"sti", b"st1", b"st1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"EXISTS", b"sti"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // ---- ZSet STORE ----
+    s.write_all(&cmd(&[b"ZADD", b"zt1", b"1", b"a", b"2", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"ZADD", b"zt2", b"10", b"b", b"20", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+
+    // ZINTERSTORE → {b: 2+10=12}
+    s.write_all(&cmd(&[b"ZINTERSTORE", b"zti", b"2", b"zt1", b"zt2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"ZSCORE", b"zti", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\n12\r\n");
+
+    // ZUNIONSTORE → {a:1, b:12, c:20} 按 score 排序
+    s.write_all(&cmd(&[b"ZUNIONSTORE", b"ztu", b"2", b"zt1", b"zt2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+    s.write_all(&cmd(&[b"ZRANGE", b"ztu", b"0", b"-1", b"WITHSCORES"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*6\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$2\r\n12\r\n$1\r\nc\r\n$2\r\n20\r\n"
+    );
+
+    // WEIGHTS 拒绝 (本轮不支持)
+    s.write_all(&cmd(&[b"ZUNIONSTORE", b"ztw", b"2", b"zt1", b"zt2", b"WEIGHTS", b"2", b"3"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ Phase G: Geo e2e (GEOADD/GEOPOS/GEODIST/GEOSEARCH, 复用 ZSet).
+#[test]
+fn resp_g_geo_commands() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // 北京 / 上海 / 广州
+    s.write_all(&cmd(&[
+        b"GEOADD", b"geo", b"116.397128", b"39.916527", b"beijing",
+        b"121.4737", b"31.2304", b"shanghai", b"113.2644", b"23.1291", b"guangzhou",
+    ]))
+    .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+
+    // TYPE = zset (Geo 即 ZSet)
+    s.write_all(&cmd(&[b"ZCARD", b"geo"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
+
+    // GEOPOS: 坐标 roundtrip 误差 < 0.001 度
+    s.write_all(&cmd(&[b"GEOPOS", b"geo", b"beijing", b"nowhere"])).unwrap();
+    let r = String::from_utf8(read_replies(&mut s, 1)[0].clone()).unwrap();
+    assert!(r.starts_with("*2\r\n*2\r\n"), "首项坐标对: {r}");
+    assert!(r.contains("116.39"), "lon 近似: {r}");
+    assert!(r.contains("39.91"), "lat 近似: {r}");
+    assert!(r.ends_with("*-1\r\n"), "缺失成员 → nil array: {r}");
+
+    // GEODIST 北京↔上海 ≈ 1067km (±1%)
+    s.write_all(&cmd(&[b"GEODIST", b"geo", b"beijing", b"shanghai", b"km"])).unwrap();
+    let r = String::from_utf8(read_replies(&mut s, 1)[0].clone()).unwrap();
+    let d: f64 = r.split("\r\n").nth(1).unwrap().parse().unwrap();
+    assert!((d - 1067.0).abs() < 15.0, "北京-上海 {d}km");
+    s.write_all(&cmd(&[b"GEODIST", b"geo", b"beijing", b"nowhere"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+
+    // GEOSEARCH 上海为心 400km → 只有 shanghai
+    s.write_all(&cmd(&[
+        b"GEOSEARCH", b"geo", b"FROMLONLAT", b"121.5", b"31.2", b"BYRADIUS", b"400", b"km",
+    ]))
+    .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*1\r\n$8\r\nshanghai\r\n");
+
+    // 1500km → 三城全中, ASC 距离序: shanghai, beijing, guangzhou; COUNT 2 截断
+    s.write_all(&cmd(&[
+        b"GEOSEARCH", b"geo", b"FROMLONLAT", b"121.5", b"31.2", b"BYRADIUS", b"1500", b"km",
+        b"ASC", b"COUNT", b"2", b"WITHDIST",
+    ]))
+    .unwrap();
+    let r = String::from_utf8(read_replies(&mut s, 1)[0].clone()).unwrap();
+    assert!(r.starts_with("*2\r\n"), "COUNT 2: {r}");
+    assert!(r.contains("shanghai"), "{r}");
+    assert!(r.contains("beijing"), "{r}");
+    assert!(!r.contains("guangzhou"), "COUNT 截断: {r}");
+
+    // WRONGTYPE: string key 上 GEOPOS
+    s.write_all(&cmd(&[b"SET", b"gstr", b"v"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GEOPOS", b"gstr", b"m"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-WRONGTYPE"));
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ Phase B: Bitmap e2e (SETBIT/GETBIT/BITCOUNT/BITPOS).
+#[test]
+fn resp_b_bitmap_commands() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // SETBIT 置位 7 → "\x01"; 旧 bit 0
+    s.write_all(&cmd(&[b"SETBIT", b"bm", b"7", b"1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"GETBIT", b"bm", b"7"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"GETBIT", b"bm", b"6"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    // 重置位 7 → 旧 bit 1
+    s.write_all(&cmd(&[b"SETBIT", b"bm", b"7", b"0"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+
+    // 零扩展: 置位 100 → 长度 13 字节
+    s.write_all(&cmd(&[b"SETBIT", b"bm", b"100", b"1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"STRLEN", b"bm"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":13\r\n");
+
+    // BITCOUNT: "foobar" → 26; 区间 [1,1] → 6
+    s.write_all(&cmd(&[b"SET", b"bstr", b"foobar"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"BITCOUNT", b"bstr"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":26\r\n");
+    s.write_all(&cmd(&[b"BITCOUNT", b"bstr", b"1", b"1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":6\r\n");
+    s.write_all(&cmd(&[b"BITCOUNT", b"nobm"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // BITPOS: "foobar" 首个 1 在 bit 1 ('f' = 0x66)
+    s.write_all(&cmd(&[b"BITPOS", b"bstr", b"1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    // "\xff" 找 0 无 end → 越界位 8
+    s.write_all(&cmd(&[b"SET", b"ff", b"\xff"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"BITPOS", b"ff", b"0"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":8\r\n");
+    // 不存在 key: 找 1 → -1; 找 0 → 0
+    s.write_all(&cmd(&[b"BITPOS", b"nobm", b"1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":-1\r\n");
+    s.write_all(&cmd(&[b"BITPOS", b"nobm", b"0"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    // 越界 offset 拒绝 (max_value_bytes 默认 1MB)
+    s.write_all(&cmd(&[b"SETBIT", b"bm", b"99999999999", b"1"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
 
     drop(s);
     server.shutdown().unwrap();

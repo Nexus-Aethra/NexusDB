@@ -24,6 +24,22 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 
 ## 当前进度
 
+### 2026-07-28 会话总览 (F45-F47, 细节见 CHANGELOG)
+
+- **F45 复合数据结构体系**: Hash/Set/List/ZSet 全命令落地 — 统一 key 编码 (`keyspace.rs`, `[kind][sub][varint klen][key][suffix]`, 编码只在存储边界) + 范围扫描 (`leaf_scan_from`/`btree_scan`, LeafGuide 跨 leaf 续) + ZSet 双索引 (保序 f64) + List 保序 i64 idx
+- **F46 统一类型 meta** `[#][klen][key]`→`[kind][count]`: 类型检查 5→2 探测; SET 覆盖复合 key 自动 purge (无孤儿行); GET miss 1 探测全类型 WRONGTYPE; 开库 `rebuild_composite_counts` 修 crash 计数漂移. **gotcha: 一个 key 至多一行类型 meta, 由所有写入口维护互斥**
+- **F47 命令面补全**: ZCOUNT/ZMSCORE/ZPOP* + SMISMEMBER/SINTERCARD/SPOP·SRANDMEMBER count + HSTRLEN/HRANDFIELD; **List 中段操作** (LREM/LTRIM/LPOS/LINSERT, **放弃 idx 连续假设** — LINDEX 扫描序 O(n), 搬行先物化 value 防溢出链误释放); *STORE (worker 二阶段聚合, 非原子记 gap); **Geo** (`storage/geo.rs` 52-bit geohash 作 ZSet score, GEOADD 解析期转 ZAdd); **Bitmap** (SETBIT shard RMW, 读类 worker 位运算)
+- 遗留: BITOP/SMOVE/LMOVE/阻塞类/ZSTORE weights/TTL/Stream/HyperLogLog
+- 测试快照: **75 suites / 736 passed / 0 failed**, clippy 0; memtier 184-203K (热路径无回退)
+
+### 2026-07-27 会话总览 (F42-F44, 细节见 CHANGELOG)
+
+- **⭐ F42 GC 静默数据丢失修复 (最重要)**: compact 判活曾用 page header vpid 自描述, 但 Internal 页该字段是 first_child → 误判死页 → 高压写后早期 key 静默丢失 (GET nil 不报错). 修复: 判活以 meta 平坦数组全扫为 SoT. **gotcha: compact/GC 判活禁止依赖页头自描述**. 排查探针 `NLOG_GC_DEBUG=1` 保留
+- **F43 热路径 9 项优化** (同机 A/B +19%): page_pool 归还闭环 + travel_to_leaf_ro (免 path 分配) + table_put 单 travel + BatchOp Arc<str> + Put.value 预置 tag 免二次拷贝 + 解析游标化. **约定: `Request::Put.value` / `BatchOp::Put.val` 统一 `[TAG_RAW][payload]` 布局 (decode 时预置)**
+- **F44 String 命令集**: MGET/MSET (跨 shard 分组聚合 + `LeafGuide` 区间复用批量, `ShardTask.group` 字段) + INCR/DECR/INCRBY/DECRBY/APPEND/SETNX (shard 端原子 RMW) + EXISTS/STRLEN/TYPE; 大 value 溢出页 (~1MB, 13B 描述符, PID_FREED 墓碑防复活)
+- **区间 travel 基建**: `internal_child_with_bounds` → `travel_to_leaf_guided` → `LeafGuide [lower, upper)` — range scan / cursor 的直接前置
+- 测试快照: **75 suites / 708 passed / 0 failed**, clippy 0
+
 ### 2026-07-25/26 会话总览 (F33-F41, 细节见 CHANGELOG)
 
 - **三个关键正确性修复**:
@@ -60,23 +76,25 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 
 ### 当前能力盘点
 
-**已支持** (T1-T17 + F32-F41):
+**已支持** (T1-T17 + F32-F47):
 - **服务化**: `nexusdb --config nexusdb.toml` 启动, Binary(5433) + RESP/Redis(6379) 双协议监听, redis-cli/memtier 可直接使用, SIGINT/SIGTERM 优雅退出 (退出前排空异步落盘 + final flush)
 - **元数据**: open/close/flush; create_db/drop_db/open_db/list_dbs/use_db; create_table/drop_table/open_table/list_tables (2PC 跨 shard)
-- **KV 数据**: table_put / table_get / table_delete (含覆盖写 leaf_update)
+- **KV 数据**: table_put / table_get / table_delete (含覆盖写 leaf_update); 大 value 溢出页 (≤1MB)
+- **Redis 数据结构**: String (含范围/RMW/批量) + Hash + Set (含代数/*STORE) + List (含中段操作) + ZSet (双索引, 含 *STORE) + Geo (复用 ZSet) + Bitmap (复用 String); 统一类型 meta + 全类型 WRONGTYPE + crash 计数重建
 - **持久化**: 多 db 物理隔离 (`{block_root}/{db_name}/shard_{N}/`); reopen recover; **自动持久化** (chunk 满 swap + 周期 10s/256 写); **异步 chunk 落盘** (FlushJob 协程 + 有界背压 MAX_INFLIGHT=8); data→meta 刷盘顺序不变量
 - **异步**: 全 async; 自实现协程调度器 + io_uring 后端 (服务器默认 io_uring)
-- **多 shard**: hash 路由 + TaskInbox/TaskReplyBus 直连 (worker→shard→worker, 零 client 线程)
-- **协议层**: RESP2 (SET/GET/DEL/PING/ECHO/AUTH/QUIT/HELLO/SELECT/COMMAND, pipeline FIFO 重排) + 自家二进制协议; KvLimits (key≤1024/value≤3000, page 编码 4096 硬限); value type tag 预留
-- **测试**: workspace 71 suites / 682 passed / 0 failed; clippy 0 警告
+- **多 shard**: hash 路由 + TaskInbox/TaskReplyBus 直连 (worker→shard→worker, 零 client 线程); 跨 key 命令 worker 端分组聚合
+- **协议层**: RESP2 命令面覆盖五大结构 + Geo/Bitmap (清单见 README); 自家二进制协议; KvLimits (key≤1024/value≤1MB); value type tag (数值原生二进制)
+- **测试**: workspace 75 suites / 736 passed / 0 failed; clippy 0 警告
 
 **还没支持** (下一步 gap):
-- **Range scan / cursor** (`table_range` + iterator) — SQL `WHERE range` 和 `SELECT *` 需要
+- **TTL/过期** (EXPIRE/TTL/PERSIST + SET 的 EX/PX/NX/XX) — 明确后置的生命周期机制
+- **跨 key 原子命令**: BITOP/SMOVE/LMOVE/RPOPLPUSH/阻塞类 BLPOP·BRPOP; MSETNX/Set 代数/*STORE 跨 shard 非原子 (已记 gap)
 - **Transaction** (begin/commit/rollback) — 跨多 page ACID
 - **Snapshot** — 事务内一致性读 (COW + meta_cache 天然支持, 实现成本低; **不需要 MVCC** 见 §3.3.2 设计决策)
 - **WAL** — 消每写 16KB 页 COW 写放大 (写重负载与 Redis 差距的主因)
-- **大 key/value (overflow page)** — 当前协议层上限拦截, 正式方案待实施
-- **PG/MySQL/Mongo 门面** — 前置: range scan + 统一记录编码 (保序 key 编码 + 表级 schema)
+- **Stream / HyperLogLog** — 最后两个 Redis 类型 (前者工程量大, 后者小众)
+- **PG/MySQL/Mongo 门面** — 前置: 统一记录编码 (保序 key 编码已有 + 表级 schema)
 - **shard 自包含网络** (ScyllaDB 模式) — 消 worker↔shard 两跳 handoff 的终局方案
 
 **⭐ 不需要 MVCC 的设计决策** (见 `docs/superpowers/plans/2026-07-18-storage-crate.md` §3.3.2):

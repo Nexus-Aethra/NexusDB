@@ -1,21 +1,19 @@
 //! Value 类型标签编码层.
 //!
 //! 多协议数据互联的统一 value 编码约定: 存储格式 = `[type_tag u8][payload]`.
-//! 本阶段所有网络门面 (Binary/RESP) 写入统一打 `TAG_RAW`, 其余 tag 预留给
-//! Phase 3 (SQL/Mongo 门面的类型化编码), 现在预留 1 字节避免存量数据迁移.
+//! 网络门面 (Binary/RESP) 的原始写入打 `TAG_RAW`; ⭐ 数值 RMW (INCR/
+//! INCRBYFLOAT) 产出**原生二进制数值** (`TAG_I64`/`TAG_F64`, LE bytes),
+//! RESP 读回经 `render` 按 tag 渲染为字符串.
+//!
+//! **tag 常量与数值编解码的唯一定义源在 `shard_manager::value_num`**
+//! (shard 端 RMW 也要用, 而 network 依赖 shard_manager) — 这里 re-export.
 //!
 //! **作用域**: 仅网络门面写入的数据; 直连 API (submit_tasks) 不经过此层.
 
-/// 原始字节 (Redis/Binary 直通).
-pub const TAG_RAW: u8 = 0x01;
-/// 预留: i64 (保序编码).
-pub const TAG_I64: u8 = 0x02;
-/// 预留: f64 (保序编码).
-pub const TAG_F64: u8 = 0x03;
-/// 预留: UTF-8 字符串.
-pub const TAG_STR: u8 = 0x04;
-/// 预留: 文档 (Mongo BSON 子集 / tuple).
-pub const TAG_DOC: u8 = 0x05;
+pub use shard_manager::value_num::{
+    NumValue, TAG_DOC, TAG_F32, TAG_F64, TAG_I64, TAG_RAW, TAG_STR, encode_f32, encode_f64,
+    encode_i64, is_known_tag, parse_num, render,
+};
 
 /// 编码: 在 payload 前附加 1 字节 type tag.
 pub fn encode_value(tag: u8, payload: &[u8]) -> Vec<u8> {
@@ -29,16 +27,14 @@ pub fn encode_value(tag: u8, payload: &[u8]) -> Vec<u8> {
 ///
 /// 容错: 空 value 或首字节不是已知 tag 时, 按 (TAG_RAW, 原样) 返回 —
 /// 兼容早期未打 tag 的存量数据 / 直连 API 写入的数据.
+///
+/// ⭐ 注意: 这是 **Binary 门面**的剥 tag 路径 (返回原生 payload bytes,
+/// 数值 key 是 LE 二进制); RESP 门面应使用 `render` (字符串渲染).
 pub fn decode_value(stored: &[u8]) -> (u8, &[u8]) {
     match stored.first() {
         Some(&tag) if is_known_tag(tag) => (tag, &stored[1..]),
         _ => (TAG_RAW, stored),
     }
-}
-
-/// 首字节是否为已知 type tag.
-pub fn is_known_tag(tag: u8) -> bool {
-    matches!(tag, TAG_RAW | TAG_I64 | TAG_F64 | TAG_STR | TAG_DOC)
 }
 
 #[cfg(test)]

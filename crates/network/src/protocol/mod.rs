@@ -8,7 +8,7 @@ pub mod resp;
 use thiserror::Error;
 
 pub use self::binary::BinaryProtocol;
-pub use self::resp::{RespCommand, RespCodec};
+pub use self::resp::{RespCodec, RespCommand, SetAlgOp};
 
 /// Protocol codec error.
 #[derive(Debug, Error)]
@@ -73,11 +73,20 @@ impl Default for KvLimits {
 }
 
 /// 校验请求的 key/value 长度. 超限返回人类可读错误消息 (直接回给 client).
+///
+/// ⭐ `Request::Put.value` 是 `[type_tag][payload]` 布局 (decode 时预置),
+/// 校验按业务 payload 长度扣除 1B tag.
 pub fn validate_request(req: &Request, limits: &KvLimits) -> Result<(), String> {
-    let (key, value): (&[u8], &[u8]) = match req {
-        Request::Put { key, value } => (key, value),
-        Request::Get { key } | Request::Delete { key } => (key, &[]),
+    let (key, value_len): (&[u8], usize) = match req {
+        Request::Put { key, value } => (key, value.len().saturating_sub(1)),
+        Request::Get { key } | Request::Delete { key } => (key, 0),
     };
+    validate_kv(key, value_len, limits)
+}
+
+/// ⭐ 借用版校验 (热路径: 免为校验构造 Request / clone key).
+/// `value_len` 是**业务 payload 长度** (不含 value type tag 字节).
+pub fn validate_kv(key: &[u8], value_len: usize, limits: &KvLimits) -> Result<(), String> {
     if key.is_empty() {
         return Err("key must not be empty".to_string());
     }
@@ -88,11 +97,10 @@ pub fn validate_request(req: &Request, limits: &KvLimits) -> Result<(), String> 
             limits.max_key_bytes
         ));
     }
-    if value.len() > limits.max_value_bytes {
+    if value_len > limits.max_value_bytes {
         return Err(format!(
             "value too long: {} > max {}",
-            value.len(),
-            limits.max_value_bytes
+            value_len, limits.max_value_bytes
         ));
     }
     Ok(())

@@ -31,6 +31,10 @@ impl TaskInbox {
     }
 
     /// Worker 端: push 单个 task (batch coalescing: 首次 push 才通知).
+    ///
+    /// Err = 队满退还 task (caller 自旋重试), 语义上必须把所有权还回去 —
+    /// 装箱会波及全链路分配, 且退还是罕见路径, 尺寸 lint 不适用.
+    #[allow(clippy::result_large_err)]
     pub fn push(&self, task: ShardTask) -> Result<(), ShardTask> {
         self.ring.push(task)?;
         if self.pending.fetch_add(1, Ordering::AcqRel) == 0 {

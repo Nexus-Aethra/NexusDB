@@ -13,9 +13,10 @@ fn put_roundtrip() {
     match p.decode_request(&bytes).unwrap() {
         DecodeOutcome::Complete { consumed, value } => {
             assert_eq!(consumed, bytes.len());
+            // ⭐ decode 时 Put.value 预置 1B type tag (0x01 = TAG_RAW)
             assert_eq!(value, Request::Put {
                 key: b"hello".to_vec(),
-                value: b"world".to_vec(),
+                value: b"\x01world".to_vec(),
             });
         }
         DecodeOutcome::NeedMore => panic!("should be complete"),
@@ -55,7 +56,8 @@ fn empty_key_value() {
     });
     match p.decode_request(&bytes).unwrap() {
         DecodeOutcome::Complete { value, .. } => {
-            assert_eq!(value, Request::Put { key: vec![], value: vec![] });
+            // ⭐ 空 payload decode 后 value = [TAG_RAW] (仅 1B tag)
+            assert_eq!(value, Request::Put { key: vec![], value: vec![0x01] });
         }
         DecodeOutcome::NeedMore => panic!(),
     }

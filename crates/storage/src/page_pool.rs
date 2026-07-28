@@ -91,15 +91,28 @@ impl Drop for PageBuf {
 }
 
 /// 从 pool 拿一个 page buffer. pool 空时分配新的.
+///
+/// ⭐ 免清零: 返回的 buffer 是 **未初始化/旧内容** (buffer 语义, 调用方
+/// 必须全量覆盖后再读 — pager.read 的所有路径都是先 copy_from_slice 整页).
+/// 之前 `Box::new([0u8; PAGE_SIZE])` 每次 miss 白付 16KB memset.
 pub fn alloc() -> Box<[u8; PAGE_SIZE]> {
     PAGE_POOL.with(|pool| {
         let mut p = pool.borrow_mut();
         if let Some(buf) = p.pop() {
             buf
         } else {
-            Box::new([0u8; PAGE_SIZE])
+            // SAFETY: [u8; N] 任意位模式合法 (u8 无无效值), 语义上等价
+            // "内容未定义的缓冲区". 调用方契约: 写满后才读.
+            unsafe { Box::<[u8; PAGE_SIZE]>::new_uninit().assume_init() }
         }
     })
+}
+
+/// 与 `alloc` 相同但保证全零 (少数需要零初始化语义的 caller 用).
+pub fn alloc_zeroed() -> Box<[u8; PAGE_SIZE]> {
+    let mut b = alloc();
+    b.fill(0);
+    b
 }
 
 /// 归还 buffer 到 pool. pool 满时直接 drop.
@@ -236,8 +249,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn alloc_returns_zeroed_page() {
-        let buf = alloc();
+    fn alloc_zeroed_returns_zeroed_page() {
+        let buf = alloc_zeroed();
         assert_eq!(buf.len(), PAGE_SIZE);
         assert!(buf.iter().all(|&b| b == 0));
     }

@@ -23,6 +23,11 @@ pub mod server;
 pub mod value_codec;
 pub mod worker;
 
+/// ⭐ Phase G: geohash 纯函数桥 (协议层编/解码 + worker 渲染用).
+pub mod geo_bridge {
+    pub use storage::geo::{decode, encode, haversine_m, unit_factor};
+}
+
 pub use acceptor::{Acceptor, AcceptorConfig, LbStrategy, NewConn};
 pub use kv_to_shard::dispatch_request;
 pub use protocol::{

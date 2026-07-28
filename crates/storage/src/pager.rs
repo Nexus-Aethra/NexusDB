@@ -193,6 +193,13 @@ fn next_bump_chunk(file_id: u32, chunk_idx: u8) -> (u32, u8) {
     }
 }
 
+/// ⭐ GC 排查日志开关 (NLOG_GC_DEBUG=1 启用, 进程内缓存).
+fn gc_debug() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NLOG_GC_DEBUG").is_ok_and(|v| v == "1"))
+}
+
 /// ⭐ G2: 从 chunk 字节解析第 i 页的 vpid (page 自描述: magic "LCBP" +
 /// vpid 在 [0x18..0x20]). 无 magic → None (从未写过).
 /// 与 recover 扫描同约定: 所有落盘页头部含 magic.
@@ -1003,16 +1010,43 @@ impl Pager {
             self.compact_inflight = false;
             return None;
         }
-        // src 活页: header vpid 候选 + meta 点查确认
+        // ⭐ 判活以 **meta 全扫为 SoT** (修复数据丢失 bug, 2026-07-24):
+        // 旧实现用 page header vpid 自描述 (parse_page_vpid + meta 点查),
+        // 但 **Internal 页的 header vpid 字段是 first_child** (page crate
+        // 约定, 见 chunk_writer::write_page_with_header) —— header 候选法
+        // 会把 Internal 页误判为死页:
+        // - 作为 src: 不搬运 → chunk 释放复用后 Internal 页物理销毁
+        // - 作为 dst: 活 Internal 页被当死槽直接覆盖
+        // 两者都导致子树路由断, travel 落到错误 leaf → GET 返回 nil (静默丢数据).
+        // meta 平坦数组全扫微秒~毫秒级, compact 低频 (空闲段 + 10ms 节流) 可接受.
         let mut src_live: Vec<(u64, PidLocation, usize)> = Vec::new();
-        for i in 0..PAGES_PER_CHUNK {
-            if let Some(vpid) = parse_page_vpid(&src_bytes, i)
-                && let Some(pid) = self.meta.peek(vpid)
-                && pid.file_id() == src.file_id
-                && pid.chunk_idx() == src.chunk_idx
-                && pid.page_idx() as usize == i
-            {
-                src_live.push((vpid, pid, i));
+        let mut dst_alive = [false; PAGES_PER_CHUNK];
+        for (vpid, pid) in self.meta.iter_allocated() {
+            if pid.flags() & crate::types::PID_ALIVE == 0 {
+                continue; // 墓碑 (已释放溢出页) 不算活
+            }
+            let slot = pid.page_idx() as usize;
+            if slot >= PAGES_PER_CHUNK {
+                continue;
+            }
+            if pid.file_id() == src.file_id && pid.chunk_idx() == src.chunk_idx {
+                src_live.push((vpid, pid, slot));
+            } else if pid.file_id() == dst.file_id && pid.chunk_idx() == dst.chunk_idx {
+                dst_alive[slot] = true;
+            }
+        }
+        // ⭐ 排查日志 (NLOG_GC_DEBUG=1): header 候选法与 meta SoT 的差异 —
+        // 差异槽即旧逻辑会误判/误伤的页 (典型: Internal 页)
+        if gc_debug() {
+            for (vpid, _, slot) in &src_live {
+                let header_says_alive = parse_page_vpid(&src_bytes, *slot)
+                    .is_some_and(|hv| hv == *vpid);
+                if !header_says_alive {
+                    eprintln!(
+                        "[GC_DEBUG] src {:?} slot {} vpid {} alive-in-meta but header disagrees (page_type={}) — old logic would DROP it",
+                        src, slot, vpid, src_bytes[slot * PAGE_SIZE + 4]
+                    );
+                }
             }
         }
         if src_live.is_empty() {
@@ -1023,17 +1057,9 @@ impl Pager {
             self.meta_flush_due = true; // 推动 meta 确认 → promote
             return None;
         }
-        // dst 死槽: 非活槽 (header/meta 点查同法)
+        // dst 死槽 = meta 无活页指向的槽 (SoT 同上; fresh dst 天然全死槽)
         let mut dead_slots: Vec<u8> = Vec::new();
-        for i in 0..PAGES_PER_CHUNK {
-            let alive = parse_page_vpid(&dst_bytes, i)
-                .and_then(|vpid| self.meta.peek(vpid))
-                .map(|pid| {
-                    pid.file_id() == dst.file_id
-                        && pid.chunk_idx() == dst.chunk_idx
-                        && pid.page_idx() as usize == i
-                })
-                .unwrap_or(false);
+        for (i, alive) in dst_alive.iter().enumerate() {
             if !alive {
                 dead_slots.push(i as u8);
             }
@@ -1505,7 +1531,10 @@ impl PageWriteBatch {
             }
             pager
                 .nowchunks
-                .write_page_with_vpid(key, page_idx, vpid, *data);
+                .write_page_with_vpid(key, page_idx, vpid, &data);
+            // ⭐ 热路径优化: page 字节已 memcpy 进 nowchunks, Box 归还页池
+            // (闭合 page_pool 循环: read alloc → submit 消费 → recycle).
+            page_pool::recycle(data);
             // 3. 写回 meta_cache (标 dirty, 持久化在 flush 时).
             pager.meta.write(vpid, pid);
 

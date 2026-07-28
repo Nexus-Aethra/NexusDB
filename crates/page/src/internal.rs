@@ -27,6 +27,23 @@ pub fn internal_new() -> [u8; PAGE_SIZE] {
 /// 段二分定位段 + 段内顺序扫描, 跳过哨兵.
 /// 哨兵的 key="" 永远 <= 任何 key, 但它的 child_vpid=0 应当被忽略.
 pub fn internal_child(page: &[u8], key: &[u8]) -> Option<u64> {
+    internal_child_with_bounds(page, key).map(|(c, _, _)| c)
+}
+
+/// ⭐ 区间版 internal_child: 顺带返回选中 child 的覆盖区间
+/// `(child, lower_sep, upper_sep)` — child 覆盖 `[lower_sep, upper_sep)`.
+///
+/// - `lower_sep = None`: 走 first_child / 页内无更小 sep (下界由父层给)
+/// - `upper_sep = None`: 页内无更大 sep (上界由父层给)
+///
+/// 零额外扫描成本: 现有 "找最大 sep <= key" 的循环本就路过这两个词
+/// (chosen 的 sep 与第一个 > key 的 sep). travel 逐层收窄即得 leaf
+/// 覆盖区间, 供批量操作判断 "下一个 key 是否同一 leaf" (免回 root).
+#[allow(clippy::type_complexity)]
+pub fn internal_child_with_bounds(
+    page: &[u8],
+    key: &[u8],
+) -> Option<(u64, Option<Vec<u8>>, Option<Vec<u8>>)> {
     if page_type(page) != PageType::Internal {
         return None;
     }
@@ -43,7 +60,7 @@ pub fn internal_child(page: &[u8], key: &[u8]) -> Option<u64> {
     let first_child = page_vpid(page);
     let idx = PageIndex::load(page, ItemKind::Internal).ok()?;
     if idx.segments.is_empty() {
-        return Some(first_child);
+        return Some((first_child, None, None));
     }
     let seg_idx = idx.locate_segment(key);
     let seg = &idx.segments[seg_idx];
@@ -53,27 +70,30 @@ pub fn internal_child(page: &[u8], key: &[u8]) -> Option<u64> {
     if seg_idx == 0 && ptr.key().is_empty() {
         ptr = match ptr.next() {
             Ok(Some(p)) => p,
-            _ => return Some(first_child), // 只有哨兵, 走 first_child
+            _ => return Some((first_child, None, None)), // 只有哨兵, 走 first_child
         };
     }
     // 找最大 i 使 full_key(i) <= key. chosen 默认 first_child.
-    let mut chosen = if seg_idx == 0 {
-        first_child
+    let (mut chosen, mut lower) = if seg_idx == 0 {
+        (first_child, None)
     } else {
-        ptr.child_vpid()
+        (ptr.child_vpid(), Some(ptr.key().to_vec()))
     };
     // 段内找到 >= key 时停止
+    let mut upper: Option<Vec<u8>> = None;
     loop {
         if ptr.key() > key {
+            upper = Some(ptr.key().to_vec());
             break;
         }
         chosen = ptr.child_vpid();
+        lower = Some(ptr.key().to_vec());
         match ptr.next() {
             Ok(Some(p)) => ptr = p,
-            _ => break,
+            _ => break, // 页尾: 无更大 sep, 上界由父层给
         }
     }
-    Some(chosen)
+    Some((chosen, lower, upper))
 }
 
 /// 在 internal page 中插入 (separator_key, child_vpid).

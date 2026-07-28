@@ -67,10 +67,17 @@ impl Protocol for BinaryProtocol {
         }
 
         let key = buf[HEADER_LEN..HEADER_LEN + key_len].to_vec();
-        let value = buf[HEADER_LEN + key_len..HEADER_LEN + key_len + val_len].to_vec();
-
+        // ⭐ 热路径优化: Put 的 value 物化时直接预置 1B type tag
+        // (`Request::Put.value` 统一 `[TAG_RAW][payload]` 布局,
+        // worker 层零二次拷贝; Get/Delete 无 value 不受影响).
         let req = match op {
-            OP_PUT => Request::Put { key, value },
+            OP_PUT => {
+                let payload = &buf[HEADER_LEN + key_len..HEADER_LEN + key_len + val_len];
+                let mut value = Vec::with_capacity(1 + payload.len());
+                value.push(crate::value_codec::TAG_RAW);
+                value.extend_from_slice(payload);
+                Request::Put { key, value }
+            }
             OP_GET => Request::Get { key },
             OP_DELETE => Request::Delete { key },
             other => return Err(ProtocolError::InvalidOpcode(other)),

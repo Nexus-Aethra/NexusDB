@@ -162,21 +162,21 @@ fn main() {
                         let batch_op = if op == 0 {
                             let v = vec![((next() >> 32) & 0xFF) as u8; VALUE_LEN];
                             BatchOp::Put {
-                                db: "bench".to_string(),
-                                table: "kv".to_string(),
+                                db: std::sync::Arc::from("bench"),
+                                table: std::sync::Arc::from("kv"),
                                 key: key.into_bytes(),
                                 val: v,
                             }
                         } else if op == 1 {
                             BatchOp::Get {
-                                db: "bench".to_string(),
-                                table: "kv".to_string(),
+                                db: std::sync::Arc::from("bench"),
+                                table: std::sync::Arc::from("kv"),
                                 key: key.into_bytes(),
                             }
                         } else {
                             BatchOp::Delete {
-                                db: "bench".to_string(),
-                                table: "kv".to_string(),
+                                db: std::sync::Arc::from("bench"),
+                                table: std::sync::Arc::from("kv"),
                                 key: key.into_bytes(),
                             }
                         };
@@ -193,9 +193,21 @@ fn main() {
                                     BatchOp::Put { .. } => 0u8,
                                     BatchOp::Get { .. } => 1u8,
                                     BatchOp::Delete { .. } => 2u8,
+                                    // stress 不构造 Multi/RMW op
+                                    _ => 3u8,
                                 };
                                 match result {
-                                    BatchResult::PutOk | BatchResult::GetValue(_) | BatchResult::DeleteExisted(_) => {
+                                    BatchResult::PutOk
+                                    | BatchResult::GetValue(_)
+                                    | BatchResult::DeleteExisted(_)
+                                    | BatchResult::Values(_)
+                                    | BatchResult::Integer(_)
+                                    | BatchResult::Double(_)
+                                    | BatchResult::Pairs(_)
+                                    | BatchResult::Members(_)
+                                    | BatchResult::OptMember(_)
+                                    | BatchResult::IntList(_)
+                                    | BatchResult::MultiPutOk => {
                                         match op_type {
                                             0 => { total_put.fetch_add(1, Ordering::Relaxed); }
                                             1 => { total_get.fetch_add(1, Ordering::Relaxed); }
