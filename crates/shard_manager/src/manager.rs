@@ -388,9 +388,60 @@ impl ShardManager {
                     table.as_ref(),
                     pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
                 ),
+                BatchOp::MultiPutNx { db, table, pairs } => (
+                    db.as_ref(),
+                    table.as_ref(),
+                    pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
+                ),
                 BatchOp::Incr { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::IncrFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
                 BatchOp::Append { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
                 BatchOp::SetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::GetDel { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::GetSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SetRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HSetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HMGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HDel { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HGetAll { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HIncrByFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SIsMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SMembers { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SPop { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SRandMember { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LPush { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LIndex { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZRangeByScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZRank { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZMScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SMisMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SPopN { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SRandCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HRandField { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LTrim { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LPos { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LInsert { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SetBit { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
             };
             let shard_id = self.route_db_table_key(db, table, key);
             shard_groups[shard_id].push((i, op.clone()));
@@ -474,9 +525,60 @@ impl ShardManager {
                     table.as_ref(),
                     pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
                 ),
+                BatchOp::MultiPutNx { db, table, pairs } => (
+                    db.as_ref(),
+                    table.as_ref(),
+                    pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
+                ),
                 BatchOp::Incr { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::IncrFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
                 BatchOp::Append { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
                 BatchOp::SetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::GetDel { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::GetSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SetRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HSetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HMGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HDel { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HGetAll { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HIncrByFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SIsMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SMembers { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SPop { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SRandMember { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LPush { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LIndex { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZRangeByScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZRank { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZMScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::ZPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SMisMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SPopN { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SRandCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::HRandField { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LTrim { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LPos { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::LInsert { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+                BatchOp::SetBit { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
             };
             let shard_id = self.route_db_table_key(db, table, key);
             self.shards[shard_id].task_inbox.push_spin(ShardTask {
@@ -1070,7 +1172,11 @@ impl ShardManager {
 // =====================================================================
 
 /// ⭐ String RMW: INCR/DECR (shard 单线程内天然原子).
-/// stored = `[tag][payload]`, payload 按十进制 i64 解析.
+///
+/// ⭐ 数值原生存储 (N2): 按 tag 分派 —
+/// - TAG_I64: 直接 LE 读 + checked_add → 写回 TAG_I64 (8B 二进制)
+/// - TAG_RAW 十进制文本 (Redis 兼容/存量): parse i64 → **结果升级为 TAG_I64**
+/// - TAG_F64/F32: Redis 语义报 "not an integer"
 fn exec_incr(
     e: &mut storage::StorageEngine,
     db: &str,
@@ -1078,44 +1184,75 @@ fn exec_incr(
     key: &[u8],
     delta: i64,
 ) -> crate::request::BatchResult {
-    use crate::request::{BatchResult, VALUE_TAG_RAW};
+    use crate::request::BatchResult;
+    use crate::value_num;
     let old = match block_on_io(e.table_get(db, table, key)) {
         Ok(v) => v,
         Err(err) => return BatchResult::Error(err.to_string()),
     };
     let cur: i64 = match &old {
         None => 0,
-        Some(stored) => {
-            let payload = match stored.first() {
-                Some(&VALUE_TAG_RAW) => &stored[1..],
-                _ => &stored[..],
-            };
-            match std::str::from_utf8(payload)
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-            {
-                Some(n) => n,
-                None => {
-                    return BatchResult::Error(
-                        "value is not an integer or out of range".to_string(),
-                    );
-                }
+        Some(stored) => match value_num::parse_num_int_only(stored) {
+            Some(n) => n,
+            None => {
+                return BatchResult::Error(
+                    "value is not an integer or out of range".to_string(),
+                );
             }
-        }
+        },
     };
     let Some(newv) = cur.checked_add(delta) else {
         return BatchResult::Error("increment or decrement would overflow".to_string());
     };
-    let mut stored = Vec::with_capacity(21);
-    stored.push(VALUE_TAG_RAW);
-    stored.extend_from_slice(newv.to_string().as_bytes());
+    // ⭐ 原生二进制写回 (TAG_I64 + 8B LE), 非十进制字符串
+    let stored = value_num::encode_i64(newv);
     match block_on_io(e.table_put(db, table, key, &stored)) {
         Ok(_) => BatchResult::Integer(newv),
         Err(err) => BatchResult::Error(err.to_string()),
     }
 }
 
+/// ⭐ String RMW: INCRBYFLOAT (N2). 按 tag 分派, 结果写回 TAG_F64 8B LE.
+///
+/// Redis 语义: 整数值/文本数字均可参与; 结果 NaN/inf 拒绝.
+fn exec_incr_float(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    delta: f64,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    use crate::value_num::{self, NumValue};
+    let old = match block_on_io(e.table_get(db, table, key)) {
+        Ok(v) => v,
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+    let cur: f64 = match &old {
+        None => 0.0,
+        Some(stored) => match value_num::parse_num(stored) {
+            Some(NumValue::I64(n)) => n as f64,
+            Some(NumValue::F64(f)) => f,
+            Some(NumValue::F32(f)) => f as f64, // f32 → f64 无损提升
+            None => return BatchResult::Error("value is not a valid float".to_string()),
+        },
+    };
+    let newv = cur + delta;
+    if !newv.is_finite() {
+        return BatchResult::Error("increment would produce NaN or Infinity".to_string());
+    }
+    // ⭐ 原生二进制写回 (TAG_F64 + 8B LE)
+    let stored = value_num::encode_f64(newv);
+    match block_on_io(e.table_put(db, table, key, &stored)) {
+        Ok(_) => BatchResult::Double(newv),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
 /// ⭐ String RMW: APPEND. 返回追加后 payload 长度.
+///
+/// ⭐ N2: 数值 tag 值先 `render` 字符串化再拼接, 结果退回 TAG_RAW
+/// (Redis 语义: append 后是普通 string).
 fn exec_append(
     e: &mut storage::StorageEngine,
     db: &str,
@@ -1124,6 +1261,7 @@ fn exec_append(
     suffix: &[u8],
 ) -> crate::request::BatchResult {
     use crate::request::{BatchResult, VALUE_TAG_RAW};
+    use crate::value_num;
     let old = match block_on_io(e.table_get(db, table, key)) {
         Ok(v) => v,
         Err(err) => return BatchResult::Error(err.to_string()),
@@ -1131,10 +1269,11 @@ fn exec_append(
     let mut stored = match old {
         Some(s) if s.first() == Some(&VALUE_TAG_RAW) => s,
         Some(s) => {
-            // 直连 API 写入的无 tag 值: 补 tag 归一
-            let mut t = Vec::with_capacity(1 + s.len());
+            // 数值 tag / 无 tag 存量: 渲染字符串化后归一为 RAW
+            let rendered = value_num::render(&s);
+            let mut t = Vec::with_capacity(1 + rendered.len());
             t.push(VALUE_TAG_RAW);
-            t.extend_from_slice(&s);
+            t.extend_from_slice(&rendered);
             t
         }
         None => vec![VALUE_TAG_RAW],
@@ -1164,6 +1303,328 @@ fn exec_setnx(
         },
         Err(err) => BatchResult::Error(err.to_string()),
     }
+}
+
+/// ⭐ GETDEL: 返回旧值 + 删除 (table_delete 内部释放溢出链).
+fn exec_getdel(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    let old = match block_on_io(e.table_get(db, table, key)) {
+        Ok(v) => v,
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+    if old.is_some()
+        && let Err(err) = block_on_io(e.table_delete(db, table, key))
+    {
+        return BatchResult::Error(err.to_string());
+    }
+    BatchResult::GetValue(old)
+}
+
+/// ⭐ GETSET: 写新值 + 返回旧值 (val 已带 tag).
+fn exec_getset(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    val: &[u8],
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    let old = match block_on_io(e.table_get(db, table, key)) {
+        Ok(v) => v,
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+    match block_on_io(e.table_put(db, table, key, val)) {
+        Ok(_) => BatchResult::GetValue(old),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ Phase B: SETBIT — shard 端 RMW (零扩展到 offset/8+1), 返回旧 bit.
+fn exec_setbit(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    offset: u64,
+    bit: bool,
+) -> crate::request::BatchResult {
+    use crate::request::{BatchResult, VALUE_TAG_RAW};
+    use crate::value_num;
+    let old = match block_on_io(e.table_get(db, table, key)) {
+        Ok(v) => v,
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+    let mut base: Vec<u8> = match &old {
+        Some(s) => value_num::render(s).into_owned(),
+        None => Vec::new(),
+    };
+    let byte = (offset / 8) as usize;
+    let mask = 1u8 << (7 - (offset % 8) as u8);
+    if base.len() <= byte {
+        base.resize(byte + 1, 0u8); // 零扩展
+    }
+    let old_bit = (base[byte] & mask) != 0;
+    if bit {
+        base[byte] |= mask;
+    } else {
+        base[byte] &= !mask;
+    }
+    let mut stored = Vec::with_capacity(1 + base.len());
+    stored.push(VALUE_TAG_RAW);
+    stored.extend_from_slice(&base);
+    match block_on_io(e.table_put(db, table, key, &stored)) {
+        Ok(_) => BatchResult::Integer(i64::from(old_bit)),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ SETRANGE: 从 offset 覆盖写 data (零扩展), 结果归一为 TAG_RAW,
+/// 返回新长度. data 空 → 不写, 返回当前长度 (Redis 语义).
+fn exec_setrange(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    offset: u32,
+    data: &[u8],
+) -> crate::request::BatchResult {
+    use crate::request::{BatchResult, VALUE_TAG_RAW};
+    use crate::value_num;
+    let old = match block_on_io(e.table_get(db, table, key)) {
+        Ok(v) => v,
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+    let mut base: Vec<u8> = match &old {
+        Some(s) => value_num::render(s).into_owned(),
+        None => Vec::new(),
+    };
+    if data.is_empty() {
+        return BatchResult::Integer(base.len() as i64);
+    }
+    let offset = offset as usize;
+    let end = offset + data.len();
+    if base.len() < end {
+        base.resize(end, 0u8); // 零扩展
+    }
+    base[offset..end].copy_from_slice(data);
+    let new_len = base.len() as i64;
+    let mut stored = Vec::with_capacity(1 + base.len());
+    stored.push(VALUE_TAG_RAW);
+    stored.extend_from_slice(&base);
+    match block_on_io(e.table_put(db, table, key, &stored)) {
+        Ok(_) => BatchResult::Integer(new_len),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ MSETNX 分片: 本组全部 key 不存在才写. 返回 1=写入, 0=有 key 已存在.
+/// (跨 shard 非原子: 别组可能已写 — 已记为 gap.)
+fn exec_multiputnx(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    for (k, _) in pairs {
+        match block_on_io(e.table_get(db, table, k)) {
+            Ok(Some(_)) => return BatchResult::Integer(0),
+            Ok(None) => {}
+            Err(err) => return BatchResult::Error(err.to_string()),
+        }
+    }
+    match block_on_io(e.table_put_many(db, table, pairs)) {
+        Ok(_) => BatchResult::Integer(1),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ Phase H: HINCRBY — field 整数 RMW, 结果写回 TAG_I64.
+fn exec_hincrby(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    field: &[u8],
+    delta: i64,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    use crate::value_num;
+    let old = match block_on_io(e.hash_get(db, table, key, field)) {
+        Ok(v) => v,
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+    let cur: i64 = match &old {
+        None => 0,
+        Some(stored) => match value_num::parse_num_int_only(stored) {
+            Some(n) => n,
+            None => return BatchResult::Error("hash value is not an integer".into()),
+        },
+    };
+    let Some(new) = cur.checked_add(delta) else {
+        return BatchResult::Error("increment or decrement would overflow".into());
+    };
+    let pair = vec![(field.to_vec(), value_num::encode_i64(new))];
+    match block_on_io(e.hash_set(db, table, key, &pair)) {
+        Ok(_) => BatchResult::Integer(new),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ Phase H: HINCRBYFLOAT — field 浮点 RMW, 结果写回 TAG_F64.
+fn exec_hincrbyfloat(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    field: &[u8],
+    delta: f64,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    use crate::value_num::{self, NumValue};
+    let old = match block_on_io(e.hash_get(db, table, key, field)) {
+        Ok(v) => v,
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+    let cur: f64 = match &old {
+        None => 0.0,
+        Some(stored) => match value_num::parse_num(stored) {
+            Some(NumValue::I64(n)) => n as f64,
+            Some(NumValue::F32(f)) => f as f64,
+            Some(NumValue::F64(f)) => f,
+            None => return BatchResult::Error("hash value is not a float".into()),
+        },
+    };
+    let new = cur + delta;
+    if !new.is_finite() {
+        return BatchResult::Error("increment would produce NaN or Infinity".into());
+    }
+    let pair = vec![(field.to_vec(), value_num::encode_f64(new))];
+    match block_on_io(e.hash_set(db, table, key, &pair)) {
+        Ok(_) => BatchResult::Double(new),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ Phase Set: SPOP — 取任意成员 + 删除 (shard 内原子).
+fn exec_spop(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    match block_on_io(e.set_pick_one(db, table, key)) {
+        Ok(Some(m)) => match block_on_io(e.set_rem(db, table, key, std::slice::from_ref(&m))) {
+            Ok(_) => BatchResult::Members(vec![m]),
+            Err(err) => BatchResult::Error(err.to_string()),
+        },
+        Ok(None) => BatchResult::Members(vec![]),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ C2: LPOS — count 缺省回首位 (Integer / nil), 否则 IntList (count=0 全部).
+fn exec_lpos(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    val: &[u8],
+    rank: i64,
+    count: Option<u32>,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    match count {
+        None => match block_on_io(e.list_pos(db, table, key, val, rank, 1)) {
+            Ok(ps) => match ps.first() {
+                Some(&p) => BatchResult::Integer(p),
+                None => BatchResult::OptMember(None),
+            },
+            Err(err) => BatchResult::Error(err.to_string()),
+        },
+        Some(c) => match block_on_io(e.list_pos(db, table, key, val, rank, c as usize)) {
+            Ok(ps) => BatchResult::IntList(ps),
+            Err(err) => BatchResult::Error(err.to_string()),
+        },
+    }
+}
+
+/// ⭐ Phase L: LPOP/RPOP — 弹出后 render 剥 tag (与 Set 统一为就绪字节).
+fn exec_lpop(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    left: bool,
+    count: usize,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    use crate::value_num;
+    match block_on_io(e.list_pop(db, table, key, left, count)) {
+        Ok(vs) => {
+            BatchResult::Members(vs.iter().map(|v| value_num::render(v).into_owned()).collect())
+        }
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ Phase L: LRANGE — 区间元素 render 剥 tag.
+fn exec_lrange(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    start: i64,
+    end: i64,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    use crate::value_num;
+    match block_on_io(e.list_range(db, table, key, start, end)) {
+        Ok(vs) => {
+            BatchResult::Members(vs.iter().map(|v| value_num::render(v).into_owned()).collect())
+        }
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ Phase L: LSET — 越界回 Redis 错误, 否则 Integer(1) (worker 转 +OK).
+fn exec_lset(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    key: &[u8],
+    idx: i64,
+    val: &[u8],
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    match block_on_io(e.list_set(db, table, key, idx, val)) {
+        Ok(true) => BatchResult::Integer(1),
+        Ok(false) => BatchResult::Error("index out of range".into()),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ Phase Z: score 渲染为 Redis 风格字符串 (3.0→"3", 3.5→"3.5").
+fn fmt_score(s: f64) -> Vec<u8> {
+    format!("{s}").into_bytes()
+}
+
+/// ⭐ Phase Z: (member, score) 列表 → Members (withscores 时 member/score 交替).
+fn zrows_to_members(rows: Vec<(Vec<u8>, f64)>, withscores: bool) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(if withscores { rows.len() * 2 } else { rows.len() });
+    for (m, sc) in rows {
+        out.push(m);
+        if withscores {
+            out.push(fmt_score(sc));
+        }
+    }
+    out
 }
 
 /// shard 线程专用 block_on: 重复 poll 直到就绪, **不依赖 waker 唤醒**.
@@ -1600,13 +2061,15 @@ fn shard_thread_main(
                                     }
                                 }
                                 BatchOp::Get { db, table, key } => {
-                                    match block_on_io(e.table_get(&db, &table, &key)) {
+                                    // ⭐ Phase H: 类型感知 (hash key → WRONGTYPE)
+                                    match block_on_io(e.table_get_typed(&db, &table, &key)) {
                                         Ok(v) => BatchResult::GetValue(v),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
                                 BatchOp::Delete { db, table, key } => {
-                                    match block_on_io(e.table_delete(&db, &table, &key)) {
+                                    // ⭐ Phase H: 类型感知 (顺带清 hash 全部行/孤儿行)
+                                    match block_on_io(e.key_delete_any(&db, &table, &key)) {
                                         Ok(b) => BatchResult::DeleteExisted(b),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
@@ -1625,14 +2088,260 @@ fn shard_thread_main(
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
+                                BatchOp::MultiPutNx { db, table, pairs } => {
+                                    exec_multiputnx(e, &db, &table, &pairs)
+                                }
                                 BatchOp::Incr { db, table, key, delta } => {
                                     exec_incr(e, &db, &table, &key, delta)
+                                }
+                                BatchOp::IncrFloat { db, table, key, delta } => {
+                                    exec_incr_float(e, &db, &table, &key, delta)
                                 }
                                 BatchOp::Append { db, table, key, suffix } => {
                                     exec_append(e, &db, &table, &key, &suffix)
                                 }
                                 BatchOp::SetNx { db, table, key, val } => {
                                     exec_setnx(e, &db, &table, &key, &val)
+                                }
+                                BatchOp::GetDel { db, table, key } => {
+                                    exec_getdel(e, &db, &table, &key)
+                                }
+                                BatchOp::GetSet { db, table, key, val } => {
+                                    exec_getset(e, &db, &table, &key, &val)
+                                }
+                                BatchOp::SetRange { db, table, key, offset, data } => {
+                                    exec_setrange(e, &db, &table, &key, offset, &data)
+                                }
+                                BatchOp::HSet { db, table, key, pairs } => {
+                                    match block_on_io(e.hash_set(&db, &table, &key, &pairs)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::HSetNx { db, table, key, field, val } => {
+                                    match block_on_io(e.hash_set_nx(&db, &table, &key, &field, &val)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::HGet { db, table, key, field } => {
+                                    match block_on_io(e.hash_get(&db, &table, &key, &field)) {
+                                        Ok(v) => BatchResult::GetValue(v),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::HMGet { db, table, key, fields } => {
+                                    match block_on_io(e.hash_get_many(&db, &table, &key, &fields)) {
+                                        Ok(vs) => BatchResult::Values(vs),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::HDel { db, table, key, fields } => {
+                                    match block_on_io(e.hash_del(&db, &table, &key, &fields)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::HLen { db, table, key } => {
+                                    match block_on_io(e.hash_len(&db, &table, &key)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::HGetAll { db, table, key } => {
+                                    match block_on_io(e.hash_get_all(&db, &table, &key)) {
+                                        Ok(ps) => BatchResult::Pairs(ps),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::HIncrBy { db, table, key, field, delta } => {
+                                    exec_hincrby(e, &db, &table, &key, &field, delta)
+                                }
+                                BatchOp::HIncrByFloat { db, table, key, field, delta } => {
+                                    exec_hincrbyfloat(e, &db, &table, &key, &field, delta)
+                                }
+                                BatchOp::SAdd { db, table, key, members } => {
+                                    match block_on_io(e.set_add(&db, &table, &key, &members)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::SRem { db, table, key, members } => {
+                                    match block_on_io(e.set_rem(&db, &table, &key, &members)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::SIsMember { db, table, key, member } => {
+                                    match block_on_io(e.set_is_member(&db, &table, &key, &member)) {
+                                        Ok(b) => BatchResult::Integer(i64::from(b)),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::SCard { db, table, key } => {
+                                    match block_on_io(e.set_card(&db, &table, &key)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::SMembers { db, table, key } => {
+                                    match block_on_io(e.set_members(&db, &table, &key)) {
+                                        Ok(ms) => BatchResult::Members(ms),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::SPop { db, table, key } => exec_spop(e, &db, &table, &key),
+                                BatchOp::SRandMember { db, table, key } => {
+                                    match block_on_io(e.set_pick_one(&db, &table, &key)) {
+                                        Ok(m) => BatchResult::Members(m.into_iter().collect()),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::LPush { db, table, key, values, left } => {
+                                    match block_on_io(e.list_push(&db, &table, &key, &values, left)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::LPop { db, table, key, left, count } => {
+                                    exec_lpop(e, &db, &table, &key, left, count as usize)
+                                }
+                                BatchOp::LLen { db, table, key } => {
+                                    match block_on_io(e.list_len(&db, &table, &key)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::LRange { db, table, key, start, end } => {
+                                    exec_lrange(e, &db, &table, &key, start, end)
+                                }
+                                BatchOp::LIndex { db, table, key, idx } => {
+                                    match block_on_io(e.list_index(&db, &table, &key, idx)) {
+                                        Ok(v) => BatchResult::GetValue(v),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::LSet { db, table, key, idx, val } => {
+                                    exec_lset(e, &db, &table, &key, idx, &val)
+                                }
+                                BatchOp::ZAdd { db, table, key, pairs } => {
+                                    match block_on_io(e.zset_add(&db, &table, &key, &pairs)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZRem { db, table, key, members } => {
+                                    match block_on_io(e.zset_rem(&db, &table, &key, &members)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZScore { db, table, key, member } => {
+                                    match block_on_io(e.zset_score(&db, &table, &key, &member)) {
+                                        Ok(s) => BatchResult::OptMember(s.map(fmt_score)),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZCard { db, table, key } => {
+                                    match block_on_io(e.zset_card(&db, &table, &key)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZIncrBy { db, table, key, delta, member } => {
+                                    match block_on_io(e.zset_incr(&db, &table, &key, delta, &member)) {
+                                        Ok(s) => BatchResult::Double(s),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZRange { db, table, key, start, end, rev, withscores } => {
+                                    match block_on_io(e.zset_range(&db, &table, &key, start, end, rev)) {
+                                        Ok(rows) => BatchResult::Members(zrows_to_members(rows, withscores)),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZRangeByScore { db, table, key, min, max, withscores } => {
+                                    match block_on_io(e.zset_range_by_score(&db, &table, &key, min, max)) {
+                                        Ok(rows) => BatchResult::Members(zrows_to_members(rows, withscores)),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZRank { db, table, key, member, rev } => {
+                                    match block_on_io(e.zset_rank(&db, &table, &key, &member, rev)) {
+                                        Ok(Some(r)) => BatchResult::Integer(r),
+                                        Ok(None) => BatchResult::OptMember(None),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZCount { db, table, key, min, max } => {
+                                    match block_on_io(e.zset_range_by_score(&db, &table, &key, min, max)) {
+                                        Ok(rows) => BatchResult::Integer(rows.len() as i64),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZMScore { db, table, key, members } => {
+                                    match block_on_io(e.zset_mscore(&db, &table, &key, &members)) {
+                                        Ok(scores) => BatchResult::Values(
+                                            scores.into_iter().map(|s| s.map(fmt_score)).collect(),
+                                        ),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::ZPop { db, table, key, rev, count } => {
+                                    match block_on_io(e.zset_pop(&db, &table, &key, rev, count as usize)) {
+                                        Ok(rows) => BatchResult::Members(zrows_to_members(rows, true)),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::SMisMember { db, table, key, members } => {
+                                    match block_on_io(e.set_mismember(&db, &table, &key, &members)) {
+                                        Ok(bs) => BatchResult::IntList(
+                                            bs.into_iter().map(i64::from).collect(),
+                                        ),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::SPopN { db, table, key, count } => {
+                                    match block_on_io(e.set_pop_n(&db, &table, &key, count as usize)) {
+                                        Ok(ms) => BatchResult::Members(ms),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::SRandCount { db, table, key, count } => {
+                                    match block_on_io(e.set_rand_n(&db, &table, &key, count as usize)) {
+                                        Ok(ms) => BatchResult::Members(ms),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::HRandField { db, table, key, count, .. } => {
+                                    match block_on_io(e.hash_rand(&db, &table, &key, count as usize)) {
+                                        Ok(ps) => BatchResult::Pairs(ps),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::LRem { db, table, key, count, val } => {
+                                    match block_on_io(e.list_rem(&db, &table, &key, count, &val)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::LTrim { db, table, key, start, stop } => {
+                                    match block_on_io(e.list_trim(&db, &table, &key, start, stop)) {
+                                        Ok(()) => BatchResult::Integer(1),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::LPos { db, table, key, val, rank, count } => {
+                                    exec_lpos(e, &db, &table, &key, &val, rank, count)
+                                }
+                                BatchOp::LInsert { db, table, key, before, pivot, val } => {
+                                    match block_on_io(e.list_insert(&db, &table, &key, before, &pivot, &val)) {
+                                        Ok(n) => BatchResult::Integer(n),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::SetBit { db, table, key, offset, bit } => {
+                                    exec_setbit(e, &db, &table, &key, offset, bit)
                                 }
                             };
                             results.push(r);
@@ -1672,13 +2381,15 @@ fn shard_thread_main(
                             }
                         }
                         crate::request::BatchOp::Get { ref db, ref table, ref key } => {
-                            match block_on_io(e.table_get(db, table, key)) {
+                            // ⭐ Phase H: 类型感知 (hash key → WRONGTYPE)
+                            match block_on_io(e.table_get_typed(db, table, key)) {
                                 Ok(v) => crate::request::BatchResult::GetValue(v),
                                 Err(err) => crate::request::BatchResult::Error(err.to_string()),
                             }
                         }
                         crate::request::BatchOp::Delete { ref db, ref table, ref key } => {
-                            match block_on_io(e.table_delete(db, table, key)) {
+                            // ⭐ Phase H: 类型感知 (顺带清 hash 全部行/孤儿行)
+                            match block_on_io(e.key_delete_any(db, table, key)) {
                                 Ok(b) => crate::request::BatchResult::DeleteExisted(b),
                                 Err(err) => crate::request::BatchResult::Error(err.to_string()),
                             }
@@ -1697,15 +2408,267 @@ fn shard_thread_main(
                                 Err(err) => crate::request::BatchResult::Error(err.to_string()),
                             }
                         }
+                        crate::request::BatchOp::MultiPutNx { ref db, ref table, ref pairs } => {
+                            exec_multiputnx(e, db, table, pairs)
+                        }
                         // ⭐ String RMW (shard 单线程内天然原子)
                         crate::request::BatchOp::Incr { ref db, ref table, ref key, delta } => {
                             exec_incr(e, db, table, key, delta)
+                        }
+                        crate::request::BatchOp::IncrFloat { ref db, ref table, ref key, delta } => {
+                            exec_incr_float(e, db, table, key, delta)
                         }
                         crate::request::BatchOp::Append { ref db, ref table, ref key, ref suffix } => {
                             exec_append(e, db, table, key, suffix)
                         }
                         crate::request::BatchOp::SetNx { ref db, ref table, ref key, ref val } => {
                             exec_setnx(e, db, table, key, val)
+                        }
+                        crate::request::BatchOp::GetDel { ref db, ref table, ref key } => {
+                            exec_getdel(e, db, table, key)
+                        }
+                        crate::request::BatchOp::GetSet { ref db, ref table, ref key, ref val } => {
+                            exec_getset(e, db, table, key, val)
+                        }
+                        crate::request::BatchOp::SetRange { ref db, ref table, ref key, offset, ref data } => {
+                            exec_setrange(e, db, table, key, offset, data)
+                        }
+                        // ⭐ Phase H: Hash ops (单 key 单 shard, 无需聚合)
+                        crate::request::BatchOp::HSet { ref db, ref table, ref key, ref pairs } => {
+                            match block_on_io(e.hash_set(db, table, key, pairs)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::HSetNx { ref db, ref table, ref key, ref field, ref val } => {
+                            match block_on_io(e.hash_set_nx(db, table, key, field, val)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::HGet { ref db, ref table, ref key, ref field } => {
+                            match block_on_io(e.hash_get(db, table, key, field)) {
+                                Ok(v) => crate::request::BatchResult::GetValue(v),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::HMGet { ref db, ref table, ref key, ref fields } => {
+                            match block_on_io(e.hash_get_many(db, table, key, fields)) {
+                                Ok(vs) => crate::request::BatchResult::Values(vs),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::HDel { ref db, ref table, ref key, ref fields } => {
+                            match block_on_io(e.hash_del(db, table, key, fields)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::HLen { ref db, ref table, ref key } => {
+                            match block_on_io(e.hash_len(db, table, key)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::HGetAll { ref db, ref table, ref key } => {
+                            match block_on_io(e.hash_get_all(db, table, key)) {
+                                Ok(ps) => crate::request::BatchResult::Pairs(ps),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::HIncrBy { ref db, ref table, ref key, ref field, delta } => {
+                            exec_hincrby(e, db, table, key, field, delta)
+                        }
+                        crate::request::BatchOp::HIncrByFloat { ref db, ref table, ref key, ref field, delta } => {
+                            exec_hincrbyfloat(e, db, table, key, field, delta)
+                        }
+                        // ⭐ Phase Set: Set ops
+                        crate::request::BatchOp::SAdd { ref db, ref table, ref key, ref members } => {
+                            match block_on_io(e.set_add(db, table, key, members)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::SRem { ref db, ref table, ref key, ref members } => {
+                            match block_on_io(e.set_rem(db, table, key, members)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::SIsMember { ref db, ref table, ref key, ref member } => {
+                            match block_on_io(e.set_is_member(db, table, key, member)) {
+                                Ok(b) => crate::request::BatchResult::Integer(i64::from(b)),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::SCard { ref db, ref table, ref key } => {
+                            match block_on_io(e.set_card(db, table, key)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::SMembers { ref db, ref table, ref key } => {
+                            match block_on_io(e.set_members(db, table, key)) {
+                                Ok(ms) => crate::request::BatchResult::Members(ms),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::SPop { ref db, ref table, ref key } => {
+                            exec_spop(e, db, table, key)
+                        }
+                        crate::request::BatchOp::SRandMember { ref db, ref table, ref key } => {
+                            match block_on_io(e.set_pick_one(db, table, key)) {
+                                Ok(m) => crate::request::BatchResult::Members(m.into_iter().collect()),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        // ⭐ Phase L: List ops
+                        crate::request::BatchOp::LPush { ref db, ref table, ref key, ref values, left } => {
+                            match block_on_io(e.list_push(db, table, key, values, left)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::LPop { ref db, ref table, ref key, left, count } => {
+                            exec_lpop(e, db, table, key, left, count as usize)
+                        }
+                        crate::request::BatchOp::LLen { ref db, ref table, ref key } => {
+                            match block_on_io(e.list_len(db, table, key)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::LRange { ref db, ref table, ref key, start, end } => {
+                            exec_lrange(e, db, table, key, start, end)
+                        }
+                        crate::request::BatchOp::LIndex { ref db, ref table, ref key, idx } => {
+                            match block_on_io(e.list_index(db, table, key, idx)) {
+                                Ok(v) => crate::request::BatchResult::GetValue(v),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::LSet { ref db, ref table, ref key, idx, ref val } => {
+                            exec_lset(e, db, table, key, idx, val)
+                        }
+                        // ⭐ Phase Z: ZSet ops
+                        crate::request::BatchOp::ZAdd { ref db, ref table, ref key, ref pairs } => {
+                            match block_on_io(e.zset_add(db, table, key, pairs)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZRem { ref db, ref table, ref key, ref members } => {
+                            match block_on_io(e.zset_rem(db, table, key, members)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZScore { ref db, ref table, ref key, ref member } => {
+                            match block_on_io(e.zset_score(db, table, key, member)) {
+                                Ok(s) => crate::request::BatchResult::OptMember(s.map(fmt_score)),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZCard { ref db, ref table, ref key } => {
+                            match block_on_io(e.zset_card(db, table, key)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZIncrBy { ref db, ref table, ref key, delta, ref member } => {
+                            match block_on_io(e.zset_incr(db, table, key, delta, member)) {
+                                Ok(s) => crate::request::BatchResult::Double(s),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZRange { ref db, ref table, ref key, start, end, rev, withscores } => {
+                            match block_on_io(e.zset_range(db, table, key, start, end, rev)) {
+                                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZRangeByScore { ref db, ref table, ref key, min, max, withscores } => {
+                            match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
+                                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZRank { ref db, ref table, ref key, ref member, rev } => {
+                            match block_on_io(e.zset_rank(db, table, key, member, rev)) {
+                                Ok(Some(r)) => crate::request::BatchResult::Integer(r),
+                                Ok(None) => crate::request::BatchResult::OptMember(None),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZCount { ref db, ref table, ref key, min, max } => {
+                            match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
+                                Ok(rows) => crate::request::BatchResult::Integer(rows.len() as i64),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZMScore { ref db, ref table, ref key, ref members } => {
+                            match block_on_io(e.zset_mscore(db, table, key, members)) {
+                                Ok(scores) => crate::request::BatchResult::Values(
+                                    scores.into_iter().map(|s| s.map(fmt_score)).collect(),
+                                ),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::ZPop { ref db, ref table, ref key, rev, count } => {
+                            match block_on_io(e.zset_pop(db, table, key, rev, count as usize)) {
+                                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, true)),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::SMisMember { ref db, ref table, ref key, ref members } => {
+                            match block_on_io(e.set_mismember(db, table, key, members)) {
+                                Ok(bs) => crate::request::BatchResult::IntList(
+                                    bs.into_iter().map(i64::from).collect(),
+                                ),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::SPopN { ref db, ref table, ref key, count } => {
+                            match block_on_io(e.set_pop_n(db, table, key, count as usize)) {
+                                Ok(ms) => crate::request::BatchResult::Members(ms),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::SRandCount { ref db, ref table, ref key, count } => {
+                            match block_on_io(e.set_rand_n(db, table, key, count as usize)) {
+                                Ok(ms) => crate::request::BatchResult::Members(ms),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::HRandField { ref db, ref table, ref key, count, .. } => {
+                            match block_on_io(e.hash_rand(db, table, key, count as usize)) {
+                                Ok(ps) => crate::request::BatchResult::Pairs(ps),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::LRem { ref db, ref table, ref key, count, ref val } => {
+                            match block_on_io(e.list_rem(db, table, key, count, val)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::LTrim { ref db, ref table, ref key, start, stop } => {
+                            match block_on_io(e.list_trim(db, table, key, start, stop)) {
+                                Ok(()) => crate::request::BatchResult::Integer(1),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::LPos { ref db, ref table, ref key, ref val, rank, count } => {
+                            exec_lpos(e, db, table, key, val, rank, count)
+                        }
+                        crate::request::BatchOp::LInsert { ref db, ref table, ref key, before, ref pivot, ref val } => {
+                            match block_on_io(e.list_insert(db, table, key, before, pivot, val)) {
+                                Ok(n) => crate::request::BatchResult::Integer(n),
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            }
+                        }
+                        crate::request::BatchOp::SetBit { ref db, ref table, ref key, offset, bit } => {
+                            exec_setbit(e, db, table, key, offset, bit)
                         }
                     };
                     reply_bus_set.get(task.worker_id).push(crate::request::TaskResult {

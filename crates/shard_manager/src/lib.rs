@@ -52,6 +52,7 @@ pub mod request;
 pub mod router;
 pub mod task_inbox;
 pub mod task_reply_bus;
+pub mod value_num;
 
 pub use latency_probe::PROBE;
 

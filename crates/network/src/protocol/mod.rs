@@ -8,7 +8,7 @@ pub mod resp;
 use thiserror::Error;
 
 pub use self::binary::BinaryProtocol;
-pub use self::resp::{RespCommand, RespCodec};
+pub use self::resp::{RespCodec, RespCommand, SetAlgOp};
 
 /// Protocol codec error.
 #[derive(Debug, Error)]

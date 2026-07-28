@@ -332,6 +332,45 @@ pub async fn btree_lookup_many(
     Ok((results, travels))
 }
 
+/// ⭐ Phase R: 前缀范围扫描. 顺序遍历所有 key 以 `prefix` 开头的行,
+/// 每命中一项以 (physical_key, value) 借用回调; 回调 `Break` 早停
+/// (limit / 上层提前结束).
+///
+/// **跨 leaf**: `travel_to_leaf_guided(start)` → `leaf_scan_from` 扫本 leaf →
+/// 本 leaf 扫尽后 `next = guide.upper` (下一 leaf 下界); `upper==None` 或
+/// `upper` 不再以 `prefix` 开头 → 后续 leaf 全越界, 停. 有序 BTree 中
+/// 首个不带 prefix 的 key 即全局下界, 回调内 `Break` 实现早停.
+pub async fn btree_scan<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()>>(
+    pager: &mut Pager,
+    root_vpid: Vpid,
+    prefix: &[u8],
+    f: &mut F,
+) -> Result<(), BTreeError> {
+    use core::ops::ControlFlow;
+    let mut start: Vec<u8> = prefix.to_vec();
+    loop {
+        let (guide, leaf_bytes) = travel_to_leaf_guided(pager, root_vpid, &start).await?;
+        // 本 leaf 扫 key >= start; 首遇不带 prefix 的 key → Break (全局下界)
+        let flow = page::leaf_scan_from(&leaf_bytes[..], &start, &mut |k: &[u8], v: &[u8]| {
+            if !k.starts_with(prefix) {
+                return ControlFlow::Break(());
+            }
+            f(k, v)
+        });
+        let upper = guide.upper.clone();
+        crate::page_pool::recycle(leaf_bytes);
+        // 回调 Break (limit) 或 前缀越界 → 全局结束
+        if matches!(flow, ControlFlow::Break(())) {
+            return Ok(());
+        }
+        // 本 leaf 扫尽, 去下一 leaf; upper==None (最右 leaf) 或 upper 越前缀 → 停
+        match upper {
+            Some(next) if next.starts_with(prefix) => start = next,
+            _ => return Ok(()),
+        }
+    }
+}
+
 // =====================================================================
 // btree_insert: 单 key 插入, 自动 split 传播
 // =====================================================================

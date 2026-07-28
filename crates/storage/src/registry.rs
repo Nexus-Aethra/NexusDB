@@ -62,6 +62,10 @@ pub enum RegistryError {
     TableOp(String),
     #[error("non-utf8 name")]
     NonUtf8Name,
+    /// ⭐ Phase H: key 已以另一种数据类型存在 (Redis WRONGTYPE 语义).
+    /// 消息文本与 Redis 一致, 协议层 encode_error 直接透传.
+    #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
+    WrongType,
 }
 
 impl From<page::PageError> for RegistryError {
@@ -507,6 +511,24 @@ pub async fn table_get_many(
     Ok(results)
 }
 
+/// ⭐ Phase R: 前缀范围扫描. 以 (physical_key, stored_value) 借用回调
+/// 遍历所有以 `prefix` 开头的行; 回调 `Break` 早停 (limit).
+///
+/// **注**: value 可能是溢出描述符 (大 field value); 本层不展开
+/// (回调是同步的, 无法 async 读溢出页), 由上层 (Hash/Set...) 先收集
+/// (key, stored) 再在扫描外 async 展开. physical_key 含完整编码前缀,
+/// 上层用 `keyspace::split_data` 剥出 suffix.
+pub async fn table_scan_prefix<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()>>(
+    pager: &mut Pager,
+    table_root_vpid: Vpid,
+    prefix: &[u8],
+    f: &mut F,
+) -> Result<(), RegistryError> {
+    crate::btree::btree_scan(pager, table_root_vpid, prefix, f)
+        .await
+        .map_err(Into::into)
+}
+
 /// ⭐ 批量写: 排序迭代 + LeafGuide 区间复用 — 同 leaf 的多个 key 在
 /// 同一份 leaf 字节上连续 update/insert, 一次 batch 提交.
 ///
@@ -522,7 +544,7 @@ pub async fn table_get_many(
 pub async fn table_put_many(
     pager: &mut Pager,
     table_root_vpid: Vpid,
-    pairs: &[(Vec<u8>, Vec<u8>)],
+    pairs: &[(Vec<u8>, &[u8])],
 ) -> Result<Option<Vpid>, RegistryError> {
     use crate::btree::{LeafGuide, travel_to_leaf_guided};
     use crate::overflow;
@@ -580,7 +602,8 @@ pub async fn table_put_many(
     }
 
     for &i in &order {
-        let (key, value) = &pairs[i];
+        let key = &pairs[i].0;
+        let value: &[u8] = pairs[i].1;
 
         // guide miss → 提交当前 leaf, travel 新 leaf
         let hit = matches!(&cur, Some((g, _, _)) if g.contains(key));

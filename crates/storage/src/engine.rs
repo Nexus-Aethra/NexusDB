@@ -277,11 +277,16 @@ impl StorageEngine {
                 StorageError::Io(std::io::Error::other(format!("DbRegistry::load: {}", e)))
             })?;
 
-        Ok(Self {
+        let mut engine = Self {
             pager: pager_for_registry,
             registry,
             current_db: DEFAULT_DB_ID,
-        })
+        };
+        // ⭐ U3: 从 data 行重建复合结构计数 (修复 crash 中 meta count 漂移).
+        engine.rebuild_composite_counts().await.map_err(|e| {
+            StorageError::Io(std::io::Error::other(format!("rebuild_composite_counts: {e}")))
+        })?;
+        Ok(engine)
     }
 
     /// 写一个 page. 分配新 vpid, 走 nowchunks.
@@ -450,30 +455,77 @@ impl StorageEngine {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), RegistryError> {
-        // 1. 查表 root_vpid
+        // ⭐ Phase K: user key 统一编码为 [S][klen][key]
+        // ⭐ U2: SET 覆盖异类旧值 — 若 key 当前是复合类型先 purge (Redis 语义).
+        self.purge_composite_if_any(db, table, key).await?;
+        let ek = crate::keyspace::encode_string(key);
+        self.put_physical(db, table, &ek, value).await
+    }
+
+    // =================================================================
+    // ⭐ Phase H: 物理 key 层辅助 (复合结构 op 用; String 入口是其薄封装).
+    // pkey = 已编码的 BTree 物理 key (keyspace::encode_*).
+    // =================================================================
+
+    /// 按物理 key 写入 (含 root split 的 TableDirectory 回写, 与 table_put 同逻辑).
+    pub(crate) async fn put_physical(
+        &mut self,
+        db: &str,
+        table: &str,
+        pkey: &[u8],
+        value: &[u8],
+    ) -> Result<(), RegistryError> {
         let db_handle = self.registry.open_db(db)?;
         let table_vpid = db_handle
             .open_table(&mut self.pager, table)
             .await?
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
 
-        // 2. 写
-        let new_root = crate::registry::table_put(&mut self.pager, table_vpid, key, value).await?;
+        let new_root =
+            crate::registry::table_put(&mut self.pager, table_vpid, pkey, value).await?;
 
-        // 3. ⭐ T15: root split 时同步 TableDirectory BTree + 缓存
+        // ⭐ T15: root split 时同步 TableDirectory BTree + 缓存
         if let Some(new_root) = new_root {
-            // 3a. 持久化到 TableDirectory BTree (走 btree_update, 不触发 split)
             let db_handle = self.registry.open_db(db)?;
             db_handle
                 .table_dir_mut()
                 .update_table(&mut self.pager, table, new_root)
                 .await
                 .map_err(RegistryError::from)?;
-            // 3b. 更新内存缓存镜像
             let db_handle = self.registry.open_db(db)?;
             db_handle.update_table_root(table, new_root);
         }
         Ok(())
+    }
+
+    /// 按物理 key 读 (溢出链自动展开).
+    pub(crate) async fn get_physical(
+        &mut self,
+        db: &str,
+        table: &str,
+        pkey: &[u8],
+    ) -> Result<Option<Vec<u8>>, RegistryError> {
+        let db_handle = self.registry.open_db(db)?;
+        let table_vpid = db_handle
+            .open_table(&mut self.pager, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+        crate::registry::table_get(&mut self.pager, table_vpid, pkey).await
+    }
+
+    /// 按物理 key 删 (溢出链自动释放). 返回是否存在.
+    pub(crate) async fn delete_physical(
+        &mut self,
+        db: &str,
+        table: &str,
+        pkey: &[u8],
+    ) -> Result<bool, RegistryError> {
+        let db_handle = self.registry.open_db(db)?;
+        let table_vpid = db_handle
+            .open_table(&mut self.pager, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+        crate::registry::table_delete(&mut self.pager, table_vpid, pkey).await
     }
 
     /// 读 key 对应 value. 返回 None 表示 key 不存在.
@@ -483,12 +535,8 @@ impl StorageEngine {
         table: &str,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, RegistryError> {
-        let db_handle = self.registry.open_db(db)?;
-        let table_vpid = db_handle
-            .open_table(&mut self.pager, table)
-            .await?
-            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        crate::registry::table_get(&mut self.pager, table_vpid, key).await
+        let ek = crate::keyspace::encode_string(key);
+        self.get_physical(db, table, &ek).await
     }
 
     /// ⭐ 批量读 (MGET): LeafGuide 区间复用, 结果按输入顺序.
@@ -503,7 +551,12 @@ impl StorageEngine {
             .open_table(&mut self.pager, table)
             .await?
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        crate::registry::table_get_many(&mut self.pager, table_vpid, keys).await
+        // ⭐ Phase K: 每个 key 编码为 [S][klen][key] 再交给 registry.
+        // 编码后物理序 != 裸 key 序 (klen 前缀), 但 registry 内部按传入的
+        // 物理 key 排序走 LeafGuide, 结果按输入索引还原 — 一致性成立.
+        let encoded: Vec<Vec<u8>> = keys.iter().map(|k| crate::keyspace::encode_string(k)).collect();
+        let refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
+        crate::registry::table_get_many(&mut self.pager, table_vpid, &refs).await
     }
 
     /// ⭐ 批量写 (MSET): LeafGuide 区间复用, 同 leaf 一次 batch 提交.
@@ -520,8 +573,17 @@ impl StorageEngine {
             .await?
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
 
+        // ⭐ U2: MSET 覆盖异类旧值 — 逐 key purge 复合旧值 (与 SET 一致).
+        for (k, _) in pairs {
+            self.purge_composite_if_any(db, table, k).await?;
+        }
+        // ⭐ Phase K: 编码 key (value 借用不动, 避免大 value 拷贝).
+        let encoded: Vec<(Vec<u8>, &[u8])> = pairs
+            .iter()
+            .map(|(k, v)| (crate::keyspace::encode_string(k), v.as_slice()))
+            .collect();
         let new_root =
-            crate::registry::table_put_many(&mut self.pager, table_vpid, pairs).await?;
+            crate::registry::table_put_many(&mut self.pager, table_vpid, &encoded).await?;
 
         if let Some(new_root) = new_root {
             let db_handle = self.registry.open_db(db)?;
@@ -543,12 +605,8 @@ impl StorageEngine {
         table: &str,
         key: &[u8],
     ) -> Result<bool, RegistryError> {
-        let db_handle = self.registry.open_db(db)?;
-        let table_vpid = db_handle
-            .open_table(&mut self.pager, table)
-            .await?
-            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        crate::registry::table_delete(&mut self.pager, table_vpid, key).await
+        let ek = crate::keyspace::encode_string(key);
+        self.delete_physical(db, table, &ek).await
     }
 
     /// 暴露内部 DbRegistry (高级用法: 测试 / 调试).

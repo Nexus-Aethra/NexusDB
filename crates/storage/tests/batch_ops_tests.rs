@@ -60,9 +60,13 @@ fn get_many_orders_and_reuses_leaf() {
         assert_eq!(got[3].as_deref(), Some(b"val250".as_slice()));
         assert_eq!(got[4].as_deref(), Some(b"val1".as_slice()));
 
-        // travel 计数: 500 个顺序 key 的批量读, travel 次数应远小于 key 数
+        // travel 计数: 500 个顺序 key 的批量读, travel 次数应远小于 key 数.
+        // ⭐ Phase K: 直连 btree 需用编码后的物理 key ([S][klen][key]);
+        // 等长 key 编码后仍连续, 区间复用不受影响.
         let root = engine.open_table("db1", "t1").await.unwrap().unwrap();
-        let all: Vec<Vec<u8>> = (0..500u32).map(|i| format!("key{:05}", i).into_bytes()).collect();
+        let all: Vec<Vec<u8>> = (0..500u32)
+            .map(|i| storage::keyspace::encode_string(format!("key{:05}", i).as_bytes()))
+            .collect();
         let all_refs: Vec<&[u8]> = all.iter().map(|k| k.as_slice()).collect();
         let (results, travels) =
             storage::btree::btree_lookup_many(engine.pager_mut(), root, &all_refs)

@@ -202,6 +202,11 @@ fn main() {
                                     | BatchResult::DeleteExisted(_)
                                     | BatchResult::Values(_)
                                     | BatchResult::Integer(_)
+                                    | BatchResult::Double(_)
+                                    | BatchResult::Pairs(_)
+                                    | BatchResult::Members(_)
+                                    | BatchResult::OptMember(_)
+                                    | BatchResult::IntList(_)
                                     | BatchResult::MultiPutOk => {
                                         match op_type {
                                             0 => { total_put.fetch_add(1, Ordering::Relaxed); }

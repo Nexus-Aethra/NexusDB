@@ -175,6 +175,65 @@ pub fn leaf_get_with<R>(page: &[u8], key: &[u8], f: impl FnOnce(&[u8]) -> R) -> 
     }
 }
 
+/// ⭐ Phase R: 从 `start` 开始顺序扫描 leaf 内 `key >= start` 的全部 item.
+///
+/// 每命中一项以 `(key, value)` 借用回调 (零拷贝); 回调返回
+/// `ControlFlow::Break` 立即停止并上传 (供 limit / 前缀越界早停).
+/// 返回 `Break` 表示扫描被中断, `Continue` 表示本 leaf 扫尽.
+///
+/// **按 segment 逐段迭代** (段间有序、段内 `item_count` 界定), 不依赖
+/// `next()` 跨段, 与物理布局无关; 跳过哨兵 (seg0 空 key).
+pub fn leaf_scan_from<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()>>(
+    page: &[u8],
+    start: &[u8],
+    f: &mut F,
+) -> core::ops::ControlFlow<()> {
+    use core::ops::ControlFlow;
+    if page_type(page) != PageType::Leaf || page_check_magic(page).is_err() {
+        return ControlFlow::Continue(());
+    }
+    if page_key_count(page) == 0 {
+        return ControlFlow::Continue(());
+    }
+    let Ok(idx) = PageIndex::load(page, ItemKind::Leaf) else {
+        return ControlFlow::Continue(());
+    };
+    if idx.segments.is_empty() {
+        return ControlFlow::Continue(());
+    }
+    // start 非空 → 从其所在段开始 (更早的段全 < start); 空 → 从 seg0.
+    let start_seg = if start.is_empty() {
+        0
+    } else {
+        idx.locate_segment(start)
+    };
+    for seg_idx in start_seg..idx.segments.len() {
+        let seg = &idx.segments[seg_idx];
+        let Ok(mut ptr) = LeafItemPtr::new(page, seg.first_item_off as usize) else {
+            return ControlFlow::Continue(());
+        };
+        for item_i in 0..seg.item_count {
+            let cur_key = ptr.key();
+            // seg0 item0 是哨兵 (空 key), 跳过
+            let is_sentinel = seg_idx == 0 && item_i == 0 && cur_key.is_empty();
+            if !is_sentinel
+                && cur_key >= start
+                && let ControlFlow::Break(()) = f(cur_key, ptr.value())
+            {
+                return ControlFlow::Break(());
+            }
+            // 非末项才推进
+            if item_i + 1 < seg.item_count {
+                match ptr.next() {
+                    Ok(Some(p)) => ptr = p,
+                    _ => break,
+                }
+            }
+        }
+    }
+    ControlFlow::Continue(())
+}
+
 /// 在 leaf page 中插入 (key, value).
 ///
 /// 返回 `Ok(())` 表示成功, `Err(PageError::PageFull)` 表示空间不足.
