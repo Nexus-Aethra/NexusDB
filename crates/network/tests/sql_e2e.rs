@@ -23,6 +23,7 @@ fn start_sql_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
     let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
     mgr.create_db("app").expect("create db");
@@ -998,6 +999,7 @@ fn start_sql_server_n(workers: usize) -> (NetworkServer, Arc<ShardManager>) {
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: Some(workers.max(3)),
+        wal_mode: Default::default(),
     };
     let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
     mgr.create_db("app").expect("create db");
@@ -1072,6 +1074,286 @@ fn multi_worker_route_cache_consistency() {
 
     drop(c1);
     drop(c2);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+// ===== ⭐ 事务 v1 (F61): BEGIN/COMMIT/ROLLBACK =====
+
+/// 事务全流程: 可见性 / RYOW / ROLLBACK / DDL 拒绝 / unique 冲突零部分应用.
+#[test]
+fn mysql_transactions() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c1 = MyConn::handshake_login(&server, "");
+    let mut c2 = MyConn::handshake_login(&server, "");
+    c1.query("CREATE TABLE tx (id INT PRIMARY KEY, name TEXT NOT NULL, mail TEXT UNIQUE)");
+
+    // --- COMMIT 前另一连接不可见, RYOW 自见 ---
+    assert_eq!(c1.query("BEGIN"), QueryResult::Ok { affected: 0 });
+    for i in 0..5 {
+        assert_eq!(
+            c1.query(&format!("INSERT INTO tx VALUES ({i}, 'n{i}', 'm{i}@x')")),
+            QueryResult::Ok { affected: 1 }
+        );
+    }
+    // 另一连接: 不可见
+    assert_eq!(c2.query("SELECT * FROM tx WHERE id = 3"), QueryResult::Rows(vec![]));
+    // RYOW: 本连接 pk 点查见未提交行
+    assert_eq!(c1.ids("SELECT id FROM tx WHERE id = 3"), vec!["3"]);
+    // DDL 在事务中拒绝
+    assert!(matches!(
+        c1.query("CREATE TABLE t2 (id INT PRIMARY KEY)"),
+        QueryResult::Err { .. }
+    ));
+    // COMMIT → 双方可见
+    assert_eq!(c1.query("COMMIT"), QueryResult::Ok { affected: 5 });
+    assert_eq!(c2.ids("SELECT id FROM tx WHERE id = 3"), vec!["3"]);
+    assert_eq!(c2.ids("SELECT id FROM tx ORDER BY id").len(), 5);
+
+    // --- ROLLBACK 丢弃 (含 UPDATE/DELETE pk 混合) ---
+    c1.query("BEGIN");
+    c1.query("INSERT INTO tx VALUES (100, 'ghost', 'g@x')");
+    c1.query("UPDATE tx SET name = 'changed' WHERE id = 0");
+    c1.query("DELETE FROM tx WHERE id = 1");
+    assert_eq!(c1.query("ROLLBACK"), QueryResult::Ok { affected: 0 });
+    assert_eq!(c2.query("SELECT * FROM tx WHERE id = 100"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c2.query("SELECT name FROM tx WHERE id = 0"),
+        QueryResult::Rows(vec![vec![Some("n0".into())]])
+    );
+    assert_eq!(c2.ids("SELECT id FROM tx WHERE id = 1"), vec!["1"]);
+
+    // --- 事务中 UPDATE/DELETE 提交生效 ---
+    c1.query("BEGIN");
+    c1.query("UPDATE tx SET name = 'upd' WHERE id = 2");
+    c1.query("DELETE FROM tx WHERE id = 4");
+    assert_eq!(c1.query("COMMIT"), QueryResult::Ok { affected: 2 });
+    assert_eq!(
+        c2.query("SELECT name FROM tx WHERE id = 2"),
+        QueryResult::Rows(vec![vec![Some("upd".into())]])
+    );
+    assert_eq!(c2.query("SELECT * FROM tx WHERE id = 4"), QueryResult::Rows(vec![]));
+
+    // --- unique 冲突: 同 shard 时 commit 报错且零部分应用; 不同 shard 时
+    // 漏检 (O3 既有跨 shard 唯一性 gap, 非事务引入 — 稳定验证见
+    // mysql_txn_unique_single_shard) ---
+    c1.query("BEGIN");
+    c1.query("INSERT INTO tx VALUES (200, 'a', 'dup@x')");
+    c1.query("INSERT INTO tx VALUES (201, 'b', 'm0@x')"); // 与 id=0 的 mail 冲突
+    if let QueryResult::Err { ref msg, .. } = c1.query("COMMIT") {
+        assert!(msg.contains("duplicate"), "{msg}");
+        assert_eq!(c2.query("SELECT * FROM tx WHERE id = 201"), QueryResult::Rows(vec![]));
+    }
+
+    // --- 批内自冲突 (两行同 unique 值) ---
+    c1.query("BEGIN");
+    c1.query("INSERT INTO tx VALUES (300, 'x', 'same@x')");
+    c1.query("INSERT INTO tx VALUES (301, 'y', 'same@x')");
+    let r = c1.query("COMMIT");
+    // 同 shard 时预检拒; 跨 shard 时盘上探测各自过 (v1 gap) — 至少不 panic
+    if matches!(r, QueryResult::Err { .. }) {
+        assert_eq!(c2.query("SELECT * FROM tx WHERE id = 300"), QueryResult::Rows(vec![]));
+    }
+
+    // --- 重复 BEGIN 忽略 + 空事务 COMMIT ---
+    c1.query("BEGIN");
+    assert_eq!(c1.query("BEGIN"), QueryResult::Ok { affected: 0 });
+    assert_eq!(c1.query("COMMIT"), QueryResult::Ok { affected: 0 });
+
+    // --- 断连隐式回滚 ---
+    c1.query("BEGIN");
+    c1.query("INSERT INTO tx VALUES (400, 'drop', 'd@x')");
+    drop(c1);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(c2.query("SELECT * FROM tx WHERE id = 400"), QueryResult::Rows(vec![]));
+
+    drop(c2);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 事务 v1: 单 shard 集群下 unique 冲突必检出 + 零部分应用 (先验后写).
+#[test]
+fn mysql_txn_unique_single_shard() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1, // 单 shard: unique 探测无跨 shard 盲区
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u1 (id INT PRIMARY KEY, mail TEXT UNIQUE)");
+    assert_eq!(c.query("INSERT INTO u1 VALUES (1, 'a@x')"), QueryResult::Ok { affected: 1 });
+
+    // 盘上冲突: 预检拒 + 零部分应用 (2 号行也不落)
+    c.query("BEGIN");
+    c.query("INSERT INTO u1 VALUES (2, 'clean@x')");
+    c.query("INSERT INTO u1 VALUES (3, 'a@x')"); // 与 id=1 冲突
+    let r = c.query("COMMIT");
+    assert!(matches!(r, QueryResult::Err { ref msg, .. } if msg.contains("duplicate")), "{r:?}");
+    assert_eq!(c.query("SELECT * FROM u1 WHERE id = 2"), QueryResult::Rows(vec![]), "零部分应用");
+    assert_eq!(c.query("SELECT * FROM u1 WHERE id = 3"), QueryResult::Rows(vec![]));
+
+    // 批内自冲突: 预检拒
+    c.query("BEGIN");
+    c.query("INSERT INTO u1 VALUES (4, 'same@x')");
+    c.query("INSERT INTO u1 VALUES (5, 'same@x')");
+    let r = c.query("COMMIT");
+    assert!(
+        matches!(r, QueryResult::Err { ref msg, .. } if msg.contains("within transaction")),
+        "{r:?}"
+    );
+    assert_eq!(c.query("SELECT * FROM u1 WHERE id = 4"), QueryResult::Rows(vec![]));
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+// ===== ⭐ 事务 v2 (F62): 隔离级别 / OCC 冲突 / READ ONLY / SAVEPOINT =====
+
+/// 隔离级别语法 + SERIALIZABLE OCC 冲突检测 + RC 对照.
+#[test]
+fn mysql_isolation_levels() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c1 = MyConn::handshake_login(&server, "");
+    let mut c2 = MyConn::handshake_login(&server, "");
+    c1.query("CREATE TABLE iso (id INT PRIMARY KEY, v INT)");
+    c1.query("INSERT INTO iso VALUES (1, 10)");
+    c1.query("INSERT INTO iso VALUES (2, 20)");
+
+    // --- 语法全解析 (四级 + SET 变体) ---
+    for s in [
+        "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    ] {
+        assert_eq!(c1.query(s), QueryResult::Ok { affected: 0 }, "{s}");
+    }
+    // 复位默认
+    c1.query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED");
+
+    // --- SERIALIZABLE: 不可重复读防护 (读过的行被并发改 → commit 拒) ---
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(
+        c1.query("SELECT v FROM iso WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("10".into())]])
+    );
+    // 另一连接并发改 id=1 并提交
+    assert_eq!(
+        c2.query("UPDATE iso SET v = 99 WHERE id = 1"),
+        QueryResult::Ok { affected: 1 }
+    );
+    // 本事务写 (基于已读的过期值) → commit 必须 1213
+    c1.query("UPDATE iso SET v = 11 WHERE id = 1");
+    let r = c1.query("COMMIT");
+    assert!(
+        matches!(r, QueryResult::Err { code: 1213, .. }),
+        "SERIALIZABLE 冲突应回 1213: {r:?}"
+    );
+    // 冲突未应用: c2 的 99 保留
+    assert_eq!(
+        c2.query("SELECT v FROM iso WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("99".into())]])
+    );
+    // 重试成功 (ORM 标准路径)
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    c1.query("SELECT v FROM iso WHERE id = 1");
+    c1.query("UPDATE iso SET v = 11 WHERE id = 1");
+    assert_eq!(c1.query("COMMIT"), QueryResult::Ok { affected: 1 });
+
+    // --- RC 对照: 同场景 last-writer-wins 成功 ---
+    c1.query("BEGIN"); // 默认 RC
+    c1.query("SELECT v FROM iso WHERE id = 2");
+    c2.query("UPDATE iso SET v = 200 WHERE id = 2");
+    c1.query("UPDATE iso SET v = 21 WHERE id = 2");
+    assert_eq!(c1.query("COMMIT"), QueryResult::Ok { affected: 1 }, "RC 无读集验证");
+
+    // --- SER 读到的行未变 → commit 成功 (无假阳性) ---
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    c1.query("SELECT v FROM iso WHERE id = 1");
+    c1.query("UPDATE iso SET v = 12 WHERE id = 1");
+    assert_eq!(c1.query("COMMIT"), QueryResult::Ok { affected: 1 });
+
+    // --- 纯读 SER 事务: 无写不验证, 直接成功 ---
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    c1.query("SELECT v FROM iso WHERE id = 1");
+    c2.query("UPDATE iso SET v = 1000 WHERE id = 1");
+    assert_eq!(c1.query("COMMIT"), QueryResult::Ok { affected: 0 });
+
+    // --- READ ONLY: 写拒 1792 ---
+    c1.query("BEGIN READ ONLY");
+    let r = c1.query("INSERT INTO iso VALUES (3, 30)");
+    assert!(matches!(r, QueryResult::Err { code: 1792, .. }), "{r:?}");
+    assert_eq!(
+        c1.query("SELECT v FROM iso WHERE id = 2"),
+        QueryResult::Rows(vec![vec![Some("21".into())]]),
+        "READ ONLY 可读"
+    );
+    c1.query("COMMIT");
+
+    drop(c1);
+    drop(c2);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// SAVEPOINT: 嵌套部分回滚 / RELEASE / 非事务报错.
+#[test]
+fn mysql_savepoints() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE sp (id INT PRIMARY KEY, v TEXT NOT NULL)");
+
+    // 非事务中 SAVEPOINT 报错
+    assert!(matches!(c.query("SAVEPOINT s1"), QueryResult::Err { .. }));
+
+    c.query("BEGIN");
+    c.query("INSERT INTO sp VALUES (1, 'keep')");
+    c.query("SAVEPOINT s1");
+    c.query("INSERT INTO sp VALUES (2, 'drop-me')");
+    c.query("INSERT INTO sp VALUES (3, 'drop-me-too')");
+    // 回滚到 s1: 2/3 丢弃, 1 保留
+    assert_eq!(c.query("ROLLBACK TO SAVEPOINT s1"), QueryResult::Ok { affected: 0 });
+    // RYOW 验证: 2 不可见, 1 可见
+    assert_eq!(c.query("SELECT * FROM sp WHERE id = 2"), QueryResult::Rows(vec![]));
+    assert_eq!(c.ids("SELECT id FROM sp WHERE id = 1"), vec!["1"]);
+    // 继续写 + 再次回滚到同一 savepoint (PG 允许)
+    c.query("INSERT INTO sp VALUES (4, 'also-drop')");
+    c.query("ROLLBACK TO s1");
+    // RELEASE 后名字失效
+    assert_eq!(c.query("RELEASE SAVEPOINT s1"), QueryResult::Ok { affected: 0 });
+    assert!(matches!(c.query("ROLLBACK TO s1"), QueryResult::Err { .. }));
+    c.query("INSERT INTO sp VALUES (5, 'final')");
+    assert_eq!(c.query("COMMIT"), QueryResult::Ok { affected: 2 }); // 1 + 5
+
+    assert_eq!(c.ids("SELECT id FROM sp ORDER BY id"), vec!["1", "5"]);
+
+    drop(c);
     server.shutdown().unwrap();
     drop(mgr);
 }

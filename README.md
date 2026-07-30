@@ -307,6 +307,15 @@ Overflow 数据页:
 
 **预处理语句 (ORM 接轨)**: `?` (MySQL) / `$n` (PG) 占位符, AST 模板绑定 (零注入面); MySQL COM_STMT_* (二进制参数/结果集) + PG 扩展查询协议 (Parse/Bind/Describe/Execute/Sync)。实测驱动: mysql-connector-python (prepared=True)、psycopg3; Go database/sql、JDBC、mysql2、node-postgres、pgx 同协议路径。asyncpg (Flush 时序依赖) 暂不保证。
 
+**事务 (F61 v1 + F62 v2)**: `BEGIN / START TRANSACTION / COMMIT / ROLLBACK` 双协议。conn 层 write_set 缓冲, COMMIT 时按 shard 分组原子批应用 (先验后写 + WAL fsync 后才回复 — **COMMIT 返回即持久**, 独立于 wal_mode)。
+
+| 隔离级别 | 实现 | 语义 |
+|---|---|---|
+| READ UNCOMMITTED / READ COMMITTED | RC (默认) | 读已提交 + 本事务 pk 点查 RYOW |
+| REPEATABLE READ / SERIALIZABLE | 行级 OCC 验证 | 事务内 pk 点查记指纹, commit 时重读比对 — 并发修改 → **40001/1213** 让 ORM 重试; 防脏读/不可重复读/丢失更新/行级写偏斜, **不防幻读** (扫描读不进读集) |
+
+语法: `SET [SESSION] TRANSACTION ISOLATION LEVEL ... [READ ONLY|READ WRITE]`、`BEGIN ISOLATION LEVEL ... [READ ONLY]`、`SAVEPOINT / ROLLBACK TO / RELEASE` (SQLAlchemy 嵌套事务模式, PG E 态下 ROLLBACK TO 可恢复)。PG 事务块状态 (I/T/E + 25P02) 与 MySQL IN_TRANS 标志完整 — psycopg3 默认事务模式/`isolation_level=SERIALIZABLE` (SerializationFailure 类型化捕获) 与 mysql-connector 实测全通。v1/v2 边界: 单 shard 事务严格原子, 跨 shard best-effort; ROLLBACK/断连零成本丢弃; DDL 事务中拒绝。
+
 ```bash
 mysql -h127.0.0.1 -P5434 -uroot -ps3cret --default-auth=mysql_native_password
 psql "host=127.0.0.1 port=5435 user=root dbname=default password=s3cret"
@@ -352,7 +361,7 @@ DROP TABLE users;  USE db1;  DESCRIBE users;               -- 工具命令
 | DELETE / INSERT (pk) | ~11K qps | 0.11ms |
 | 全表扫 5K 行 (+过滤/COUNT) | ~70 qps | 55ms |
 
-> SQL gap (记录在案): 无 JOIN / GROUP BY / OR / 子查询 / 事务 / ALTER / 预处理语句 / TLS / SCRAM (PG 仅 cleartext); LIKE 仅前缀模式; **UNIQUE 跨 shard 漏检** (探测仅本 shard); DELETE/UPDATE 两阶段与多行 INSERT 非原子; ORDER BY 无 top-k (全量排序); schema 广播非原子 (幂等重试)。
+> SQL gap (记录在案): 无 JOIN / GROUP BY / OR / 子查询 / ALTER / TLS / SCRAM (PG 仅 cleartext); LIKE 仅前缀模式; **UNIQUE 跨 shard 漏检** (探测仅本 shard); 非事务的 DELETE/UPDATE 两阶段与多行 INSERT 非原子 (事务内单 shard 原子); 事务跨 shard best-effort; ORDER BY 无 top-k (全量排序); schema 广播非原子 (幂等重试)。
 
 ### REST 门面 (HTTP/1.1, 6778, 2026-07-30)
 

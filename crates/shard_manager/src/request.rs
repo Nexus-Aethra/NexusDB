@@ -90,6 +90,11 @@ pub enum ShardRequest {
     },
     /// 在本 shard 创建 db (MVP: 单 shard, 未来 T14 改 2PC 跨 shard).
     CreateDb { db: String, reply: ReplySender },
+    /// ⭐ D2 (分库): 读本 shard 的 (DbId, name) 全表 — DbDirView 初始化/刷新用.
+    ListDbsWithIds { reply: ReplySender },
+    /// ⭐ Q5 (SQL 索引): 设置表 schema (序列化字节) — ShardManager 顺序
+    /// 广播全 shard (控制面低频, 幂等; 本轮不走 2PC). 回 PutOk.
+    SetSchema { db: String, table: String, bytes: Vec<u8>, reply: ReplySender },
     // =================================================================
     // ⭐ T14: 2PC 协议消息
     // =================================================================
@@ -272,11 +277,214 @@ pub enum BatchOp {
     // ---- ⭐ Phase B: Bitmap (String 字节 RMW) ----
     /// SETBIT key offset 0|1: shard 端 RMW (零扩展), 返回旧 bit (Integer).
     SetBit { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, offset: u64, bit: bool },
+    // ---- ⭐ Q5: SQL row 表 (本地二级索引; 见 storage::sql_rows) ----
+    /// 插入/覆盖一行: 按 PK 路由, shard 端引擎内部维护索引行 (同 shard 原子).
+    RowPut { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8>, values: Vec<storage::row::ColValue> },
+    /// 主键点查: 回 GetValue (TAG_ROW 字节).
+    RowGet { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8> },
+    /// 删一行 (含全部索引行): 回 DeleteExisted.
+    RowDelete { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8> },
+    /// ⭐ S1: 部分列更新 — shard 端读-改-写 (单 shard 原子, UNIQUE/索引跟随).
+    /// sets = (列号, 新值); 回 DeleteExisted (true = 行存在且已更新).
+    RowUpdate { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8>, sets: Vec<(u16, storage::row::ColValue)> },
+    /// ⭐ S1: 广播 op — 数据面删表 (物理数据 + schema/bloom 派生状态). 回 PutOk.
+    DropTableOp { db: std::sync::Arc<str>, table: std::sync::Arc<str> },
+    /// ⭐ S2: 广播 op — 全表扫 (`[S]` 前缀收 TAG_ROW 行, 跳过纯 KV 行).
+    /// 回 Rows ((空 val, pk, row)); limit 每 shard 本地生效 (0 = 不限).
+    TableScan { db: std::sync::Arc<str>, table: std::sync::Arc<str>, limit: u32 },
+    /// ⭐ 事务 v1 (F61): COMMIT 原子批 — worker 把 conn 层 write_set 按 shard
+    /// 分组后每 shard 一个; shard 单线程保证批内无并发穿插 (先验后写 +
+    /// wal_barrier 后回复). 组内 op 同 shard (worker 路由保证).
+    /// ⭐ v2 (F62): read_set = OCC backward validation 输入 (SERIALIZABLE 档
+    /// 事务内读过的行指纹, 预检阶段重读比对, 变了回 40001).
+    TxnApply { ops: Vec<BatchOp>, read_set: Vec<ReadCheck> },
+    /// ⭐ 广播 op: caller 对**每个 shard** 各发一份 (不走 hash 路由),
+    /// shard 内闭环 "本地索引扫 → 本地回表", 回 Rows; 界为闭区间,
+    /// limit 每 shard 本地生效 (0 = 不限), 聚合方归并后截断.
+    IndexScan {
+        db: std::sync::Arc<str>,
+        table: std::sync::Arc<str>,
+        iid: u32,
+        lo: Option<storage::row::ColValue>,
+        hi: Option<storage::row::ColValue>,
+        limit: u32,
+        with_rows: bool,
+    },
+    /// ⭐ X2 (SQL 落地): 数据面 schema 分发 — worker 逐 shard 广播
+    /// (shard 端 ensure_table + set_schema, 幂等; worker 不持控制面). 回 PutOk.
+    SetSchemaOp { db: std::sync::Arc<str>, table: std::sync::Arc<str>, bytes: Vec<u8> },
+    /// ⭐ X2: 读表 schema 字节 (worker 缓存 miss 时定向 shard 0). 回 GetValue.
+    GetSchemaOp { db: std::sync::Arc<str>, table: std::sync::Arc<str> },
+}
+
+impl BatchOp {
+    /// ⭐ T1: (db, table, 路由 key) 单源提取 — 路由 hash 与 shard 端惰性建表共用.
+    /// Multi op 按第一个 key (worker 已预分组, 批内同 shard 同表).
+    pub fn locator(&self) -> (&str, &str, &[u8]) {
+        use BatchOp::*;
+        match self {
+            Put { db, table, key, .. }
+            | Get { db, table, key }
+            | Delete { db, table, key }
+            | Incr { db, table, key, .. }
+            | IncrFloat { db, table, key, .. }
+            | Append { db, table, key, .. }
+            | SetNx { db, table, key, .. }
+            | GetDel { db, table, key }
+            | GetSet { db, table, key, .. }
+            | SetRange { db, table, key, .. }
+            | HSet { db, table, key, .. }
+            | HSetNx { db, table, key, .. }
+            | HGet { db, table, key, .. }
+            | HMGet { db, table, key, .. }
+            | HDel { db, table, key, .. }
+            | HLen { db, table, key }
+            | HGetAll { db, table, key }
+            | HIncrBy { db, table, key, .. }
+            | HIncrByFloat { db, table, key, .. }
+            | SAdd { db, table, key, .. }
+            | SRem { db, table, key, .. }
+            | SIsMember { db, table, key, .. }
+            | SCard { db, table, key }
+            | SMembers { db, table, key }
+            | SPop { db, table, key }
+            | SRandMember { db, table, key }
+            | LPush { db, table, key, .. }
+            | LPop { db, table, key, .. }
+            | LLen { db, table, key }
+            | LRange { db, table, key, .. }
+            | LIndex { db, table, key, .. }
+            | LSet { db, table, key, .. }
+            | ZAdd { db, table, key, .. }
+            | ZRem { db, table, key, .. }
+            | ZScore { db, table, key, .. }
+            | ZCard { db, table, key }
+            | ZIncrBy { db, table, key, .. }
+            | ZRange { db, table, key, .. }
+            | ZRangeByScore { db, table, key, .. }
+            | ZRank { db, table, key, .. }
+            | ZCount { db, table, key, .. }
+            | ZMScore { db, table, key, .. }
+            | ZPop { db, table, key, .. }
+            | SMisMember { db, table, key, .. }
+            | SPopN { db, table, key, .. }
+            | SRandCount { db, table, key, .. }
+            | HRandField { db, table, key, .. }
+            | LRem { db, table, key, .. }
+            | LTrim { db, table, key, .. }
+            | LPos { db, table, key, .. }
+            | LInsert { db, table, key, .. }
+            | SetBit { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
+            // ⭐ Q5: row op 以 PK 为路由 key (索引行与 row co-location 的根基);
+            // IndexScan 是广播 op 不走 locator 路由, 兜底返回空 key.
+            RowPut { db, table, pk, .. }
+            | RowGet { db, table, pk }
+            | RowDelete { db, table, pk }
+            | RowUpdate { db, table, pk, .. } => (db.as_ref(), table.as_ref(), pk.as_slice()),
+            IndexScan { db, table, .. } | DropTableOp { db, table } | TableScan { db, table, .. } => {
+                (db.as_ref(), table.as_ref(), &[])
+            }
+            // ⭐ 事务批: 取第一个 op 的 locator (组内同 shard, 仅兼容用;
+            // ensure_table 在 shard 端逐 op 处理)
+            TxnApply { ops, .. } => ops.first().map(|o| o.locator()).unwrap_or(("", "", &[])),
+            SetSchemaOp { db, table, .. } | GetSchemaOp { db, table } => {
+                (db.as_ref(), table.as_ref(), &[])
+            }
+            MultiGet { db, table, keys } => (
+                db.as_ref(),
+                table.as_ref(),
+                keys.first().map(|k| k.as_slice()).unwrap_or(&[]),
+            ),
+            MultiPut { db, table, pairs } | MultiPutNx { db, table, pairs } => (
+                db.as_ref(),
+                table.as_ref(),
+                pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
+            ),
+        }
+    }
+
+    /// ⭐ T2 (分表): 单 key op 的 (table, key) 可变访问 — worker 冒号前缀
+    /// 选表在 push 前就地重写. Multi op 返回 None (dispatch 已按 key 预分组).
+    pub fn table_key_mut(&mut self) -> Option<(&mut std::sync::Arc<str>, &mut Vec<u8>)> {
+        use BatchOp::*;
+        match self {
+            Put { table, key, .. }
+            | Get { table, key, .. }
+            | Delete { table, key, .. }
+            | Incr { table, key, .. }
+            | IncrFloat { table, key, .. }
+            | Append { table, key, .. }
+            | SetNx { table, key, .. }
+            | GetDel { table, key, .. }
+            | GetSet { table, key, .. }
+            | SetRange { table, key, .. }
+            | HSet { table, key, .. }
+            | HSetNx { table, key, .. }
+            | HGet { table, key, .. }
+            | HMGet { table, key, .. }
+            | HDel { table, key, .. }
+            | HLen { table, key, .. }
+            | HGetAll { table, key, .. }
+            | HIncrBy { table, key, .. }
+            | HIncrByFloat { table, key, .. }
+            | SAdd { table, key, .. }
+            | SRem { table, key, .. }
+            | SIsMember { table, key, .. }
+            | SCard { table, key, .. }
+            | SMembers { table, key, .. }
+            | SPop { table, key, .. }
+            | SRandMember { table, key, .. }
+            | LPush { table, key, .. }
+            | LPop { table, key, .. }
+            | LLen { table, key, .. }
+            | LRange { table, key, .. }
+            | LIndex { table, key, .. }
+            | LSet { table, key, .. }
+            | ZAdd { table, key, .. }
+            | ZRem { table, key, .. }
+            | ZScore { table, key, .. }
+            | ZCard { table, key, .. }
+            | ZIncrBy { table, key, .. }
+            | ZRange { table, key, .. }
+            | ZRangeByScore { table, key, .. }
+            | ZRank { table, key, .. }
+            | ZCount { table, key, .. }
+            | ZMScore { table, key, .. }
+            | ZPop { table, key, .. }
+            | SMisMember { table, key, .. }
+            | SPopN { table, key, .. }
+            | SRandCount { table, key, .. }
+            | HRandField { table, key, .. }
+            | LRem { table, key, .. }
+            | LTrim { table, key, .. }
+            | LPos { table, key, .. }
+            | LInsert { table, key, .. }
+            | SetBit { table, key, .. } => Some((table, key)),
+            MultiGet { .. } | MultiPut { .. } | MultiPutNx { .. } => None,
+            // ⭐ Q5: SQL row op 的 pk 是二进制主键, 不参与 RESP 冒号选表
+            RowPut { .. } | RowGet { .. } | RowDelete { .. } | RowUpdate { .. }
+            | IndexScan { .. } | DropTableOp { .. } | TableScan { .. } => None,
+            // ⭐ X2: schema op 无 key
+            SetSchemaOp { .. } | GetSchemaOp { .. } => None,
+            TxnApply { .. } => None,
+        }
+    }
 }
 
 /// ⭐ value type tag: 与 network::value_codec 单源共享 (定义在 value_num).
 /// 协议门面写入的 stored value = `[tag][payload]`. shard 端 RMW 需剥/加 tag.
 pub use crate::value_num::TAG_RAW as VALUE_TAG_RAW;
+
+/// ⭐ v2 (F62): OCC 读集验证项 — SERIALIZABLE 事务内读过的 (db, table, pk)
+/// 及当时行字节的 crc32 指纹 (None = 读时不存在). commit 时 shard 端重读
+/// 比对 — 变了即 serialization failure (40001/1213), 整批拒.
+#[derive(Debug, Clone)]
+pub struct ReadCheck {
+    pub db: String,
+    pub table: String,
+    pub pk: Vec<u8>,
+    pub fp: Option<u32>,
+}
 
 /// 单个 batch 操作的结果.
 ///
@@ -302,6 +510,12 @@ pub enum BatchResult {
     OptMember(Option<Vec<u8>>),
     /// ⭐ C1: 整数列表 (SMISMEMBER → *N 个 :0/:1).
     IntList(Vec<i64>),
+    /// ⭐ Q5: 索引扫描结果 `(索引原值, pk, row_bytes)` — 单 shard 内按
+    /// (val, pk) 升序; 跨 shard 归并直接按同键排序即全局序.
+    /// `with_rows = false` 时 row_bytes 为空 (覆盖索引).
+    Rows(Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>),
+    /// ⭐ 事务 v1 (F61): TxnApply 完成 (应用的 op 数).
+    TxnApplied(u64),
     Error(String),
 }
 
@@ -369,6 +583,8 @@ pub enum ShardReply {
     FlushOk,
     /// Batch 结果: 与 ops 一一对应.
     BatchResults(Vec<BatchResult>),
+    /// ⭐ D2 (分库): (DbId, name) 全表.
+    DbList(Vec<(u32, String)>),
 }
 
 /// 错误类型. 暂时简化, 后面按 storage 错误细分.

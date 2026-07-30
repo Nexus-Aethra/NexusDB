@@ -285,6 +285,53 @@ enum SqlDmlAction {
     Update(Vec<(u16, ColValue)>),
 }
 
+/// ⭐ 事务 v1 (F61): conn 层事务缓冲 — BEGIN..COMMIT 间写语句截流,
+/// shard/调度器零事务状态 (时间维度: 交互式间隙不占 shard;
+/// 空间维度: 跨 shard 编排本就在 worker). COMMIT 时按 shard 分组为
+/// TxnApply 原子批. 断连/drop 自然丢弃 = 隐式回滚.
+struct TxnState {
+    /// 保序 write_set (只 append; 同 key 多写按序重放语义正确).
+    ops: Vec<BatchOp>,
+    /// (db, table, pk) → 最新 op 下标 (RYOW pk 点查).
+    index: HashMap<(String, String, Vec<u8>), usize>,
+    /// 粗估字节 (上限护栏).
+    bytes: usize,
+    /// ⭐ v2 (F62): 隔离级别 (Serializable = OCC 读集验证).
+    iso: sql::TxnIso,
+    /// ⭐ v2 (F62): 只读事务 (写语句拒 25006).
+    read_only: bool,
+    /// ⭐ v2 (F62): OCC 读集 — 首读指纹为准 (不覆盖); ROLLBACK TO 后
+    /// 保留 (保守更严格, 正确性无损).
+    read_set: HashMap<(String, String, Vec<u8>), Option<u32>>,
+    /// ⭐ v2 (F62): savepoint 栈 (name, ops 水位).
+    savepoints: Vec<(String, usize)>,
+}
+
+impl TxnState {
+    fn new(iso: sql::TxnIso, read_only: bool) -> Self {
+        Self {
+            ops: Vec::new(),
+            index: HashMap::new(),
+            bytes: 0,
+            iso,
+            read_only,
+            read_set: HashMap::new(),
+            savepoints: Vec::new(),
+        }
+    }
+}
+
+/// 事务缓冲上限 (超限报错并自动回滚 — 巨型事务非 v1 目标).
+const TXN_MAX_OPS: usize = 8192;
+const TXN_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// ⭐ 事务 v1 (F61): COMMIT 的 TxnApply 多 shard 计数聚合.
+struct SqlTxnAgg {
+    remaining: usize,
+    applied: u64,
+    error: Option<String>,
+}
+
 /// ⭐ S1: DML 计数聚合 (INSERT 多行 / DELETE/UPDATE phase2 / DROP 广播).
 /// 完成 → OK affected=n; DeleteExisted(true) 与 PutOk 各计 1.
 struct SqlDmlAgg {
@@ -304,6 +351,8 @@ struct SqlRowCtx {
     proj: Vec<u16>,
     /// ⭐ S2: COUNT(*) — 回单行 0/1.
     count: bool,
+    /// ⭐ v2 (F62): OCC 读集记录坐标 (SERIALIZABLE 事务内的 pk 点查).
+    read_key: Option<(String, String, Vec<u8>)>,
 }
 
 /// schema 缓存 miss 时挂起的语句 (GetSchemaOp 结果到达后续跑).
@@ -444,6 +493,16 @@ struct ConnState {
     sql_ddl_agg: HashMap<u64, SqlDdlAgg>,
     /// ⭐ S1: DML 计数聚合 (多行 INSERT / DELETE·UPDATE phase2 / DROP 广播).
     sql_dml_agg: HashMap<u64, SqlDmlAgg>,
+    /// ⭐ 事务 v1 (F61): 当前事务缓冲 (None = autocommit).
+    txn: Option<TxnState>,
+    /// ⭐ 事务 v1 (F61): PG 语义 — 事务内语句出错后拒后续 (25P02),
+    /// COMMIT/ROLLBACK 清位. MySQL 语义不置位 (语句失败事务继续).
+    txn_failed: bool,
+    /// ⭐ 事务 v1 (F61): COMMIT 聚合 (seq → 多 shard TxnApply 计数).
+    sql_txn_agg: HashMap<u64, SqlTxnAgg>,
+    /// ⭐ v2 (F62): 连接级默认隔离级别/读写属性 (SET SESSION TRANSACTION).
+    default_iso: sql::TxnIso,
+    default_ro: bool,
     /// ⭐ X3: SELECT 索引路径广播聚合 (seq → 状态).
     sql_select_agg: HashMap<u64, SqlSelectAgg>,
     /// ⭐ X3: SELECT pk 点查渲染上下文 (seq → 状态).
@@ -566,6 +625,11 @@ impl ConnState {
             sql_shared,
             sql_ddl_agg: HashMap::new(),
             sql_dml_agg: HashMap::new(),
+            txn: None,
+            txn_failed: false,
+            sql_txn_agg: HashMap::new(),
+            default_iso: sql::TxnIso::default(),
+            default_ro: false,
             sql_select_agg: HashMap::new(),
             sql_row_ctx: HashMap::new(),
             sql_pending: HashMap::new(),
@@ -630,13 +694,44 @@ impl ConnState {
     fn resp_complete(&mut self, seq: u64, bytes: Vec<u8>) {
         // ⭐ P3: PG 扩展查询批次 — 响应前拼 [ParseComplete][BindComplete]... 前缀
         // (单点侵入; 非 Pg conn 恒空查零开销)
-        let bytes = match self.pg_ext.remove(&seq) {
+        let mut bytes = match self.pg_ext.remove(&seq) {
             Some(mut prefix) => {
                 prefix.extend_from_slice(&bytes);
                 prefix
             }
             None => bytes,
         };
+        // ⭐ 事务 v1 (F61): 协议级事务状态单点注入 (免渲染函数签名扩散)
+        match self.proto {
+            ProtocolKind::Pg => {
+                // 事务内遇 ErrorResponse → 置 failed (后续语句 25P02 拦截)
+                if self.txn.is_some() && !self.txn_failed && pg_frames_contain_error(&bytes) {
+                    self.txn_failed = true;
+                }
+                // 尾部 ReadyForQuery 状态字节: I idle / T in-txn / E failed
+                let n = bytes.len();
+                if n >= 6 && bytes[n - 6] == b'Z' && bytes[n - 5..n - 1] == [0, 0, 0, 5] {
+                    bytes[n - 1] = if self.txn_failed {
+                        b'E'
+                    } else if self.txn.is_some() {
+                        b'T'
+                    } else {
+                        b'I'
+                    };
+                }
+            }
+            ProtocolKind::Sql if self.txn.is_some() => {
+                // 纯 OK 包 (单包且 payload 首字节 0x00) → status |= IN_TRANS
+                let n = bytes.len();
+                if n >= 11
+                    && bytes[4] == 0x00
+                    && u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]) as usize + 4 == n
+                {
+                    bytes[n - 4] |= 0x01; // SERVER_STATUS_IN_TRANS
+                }
+            }
+            _ => {}
+        }
         self.pending.insert(seq, bytes);
         self.resp_flush_ready();
     }
@@ -2349,6 +2444,17 @@ fn handle_resp_shard_result(
     // ⭐ X3: SELECT pk 点查 — decode + 全条件过滤 → 0/1 行 (⭐ S2: COUNT → 计数)
     if let Some(ctx) = conn.sql_row_ctx.remove(&seq) {
         let bin = conn.mysql_binary.remove(&seq);
+        // ⭐ v2 (F62): SERIALIZABLE 读集记录 — 首读指纹为准 (entry 不覆盖);
+        // RYOW 命中 write_set 的读不经此路径 (读自己的写无需验证)
+        if let Some(key) = ctx.read_key.clone()
+            && let Some(txn) = conn.txn.as_mut()
+        {
+            let fp = match &result {
+                BatchResult::GetValue(Some(row)) => Some(storage::wal::crc32(row)),
+                _ => None,
+            };
+            txn.read_set.entry(key).or_insert(fp);
+        }
         let bytes = match result {
             BatchResult::GetValue(Some(row)) => {
                 match storage::row::decode_row(&ctx.schema, row) {
@@ -2427,6 +2533,20 @@ fn handle_resp_shard_result(
             Fire::No => {}
             Fire::Reply(bytes) => conn.resp_complete(seq, bytes),
             Fire::Dml { pks, action, target } => {
+                // ⭐ 事务 v1 (F61): 两阶段 DML 的 phase2 在事务中截流
+                // (phase1 读的是已提交态 — v1 文档化语义)
+                if conn.txn.is_some() {
+                    let n = pks.len() as u64;
+                    for pk in pks {
+                        let op = sql_dml_op(&target.0, &target.1, pk, &action);
+                        if let Err(e) = txn_buffer_op(conn, op) {
+                            conn.resp_complete(seq, sql_err_bytes(proto, &e));
+                            return;
+                        }
+                    }
+                    conn.resp_complete(seq, sql_ok_bytes(proto, n));
+                    return;
+                }
                 // phase2: 逐 pk 按路由下发 (DML 禁早停保证此刻 phase1 已 drained,
                 // 同 seq 注册 dml_agg 无双聚合并存)
                 debug_assert!(drained, "DML phase1 必须全量回齐后才 fire");
@@ -2451,6 +2571,27 @@ fn handle_resp_shard_result(
                     }
                 }
             }
+        }
+        return;
+    }
+    // ⭐ 事务 v1 (F61): COMMIT 的 TxnApply 多 shard 聚合 — 全 OK 回 commit ok
+    // (此刻各 shard 已 wal_barrier, 回复到达 ⇒ 已持久);
+    // 任一失败回错 (跨 shard 已应用分片不回滚 — v1 gap 文档化)
+    if let Some(agg) = conn.sql_txn_agg.get_mut(&seq) {
+        match result {
+            BatchResult::TxnApplied(n) => agg.applied += n,
+            BatchResult::Error(e) => agg.error = Some(e.clone()),
+            _ => agg.error = Some("unexpected reply".into()),
+        }
+        agg.remaining -= 1;
+        if agg.remaining == 0 {
+            let agg = conn.sql_txn_agg.remove(&seq).expect("just checked");
+            conn.mysql_binary.remove(&seq);
+            let bytes = match agg.error {
+                Some(e) => sql_err_bytes(conn.proto, &format!("commit failed: {e}")),
+                None => sql_ok_bytes(conn.proto, agg.applied),
+            };
+            conn.resp_complete(seq, bytes);
         }
         return;
     }
@@ -2882,6 +3023,8 @@ fn handle_resp_shard_result(
     }
 
     let bytes = match result {
+        // ⭐ 事务 v1: TxnApplied 只出现在 SQL 门面 (上方 sql_txn_agg 已拦截)
+        BatchResult::TxnApplied(_) => codec.encode_error("unexpected txn reply"),
         BatchResult::PutOk | BatchResult::MultiPutOk => codec.encode_ok(),
         BatchResult::GetValue(None) => codec.encode_nil(),
         BatchResult::GetValue(Some(stored)) => {
@@ -3057,6 +3200,7 @@ fn request_to_batch_op(req: Request, db: &std::sync::Arc<str>, table: &std::sync
 fn batch_result_to_response(result: &BatchResult) -> Response {
     match result {
         BatchResult::PutOk => Response::PutOk,
+        BatchResult::TxnApplied(_) => Response::PutOk, // 事务批不走 Binary 门面
         BatchResult::GetValue(None) => Response::Get(None),
         BatchResult::GetValue(Some(stored)) => {
             let (_tag, payload) = decode_value(stored);
@@ -3268,6 +3412,90 @@ fn render_bit(codec: &RespCodec, ctx: BitCtx, result: &BatchResult) -> Vec<u8> {
 // =====================================================================
 
 /// 语句分派: CREATE 广播 schema; INSERT/SELECT 需 schema (缓存 miss 先拉).
+/// ⭐ 事务 v1 (F61): PG 帧流中是否含 ErrorResponse ('E' 帧) —
+/// resp_complete 单点检测, 事务内出错置 failed (25P02 语义).
+fn pg_frames_contain_error(bytes: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while pos + 5 <= bytes.len() {
+        let ty = bytes[pos];
+        let len = u32::from_be_bytes([
+            bytes[pos + 1],
+            bytes[pos + 2],
+            bytes[pos + 3],
+            bytes[pos + 4],
+        ]) as usize;
+        if ty == b'E' {
+            return true;
+        }
+        pos += 1 + len.max(4); // len 含自身 4B
+    }
+    false
+}
+
+/// ⭐ W2/事务 v1: RowPut 喂进程级路由 bloom (value → shard).
+/// 事务缓冲时也喂 — rollback 后只多假阳性 (只增语义无害);
+/// commit 时不重复喂.
+fn feed_route_bloom(
+    conn: &ConnState,
+    db: &str,
+    table: &str,
+    schema: &TableSchema,
+    op: &BatchOp,
+    sid: usize,
+) {
+    let sh = &conn.sql_shared;
+    let ckey = (db.to_string(), table.to_string());
+    if !sh.created_here.read().unwrap().contains(&ckey) {
+        return;
+    }
+    let BatchOp::RowPut { values, .. } = op else { return };
+    for idx in schema.indexes.iter() {
+        let ty = schema.columns[idx.col as usize].ty;
+        if let Some(enc) = storage::sql_rows::index_val_bytes(ty, &values[idx.col as usize]) {
+            let entry = sh
+                .routes
+                .read()
+                .unwrap()
+                .get(&(ckey.0.clone(), ckey.1.clone(), idx.iid))
+                .cloned();
+            if let Some(blooms) = entry {
+                blooms[sid].insert(&enc);
+            }
+        }
+    }
+}
+
+/// ⭐ v2 (F62): SERIALIZABLE 事务内的 pk 点查 → 读集记录坐标
+/// (RC/非事务回 None 零开销).
+fn sql_read_key(
+    conn: &ConnState,
+    db: &std::sync::Arc<str>,
+    table: &str,
+    pk: &[u8],
+) -> Option<(String, String, Vec<u8>)> {
+    conn.txn
+        .as_ref()
+        .filter(|t| t.iso == sql::TxnIso::Serializable)
+        .map(|_| (db.to_string(), table.to_string(), pk.to_vec()))
+}
+
+/// ⭐ 事务 v1 (F61): 写 op 进 write_set (上限护栏; 超限自动回滚).
+fn txn_buffer_op(conn: &mut ConnState, op: BatchOp) -> Result<(), String> {
+    let (d, t, k) = op.locator();
+    let key = (d.to_string(), t.to_string(), k.to_vec());
+    let sz = 128 + key.2.len(); // 粗估 (values 不逐列量)
+    let txn = conn.txn.as_mut().expect("txn_buffer_op 仅事务内调用");
+    if txn.ops.len() >= TXN_MAX_OPS || txn.bytes + sz > TXN_MAX_BYTES {
+        conn.txn = None;
+        conn.txn_failed = false;
+        return Err("transaction too large (rolled back)".into());
+    }
+    txn.ops.push(op);
+    txn.index.insert(key, txn.ops.len() - 1);
+    txn.bytes += sz;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sql_dispatch_stmt(
     conn: &mut ConnState,
@@ -3293,6 +3521,189 @@ fn sql_dispatch_stmt(
         }
     }
     match stmt {
+        // ⭐ 事务 v1/v2: BEGIN / COMMIT / ROLLBACK / SAVEPOINT (conn 层状态机)
+        SqlStmt::Begin { iso, read_only } => {
+            if conn.txn.is_some() {
+                // PG 行为: 警告+忽略 (不重置已有缓冲)
+            } else {
+                conn.txn = Some(TxnState::new(
+                    iso.unwrap_or(conn.default_iso),
+                    read_only.unwrap_or(conn.default_ro),
+                ));
+                conn.txn_failed = false;
+            }
+            conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+        }
+        // ⭐ v2 (F62): SET [SESSION] TRANSACTION — session 改连接默认,
+        // 否则改当前事务 (非事务中也落连接默认 — MySQL "下一个事务" 近似)
+        SqlStmt::SetTransaction { iso, read_only, session } => {
+            if !session && let Some(txn) = conn.txn.as_mut() {
+                if let Some(i) = iso {
+                    txn.iso = i;
+                }
+                if let Some(ro) = read_only {
+                    txn.read_only = ro;
+                }
+            } else {
+                if let Some(i) = iso {
+                    conn.default_iso = i;
+                }
+                if let Some(ro) = read_only {
+                    conn.default_ro = ro;
+                }
+            }
+            conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+        }
+        SqlStmt::Rollback => {
+            conn.txn = None;
+            conn.txn_failed = false;
+            conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+        }
+        // ⭐ v2 (F62): ROLLBACK TO — E 态下允许 (SQLAlchemy/psycopg 靠它恢复
+        // aborted 子事务), 成功后清 failed 位
+        SqlStmt::RollbackTo { name } => {
+            let Some(txn) = conn.txn.as_mut() else {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, &format!("savepoint \"{name}\" does not exist")),
+                );
+                return;
+            };
+            let Some(pos) = txn.savepoints.iter().rposition(|(n, _)| n == &name) else {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, &format!("savepoint \"{name}\" does not exist")),
+                );
+                return;
+            };
+            let watermark = txn.savepoints[pos].1;
+            txn.ops.truncate(watermark);
+            txn.savepoints.truncate(pos + 1); // 保留自身 (PG 语义可重复回滚)
+            // index 重建 (截断后下标失效)
+            txn.index.clear();
+            let entries: Vec<_> = txn
+                .ops
+                .iter()
+                .enumerate()
+                .map(|(i, op)| {
+                    let (d, t, k) = op.locator();
+                    ((d.to_string(), t.to_string(), k.to_vec()), i)
+                })
+                .collect();
+            txn.index.extend(entries);
+            conn.txn_failed = false;
+            conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+        }
+        SqlStmt::Commit => {
+            let failed = conn.txn_failed;
+            conn.txn_failed = false;
+            match conn.txn.take() {
+                // failed 事务的 COMMIT = 回滚 (PG 语义); 无事务/空事务 no-op
+                None => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0)),
+                Some(_) if failed => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0)),
+                Some(txn) if txn.ops.is_empty() => {
+                    // 纯读事务: 序列化点可取 BEGIN 时刻, 无需验证直接成功
+                    conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+                }
+                Some(txn) => {
+                    // 按 shard 分组 → 每 shard 一个 TxnApply 原子批;
+                    // ⭐ v2: read_set 同样按 pk 路由分组 (验证与写同批原子)
+                    let mut groups: HashMap<usize, Vec<BatchOp>> = HashMap::new();
+                    for op in txn.ops {
+                        let sid = hash_route_op(&op, num_shards);
+                        groups.entry(sid).or_default().push(op);
+                    }
+                    let mut checks: HashMap<usize, Vec<shard_manager::request::ReadCheck>> =
+                        HashMap::new();
+                    for ((d, t, pk), fp) in txn.read_set {
+                        let sid = hash_route_key(&d, &t, &pk, num_shards);
+                        checks.entry(sid).or_default().push(
+                            shard_manager::request::ReadCheck { db: d, table: t, pk, fp },
+                        );
+                    }
+                    // 并集 shard: 有写或有验证项都发 (纯验证批 ops 空)
+                    let mut sids: Vec<usize> = groups.keys().chain(checks.keys()).copied().collect();
+                    sids.sort_unstable();
+                    sids.dedup();
+                    conn.sql_txn_agg.insert(
+                        seq,
+                        SqlTxnAgg { remaining: sids.len(), applied: 0, error: None },
+                    );
+                    for (gidx, sid) in sids.into_iter().enumerate() {
+                        push_task_grouped(
+                            conn_id,
+                            seq,
+                            worker_id,
+                            gidx as u32,
+                            sid,
+                            BatchOp::TxnApply {
+                                ops: groups.remove(&sid).unwrap_or_default(),
+                                read_set: checks.remove(&sid).unwrap_or_default(),
+                            },
+                            shard_inboxes,
+                        );
+                    }
+                }
+            }
+        }
+        // ⭐ 事务 v1 (F61): failed 事务拒后续 (PG 25P02 语义; MySQL 门面
+        // 不置位故此臂仅 PG 命中; ROLLBACK TO 已在上方放行)
+        _ if conn.txn_failed => {
+            conn.resp_complete(
+                seq,
+                sql_err_bytes(
+                    conn.proto,
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                ),
+            );
+        }
+        // ⭐ v2 (F62): SAVEPOINT / RELEASE (E 态被上方拦截 — PG 语义)
+        SqlStmt::Savepoint { name } => match conn.txn.as_mut() {
+            Some(txn) => {
+                let watermark = txn.ops.len();
+                txn.savepoints.push((name, watermark));
+                conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+            }
+            None => conn.resp_complete(
+                seq,
+                sql_err_bytes(conn.proto, "SAVEPOINT can only be used in transaction blocks"),
+            ),
+        },
+        SqlStmt::Release { name } => match conn.txn.as_mut() {
+            Some(txn) => match txn.savepoints.iter().rposition(|(n, _)| n == &name) {
+                Some(pos) => {
+                    txn.savepoints.remove(pos);
+                    conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+                }
+                None => conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, &format!("savepoint \"{name}\" does not exist")),
+                ),
+            },
+            None => conn.resp_complete(
+                seq,
+                sql_err_bytes(conn.proto, "RELEASE can only be used in transaction blocks"),
+            ),
+        },
+        // ⭐ v2 (F62): READ ONLY 事务拒写 (25006)
+        SqlStmt::Insert { .. } | SqlStmt::Update { .. } | SqlStmt::Delete { .. }
+            if conn.txn.as_ref().is_some_and(|t| t.read_only) =>
+        {
+            conn.resp_complete(
+                seq,
+                sql_err_bytes(
+                    conn.proto,
+                    "cannot execute write statement in a read-only transaction",
+                ),
+            );
+        }
+        // ⭐ 事务 v1 (F61): DDL 在事务中拒绝 (避免与 2PC 交叉)
+        SqlStmt::CreateTable { .. } | SqlStmt::DropTable { .. } if conn.txn.is_some() => {
+            conn.resp_complete(
+                seq,
+                sql_err_bytes(conn.proto, "DDL is not allowed inside a transaction"),
+            );
+        }
         // ⭐ S3: 工具命令 (worker 本地, 零任务)
         SqlStmt::SetStub => {
             conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
@@ -3442,6 +3853,21 @@ fn sql_run_dml(
                     values,
                 });
             }
+            // ⭐ 事务 v1 (F61): 事务中 INSERT 截流进 write_set (喂 bloom
+            // 照旧 — rollback 只多假阳性), 立即回 OK, commit 时原子应用
+            if conn.txn.is_some() {
+                let n = ops.len() as u64;
+                for op in ops {
+                    let sid = hash_route_op(&op, num_shards);
+                    feed_route_bloom(conn, db, &table, &schema, &op, sid);
+                    if let Err(e) = txn_buffer_op(conn, op) {
+                        conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+                        return;
+                    }
+                }
+                conn.resp_complete(seq, sql_ok_bytes(conn.proto, n));
+                return;
+            }
             conn.sql_dml_agg.insert(
                 seq,
                 SqlDmlAgg {
@@ -3455,29 +3881,7 @@ fn sql_run_dml(
                 // ⭐ W2 → ORM-B2: created_here 的表 → 喂进程级路由缓存
                 // (value → 所在 shard; bloom 原子只增, 多 worker/门面并发安全)
                 let sid = hash_route_op(&op, num_shards);
-                {
-                    let sh = &conn.sql_shared;
-                    let ckey = (db.to_string(), table.clone());
-                    if sh.created_here.read().unwrap().contains(&ckey) {
-                        let BatchOp::RowPut { ref values, .. } = op else { unreachable!() };
-                        for idx in schema.indexes.clone() {
-                            let ty = schema.columns[idx.col as usize].ty;
-                            if let Some(enc) =
-                                storage::sql_rows::index_val_bytes(ty, &values[idx.col as usize])
-                            {
-                                let entry = sh
-                                    .routes
-                                    .read()
-                                    .unwrap()
-                                    .get(&(ckey.0.clone(), ckey.1.clone(), idx.iid))
-                                    .cloned();
-                                if let Some(blooms) = entry {
-                                    blooms[sid].insert(&enc); // 锁外原子写
-                                }
-                            }
-                        }
-                    }
-                }
+                feed_route_bloom(conn, db, &table, &schema, &op, sid);
                 push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
             }
         }
@@ -3526,6 +3930,16 @@ fn sql_run_dml(
             match sql_plan_select(&schema, &conds) {
                 Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
                 Ok(SqlPlan::PkGet { pk }) => {
+                    // ⭐ 事务 v1 (F61): pk 等值 UPDATE/DELETE 截流进 write_set
+                    // (affected 乐观估 1, 真实效果 commit 时定 — 文档化)
+                    if conn.txn.is_some() {
+                        let op = sql_dml_op(db, &table, pk, &action);
+                        match txn_buffer_op(conn, op) {
+                            Ok(()) => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 1)),
+                            Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
+                        }
+                        return;
+                    }
                     // pk 等值 → 单 shard 原子, 直发 phase2
                     conn.sql_dml_agg.insert(
                         seq,
@@ -3647,7 +4061,65 @@ fn sql_run_dml(
             match sql_plan_select(&schema, &conds) {
             Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
             Ok(SqlPlan::PkGet { pk }) => {
-                conn.sql_row_ctx.insert(seq, SqlRowCtx { schema, conds, proj, count });
+                // ⭐ 事务 v1 (F61): RYOW — pk 点查命中本事务 write_set 时
+                // 直接回缓冲内容 (INSERT 见新行 / DELETE 见空; UPDATE 直通
+                // 读已提交版本 — v1 文档化)
+                if let Some(txn) = conn.txn.as_ref() {
+                    let tkey = (db.to_string(), table.clone(), pk.clone());
+                    if let Some(&i) = txn.index.get(&tkey) {
+                        let bin = conn.mysql_binary.remove(&seq);
+                        let bytes = match &txn.ops[i] {
+                            BatchOp::RowPut { values, .. } => {
+                                if sql_eval_conds(&schema, values, &conds) {
+                                    if count {
+                                        render_sql_count(conn.proto, bin, 1)
+                                    } else {
+                                        render_sql_rows(
+                                            conn.proto,
+                                            bin,
+                                            &schema,
+                                            &proj,
+                                            std::slice::from_ref(values),
+                                        )
+                                    }
+                                } else if count {
+                                    render_sql_count(conn.proto, bin, 0)
+                                } else {
+                                    render_sql_rows(conn.proto, bin, &schema, &proj, &[])
+                                }
+                            }
+                            BatchOp::RowDelete { .. } => {
+                                if count {
+                                    render_sql_count(conn.proto, bin, 0)
+                                } else {
+                                    render_sql_rows(conn.proto, bin, &schema, &proj, &[])
+                                }
+                            }
+                            // RowUpdate 等: 直通读盘 (不在此臂处理)
+                            _ => {
+                                let read_key = sql_read_key(conn, db, &table, &pk);
+                                conn.sql_row_ctx.insert(
+                                    seq,
+                                    SqlRowCtx { schema, conds, proj, count, read_key },
+                                );
+                                let op = BatchOp::RowGet {
+                                    db: db.clone(),
+                                    table: std::sync::Arc::from(table.as_str()),
+                                    pk,
+                                };
+                                push_task(
+                                    conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards,
+                                );
+                                return;
+                            }
+                        };
+                        conn.resp_complete(seq, bytes);
+                        return;
+                    }
+                }
+                let read_key = sql_read_key(conn, db, &table, &pk);
+                conn.sql_row_ctx
+                    .insert(seq, SqlRowCtx { schema, conds, proj, count, read_key });
                 let op = BatchOp::RowGet {
                     db: db.clone(),
                     table: std::sync::Arc::from(table.as_str()),
@@ -3797,6 +4269,15 @@ fn sql_run_dml(
         }
         SqlStmt::CreateTable { .. } => unreachable!("CREATE 在 sql_dispatch_stmt 处理"),
         SqlStmt::DropTable { .. } => unreachable!("DROP 在 sql_dispatch_stmt 处理"),
+        SqlStmt::Begin { .. }
+        | SqlStmt::Commit
+        | SqlStmt::Rollback
+        | SqlStmt::SetTransaction { .. }
+        | SqlStmt::Savepoint { .. }
+        | SqlStmt::RollbackTo { .. }
+        | SqlStmt::Release { .. } => {
+            unreachable!("事务语句在 sql_dispatch_stmt 处理")
+        }
         SqlStmt::Use { .. } | SqlStmt::SetStub | SqlStmt::VersionStub | SqlStmt::DatabaseStub => {
             unreachable!("工具命令在 sql_dispatch_stmt 处理")
         }
@@ -4083,6 +4564,12 @@ fn sql_err_bytes(proto: ProtocolKind, msg: &str) -> Vec<u8> {
             "42703"
         } else if msg.contains("duplicate key") {
             "23505"
+        } else if msg.contains("serialization failure") {
+            "40001"
+        } else if msg.contains("read-only transaction") {
+            "25006"
+        } else if msg.contains("transaction is aborted") {
+            "25P02"
         } else if msg.contains("Unknown database") {
             "3D000"
         } else if msg.contains("expected")
@@ -5140,6 +5627,10 @@ fn conn_default(default_db: &std::sync::Arc<str>) -> std::sync::Arc<str> {
 fn mysql_err_packet(msg: &str) -> Vec<u8> {
     let code = if msg.contains("unknown column") {
         1054
+    } else if msg.contains("serialization failure") {
+        1213 // MySQL deadlock/serialization 惯用重试码
+    } else if msg.contains("read-only transaction") {
+        1792
     } else if msg.contains("Unknown database") {
         1049
     } else if msg.contains("expected") || msg.contains("unexpected") || msg.contains("unterminated")

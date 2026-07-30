@@ -24,6 +24,24 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 
 ## 当前进度
 
+### 2026-07-31 会话四总览 (F62, 细节见 CHANGELOG)
+
+- **事务 v2 多隔离级别**: SET [SESSION] TRANSACTION / BEGIN 尾缀四级语法 (RU→RC, RR→Serializable 归并); SERIALIZABLE = OCC backward validation (pk 点查记 read_set crc32 指纹, TxnApply 预检重读比对, 冲突 40001/1213); READ ONLY (25006/1792); SAVEPOINT/ROLLBACK TO/RELEASE (ops 水位截断, E 态 ROLLBACK TO 恢复 — SQLAlchemy 标准路径); 仍零锁零 MVCC 零调度器改造
+- 边界: 不防幻读 (行级 OCC, 扫描读不进 read-set); RR=SER 等价; 真快照读留后
+- 验收: 实机 psycopg3 SerializationFailure 类型化捕获+重试 + SQLAlchemy savepoint 序列全通; 回归 827/0 + clippy 0
+
+### 2026-07-31 会话三总览 (F61, 细节见 CHANGELOG)
+
+- **事务 v1**: BEGIN/COMMIT/ROLLBACK 双协议 (MySQL+PG+HTTP SQL) — conn 层 write_set 缓冲 (shard/调度器零事务状态), COMMIT 按 shard 分组 TxnApply 原子批 (先验后写 + 无条件 wal_barrier — 回复到达即持久); RC 隔离 + pk 点查 RYOW; PG I/T/E 状态字节 + 25P02, MySQL IN_TRANS 位 (resp_complete 单点注入)
+- 边界: 跨 shard commit best-effort (单 shard 严格); RYOW 仅 pk 点查; DDL 事务中拒; Serializable (read-set 验证)/快照读 (COW 视图) 留 v2
+- 验收: 实机 psycopg3 默认事务模式 + mysql-connector commit/rollback 全通; COMMIT 后立即 kill -9 → 20/20; 回归 824/0 + clippy 0; String 316K 无回退
+
+### 2026-07-31 会话二总览 (F60, 细节见 CHANGELOG)
+
+- **WAL 预写日志**: `storage.wal_mode = off | periodic (默认, 每秒 fsync, 窗口 ~1s) | strict (回复前 fsync + 组提交, crash 零丢失)`; per-shard 段文件 `{block_root}/shard_N.wal.{seq}`, 插在 put/delete_physical 收敛点记结果态 (重放幂等), 刷盘快照时 seal / meta 全落盘后删段; DDL 不进 WAL → 成功后强制 flush
+- 验收: strict 写完立即 kill -9 → 50/50 全恢复; 性能 off 234K / periodic 231K (-1.6%) / strict 63K@8.1ms; 回归 821/0 + clippy 0
+- **gotcha 作废更新**: crash 测试不再需等 10s 刷盘 (strict 立即可杀 / periodic 等 >1s); wal_mode=off 时旧 gotcha 仍适用
+
 ### 2026-07-31 会话总览 (F59, 细节见 CHANGELOG)
 
 - **ORM 性能专项 — SQL 门面多 worker 化**: `sql_worker_count` 配置 (MySQL+PG 门面, 默认 1); **单 SQL worker 前提正式解除** — schema 缓存 per-worker 零锁 + 进程级 DDL epoch 失效 (DROP +1, 每语句一次 load); routes bloom/created_here 进程级 `SqlSharedRoutes` (IndexBloom 原子位图化 fetch_or 无锁; per-worker 会假阴性漏行). 热路径零锁 (1 epoch load + bloom 原子读)
@@ -134,9 +152,9 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 **还没支持** (下一步 gap):
 - **TTL/过期** (EXPIRE/TTL/PERSIST + SET 的 EX/PX/NX/XX) — 明确后置的生命周期机制
 - **跨 key 原子命令**: BITOP/SMOVE/LMOVE/RPOPLPUSH/阻塞类 BLPOP·BRPOP; MSETNX/Set 代数/*STORE 跨 shard 非原子 (已记 gap)
-- **Transaction** (begin/commit/rollback) — 跨多 page ACID
+- **Transaction** — ✅ F61 v1 + F62 v2 已交付 (conn 层缓冲 + commit 原子批; RC/SERIALIZABLE 双档 + OCC 验证 + SAVEPOINT + READ ONLY; 跨 shard best-effort, 幻读防护/快照读留后)
 - **Snapshot** — 事务内一致性读 (COW + meta_cache 天然支持, 实现成本低; **不需要 MVCC** 见 §3.3.2 设计决策)
-- **WAL** — 消每写 16KB 页 COW 写放大 (写重负载与 Redis 差距的主因)
+- ~~WAL~~ — ✅ F60 已交付 (三档可配; 注: "消 16KB 页写放大"的 WAL-as-主存储变体未做, 当前 WAL 是附加日志非替代写路径)
 - **Stream / HyperLogLog** — 最后两个 Redis 类型 (前者工程量大, 后者小众)
 - **PG/MySQL/Mongo 门面** — 前置: 统一记录编码 (保序 key 编码已有 + 表级 schema)
 - **shard 自包含网络** (ScyllaDB 模式) — 消 worker↔shard 两跳 handoff 的终局方案

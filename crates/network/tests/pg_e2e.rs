@@ -19,6 +19,7 @@ fn start_pg_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>)
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
     let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
     mgr.create_db("app").expect("create db");
@@ -47,6 +48,8 @@ fn start_pg_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>)
 struct PgConn {
     stream: TcpStream,
     buf: Vec<u8>,
+    /// ⭐ 事务 v1: 最近一次 ReadyForQuery 的状态字节 ('I'/'T'/'E').
+    last_ready: u8,
 }
 
 #[derive(Debug, PartialEq)]
@@ -66,7 +69,7 @@ impl PgConn {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
-        Self { stream, buf: Vec::new() }
+        Self { stream, buf: Vec::new(), last_ready: 0 }
     }
 
     fn fill(&mut self) {
@@ -198,6 +201,7 @@ impl PgConn {
                 b'E' => err = Some(parse_error(&p)),
                 b'I' => complete = "EMPTY".into(),
                 b'Z' => {
+                    self.last_ready = p[0];
                     if let Some((code, msg)) = err {
                         return PgResult::Err(code, msg);
                     }
@@ -320,6 +324,7 @@ fn pg_mysql_cross_read() {
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: Some(3),
+        wal_mode: Default::default(),
     };
     let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
     mgr.create_db("app").expect("create db");
@@ -528,6 +533,125 @@ fn pg_extended_query() {
     );
 
     drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+// ===== ⭐ 事务 v1 (F61): PG 事务块 + ReadyForQuery 状态字节 =====
+
+#[test]
+fn pg_transactions() {
+    let (server, mgr) = start_pg_server(None);
+    let mut c1 = PgConn::login(&server, None, false).expect("login");
+    let mut c2 = PgConn::login(&server, None, false).expect("login");
+    c1.query("CREATE TABLE ptx (id INT PRIMARY KEY, v TEXT NOT NULL)");
+    assert_eq!(c1.last_ready, b'I', "空闲态 I");
+
+    // BEGIN → T 态; 写不可见; COMMIT → I 态 + 可见
+    assert_eq!(c1.query("BEGIN"), PgResult::Complete("OK 0".into()));
+    assert_eq!(c1.last_ready, b'T', "事务中 T");
+    c1.query("INSERT INTO ptx VALUES (1, 'a')");
+    assert_eq!(c1.last_ready, b'T');
+    assert_eq!(c2.query("SELECT v FROM ptx WHERE id = 1"), PgResult::Rows(vec!["v".into()], vec![]));
+    c1.query("COMMIT");
+    assert_eq!(c1.last_ready, b'I', "提交后回 I");
+    assert_eq!(
+        c2.query("SELECT v FROM ptx WHERE id = 1"),
+        PgResult::Rows(vec!["v".into()], vec![vec![Some("a".into())]])
+    );
+
+    // 事务内语句出错 → E 态, 后续拒 (25P02), ROLLBACK 恢复 I
+    c1.query("BEGIN");
+    let r = c1.query("SELECT nope FROM ptx WHERE id = 1"); // unknown column
+    assert!(matches!(r, PgResult::Err(..)), "{r:?}");
+    assert_eq!(c1.last_ready, b'E', "出错后 E 态");
+    let r = c1.query("INSERT INTO ptx VALUES (2, 'b')");
+    match r {
+        PgResult::Err(_, ref msg) => assert!(msg.contains("aborted"), "{msg}"),
+        other => panic!("aborted 事务应拒后续: {other:?}"),
+    }
+    c1.query("ROLLBACK");
+    assert_eq!(c1.last_ready, b'I');
+    // abort 期间的 INSERT 未生效
+    assert_eq!(
+        c2.query("SELECT v FROM ptx WHERE id = 2"),
+        PgResult::Rows(vec!["v".into()], vec![])
+    );
+
+    // psycopg 形态: BEGIN 由驱动隐式发 → ROLLBACK 丢弃
+    c1.query("BEGIN");
+    c1.query("INSERT INTO ptx VALUES (3, 'c')");
+    c1.query("ROLLBACK");
+    assert_eq!(
+        c2.query("SELECT v FROM ptx WHERE id = 3"),
+        PgResult::Rows(vec!["v".into()], vec![])
+    );
+
+    drop(c1);
+    drop(c2);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+// ===== ⭐ 事务 v2 (F62): PG 隔离级别 + 40001 =====
+
+#[test]
+fn pg_serializable_conflict() {
+    let (server, mgr) = start_pg_server(None);
+    let mut c1 = PgConn::login(&server, None, false).expect("login");
+    let mut c2 = PgConn::login(&server, None, false).expect("login");
+    c1.query("CREATE TABLE piso (id INT PRIMARY KEY, v INT)");
+    c1.query("INSERT INTO piso VALUES (1, 10)");
+
+    // psycopg isolation_level=SERIALIZABLE 发的形态
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(c1.last_ready, b'T');
+    c1.query("SELECT v FROM piso WHERE id = 1");
+    // 并发修改
+    c2.query("UPDATE piso SET v = 99 WHERE id = 1");
+    c1.query("UPDATE piso SET v = 11 WHERE id = 1");
+    let r = c1.query("COMMIT");
+    match r {
+        PgResult::Err(ref code, _) => assert_eq!(code, "40001", "{r:?}"),
+        other => panic!("SERIALIZABLE 冲突应回 40001: {other:?}"),
+    }
+    assert_eq!(c1.last_ready, b'I', "commit 失败后事务已结束");
+
+    // SET SESSION 默认 + 裸 BEGIN 继承
+    c1.query("SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    c1.query("BEGIN");
+    c1.query("SELECT v FROM piso WHERE id = 1");
+    c2.query("UPDATE piso SET v = 100 WHERE id = 1");
+    c1.query("UPDATE piso SET v = 12 WHERE id = 1");
+    let r = c1.query("COMMIT");
+    assert!(matches!(r, PgResult::Err(ref code, _) if code == "40001"), "{r:?}");
+
+    // READ ONLY → 25006
+    c1.query("BEGIN READ ONLY");
+    let r = c1.query("INSERT INTO piso VALUES (9, 9)");
+    assert!(matches!(r, PgResult::Err(ref code, _) if code == "25006"), "{r:?}");
+    c1.query("ROLLBACK");
+
+    // SAVEPOINT 经 PG 门面 + E 态 ROLLBACK TO 恢复 (SQLAlchemy 模式)
+    c1.query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    c1.query("BEGIN");
+    c1.query("INSERT INTO piso VALUES (2, 20)");
+    c1.query("SAVEPOINT sp1");
+    let r = c1.query("SELECT nope FROM piso WHERE id = 1"); // 触发 E 态
+    assert!(matches!(r, PgResult::Err(..)));
+    assert_eq!(c1.last_ready, b'E');
+    c1.query("ROLLBACK TO SAVEPOINT sp1"); // E 态下允许
+    assert_eq!(c1.last_ready, b'T', "ROLLBACK TO 恢复 T 态");
+    c1.query("INSERT INTO piso VALUES (3, 30)");
+    let r = c1.query("COMMIT");
+    assert!(matches!(r, PgResult::Complete(_)), "{r:?}");
+    assert_eq!(
+        c2.query("SELECT v FROM piso WHERE id = 3"),
+        PgResult::Rows(vec!["v".into()], vec![vec![Some("30".into())]])
+    );
+
+    drop(c1);
+    drop(c2);
     server.shutdown().unwrap();
     drop(mgr);
 }

@@ -43,6 +43,7 @@ fn opts_for_db(block_root: &Path, db_name: &str) -> OpenOptions {
         shard_id: 0,
         create_if_missing: true,
         chunk_cache_size: 4,
+        wal_mode: Default::default(),
     }
 }
 
@@ -349,6 +350,7 @@ fn shard_id_different_is_physically_separated() {
             chunk_cache_size: 4,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
         let opts_s1 = OpenOptions {
             block_root: block_root.clone(),
@@ -359,6 +361,7 @@ fn shard_id_different_is_physically_separated() {
             chunk_cache_size: 4,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
         
         let _e0 = StorageEngine::open(opts_s0).await.expect("open shard 0");

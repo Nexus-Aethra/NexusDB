@@ -10,6 +10,99 @@
 
 ---
 
+## 2026-07-31 会话四 (F62: 事务 v2 — 多隔离级别标准 + OCC 验证 + SAVEPOINT)
+
+### 交付总览 (计划 V1-V4)
+
+| # | 交付 | 文件 |
+|---|------|------|
+| V1 | 隔离级别语法全集: `SET [SESSION] TRANSACTION ISOLATION LEVEL 四级 [READ ONLY\|WRITE]` (SET 整吞前剔出 TRANSACTION 子句) + `BEGIN/START TRANSACTION [ISOLATION LEVEL ...][READ ONLY\|WRITE]` 尾缀; 四级归并两档 (RU→RC, RR→Serializable); conn 默认 + 事务级覆盖 | `sql.rs`, `worker.rs` |
+| V2 | OCC backward validation: SERIALIZABLE 事务内 pk 点查记 read_set (首读 crc32 指纹, RYOW 读不记); COMMIT 时 ReadCheck 按 pk 路由随 TxnApply 下发, shard 预检首步重读比对 — 变了整批拒 **40001/1213** (serialization failure); 纯验证批 (ops 空) 支持 | `request.rs`, `manager.rs`, `wal.rs` (crc32 pub) |
+| V3 | SAVEPOINT / ROLLBACK TO / RELEASE: ops 水位截断 + index 重建; **E 态下 ROLLBACK TO 允许** (SQLAlchemy/psycopg 恢复 aborted 子事务标准路径), 成功后清 failed 位; read_set 不回滚 (保守更严格无损正确性) | `worker.rs` |
+| V4 | READ ONLY 事务 (写拒 25006/1792); 错误码映射 40001/1213/25006/25P02 | `worker.rs` |
+
+### 关键设计
+
+- 隔离是语义规范非实现规范: SERIALIZABLE 靠 commit 时验证而非阻塞 — 仍然**零锁零 MVCC 零调度器改造**; shard 单线程 = 验证+应用天然原子 (别家要 latch 构造的窗口我们免费)
+- 纯读 SER 事务 commit 直接成功 (无写则序列化点可取 BEGIN 时刻, 无需验证)
+- RC 事务零 read-set 开销 (sql_read_key 在非 SER 直接 None)
+
+### 诚实边界 (文档化)
+
+- **不防幻读**: 行级 OCC 无谓词/范围指纹 — SERIALIZABLE 防脏读/不可重复读/丢失更新/行级写偏斜, 与 PG SSI 有差距; 扫描/索引读不进 read-set
+- RR 与 SERIALIZABLE 在本实现中等价; crc32 指纹 ABA 碰撞 2^-32 理论存在 (升 64 位留后)
+- 真快照读 (COW meta_cache 视图) 仍留后 — 需跨 shard 一致性快照点
+
+### 验收
+
+- e2e: mysql_isolation_levels (SER 冲突 1213 + 重试 + RC 对照 last-writer-wins + 无假阳性 + 纯读 + READ ONLY 1792) / mysql_savepoints (嵌套回滚/重复回滚/RELEASE 失效) / pg_serializable_conflict (40001 + SET SESSION 继承 + 25006 + **E 态 ROLLBACK TO 恢复 T 态**) — 全一次过
+- **实机**: psycopg3 `isolation_level=SERIALIZABLE` 并发冲突被类型化捕获 `psycopg.errors.SerializationFailure` → 重试成功; SQLAlchemy 风格 savepoint 序列全通
+- 回归: others 351 + storage 476 = **827/0**, clippy 0
+
+---
+
+## 2026-07-31 会话三 (F61: 事务 v1 — conn 层缓冲 + commit 原子批, RC)
+
+### 交付总览 (计划 T1-T4)
+
+| # | 交付 | 文件 |
+|---|------|------|
+| T1 | conn 层 `TxnState` (保序 ops + RYOW index + 8192 ops/8MB 护栏); 写语句截流 (INSERT / pk UPDATE·DELETE / 两阶段 phase2); RYOW pk 点查命中 write_set 直回缓冲 (INSERT 见新/DELETE 见空; UPDATE 直通读盘) | `worker.rs` |
+| T2 | SqlStmt::Begin/Commit/Rollback (BEGIN/START TRANSACTION); 双协议状态 **resp_complete 单点注入**: PG ReadyForQuery 尾字节 I/T/E 改写 + 事务内 ErrorResponse 自动置 failed (25P02 拦截, ROLLBACK 清位); MySQL 纯 OK 包 status \|= IN_TRANS — 零渲染函数签名扩散 | `sql.rs`, `worker.rs` |
+| T3 | `BatchOp::TxnApply` + `exec_task_op` 提取 (338 行 ShardTask 臂原样提函数, 与事务批共用); `exec_txn_apply` **先验后写** (ensure_table + row_put_check 预检 + 批内自冲突检测) + 无条件 wal_barrier; sql_rows 拆 `check_unique`/`row_put_check` | `manager.rs`, `request.rs`, `sql_rows.rs` |
+| T4 | e2e ×3 (mysql_transactions / mysql_txn_unique_single_shard / pg_transactions) + 实机双驱动 + kill -9 | tests |
+
+### 关键设计 (与用户对齐的基线)
+
+- **shard/调度器零事务状态**: 时间维度 (交互式间隙属于客户端, 不占 shard) + 空间维度 (跨 shard 编排本就在 worker) → 事务 = conn 层缓冲, COMMIT 时 shard 只见一个原子批 (单线程 = 批内零并发穿插, 免锁免 MVCC)
+- **OCC 路线**: 四种隔离是语义规范非实现规范, 阻塞是 2PL 的选择; v1 = RC + 原子写批; Serializable (read-set 值指纹验证) / 快照读 (COW meta_cache 视图, 非 MVCC) 留 v2
+- **commit 持久化 = WAL barrier**: TxnApply 无条件 barrier (独立于 wal_mode periodic/strict), 回复到达 ⇒ 已 fsync; wal_mode=off 时退化 (文档化)
+- **先验后写零部分应用**: 预检 = ensure_table 全表 + RowPut 逐个 unique 探测 + 批内自冲突 map; 预检后仅剩 IO 级失败 (灾难态标注 partially applied)
+- **ROLLBACK/断连零成本**: 丢 write_set 即可, 连 shard 都不通知; bloom 事务中照喂 (rollback 只多假阳性, 只增语义无害)
+
+### v1 语义边界 (文档化)
+
+- 隔离 = RC; RYOW 仅 pk 点查 (扫描/索引/COUNT 读已提交态; UPDATE 后点查读已提交版本); affected 乐观估
+- 跨 shard commit 原子性 best-effort (单 shard 严格; 已应用分片不回滚); unique 跨 shard 漏检为 O3 既有 gap 非事务引入
+- DDL 在事务中拒绝; MySQL 门面不置 failed (语句失败事务继续, 符合 MySQL 语义); 事务仅 SQL 三门面 (RESP MULTI/EXEC 另议)
+
+### 验收
+
+- e2e: 可见性/RYOW/ROLLBACK/UPDATE·DELETE 混合/unique 零部分应用 (单 shard 专项)/批内自冲突/DDL 拒/重复 BEGIN/断连隐式回滚/PG I→T→E 状态字节/25P02 拒后续 — 全过
+- **实机 strict**: mysql-connector (autocommit=False, start_transaction/commit/rollback) + **psycopg3 默认非 autocommit 模式** (驱动隐式 BEGIN) 全流程含 RYOW/aborted 恢复; **COMMIT 后立即 kill -9 → 20/20 全恢复** (WAL 重放日志可见)
+- 回归: others 348 + storage 476 = **824/0**, clippy 0; String mixed 316K 无回退 (非事务路径零触碰)
+
+---
+
+## 2026-07-31 会话二 (F60: WAL 预写日志 — 三档可配, strict 零丢失)
+
+### 交付总览 (计划 W1-W4)
+
+| # | 交付 | 文件 |
+|---|------|------|
+| W1 | `storage/wal.rs`: 段文件 `{block_root}/shard_{N}.wal.{seq:06}` + 记录 len+crc32 (torn tail 静默截断) + 三档 WalMode + seal/drop_sealed/purge_all 生命周期 | `wal.rs` (新, ~370 行) |
+| W2 | engine 接线: put_physical/put_physical_many/delete_physical 成功路径 append 结果态; open 时按段序重放 (ensure_table 覆盖惰性建表窗口) → flush → 删段; close 时 purge_all | `engine.rs`, `pager.rs` (meta_all_flushed) |
+| W3 | strict 档: Batch 回复前 wal_barrier (天然批共享 fsync); ShardTask 组提交 (本轮有未 sync 写 → 回复押轮末一次 fsync 后统一 push); DDL (create_db/create_table, 含 2PC Prepare) 不进 WAL → 成功后强制 flush | `manager.rs` |
+| W4 | 配置: `storage.wal_mode = "off"|"periodic"(默认)|"strict"` 全管道 + validate | `config`, `main.rs`, `nexusdb.toml` |
+
+### 关键设计
+
+- **插入点唯一**: 全部写路径 (String KV / SQL row / Redis 复合) 收敛到三个 physical 原语; 非幂等 RMW (INCR/APPEND/..) 在 shard 层先算结果态才落 KV → WAL 只记 (db,table,pkey,value/del), 重放天然幂等 (last-writer-wins)
+- **段生命周期与刷盘对齐**: maybe_periodic_flush 触发快照 → 同轮内 seal (无并发写间隙, 段覆盖记录 ⊆ 快照); complete_meta_flush 全部确认 (meta_all_flushed) 后删 sealed 段; 晚删无害 (重放幂等), 早删禁止
+- **fsync 后端分派**: IoUring 走 io_ops::fsync 异步 SQE (不阻塞 shard), StdFs 走 sync_data
+- **strict 读 op 不受累**: 无待 sync 内容时直发回复; 乱序到达由 worker seq 重排兼容
+- **DDL 不进 WAL** (catalog 页写非 kv 原语): create_db/create_table 成功后立即全量 flush (低频); 惰性建表窗口由重放侧 ensure_table 覆盖
+
+### 验收
+
+- **kill -9 实机**: strict 写完**立即**杀 50/50 全恢复 (旧行为必丢); periodic 写后 2s 杀 50/50
+- **性能** (memtier String mixed): off 234K / periodic 231K (**-1.6%**, 达标 <5%) / strict 63K @ 8.1ms (组提交下保住 27% 吞吐, 严格持久化的合理代价); SQL 点查 51-57K 无回退
+- 回归: storage 476 (+9 wal) + 其余 345 = **821/0**, clippy 0
+- **gotcha 更新**: crash 测试不再需等 10s 刷盘 — strict 立即可杀, periodic 等 >1s 即可 (WAL 前的旧 gotcha 作废)
+- 丢失窗口: off 10s → periodic ~1s → strict 0
+
+---
+
 ## 2026-07-31 会话 (F59: ORM 性能专项 — SQL 门面多 worker 化)
 
 ### 交付总览 (计划 A-D)

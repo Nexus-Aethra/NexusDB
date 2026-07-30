@@ -35,6 +35,7 @@ pub mod db_name_resolver;
 pub mod engine;
 pub mod keyspace;
 pub mod geo;
+pub mod index_bloom;
 pub mod meta_cache;
 pub mod meta_page;
 pub mod overflow;
@@ -43,8 +44,12 @@ pub mod pager;
 pub mod pager_io;
 pub mod recover;
 pub mod registry;
+pub mod row;
+pub mod schema;
+pub mod sql_rows;
 pub mod table_directory;
 pub mod types;
+pub mod wal;
 
 // ⭐ Scheduler 多线程契约 (storage 实施必须严格遵守):
 // 1. 每个 shard 线程自己 NEW 一个 Scheduler (独立 io_uring), 永久 run() loop
