@@ -23,11 +23,14 @@ use crossbeam_channel::Receiver;
 use shard_manager::{BatchOp, BatchResult, SharedTaskInbox, SharedTaskReplyBus, ShardTask};
 
 use crate::acceptor::NewConn;
+use crate::protocol::sql::{self, CmpOp, Cond, SqlStmt, SqlValue};
 use crate::protocol::{
     BinaryProtocol, DecodeOutcome, KvLimits, Protocol, Request, RespCodec, RespCommand, Response,
     SetAlgOp, validate_kv, validate_request,
 };
 use crate::value_codec::{decode_value, render};
+use storage::row::ColValue;
+use storage::schema::{ColType, TableSchema};
 
 /// 特殊 epoll token: reply bus eventfd.
 const REPLY_TOKEN: u64 = u64::MAX;
@@ -39,6 +42,12 @@ const NEW_CONN_TOKEN: u64 = u64::MAX - 1;
 pub enum ProtocolKind {
     Binary,
     Resp,
+    /// ⭐ Z2: MySQL wire SQL 门面 (5434).
+    Sql,
+    /// ⭐ S4: PostgreSQL wire SQL 门面 (5435) — 与 Sql 共内核, 仅 framing 分流.
+    Pg,
+    /// ⭐ H1: HTTP/1.1 REST 门面 (6778) — KV/SQL JSON + CORS + 可观测性.
+    Http,
 }
 
 pub struct WorkerConfig {
@@ -56,6 +65,10 @@ pub struct WorkerConfig {
     pub limits: KvLimits,
     /// RESP AUTH 密码 (None = 不启用认证).
     pub auth_password: Option<String>,
+    /// ⭐ D3 (分库): SELECT n → db name 翻译视图 (ShardManager resolver 镜像).
+    pub db_view: std::sync::Arc<shard_manager::DbDirView>,
+    /// ⭐ ORM-B2: 进程级共享路由缓存 (同数据集群的全部 SQL 门面共用一个).
+    pub sql_shared: std::sync::Arc<SqlSharedRoutes>,
 }
 
 pub struct WorkerPool {
@@ -165,6 +178,10 @@ struct SetAlgAgg {
     limit: usize,
     /// ⭐ C3: *STORE — 结果写入 dst (先 DEL 再 SAdd), 回 :card.
     store_dst: Option<Vec<u8>>,
+    /// ⭐ D3 (分库): 命令发起时的 (db, table) — 二阶段任务用, 防 pipeline 中
+    /// SELECT 切库后错库.
+    db: std::sync::Arc<str>,
+    table: std::sync::Arc<str>,
 }
 
 /// ⭐ C3: *STORE 第二阶段 (Delete dst + SAdd/ZAdd dst) 完成聚合.
@@ -184,6 +201,9 @@ struct ZStoreAgg {
     sets: Vec<Option<ScoredMembers>>,
     error: Option<String>,
     dst: Vec<u8>,
+    /// ⭐ D3 (分库): 命令发起时的 (db, table) — 二阶段任务用.
+    db: std::sync::Arc<str>,
+    table: std::sync::Arc<str>,
 }
 
 /// ⭐ Phase G: Geo 命令的渲染上下文 (复用 ZMScore/ZRange 结果 + geohash 解码).
@@ -212,6 +232,158 @@ enum BitCtx {
     Count { start: i64, end: i64 },
     /// BITPOS bit [start [end]] → :pos / :-1
     Pos { bit: bool, start: i64, end: Option<i64> },
+}
+
+// =====================================================================
+// ⭐ X3 (SQL 落地): worker 端规划器的聚合/上下文状态
+// =====================================================================
+
+/// CREATE TABLE: SetSchemaOp 广播聚合 (N shard 各一份 PutOk).
+struct SqlDdlAgg {
+    remaining: usize,
+    error: Option<String>,
+    /// 成功后填 worker schema 缓存的 key/值.
+    key: (String, String),
+    schema: std::sync::Arc<TableSchema>,
+}
+
+/// SELECT 索引路径: IndexScan 广播聚合.
+/// 完成时: (val, pk) 排序 → decode row → 全条件残余过滤 → LIMIT → 渲染.
+struct SqlSelectAgg {
+    remaining: usize,
+    error: Option<String>,
+    rows: Vec<storage::sql_rows::IndexEntry>,
+    schema: std::sync::Arc<TableSchema>,
+    conds: Vec<Cond>,
+    limit: Option<u32>,
+    /// ⭐ O1: 投影列号 (渲染只出这些列, 顺序 = 投影序).
+    proj: Vec<u16>,
+    /// ⭐ O1: 覆盖索引 — Some((索引列号, pk 列号)) 时条目免回表,
+    /// 行值从 (val, pk) 重建 (仅这两列有值; 覆盖判定保证过滤/投影不越界).
+    cover: Option<(u16, u16)>,
+    /// ⭐ O3: 唯一索引等值查询 — 首个非空 Rows 即回复 (早停).
+    unique_early: bool,
+    /// ⭐ O3: 已回复 (早停后续收迟到回包只减计数丢结果, 防重复 complete).
+    done: bool,
+    /// ⭐ S1: DML 两阶段 — Some 时本聚合是 DELETE/UPDATE 的 phase1
+    /// (收行过滤取 pk, 完成后发 phase2 而非渲染结果集).
+    dml: Option<SqlDmlAction>,
+    /// ⭐ S1: phase2 发送目标 (db, table).
+    dml_target: Option<(std::sync::Arc<str>, String)>,
+    /// ⭐ S2: ORDER BY (列号, desc); 非空时 shard limit 不下推 (需全量排序).
+    order: Vec<(u16, bool)>,
+    /// ⭐ S2: OFFSET (排序后跳过).
+    offset: u32,
+    /// ⭐ S2: COUNT(*) — 输出单行计数 (免投影; limit/offset 不影响计数).
+    count: bool,
+}
+
+/// ⭐ S1: 两阶段 DML 的动作 (phase2 每 pk 一发).
+#[derive(Clone)]
+enum SqlDmlAction {
+    Delete,
+    Update(Vec<(u16, ColValue)>),
+}
+
+/// ⭐ S1: DML 计数聚合 (INSERT 多行 / DELETE/UPDATE phase2 / DROP 广播).
+/// 完成 → OK affected=n; DeleteExisted(true) 与 PutOk 各计 1.
+struct SqlDmlAgg {
+    remaining: usize,
+    affected: u64,
+    error: Option<String>,
+    /// DROP TABLE: 完成时清 worker 缓存 (schemas/routes/created_here),
+    /// 且 affected 渲染为 0 (广播 PutOk 不是行数).
+    drop_key: Option<(String, String)>,
+}
+
+/// SELECT pk 点查: RowGet 结果的过滤/渲染上下文.
+struct SqlRowCtx {
+    schema: std::sync::Arc<TableSchema>,
+    conds: Vec<Cond>,
+    /// ⭐ O1: 投影列号.
+    proj: Vec<u16>,
+    /// ⭐ S2: COUNT(*) — 回单行 0/1.
+    count: bool,
+}
+
+/// schema 缓存 miss 时挂起的语句 (GetSchemaOp 结果到达后续跑).
+struct PendingSql {
+    stmt: SqlStmt,
+    db: std::sync::Arc<str>,
+    table: String,
+}
+
+/// SELECT 访问路径 (worker 过滤器选择).
+enum SqlPlan {
+    /// WHERE pk = v → 单 shard 点查.
+    PkGet { pk: Vec<u8> },
+    /// 索引列命中 → 广播/候选分派 IndexScan (界下推; eq_enc = 等值编码,
+    /// Some 时可查 worker 路由缓存做候选剪枝).
+    Index {
+        iid: u32,
+        lo: Option<ColValue>,
+        hi: Option<ColValue>,
+        limit_push: bool,
+        eq_enc: Option<Vec<u8>>,
+    },
+    /// ⭐ S2: 无可用索引 → 广播全表扫 + 全条件残余过滤.
+    FullScan,
+}
+
+/// ⭐ W1 (索引路由缓存): SQL worker 级共享缓存 — schema + 索引路由.
+///
+/// **正确性红线** (双层剪枝, 永不假阴性):
+/// - routes 只对 `created_here` 的表存在 (CREATE 时刻零数据, 空 bloom 即完备);
+///   重启后旧表 / GetSchemaOp 拉来的表无 entry → 回退广播 (shard 本地 bloom 兜底)
+/// - bloom 只增不减 (UPDATE 换值/DELETE 不摘除 → 假阳性多播, 无害);
+///   **禁止**换成精确 map + LRU (驱逐后重新累积 = "存在但不完整" → 假阴性漏行)
+/// - 单 SQL worker 前提: 所有 INSERT 必经此线程 (放开多 worker 前必须改共享结构)
+#[derive(Default)]
+struct SqlWorkerCache {
+    /// (db, table) → schema (CREATE 或 GetSchemaOp 填充).
+    /// ⭐ ORM-B2: per-worker 零锁; 失效靠进程级 DDL epoch (陈旧即整体清空).
+    schemas: HashMap<(String, String), std::sync::Arc<TableSchema>>,
+    /// 本 worker 已同步到的 DDL epoch (与 SqlSharedRoutes::ddl_epoch 比对).
+    local_epoch: u64,
+}
+
+type SharedSqlCache = std::rc::Rc<std::cell::RefCell<SqlWorkerCache>>;
+
+/// 路由条目: per-shard 只增 bloom 组 (Arc 克隆锁外读写).
+type RouteBlooms = std::sync::Arc<Vec<storage::index_bloom::IndexBloom>>;
+
+/// ⭐ ORM-B2: 进程级共享路由缓存 (跨 worker 跨 SQL 门面单例).
+/// bloom 本体原子无锁; RwLock 仅保护 map 结构 (读取克隆 Arc 锁外操作,
+/// 写仅 DDL 低频). created_here/routes **必须**进程级 — per-worker 会因
+/// INSERT 分散到多 worker 产生假阴性漏行.
+pub struct SqlSharedRoutes {
+    /// (db, table, iid) → per-shard 只增 bloom (仅 created_here 的表).
+    routes: std::sync::RwLock<HashMap<(String, String, u32), RouteBlooms>>,
+    /// 本进程内 CREATE 的表 (路由缓存启用条件; 语义从"本 worker"平移到"本进程").
+    created_here: std::sync::RwLock<std::collections::HashSet<(String, String)>>,
+    /// DDL 世代 (DROP 时 +1; worker 每语句比对, 变化即清 per-worker schema 缓存).
+    ddl_epoch: std::sync::atomic::AtomicU64,
+    /// 观测: 等值查询被候选剪枝的次数 (fanout < num_shards).
+    route_pruned: std::sync::atomic::AtomicU64,
+    /// 观测: 等值查询零任务短路的次数 (候选空, 直接回空结果).
+    route_bypassed: std::sync::atomic::AtomicU64,
+}
+
+impl Default for SqlSharedRoutes {
+    fn default() -> Self {
+        Self {
+            routes: std::sync::RwLock::new(HashMap::new()),
+            created_here: std::sync::RwLock::new(std::collections::HashSet::new()),
+            ddl_epoch: std::sync::atomic::AtomicU64::new(0),
+            route_pruned: std::sync::atomic::AtomicU64::new(0),
+            route_bypassed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// 进程级实例构造 (main/测试 每逻辑集群一个, 传给同数据的全部 SQL 门面).
+pub fn new_sql_shared() -> std::sync::Arc<SqlSharedRoutes> {
+    std::sync::Arc::new(SqlSharedRoutes::default())
 }
 
 /// 单个连接状态.
@@ -260,12 +432,105 @@ struct ConnState {
     geo_ctx: HashMap<u64, GeoCtx>,
     /// ⭐ Phase B: Bitmap 读渲染上下文 (seq → 状态).
     bit_ctx: HashMap<u64, BitCtx>,
+    /// ⭐ D3 (分库): 当前连接选中的 db (SELECT n 翻译后的 name; 断连重置).
+    current_db: std::sync::Arc<str>,
+    /// ⭐ T2 (分表): 表名前缀 → Arc<str> 缓存 (免热路径每 op 一次 String 分配).
+    table_cache: HashMap<Vec<u8>, std::sync::Arc<str>>,
+    /// ⭐ X3 (SQL): worker 级共享缓存 (schema + 索引路由; 同 worker 全 conn 共享).
+    sql_cache: SharedSqlCache,
+    /// ⭐ ORM-B2: 进程级共享路由缓存 (跨 worker/门面).
+    sql_shared: std::sync::Arc<SqlSharedRoutes>,
+    /// ⭐ X3: CREATE TABLE 的 SetSchemaOp 广播聚合 (seq → 状态).
+    sql_ddl_agg: HashMap<u64, SqlDdlAgg>,
+    /// ⭐ S1: DML 计数聚合 (多行 INSERT / DELETE·UPDATE phase2 / DROP 广播).
+    sql_dml_agg: HashMap<u64, SqlDmlAgg>,
+    /// ⭐ X3: SELECT 索引路径广播聚合 (seq → 状态).
+    sql_select_agg: HashMap<u64, SqlSelectAgg>,
+    /// ⭐ X3: SELECT pk 点查渲染上下文 (seq → 状态).
+    sql_row_ctx: HashMap<u64, SqlRowCtx>,
+    /// ⭐ X3: schema miss 挂起的语句 (seq → 语句; GetSchemaOp 回来后续跑).
+    sql_pending: HashMap<u64, PendingSql>,
+    /// ⭐ Z2 (MySQL wire): Sql conn 的握手/登录状态 (非 Sql conn 为 None).
+    mysql: Option<MysqlState>,
+    /// ⭐ S4: PG wire 状态 (0 = 等 startup, 1 = 等 password, 2 = 已认证).
+    pg_phase: u8,
+    /// ⭐ H2: HTTP KV 请求渲染簿记 (seq → 请求上下文).
+    http_ctx: HashMap<u64, HttpReqCtx>,
+    /// ⭐ P2: MySQL 预处理语句注册表 (stmt_id → 模板).
+    mysql_stmts: HashMap<u32, MyPrepared>,
+    next_stmt_id: u32,
+    /// ⭐ P2: COM_STMT_EXECUTE 的 seq → 结果集需用二进制协议编码.
+    mysql_binary: std::collections::HashSet<u64>,
+    /// ⭐ P3: PG 命名预处理语句 (Parse 注册; "" = unnamed, 每次覆盖).
+    pg_stmts: HashMap<String, PgPrepared>,
+    /// ⭐ P3: 扩展查询批次累积 (Parse..Sync 之间).
+    pg_batch: PgBatch,
+    /// ⭐ P3: seq → 扩展协议响应前缀 (resp_complete 单点拼接).
+    pg_ext: HashMap<u64, Vec<u8>>,
     /// RESP: QUIT/协议错误后, 待 pending 清空即关连接.
     close_after_flush: bool,
 }
 
+/// ⭐ Z2: MySQL 连接登录状态机.
+struct MysqlState {
+    salt: [u8; 20],
+    /// 0 = 等 HandshakeResponse41; 1 = 等 AuthSwitch 响应; 2 = 已认证.
+    phase: u8,
+    /// ⭐ S5: 登录报文带的 database (AuthSwitch 二段认证后再切库).
+    pending_db: Option<String>,
+}
+
+/// ⭐ P2: MySQL 预处理语句 (conn 级注册表项).
+struct MyPrepared {
+    stmt: SqlStmt,
+    params: u16,
+    /// COM_STMT_EXECUTE new_params_bound=0 时复用的类型缓存.
+    types: Option<Vec<(u8, u8)>>,
+}
+
+/// ⭐ P3: PG 命名预处理语句.
+struct PgPrepared {
+    stmt: SqlStmt,
+    params: u16,
+    /// Parse 声明的参数 OID (二进制格式参数解码依据; 0 = 未声明).
+    oids: Vec<u32>,
+}
+
+/// ⭐ P3: PG 扩展查询批次状态 (Parse..Sync 累积; Sync 时消费重置).
+#[derive(Default)]
+struct PgBatch {
+    /// 累积的即时响应帧 (ParseComplete/BindComplete/CloseComplete/ParamDesc...).
+    prefix: Vec<u8>,
+    /// Bind 完成的待执行语句.
+    bound: Option<SqlStmt>,
+    /// Execute 收到 (无 Execute 的批次 Sync 时只回前缀).
+    has_execute: bool,
+    /// 批内错误 → skip-to-Sync (协议标准行为).
+    error: Option<String>,
+}
+
+/// ⭐ H2: HTTP KV 请求上下文 (回包渲染 JSON 用).
+struct HttpReqCtx {
+    op: HttpKvOp,
+    keep_alive: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum HttpKvOp {
+    Get,
+    Put,
+    Delete,
+}
+
 impl ConnState {
-    fn new(fd: RawFd, proto: ProtocolKind, auth_required: bool) -> Self {
+    fn new(
+        fd: RawFd,
+        proto: ProtocolKind,
+        auth_required: bool,
+        default_db: std::sync::Arc<str>,
+        sql_cache: SharedSqlCache,
+        sql_shared: std::sync::Arc<SqlSharedRoutes>,
+    ) -> Self {
         let stream = unsafe { TcpStream::from_raw_fd(fd) };
         stream.set_nonblocking(true).ok();
         // ⭐ 关闭 Nagle: 小回复立即发送, 避免与 delayed-ACK 交互导致 40ms 延迟
@@ -295,6 +560,24 @@ impl ConnState {
             zstore_agg: HashMap::new(),
             geo_ctx: HashMap::new(),
             bit_ctx: HashMap::new(),
+            current_db: default_db,
+            table_cache: HashMap::new(),
+            sql_cache,
+            sql_shared,
+            sql_ddl_agg: HashMap::new(),
+            sql_dml_agg: HashMap::new(),
+            sql_select_agg: HashMap::new(),
+            sql_row_ctx: HashMap::new(),
+            sql_pending: HashMap::new(),
+            mysql: None,
+            pg_phase: 0,
+            http_ctx: HashMap::new(),
+            mysql_stmts: HashMap::new(),
+            next_stmt_id: 1,
+            mysql_binary: std::collections::HashSet::new(),
+            pg_stmts: HashMap::new(),
+            pg_batch: PgBatch::default(),
+            pg_ext: HashMap::new(),
             close_after_flush: false,
         }
     }
@@ -345,6 +628,15 @@ impl ConnState {
 
     /// RESP: 回复字节进重排缓冲, 然后把从 next_to_send 起的连续段发出.
     fn resp_complete(&mut self, seq: u64, bytes: Vec<u8>) {
+        // ⭐ P3: PG 扩展查询批次 — 响应前拼 [ParseComplete][BindComplete]... 前缀
+        // (单点侵入; 非 Pg conn 恒空查零开销)
+        let bytes = match self.pg_ext.remove(&seq) {
+            Some(mut prefix) => {
+                prefix.extend_from_slice(&bytes);
+                prefix
+            }
+            None => bytes,
+        };
         self.pending.insert(seq, bytes);
         self.resp_flush_ready();
     }
@@ -364,6 +656,40 @@ impl ConnState {
     fn resp_should_close(&self) -> bool {
         self.close_after_flush && self.pending.is_empty() && self.next_seq == self.next_to_send
     }
+
+    /// ⭐ T2 (分表): 表名前缀 → Arc<str> (缓存复用, 免热路径 String 分配).
+    fn table_arc(&mut self, prefix: &[u8]) -> std::sync::Arc<str> {
+        if let Some(t) = self.table_cache.get(prefix) {
+            return t.clone();
+        }
+        let t: std::sync::Arc<str> =
+            std::sync::Arc::from(std::str::from_utf8(prefix).expect("前缀已校验 ASCII"));
+        self.table_cache.insert(prefix.to_vec(), t.clone());
+        t
+    }
+
+    /// ⭐ T2 (分表): 就地解析 "table:key" — 命中合法前缀则剥离前缀并返回表;
+    /// 否则 None (整个 key 落 default 表).
+    fn resolve_table(&mut self, key: &mut Vec<u8>) -> Option<std::sync::Arc<str>> {
+        let pos = split_table_key(key)?;
+        let tbl = self.table_arc(&key[..pos]);
+        key.drain(..=pos);
+        Some(tbl)
+    }
+}
+
+/// ⭐ T2 (分表): key 首个 `:` 前的前缀若为合法表名 (`[A-Za-z0-9_.-]{1,64}`)
+/// 返回其字节长; 否则 None → 整个 key 落 default 表
+/// (防二进制 key 撞 `:` 字节产生垃圾表 + 无界建表).
+fn split_table_key(raw: &[u8]) -> Option<usize> {
+    let pos = raw.iter().position(|&b| b == b':')?;
+    if pos == 0 || pos > 64 {
+        return None;
+    }
+    raw[..pos]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        .then_some(pos)
 }
 
 /// epoll 事件循环主函数.
@@ -384,6 +710,14 @@ fn worker_main_epoll(cfg: WorkerConfig) {
     // ⭐ 热路径优化: db/table 一次性转 Arc<str>, 每 op 仅引用计数 clone
     let db: std::sync::Arc<str> = std::sync::Arc::from(cfg.default_db.as_str());
     let table: std::sync::Arc<str> = std::sync::Arc::from(cfg.default_table.as_str());
+    // ⭐ W1: SQL worker 级共享缓存 (schema + 索引路由; 单线程 Rc<RefCell>)
+    let sql_cache: SharedSqlCache = std::rc::Rc::new(std::cell::RefCell::new(
+        SqlWorkerCache::default(),
+    ));
+    // ⭐ ORM-B2: 进程级共享路由缓存 (server 注入, 跨 worker/门面)
+    let sql_shared = cfg.sql_shared;
+    // ⭐ D3 (分库): SELECT n → db name 翻译视图
+    let db_view = cfg.db_view;
     let inbox = cfg.inbox;
     let conn_eventfd = cfg.conn_eventfd;
     let proto_kind = cfg.protocol;
@@ -406,7 +740,15 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                 Ok(new_conn) => {
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let state = ConnState::new(new_conn.fd, proto_kind, auth_required);
+                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone());
+                    // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
+                    if proto_kind == ProtocolKind::Sql {
+                        let salt = mysql_gen_salt(id, worker_id);
+                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10(
+                            &salt, id as u32,
+                        ));
+                        state.mysql = Some(MysqlState { salt, phase: 0, pending_db: None });
+                    }
                     epoll_add(epoll_fd, state.fd, id);
                     conn_map.insert(id, state);
                     nlog::debug!("worker", "worker-{worker_id} conn {id} from {}", new_conn.peer);
@@ -451,15 +793,17 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                                 let resp = batch_result_to_response(&r.result);
                                 conn.send_binary_response(r.req_id, &resp);
                             }
-                            ProtocolKind::Resp => {
+                            ProtocolKind::Resp
+                            | ProtocolKind::Sql
+                            | ProtocolKind::Pg
+                            | ProtocolKind::Http => {
+                                // ⭐ Y2/S4/H1: SQL/HTTP conn 复用 seq 重排 + 聚合钩子
                                 handle_resp_shard_result(
                                     conn,
                                     r.conn_id,
                                     r.req_id,
                                     r.group,
                                     &r.result,
-                                    &db,
-                                    &table,
                                     worker_id,
                                     &shard_inboxes,
                                     num_shards,
@@ -481,7 +825,15 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                 while let Ok(new_conn) = inbox.try_recv() {
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let state = ConnState::new(new_conn.fd, proto_kind, auth_required);
+                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone());
+                    // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
+                    if proto_kind == ProtocolKind::Sql {
+                        let salt = mysql_gen_salt(id, worker_id);
+                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10(
+                            &salt, id as u32,
+                        ));
+                        state.mysql = Some(MysqlState { salt, phase: 0, pending_db: None });
+                    }
                     epoll_add(epoll_fd, state.fd, id);
                     conn_map.insert(id, state);
                     nlog::debug!("worker", "worker-{worker_id} conn {id} from {}", new_conn.peer);
@@ -501,8 +853,32 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                             }
                             ProtocolKind::Resp => {
                                 process_resp_input(
-                                    conn, conn_id, worker_id, &db, &table, &limits,
+                                    conn, conn_id, worker_id, &db_view, &table, &limits,
                                     &auth_password, &shard_inboxes, num_shards,
+                                );
+                                should_remove = conn.resp_should_close();
+                            }
+                            ProtocolKind::Sql => {
+                                // ⭐ Z2: MySQL wire 帧循环
+                                process_sql_input(
+                                    conn, conn_id, worker_id, &auth_password, &db, &db_view,
+                                    &shard_inboxes, num_shards,
+                                );
+                                should_remove = conn.resp_should_close();
+                            }
+                            ProtocolKind::Pg => {
+                                // ⭐ S4: PostgreSQL wire 帧循环
+                                process_pg_input(
+                                    conn, conn_id, worker_id, &auth_password, &db, &db_view,
+                                    &shard_inboxes, num_shards,
+                                );
+                                should_remove = conn.resp_should_close();
+                            }
+                            ProtocolKind::Http => {
+                                // ⭐ H1: HTTP/1.1 REST 帧循环 (token = auth_password)
+                                process_http_input(
+                                    conn, conn_id, worker_id, &auth_password, &db, &db_view,
+                                    &limits, num_shards, &shard_inboxes, num_shards,
                                 );
                                 should_remove = conn.resp_should_close();
                             }
@@ -595,7 +971,7 @@ fn process_resp_input(
     conn: &mut ConnState,
     conn_id: u64,
     worker_id: u32,
-    db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
     table: &std::sync::Arc<str>,
     limits: &KvLimits,
     auth_password: &Option<String>,
@@ -615,9 +991,11 @@ fn process_resp_input(
         match codec.decode_command(&conn.read_buf[cursor..]) {
             Ok(DecodeOutcome::Complete { consumed, value }) => {
                 cursor += consumed;
+                // ⭐ D3 (分库): 每命令取当前连接 db (SELECT 可在 pipeline 中切换)
+                let cur_db = conn.current_db.clone();
                 dispatch_resp_command(
-                    conn, conn_id, worker_id, db, table, limits, auth_password,
-                    shard_inboxes, num_shards, value,
+                    conn, conn_id, worker_id, &cur_db, table, limits, auth_password,
+                    db_view, shard_inboxes, num_shards, value,
                 );
             }
             Ok(DecodeOutcome::NeedMore) => break,
@@ -649,10 +1027,13 @@ fn dispatch_resp_command(
     table: &std::sync::Arc<str>,
     limits: &KvLimits,
     auth_password: &Option<String>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
     cmd: RespCommand,
 ) {
+    // ⭐ H4: 命令计数 (relaxed 单次原子加, 热路径零锁)
+    crate::metrics::KV_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let codec = RespCodec::new();
     let seq = conn.next_seq;
     conn.next_seq += 1;
@@ -682,7 +1063,7 @@ fn dispatch_resp_command(
                 key,
                 val: value,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::Get { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -694,7 +1075,7 @@ fn dispatch_resp_command(
                 table: table.clone(),
                 key,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::Del { keys } => {
             // 逐 key 校验 (借用版, 免 clone); 任一超限整条命令拒绝 (不部分执行)
@@ -718,7 +1099,7 @@ fn dispatch_resp_command(
                     table: table.clone(),
                     key,
                 };
-                push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+                push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
             }
         }
         RespCommand::MGet { keys } => {
@@ -728,18 +1109,23 @@ fn dispatch_resp_command(
                     return;
                 }
             }
-            // ⭐ 按 shard 分组: 每 shard 一个 MultiGet (shard 内区间复用),
-            // group 号回传后按索引表回填原始槽
+            // ⭐ 按 (shard, 表) 分组: 每组一个 MultiGet (shard 内区间复用),
+            // group 号回传后按索引表回填原始槽. ⭐ T2: 每 key 独立冒号选表.
             let n = keys.len();
-            let mut by_shard: Vec<(usize, Vec<Vec<u8>>, Vec<usize>)> = Vec::new();
-            for (i, key) in keys.into_iter().enumerate() {
-                let sid = hash_route_key(db.as_ref(), table.as_ref(), &key, num_shards);
-                match by_shard.iter_mut().find(|(s, _, _)| *s == sid) {
+            type MGroup = ((usize, std::sync::Arc<str>), Vec<Vec<u8>>, Vec<usize>);
+            let mut by_shard: Vec<MGroup> = Vec::new();
+            for (i, mut key) in keys.into_iter().enumerate() {
+                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
+                match by_shard
+                    .iter_mut()
+                    .find(|(g, _, _)| g.0 == sid && g.1 == tbl)
+                {
                     Some((_, ks, idxs)) => {
                         ks.push(key);
                         idxs.push(i);
                     }
-                    None => by_shard.push((sid, vec![key], vec![i])),
+                    None => by_shard.push(((sid, tbl), vec![key], vec![i])),
                 }
             }
             let groups: Vec<Vec<usize>> = by_shard.iter().map(|(_, _, idxs)| idxs.clone()).collect();
@@ -752,10 +1138,10 @@ fn dispatch_resp_command(
                     error: None,
                 },
             );
-            for (gidx, (sid, ks, _)) in by_shard.into_iter().enumerate() {
+            for (gidx, ((sid, tbl), ks, _)) in by_shard.into_iter().enumerate() {
                 let op = BatchOp::MultiGet {
                     db: db.clone(),
-                    table: table.clone(),
+                    table: tbl,
                     keys: ks,
                 };
                 push_task_grouped(conn_id, seq, worker_id, gidx as u32, sid, op, shard_inboxes);
@@ -769,13 +1155,15 @@ fn dispatch_resp_command(
                     return;
                 }
             }
-            type ShardPairs = (usize, Vec<(Vec<u8>, Vec<u8>)>);
+            // ⭐ T2: 每 key 独立冒号选表 → 按 (shard, 表) 分组
+            type ShardPairs = ((usize, std::sync::Arc<str>), Vec<(Vec<u8>, Vec<u8>)>);
             let mut by_shard: Vec<ShardPairs> = Vec::new();
-            for (key, value) in pairs {
-                let sid = hash_route_key(db.as_ref(), table.as_ref(), &key, num_shards);
-                match by_shard.iter_mut().find(|(s, _)| *s == sid) {
+            for (mut key, value) in pairs {
+                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
+                match by_shard.iter_mut().find(|(g, _)| g.0 == sid && g.1 == tbl) {
                     Some((_, ps)) => ps.push((key, value)),
-                    None => by_shard.push((sid, vec![(key, value)])),
+                    None => by_shard.push(((sid, tbl), vec![(key, value)])),
                 }
             }
             conn.mset_agg.insert(
@@ -785,10 +1173,10 @@ fn dispatch_resp_command(
                     error: None,
                 },
             );
-            for (gidx, (sid, ps)) in by_shard.into_iter().enumerate() {
+            for (gidx, ((sid, tbl), ps)) in by_shard.into_iter().enumerate() {
                 let op = BatchOp::MultiPut {
                     db: db.clone(),
-                    table: table.clone(),
+                    table: tbl,
                     pairs: ps,
                 };
                 push_task_grouped(conn_id, seq, worker_id, gidx as u32, sid, op, shard_inboxes);
@@ -812,7 +1200,7 @@ fn dispatch_resp_command(
                 key,
                 delta,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::IncrFloat { key, delta } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -825,7 +1213,7 @@ fn dispatch_resp_command(
                 key,
                 delta,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::Append { key, suffix } => {
             // suffix 不带 tag (RMW 端拼接); 校验按追加段长度上限保守拦截
@@ -839,7 +1227,7 @@ fn dispatch_resp_command(
                 key,
                 suffix,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SetNx { key, value } => {
             if let Err(msg) = validate_kv(&key, value.len().saturating_sub(1), limits) {
@@ -852,7 +1240,7 @@ fn dispatch_resp_command(
                 key,
                 val: value,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::Exists { keys } => {
             for key in &keys {
@@ -875,7 +1263,7 @@ fn dispatch_resp_command(
                     table: table.clone(),
                     key,
                 };
-                push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+                push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
             }
         }
         RespCommand::Strlen { key } => {
@@ -889,7 +1277,7 @@ fn dispatch_resp_command(
                 table: table.clone(),
                 key,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::TypeOf { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -902,7 +1290,7 @@ fn dispatch_resp_command(
                 table: table.clone(),
                 key,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::GetDel { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -914,7 +1302,7 @@ fn dispatch_resp_command(
                 table: table.clone(),
                 key,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::GetSet { key, value } => {
             if let Err(msg) = validate_kv(&key, value.len().saturating_sub(1), limits) {
@@ -927,7 +1315,7 @@ fn dispatch_resp_command(
                 key,
                 val: value,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SetRange { key, offset, data } => {
             // 新长度 = offset + data.len(), 保守校验不超 value 上限
@@ -942,7 +1330,7 @@ fn dispatch_resp_command(
                 offset,
                 data,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::GetRange { key, start, end } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -956,7 +1344,7 @@ fn dispatch_resp_command(
                 table: table.clone(),
                 key,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::MSetNx { pairs } => {
             for (key, value) in &pairs {
@@ -965,14 +1353,16 @@ fn dispatch_resp_command(
                     return;
                 }
             }
-            // 按 shard 分组, 每 shard 一个 MultiPutNx; 全部写入 → :1, 否则 :0
-            type ShardPairs = (usize, Vec<(Vec<u8>, Vec<u8>)>);
-            let mut by_shard: Vec<ShardPairs> = Vec::new();
-            for (key, value) in pairs {
-                let sid = hash_route_key(db.as_ref(), table.as_ref(), &key, num_shards);
-                match by_shard.iter_mut().find(|(s, _)| *s == sid) {
+            // 按 (shard, 表) 分组, 每组一个 MultiPutNx; 全部写入 → :1, 否则 :0
+            // ⭐ T2: 每 key 独立冒号选表
+            type NxPairs = ((usize, std::sync::Arc<str>), Vec<(Vec<u8>, Vec<u8>)>);
+            let mut by_shard: Vec<NxPairs> = Vec::new();
+            for (mut key, value) in pairs {
+                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
+                match by_shard.iter_mut().find(|(g, _)| g.0 == sid && g.1 == tbl) {
                     Some((_, ps)) => ps.push((key, value)),
-                    None => by_shard.push((sid, vec![(key, value)])),
+                    None => by_shard.push(((sid, tbl), vec![(key, value)])),
                 }
             }
             conn.msetnx_agg.insert(
@@ -982,10 +1372,10 @@ fn dispatch_resp_command(
                     all_set: true,
                 },
             );
-            for (gidx, (sid, ps)) in by_shard.into_iter().enumerate() {
+            for (gidx, ((sid, tbl), ps)) in by_shard.into_iter().enumerate() {
                 let op = BatchOp::MultiPutNx {
                     db: db.clone(),
-                    table: table.clone(),
+                    table: tbl,
                     pairs: ps,
                 };
                 push_task_grouped(conn_id, seq, worker_id, gidx as u32, sid, op, shard_inboxes);
@@ -1005,7 +1395,7 @@ fn dispatch_resp_command(
                 conn.hmset_ok.insert(seq); // HMSET 回 +OK (Integer 转换)
             }
             let op = BatchOp::HSet { db: db.clone(), table: table.clone(), key, pairs };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HSetNx { key, field, value } => {
             if let Err(msg) = validate_kv(&key, 0, limits)
@@ -1021,7 +1411,7 @@ fn dispatch_resp_command(
                 field,
                 val: value,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HGet { key, field } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1029,7 +1419,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::HGet { db: db.clone(), table: table.clone(), key, field };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HMGet { key, fields } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1037,7 +1427,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::HMGet { db: db.clone(), table: table.clone(), key, fields };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HDel { key, fields } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1045,7 +1435,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::HDel { db: db.clone(), table: table.clone(), key, fields };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HExists { key, field } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1054,7 +1444,7 @@ fn dispatch_resp_command(
             }
             conn.get_kind.insert(seq, GetKind::HExists);
             let op = BatchOp::HGet { db: db.clone(), table: table.clone(), key, field };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HLen { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1062,7 +1452,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::HLen { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HGetAll { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1071,7 +1461,7 @@ fn dispatch_resp_command(
             }
             conn.pairs_kind.insert(seq, PairsKind::All);
             let op = BatchOp::HGetAll { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HKeys { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1080,7 +1470,7 @@ fn dispatch_resp_command(
             }
             conn.pairs_kind.insert(seq, PairsKind::Keys);
             let op = BatchOp::HGetAll { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HVals { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1089,7 +1479,7 @@ fn dispatch_resp_command(
             }
             conn.pairs_kind.insert(seq, PairsKind::Vals);
             let op = BatchOp::HGetAll { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HScan { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1098,7 +1488,7 @@ fn dispatch_resp_command(
             }
             conn.pairs_kind.insert(seq, PairsKind::Scan);
             let op = BatchOp::HGetAll { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HIncrBy { key, field, delta } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1112,7 +1502,7 @@ fn dispatch_resp_command(
                 field,
                 delta,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HIncrByFloat { key, field, delta } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1126,7 +1516,7 @@ fn dispatch_resp_command(
                 field,
                 delta,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         // ---- ⭐ Phase Set: Set (单 key 直推; 代数类跨 shard 聚合) ----
         RespCommand::SAdd { key, members } => {
@@ -1139,7 +1529,7 @@ fn dispatch_resp_command(
                 }
             }
             let op = BatchOp::SAdd { db: db.clone(), table: table.clone(), key, members };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SRem { key, members } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1147,7 +1537,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::SRem { db: db.clone(), table: table.clone(), key, members };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SIsMember { key, member } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1155,7 +1545,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::SIsMember { db: db.clone(), table: table.clone(), key, member };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SCard { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1163,7 +1553,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::SCard { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SMembers { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1172,7 +1562,7 @@ fn dispatch_resp_command(
             }
             conn.members_kind.insert(seq, MembersKind::List);
             let op = BatchOp::SMembers { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SScan { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1181,7 +1571,7 @@ fn dispatch_resp_command(
             }
             conn.members_kind.insert(seq, MembersKind::Scan);
             let op = BatchOp::SMembers { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SPop { key, count } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1193,12 +1583,12 @@ fn dispatch_resp_command(
                 None => {
                     conn.members_kind.insert(seq, MembersKind::One);
                     let op = BatchOp::SPop { db: db.clone(), table: table.clone(), key };
-                    push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+                    push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
                 }
                 Some(c) => {
                     conn.members_kind.insert(seq, MembersKind::List);
                     let op = BatchOp::SPopN { db: db.clone(), table: table.clone(), key, count: c };
-                    push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+                    push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
                 }
             }
         }
@@ -1211,12 +1601,12 @@ fn dispatch_resp_command(
                 None => {
                     conn.members_kind.insert(seq, MembersKind::One);
                     let op = BatchOp::SRandMember { db: db.clone(), table: table.clone(), key };
-                    push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+                    push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
                 }
                 Some(c) => {
                     conn.members_kind.insert(seq, MembersKind::List);
                     let op = BatchOp::SRandCount { db: db.clone(), table: table.clone(), key, count: c };
-                    push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+                    push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
                 }
             }
         }
@@ -1226,7 +1616,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::SMisMember { db: db.clone(), table: table.clone(), key, members };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SInterCard { keys, limit } => {
             for key in &keys {
@@ -1247,11 +1637,15 @@ fn dispatch_resp_command(
                     card_only: true,
                     limit,
                     store_dst: None,
+                    db: db.clone(),
+                    table: table.clone(),
                 },
             );
-            for (i, key) in keys.into_iter().enumerate() {
-                let sid = hash_route_key(db.as_ref(), table.as_ref(), &key, num_shards);
-                let smem = BatchOp::SMembers { db: db.clone(), table: table.clone(), key };
+            for (i, mut key) in keys.into_iter().enumerate() {
+                // ⭐ T2: 源 key 逐个冒号选表 (天然支持跨表代数)
+                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
+                let smem = BatchOp::SMembers { db: db.clone(), table: tbl, key };
                 push_task_grouped(conn_id, seq, worker_id, i as u32, sid, smem, shard_inboxes);
             }
         }
@@ -1274,11 +1668,15 @@ fn dispatch_resp_command(
                     card_only: false,
                     limit: 0,
                     store_dst: None,
+                    db: db.clone(),
+                    table: table.clone(),
                 },
             );
-            for (i, key) in keys.into_iter().enumerate() {
-                let sid = hash_route_key(db.as_ref(), table.as_ref(), &key, num_shards);
-                let smem = BatchOp::SMembers { db: db.clone(), table: table.clone(), key };
+            for (i, mut key) in keys.into_iter().enumerate() {
+                // ⭐ T2: 源 key 逐个冒号选表 (天然支持跨表代数)
+                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
+                let smem = BatchOp::SMembers { db: db.clone(), table: tbl, key };
                 push_task_grouped(conn_id, seq, worker_id, i as u32, sid, smem, shard_inboxes);
             }
         }
@@ -1291,6 +1689,9 @@ fn dispatch_resp_command(
                 }
             }
             let n = keys.len();
+            // ⭐ T2: dst 冒号选表 (二阶段任务写入 dst 的表)
+            let mut dst = dst;
+            let dst_tbl = conn.resolve_table(&mut dst).unwrap_or_else(|| table.clone());
             conn.setalg_agg.insert(
                 seq,
                 SetAlgAgg {
@@ -1301,11 +1702,15 @@ fn dispatch_resp_command(
                     card_only: false,
                     limit: 0,
                     store_dst: Some(dst),
+                    db: db.clone(),
+                    table: dst_tbl,
                 },
             );
-            for (i, key) in keys.into_iter().enumerate() {
-                let sid = hash_route_key(db.as_ref(), table.as_ref(), &key, num_shards);
-                let smem = BatchOp::SMembers { db: db.clone(), table: table.clone(), key };
+            for (i, mut key) in keys.into_iter().enumerate() {
+                // ⭐ T2: 源 key 逐个冒号选表 (天然支持跨表代数)
+                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
+                let smem = BatchOp::SMembers { db: db.clone(), table: tbl, key };
                 push_task_grouped(conn_id, seq, worker_id, i as u32, sid, smem, shard_inboxes);
             }
         }
@@ -1317,6 +1722,9 @@ fn dispatch_resp_command(
                 }
             }
             let n = keys.len();
+            // ⭐ T2: dst 冒号选表 (二阶段任务写入 dst 的表)
+            let mut dst = dst;
+            let dst_tbl = conn.resolve_table(&mut dst).unwrap_or_else(|| table.clone());
             conn.zstore_agg.insert(
                 seq,
                 ZStoreAgg {
@@ -1325,14 +1733,18 @@ fn dispatch_resp_command(
                     sets: vec![None; n],
                     error: None,
                     dst,
+                    db: db.clone(),
+                    table: dst_tbl,
                 },
             );
             // 每源 key 取全量 (member, score) — 复用 ZRange withscores 交替串
-            for (i, key) in keys.into_iter().enumerate() {
-                let sid = hash_route_key(db.as_ref(), table.as_ref(), &key, num_shards);
+            for (i, mut key) in keys.into_iter().enumerate() {
+                // ⭐ T2: 源 key 逐个冒号选表
+                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
                 let zr = BatchOp::ZRange {
                     db: db.clone(),
-                    table: table.clone(),
+                    table: tbl,
                     key,
                     start: 0,
                     end: -1,
@@ -1353,7 +1765,7 @@ fn dispatch_resp_command(
                 }
             }
             let op = BatchOp::LPush { db: db.clone(), table: table.clone(), key, values, left };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LPop { key, left, count } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1372,7 +1784,7 @@ fn dispatch_resp_command(
                 left,
                 count: count.unwrap_or(1),
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LLen { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1380,7 +1792,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::LLen { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LRange { key, start, end } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1389,7 +1801,7 @@ fn dispatch_resp_command(
             }
             conn.members_kind.insert(seq, MembersKind::List);
             let op = BatchOp::LRange { db: db.clone(), table: table.clone(), key, start, end };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LIndex { key, idx } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1397,7 +1809,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::LIndex { db: db.clone(), table: table.clone(), key, idx };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LSet { key, idx, value } => {
             if let Err(msg) = validate_kv(&key, value.len().saturating_sub(1), limits) {
@@ -1406,7 +1818,7 @@ fn dispatch_resp_command(
             }
             conn.hmset_ok.insert(seq); // Integer(1) → +OK
             let op = BatchOp::LSet { db: db.clone(), table: table.clone(), key, idx, val: value };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         // ---- ⭐ C2: List 中段操作 ----
         RespCommand::LRem { key, count, value } => {
@@ -1415,7 +1827,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::LRem { db: db.clone(), table: table.clone(), key, count, val: value };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LTrim { key, start, stop } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1424,7 +1836,7 @@ fn dispatch_resp_command(
             }
             conn.hmset_ok.insert(seq); // Integer(1) → +OK
             let op = BatchOp::LTrim { db: db.clone(), table: table.clone(), key, start, stop };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LPos { key, value, rank, count } => {
             if let Err(msg) = validate_kv(&key, value.len().saturating_sub(1), limits) {
@@ -1432,7 +1844,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::LPos { db: db.clone(), table: table.clone(), key, val: value, rank, count };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LInsert { key, before, pivot, value } => {
             if let Err(msg) = validate_kv(&key, value.len().saturating_sub(1), limits) {
@@ -1447,7 +1859,7 @@ fn dispatch_resp_command(
                 pivot,
                 val: value,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         // ---- ⭐ Phase Z: ZSet (单 key 直推) ----
         RespCommand::ZAdd { key, pairs } => {
@@ -1458,7 +1870,7 @@ fn dispatch_resp_command(
                 }
             }
             let op = BatchOp::ZAdd { db: db.clone(), table: table.clone(), key, pairs };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZRem { key, members } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1466,7 +1878,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::ZRem { db: db.clone(), table: table.clone(), key, members };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZScore { key, member } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1474,7 +1886,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::ZScore { db: db.clone(), table: table.clone(), key, member };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZCard { key } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1482,7 +1894,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::ZCard { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZIncrBy { key, delta, member } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1490,7 +1902,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::ZIncrBy { db: db.clone(), table: table.clone(), key, delta, member };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZRange { key, start, end, rev, withscores } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1499,7 +1911,7 @@ fn dispatch_resp_command(
             }
             conn.members_kind.insert(seq, MembersKind::List);
             let op = BatchOp::ZRange { db: db.clone(), table: table.clone(), key, start, end, rev, withscores };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZRangeByScore { key, min, max, withscores } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1508,7 +1920,7 @@ fn dispatch_resp_command(
             }
             conn.members_kind.insert(seq, MembersKind::List);
             let op = BatchOp::ZRangeByScore { db: db.clone(), table: table.clone(), key, min, max, withscores };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZRank { key, member, rev } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1516,7 +1928,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::ZRank { db: db.clone(), table: table.clone(), key, member, rev };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         // ---- ⭐ C1: ZSet/Hash 命令空洞 ----
         RespCommand::ZCount { key, min, max } => {
@@ -1525,7 +1937,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::ZCount { db: db.clone(), table: table.clone(), key, min, max };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZMScore { key, members } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1535,7 +1947,7 @@ fn dispatch_resp_command(
             // Values 已是成形 score 串, 按裸 bulk 渲染 (不走 render tag)
             conn.values_raw.insert(seq);
             let op = BatchOp::ZMScore { db: db.clone(), table: table.clone(), key, members };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZPop { key, rev, count } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1544,7 +1956,7 @@ fn dispatch_resp_command(
             }
             conn.members_kind.insert(seq, MembersKind::List);
             let op = BatchOp::ZPop { db: db.clone(), table: table.clone(), key, rev, count };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HStrlen { key, field } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1554,7 +1966,7 @@ fn dispatch_resp_command(
             // 复用 HGet + Strlen 语义转换 (miss → :0)
             conn.get_kind.insert(seq, GetKind::Strlen);
             let op = BatchOp::HGet { db: db.clone(), table: table.clone(), key, field };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HRandField { key, count, withvalues } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1574,7 +1986,7 @@ fn dispatch_resp_command(
                 count: count.unwrap_or(1),
                 withvalues,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         // ---- ⭐ Phase G: Geo (复用 ZSet 链路 + 渲染钩子) ----
         RespCommand::GeoPos { key, members } => {
@@ -1584,7 +1996,7 @@ fn dispatch_resp_command(
             }
             conn.geo_ctx.insert(seq, GeoCtx::Pos);
             let op = BatchOp::ZMScore { db: db.clone(), table: table.clone(), key, members };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::GeoDist { key, m1, m2, factor } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1598,7 +2010,7 @@ fn dispatch_resp_command(
                 key,
                 members: vec![m1, m2],
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::GeoSearch { key, lon, lat, radius_m, asc, count, withcoord, withdist } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1619,7 +2031,7 @@ fn dispatch_resp_command(
                 rev: false,
                 withscores: true,
             };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         // ---- ⭐ Phase B: Bitmap (String 字节) ----
         RespCommand::SetBit { key, offset, bit } => {
@@ -1636,7 +2048,7 @@ fn dispatch_resp_command(
                 return;
             }
             let op = BatchOp::SetBit { db: db.clone(), table: table.clone(), key, offset, bit };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::GetBit { key, offset } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1645,7 +2057,7 @@ fn dispatch_resp_command(
             }
             conn.bit_ctx.insert(seq, BitCtx::GetBit { offset });
             let op = BatchOp::Get { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::BitCount { key, start, end } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1654,7 +2066,7 @@ fn dispatch_resp_command(
             }
             conn.bit_ctx.insert(seq, BitCtx::Count { start, end });
             let op = BatchOp::Get { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::BitPos { key, bit, start, end } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
@@ -1663,7 +2075,7 @@ fn dispatch_resp_command(
             }
             conn.bit_ctx.insert(seq, BitCtx::Pos { bit, start, end });
             let op = BatchOp::Get { db: db.clone(), table: table.clone(), key };
-            push_task(conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::InvalidInt(_) => {
             conn.resp_complete(
@@ -1727,9 +2139,17 @@ fn dispatch_resp_command(
             };
             conn.resp_complete(seq, bytes);
         }
-        RespCommand::Select => {
-            // 单 db 语义: 接受并忽略
-            conn.resp_complete(seq, codec.encode_ok());
+        RespCommand::Select { idx } => {
+            // ⭐ D3 (分库): idx 经 DbDirView 翻译为 db name, per-connection 生效.
+            // (分表维度走 key 冒号前缀, 与 SELECT 正交)
+            let bytes = match u32::try_from(idx).ok().and_then(|id| db_view.name_of(id)) {
+                Some(name) => {
+                    conn.current_db = name;
+                    codec.encode_ok()
+                }
+                None => codec.encode_error("DB index is out of range"),
+            };
+            conn.resp_complete(seq, bytes);
         }
         RespCommand::Unknown(name) => {
             conn.resp_complete(seq, codec.encode_error(&format!("unknown command '{name}'")));
@@ -1744,13 +2164,23 @@ fn dispatch_resp_command(
 }
 
 fn push_task(
+    conn: &mut ConnState,
     conn_id: u64,
     req_id: u64,
     worker_id: u32,
-    op: BatchOp,
+    mut op: BatchOp,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
 ) {
+    // ⭐ T2 (分表): 单 key op 统一在此按 "table:key" 冒号前缀选表 (单点重写;
+    // 无前缀保持构造时的 default 表). Multi op 由 dispatch 预分组时已解析.
+    if let Some((tbl, key)) = op.table_key_mut()
+        && let Some(pos) = split_table_key(key)
+    {
+        let prefix = key[..pos].to_vec();
+        *tbl = conn.table_arc(&prefix);
+        key.drain(..=pos);
+    }
     let shard_id = hash_route_op(&op, num_shards);
     shard_inboxes[shard_id].push_spin(ShardTask {
         conn_id,
@@ -1815,7 +2245,7 @@ fn getrange_slice(data: &[u8], start: i64, end: i64) -> &[u8] {
 }
 
 /// RESP: 处理 shard 回来的单条结果 (含 DEL/MGET/MSET 聚合).
-/// ⭐ C3: *STORE 需在聚合完成点发第二阶段任务 → 携带路由上下文.
+/// ⭐ C3: *STORE 二阶段任务的 (db, table) 存于 agg (发起时快照), 无需入参.
 #[allow(clippy::too_many_arguments)]
 fn handle_resp_shard_result(
     conn: &mut ConnState,
@@ -1823,13 +2253,297 @@ fn handle_resp_shard_result(
     seq: u64,
     group: u32,
     result: &BatchResult,
-    db: &std::sync::Arc<str>,
-    table: &std::sync::Arc<str>,
     worker_id: u32,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
 ) {
     let codec = RespCodec::new();
+    // ⭐ H2: HTTP KV 回包渲染 (seq 簿记, 与 SQL 钩子互斥)
+    if let Some(ctx) = conn.http_ctx.remove(&seq) {
+        use crate::protocol::http as h;
+        use shard_manager::value_num as vn;
+        let cors = crate::http_config::cors_origin();
+        let bytes = match (ctx.op, result) {
+            (HttpKvOp::Get, BatchResult::GetValue(Some(stored))) => {
+                let (tag, payload) = crate::value_codec::decode_value(stored);
+                let val = match tag {
+                    vn::TAG_I64 if payload.len() == 8 => {
+                        serde_json::json!(i64::from_le_bytes(payload.try_into().unwrap()))
+                    }
+                    vn::TAG_F64 if payload.len() == 8 => {
+                        serde_json::json!(f64::from_le_bytes(payload.try_into().unwrap()))
+                    }
+                    _ => match std::str::from_utf8(payload) {
+                        Ok(s) => serde_json::json!(s),
+                        Err(_) => serde_json::json!({
+                            "b64": h::base64_encode(payload),
+                            "encoding": "base64",
+                        }),
+                    },
+                };
+                let body = serde_json::to_vec(&serde_json::json!({ "value": val }))
+                    .unwrap_or_default();
+                h::build_response(200, &body, cors, ctx.keep_alive)
+            }
+            (HttpKvOp::Get, BatchResult::GetValue(None)) => {
+                h::build_response(404, &h::error_body("not found"), cors, ctx.keep_alive)
+            }
+            (HttpKvOp::Put, BatchResult::PutOk) => {
+                h::build_response(200, br#"{"ok":true}"#, cors, ctx.keep_alive)
+            }
+            (HttpKvOp::Delete, BatchResult::DeleteExisted(b)) => {
+                let body = serde_json::to_vec(&serde_json::json!({ "deleted": b }))
+                    .unwrap_or_default();
+                h::build_response(200, &body, cors, ctx.keep_alive)
+            }
+            (_, BatchResult::Error(e)) => {
+                crate::metrics::HTTP_ERRORS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                h::build_response(500, &h::error_body(e), cors, ctx.keep_alive)
+            }
+            _ => h::build_response(
+                500,
+                &h::error_body("unexpected reply"),
+                cors,
+                ctx.keep_alive,
+            ),
+        };
+        conn.resp_complete(seq, bytes);
+        return;
+    }
+    // ⭐ X3: SQL 钩子 — schema 拉取续跑 (挂起语句在 schema 到达后继续规划)
+    if let Some(pending) = conn.sql_pending.remove(&seq) {
+        match result {
+            BatchResult::GetValue(Some(bytes)) => match TableSchema::decode(bytes) {
+                Ok(s) => {
+                    let schema = std::sync::Arc::new(s);
+                    // ⭐ W1: 存量表 (GetSchemaOp 拉取) 只填 schema, 不建路由
+                    // (启用路由需 CREATE 时刻零数据的完备性前提)
+                    conn.sql_cache
+                        .borrow_mut()
+                        .schemas
+                        .insert((pending.db.to_string(), pending.table), schema.clone());
+                    sql_run_dml(
+                        conn, conn_id, seq, worker_id, &pending.db, shard_inboxes, num_shards,
+                        schema, pending.stmt,
+                    );
+                }
+                Err(e) => {
+                    conn.resp_complete(seq, sql_err_bytes(conn.proto, &format!("bad schema: {e}")));
+                }
+            },
+            BatchResult::GetValue(None) => {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, &format!(
+                        "table '{}' has no schema (not a SQL table)",
+                        pending.table
+                    )),
+                );
+            }
+            BatchResult::Error(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, e)),
+            _ => conn.resp_complete(seq, sql_err_bytes(conn.proto, "unexpected schema reply")),
+        }
+        return;
+    }
+    // ⭐ X3: SELECT pk 点查 — decode + 全条件过滤 → 0/1 行 (⭐ S2: COUNT → 计数)
+    if let Some(ctx) = conn.sql_row_ctx.remove(&seq) {
+        let bin = conn.mysql_binary.remove(&seq);
+        let bytes = match result {
+            BatchResult::GetValue(Some(row)) => {
+                match storage::row::decode_row(&ctx.schema, row) {
+                    Ok(values) if sql_eval_conds(&ctx.schema, &values, &ctx.conds) => {
+                        if ctx.count {
+                            render_sql_count(conn.proto, bin, 1)
+                        } else {
+                            render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[values])
+                        }
+                    }
+                    Ok(_) if ctx.count => render_sql_count(conn.proto, bin, 0),
+                    Ok(_) => render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[]),
+                    Err(e) => sql_err_bytes(conn.proto, &e.to_string()),
+                }
+            }
+            BatchResult::GetValue(None) if ctx.count => render_sql_count(conn.proto, bin, 0),
+            BatchResult::GetValue(None) => render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[]),
+            BatchResult::Error(e) => sql_err_bytes(conn.proto, e),
+            _ => sql_err_bytes(conn.proto, "unexpected reply"),
+        };
+        conn.resp_complete(seq, bytes);
+        return;
+    }
+    // ⭐ X3: SELECT 索引路径广播聚合 (⭐ O3: unique 等值可早停; ⭐ S1: DML phase1)
+    if conn.sql_select_agg.contains_key(&seq) {
+        let proto = conn.proto;
+        let bin = conn.mysql_binary.contains(&seq); // ⭐ P2 (借用前 peek)
+        enum Fire {
+            No,
+            Reply(Vec<u8>),
+            Dml { pks: Vec<Vec<u8>>, action: SqlDmlAction, target: (std::sync::Arc<str>, String) },
+        }
+        let (fire, drained) = {
+            let agg = conn.sql_select_agg.get_mut(&seq).expect("just checked");
+            if !agg.done {
+                match result {
+                    BatchResult::Rows(rows) => agg.rows.extend(rows.iter().cloned()),
+                    BatchResult::Error(e) => agg.error = Some(e.clone()),
+                    _ => agg.error = Some("unexpected reply".into()),
+                }
+            }
+            agg.remaining -= 1;
+            // 回复时机: 全部回齐, 或 unique 等值首个非空/出错即早停 (DML 禁早停)
+            let should_fire = !agg.done
+                && (agg.remaining == 0
+                    || (agg.unique_early && (!agg.rows.is_empty() || agg.error.is_some())));
+            let fire = if should_fire {
+                agg.done = true;
+                match agg.dml.take() {
+                    // ⭐ S1: DML phase1 完成 — 过滤取 pk (出错则直接回错)
+                    Some(action) if agg.error.is_none() => match collect_dml_pks(agg) {
+                        Ok(pks) => Fire::Dml {
+                            pks,
+                            action,
+                            target: agg.dml_target.take().expect("dml 必带 target"),
+                        },
+                        Err(e) => Fire::Reply(sql_err_bytes(proto, &e)),
+                    },
+                    Some(_) => Fire::Reply(sql_err_bytes(
+                        proto,
+                        agg.error.as_deref().unwrap_or("error"),
+                    )),
+                    None => Fire::Reply(render_select_agg(proto, bin, agg)),
+                }
+            } else {
+                Fire::No
+            };
+            (fire, agg.remaining == 0)
+        };
+        // agg 保留至全部回包收齐 (迟到回包只减计数丢结果, 防重复 complete)
+        if drained {
+            conn.sql_select_agg.remove(&seq);
+            conn.mysql_binary.remove(&seq);
+        }
+        match fire {
+            Fire::No => {}
+            Fire::Reply(bytes) => conn.resp_complete(seq, bytes),
+            Fire::Dml { pks, action, target } => {
+                // phase2: 逐 pk 按路由下发 (DML 禁早停保证此刻 phase1 已 drained,
+                // 同 seq 注册 dml_agg 无双聚合并存)
+                debug_assert!(drained, "DML phase1 必须全量回齐后才 fire");
+                if pks.is_empty() {
+                    conn.resp_complete(seq, sql_ok_bytes(proto, 0));
+                } else {
+                    conn.sql_dml_agg.insert(
+                        seq,
+                        SqlDmlAgg {
+                            remaining: pks.len(),
+                            affected: 0,
+                            error: None,
+                            drop_key: None,
+                        },
+                    );
+                    for pk in pks {
+                        let op = sql_dml_op(&target.0, &target.1, pk, &action);
+                        let sid = hash_route_op(&op, num_shards);
+                        push_task_grouped(
+                            conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes,
+                        );
+                    }
+                }
+            }
+        }
+        return;
+    }
+    // ⭐ S1: DML 计数聚合 (INSERT 多行 / DELETE·UPDATE phase2 / DROP 广播)
+    if let Some(agg) = conn.sql_dml_agg.get_mut(&seq) {
+        match result {
+            BatchResult::PutOk => agg.affected += 1,
+            BatchResult::DeleteExisted(true) => agg.affected += 1,
+            BatchResult::DeleteExisted(false) => {}
+            BatchResult::Error(e) => agg.error = Some(e.clone()),
+            _ => agg.error = Some("unexpected reply".into()),
+        }
+        agg.remaining -= 1;
+        if agg.remaining == 0 {
+            let agg = conn.sql_dml_agg.remove(&seq).expect("just checked");
+            conn.mysql_binary.remove(&seq);
+            let bytes = match agg.error {
+                Some(e) => sql_err_bytes(conn.proto, &e),
+                None => {
+                    let affected = if let Some(key) = agg.drop_key {
+                        // DROP 完成: 本 worker schema 缓存 + 进程级路由/注册清理,
+                        // DDL epoch +1 (其它 worker 靠 epoch 失效重拉)
+                        conn.sql_cache.borrow_mut().schemas.remove(&key);
+                        let sh = &conn.sql_shared;
+                        sh.created_here.write().unwrap().remove(&key);
+                        sh.routes
+                            .write()
+                            .unwrap()
+                            .retain(|(d, t, _), _| !(d == &key.0 && t == &key.1));
+                        sh.ddl_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        0
+                    } else {
+                        agg.affected
+                    };
+                    sql_ok_bytes(conn.proto, affected)
+                }
+            };
+            conn.resp_complete(seq, bytes);
+        }
+        return;
+    }
+    // ⭐ X3: CREATE TABLE 广播聚合 (全 shard PutOk → 填缓存 + OK)
+    if let Some(agg) = conn.sql_ddl_agg.get_mut(&seq) {
+        match result {
+            BatchResult::PutOk => {}
+            BatchResult::Error(e) => agg.error = Some(e.clone()),
+            _ => agg.error = Some("unexpected reply".into()),
+        }
+        agg.remaining -= 1;
+        if agg.remaining == 0 {
+            let agg = conn.sql_ddl_agg.remove(&seq).expect("just checked");
+            conn.mysql_binary.remove(&seq);
+            let bytes = match agg.error {
+                Some(e) => sql_err_bytes(conn.proto, &e),
+                None => {
+                    // ⭐ W1/W2 → ORM-B2: CREATE 成功 → schema (本 worker) +
+                    // created_here + 空路由 bloom (进程级共享 — 建表时刻零数据,
+                    // 空 bloom 即完备; 跨 worker/门面 INSERT 都喂同一实例)
+                    {
+                        let sh = &conn.sql_shared;
+                        let mut routes = sh.routes.write().unwrap();
+                        for idx in &agg.schema.indexes {
+                            routes
+                                .entry((agg.key.0.clone(), agg.key.1.clone(), idx.iid))
+                                .or_insert_with(|| {
+                                    std::sync::Arc::new(
+                                        (0..num_shards)
+                                            .map(|_| storage::index_bloom::IndexBloom::new())
+                                            .collect(),
+                                    )
+                                });
+                        }
+                        drop(routes);
+                        sh.created_here.write().unwrap().insert(agg.key.clone());
+                    }
+                    conn.sql_cache.borrow_mut().schemas.insert(agg.key, agg.schema);
+                    sql_ok_bytes(conn.proto, 0)
+                }
+            };
+            conn.resp_complete(seq, bytes);
+        }
+        return;
+    }
+    // ⭐ Y2: SQL conn 的裸结果兜底 (Sql/Pg 共用)
+    if matches!(conn.proto, ProtocolKind::Sql | ProtocolKind::Pg) {
+        let bytes = match result {
+            BatchResult::PutOk => sql_ok_bytes(conn.proto, 1),
+            BatchResult::Error(e) => sql_err_bytes(conn.proto, e),
+            _ => sql_err_bytes(conn.proto, "unexpected reply"),
+        };
+        conn.resp_complete(seq, bytes);
+        return;
+    }
     // ⭐ Phase G: Geo 渲染钩子 (复用 ZMScore/ZRange 结果, 优先拦截)
     if let Some(ctx) = conn.geo_ctx.remove(&seq) {
         let bytes = render_geo(&codec, ctx, result);
@@ -1989,6 +2703,8 @@ fn handle_resp_shard_result(
             use std::collections::HashSet;
             let (card_only, limit) = (agg.card_only, agg.limit);
             let store_dst = agg.store_dst;
+            // ⭐ D3: 二阶段任务用命令发起时的 (db, table), 不受后续 SELECT 影响
+            let (agg_db, agg_table) = (agg.db.clone(), agg.table.clone());
             let mut sets: Vec<Vec<Vec<u8>>> =
                 agg.sets.into_iter().map(|s| s.unwrap_or_default()).collect();
             let first = if sets.is_empty() { Vec::new() } else { sets.remove(0) };
@@ -2027,13 +2743,13 @@ fn handle_resp_shard_result(
             // ⭐ C3: *STORE — 结果写 dst (同 shard FIFO: 先 Delete 再 SAdd), 完成后回 :card
             if let Some(dst) = store_dst {
                 let card = out.len() as i64;
-                let sid = hash_route_key(db.as_ref(), table.as_ref(), &dst, num_shards);
+                let sid = hash_route_key(agg_db.as_ref(), agg_table.as_ref(), &dst, num_shards);
                 let mut remaining = 1usize;
-                let del = BatchOp::Delete { db: db.clone(), table: table.clone(), key: dst.clone() };
+                let del = BatchOp::Delete { db: agg_db.clone(), table: agg_table.clone(), key: dst.clone() };
                 push_task_grouped(conn_id, seq, worker_id, 0, sid, del, shard_inboxes);
                 if !out.is_empty() {
                     remaining += 1;
-                    let sadd = BatchOp::SAdd { db: db.clone(), table: table.clone(), key: dst, members: out };
+                    let sadd = BatchOp::SAdd { db: agg_db, table: agg_table, key: dst, members: out };
                     push_task_grouped(conn_id, seq, worker_id, 1, sid, sadd, shard_inboxes);
                 }
                 conn.store_agg.insert(seq, StoreFinishAgg { remaining, card, error: None });
@@ -2087,6 +2803,8 @@ fn handle_resp_shard_result(
             // SUM 聚合 (首现序保序; inter 要求出现在全部源)
             let inter = agg.inter;
             let n_sets = agg.sets.len();
+            // ⭐ D3: 二阶段任务用命令发起时的 (db, table)
+            let (agg_db, agg_table) = (agg.db.clone(), agg.table.clone());
             let mut acc: Vec<(Vec<u8>, f64, usize)> = Vec::new();
             let mut pos: HashMap<Vec<u8>, usize> = HashMap::new();
             for set in agg.sets.into_iter().map(|s| s.unwrap_or_default()) {
@@ -2110,13 +2828,13 @@ fn handle_resp_shard_result(
                 .collect();
             let card = pairs.len() as i64;
             let dst = agg.dst;
-            let sid = hash_route_key(db.as_ref(), table.as_ref(), &dst, num_shards);
+            let sid = hash_route_key(agg_db.as_ref(), agg_table.as_ref(), &dst, num_shards);
             let mut remaining = 1usize;
-            let del = BatchOp::Delete { db: db.clone(), table: table.clone(), key: dst.clone() };
+            let del = BatchOp::Delete { db: agg_db.clone(), table: agg_table.clone(), key: dst.clone() };
             push_task_grouped(conn_id, seq, worker_id, 0, sid, del, shard_inboxes);
             if !pairs.is_empty() {
                 remaining += 1;
-                let zadd = BatchOp::ZAdd { db: db.clone(), table: table.clone(), key: dst, pairs };
+                let zadd = BatchOp::ZAdd { db: agg_db, table: agg_table, key: dst, pairs };
                 push_task_grouped(conn_id, seq, worker_id, 1, sid, zadd, shard_inboxes);
             }
             conn.store_agg.insert(seq, StoreFinishAgg { remaining, card, error: None });
@@ -2237,6 +2955,8 @@ fn handle_resp_shard_result(
             }
             out
         }
+        // ⭐ Q5: Rows 是 SQL 门面专属 (RESP 命令不产生; 防御性兜底)
+        BatchResult::Rows(_) => codec.encode_error("row results unsupported on RESP"),
         BatchResult::Error(e) => codec.encode_error(e),
     };
     conn.resp_complete(seq, bytes);
@@ -2351,7 +3071,8 @@ fn batch_result_to_response(result: &BatchResult) -> Response {
         | BatchResult::Pairs(_)
         | BatchResult::Members(_)
         | BatchResult::OptMember(_)
-        | BatchResult::IntList(_) => {
+        | BatchResult::IntList(_)
+        | BatchResult::Rows(_) => {
             Response::Error("multi ops unsupported on binary protocol".into())
         }
         BatchResult::Error(e) => Response::Error(e.clone()),
@@ -2359,68 +3080,9 @@ fn batch_result_to_response(result: &BatchResult) -> Response {
 }
 
 fn hash_route_op(op: &BatchOp, num_shards: usize) -> usize {
-    let (db, table, key) = match op {
-        BatchOp::Put { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::Get { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::Delete { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::Incr { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::IncrFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::Append { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::GetDel { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::GetSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SetRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        // ⭐ Phase H: Hash 单 key op, 按 user key 路由
-        BatchOp::HSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::HSetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::HGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::HMGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::HDel { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::HLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::HGetAll { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::HIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::HIncrByFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        // ⭐ Phase Set: Set 单 key op
-        BatchOp::SAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SIsMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SMembers { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SPop { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SRandMember { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        // ⭐ Phase L: List 单 key op
-        BatchOp::LPush { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::LPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::LLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::LRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::LIndex { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::LSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        // ⭐ Phase Z: ZSet 单 key op
-        BatchOp::ZAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZRangeByScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZRank { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZMScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::ZPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SMisMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SPopN { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SRandCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::HRandField { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::LRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::LTrim { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::LPos { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::LInsert { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        BatchOp::SetBit { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-        // Multi op 不经此路径 (dispatch 已按 key 分组定向 push)
-        BatchOp::MultiGet { .. } | BatchOp::MultiPut { .. } | BatchOp::MultiPutNx { .. } => {
-            unreachable!("Multi ops are pre-routed by dispatch")
-        }
-    };
+    // ⭐ T1: 单源提取 (Multi op 已由 dispatch 预分组定向 push, 不经此路径;
+    // locator 对 Multi 取首 key, 与预分组路由一致, 兜底亦安全)
+    let (db, table, key) = op.locator();
     hash_route_key(db, table, key, num_shards)
 }
 
@@ -2599,4 +3261,1894 @@ fn render_bit(codec: &RespCodec, ctx: BitCtx, result: &BatchResult) -> Vec<u8> {
             codec.encode_integer(pos)
         }
     }
+}
+
+// =====================================================================
+// ⭐ X3 (SQL 落地): 规划 / 执行 / 过滤 / 渲染
+// =====================================================================
+
+/// 语句分派: CREATE 广播 schema; INSERT/SELECT 需 schema (缓存 miss 先拉).
+#[allow(clippy::too_many_arguments)]
+fn sql_dispatch_stmt(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    db: &std::sync::Arc<str>,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    stmt: SqlStmt,
+) {
+    crate::metrics::SQL_QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // ⭐ ORM-B2: DDL epoch 检查 — DROP/重建后本 worker 陈旧 schema 缓存整体
+    // 失效 (一次 relaxed load 热路径; DDL 低频, 全量清空重拉可接受)
+    {
+        let ep = conn.sql_shared.ddl_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let mut cache = conn.sql_cache.borrow_mut();
+        if cache.local_epoch != ep {
+            cache.schemas.clear();
+            cache.local_epoch = ep;
+        }
+    }
+    match stmt {
+        // ⭐ S3: 工具命令 (worker 本地, 零任务)
+        SqlStmt::SetStub => {
+            conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+        }
+        SqlStmt::VersionStub => {
+            let ver: &[u8] = if conn.proto == ProtocolKind::Pg {
+                b"PostgreSQL 16.0 (NexusDB)"
+            } else {
+                b"8.0.35-NexusDB"
+            };
+            let bin = conn.mysql_binary.remove(&seq);
+            conn.resp_complete(
+                seq,
+                sql_rows_bytes(
+                    conn.proto,
+                    bin,
+                    &[("version()", ColType::Str)],
+                    &[vec![ColValue::Bytes(ver.to_vec())]],
+                ),
+            );
+        }
+        // ⭐ S5: SELECT DATABASE() — 当前库名单行
+        SqlStmt::DatabaseStub => {
+            let bin = conn.mysql_binary.remove(&seq);
+            conn.resp_complete(
+                seq,
+                sql_rows_bytes(
+                    conn.proto,
+                    bin,
+                    &[("DATABASE()", ColType::Str)],
+                    &[vec![ColValue::Bytes(db.as_bytes().to_vec())]],
+                ),
+            );
+        }
+        SqlStmt::Use { db: name } => {
+            // 校验存在 (default 库隐式不入 resolver, 特判)
+            if name.as_str() == default_db.as_ref() || db_view.id_of(&name).is_some() {
+                conn.current_db = std::sync::Arc::from(name.as_str());
+                conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+            } else {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, &format!("Unknown database '{name}'")),
+                );
+            }
+        }
+        SqlStmt::CreateTable { table, schema } => {
+            let bytes = schema.encode();
+            let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+            conn.sql_ddl_agg.insert(
+                seq,
+                SqlDdlAgg {
+                    remaining: num_shards,
+                    error: None,
+                    key: (db.to_string(), table),
+                    schema: std::sync::Arc::new(schema),
+                },
+            );
+            // 数据面广播 (worker 不持控制面); shard 端惰性建表 + set_schema 幂等
+            for sid in 0..num_shards {
+                let op = BatchOp::SetSchemaOp {
+                    db: db.clone(),
+                    table: table_arc.clone(),
+                    bytes: bytes.clone(),
+                };
+                push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+            }
+        }
+        SqlStmt::Insert { ref table, .. }
+        | SqlStmt::Select { ref table, .. }
+        | SqlStmt::Delete { ref table, .. }
+        | SqlStmt::Update { ref table, .. }
+        | SqlStmt::Describe { ref table } => {
+            let key = (db.to_string(), table.clone());
+            // ⭐ W1: worker 级共享缓存 (borrow 局部化: 取 Arc 即还)
+            let cached = conn.sql_cache.borrow().schemas.get(&key).cloned();
+            if let Some(schema) = cached {
+                sql_run_dml(conn, conn_id, seq, worker_id, db, shard_inboxes, num_shards, schema, stmt);
+            } else {
+                // schema miss: 挂起语句, 先拉 schema (GetSchemaOp 定向单 shard)
+                let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+                let table_name = table.clone();
+                conn.sql_pending.insert(seq, PendingSql { stmt, db: db.clone(), table: table_name });
+                let op = BatchOp::GetSchemaOp { db: db.clone(), table: table_arc };
+                push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            }
+        }
+        // ⭐ S1: DROP TABLE — 无需 schema, 数据面广播删表
+        SqlStmt::DropTable { table } => {
+            conn.sql_dml_agg.insert(
+                seq,
+                SqlDmlAgg {
+                    remaining: num_shards,
+                    affected: 0,
+                    error: None,
+                    drop_key: Some((db.to_string(), table.clone())),
+                },
+            );
+            let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+            for sid in 0..num_shards {
+                let op = BatchOp::DropTableOp { db: db.clone(), table: table_arc.clone() };
+                push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+            }
+        }
+    }
+}
+
+/// schema 就绪后的 DML 规划执行 (INSERT / SELECT).
+#[allow(clippy::too_many_arguments)]
+fn sql_run_dml(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    db: &std::sync::Arc<str>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    schema: std::sync::Arc<TableSchema>,
+    stmt: SqlStmt,
+) {
+    match stmt {
+        SqlStmt::Insert { table, cols, rows } => {
+            // ⭐ S1: 多行 VALUES — 逐行 RowPut, DmlAgg 计数 (批内非原子, 文档记录)
+            let mut ops: Vec<BatchOp> = Vec::with_capacity(rows.len());
+            for vals in &rows {
+                let values = match sql_build_row(&schema, &cols, vals) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+                        return;
+                    }
+                };
+                let pk = match sql_pk_bytes(
+                    schema.columns[schema.pk_col as usize].ty,
+                    &values[schema.pk_col as usize],
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+                        return;
+                    }
+                };
+                ops.push(BatchOp::RowPut {
+                    db: db.clone(),
+                    table: std::sync::Arc::from(table.as_str()),
+                    pk,
+                    values,
+                });
+            }
+            conn.sql_dml_agg.insert(
+                seq,
+                SqlDmlAgg {
+                    remaining: ops.len(),
+                    affected: 0,
+                    error: None,
+                    drop_key: None,
+                },
+            );
+            for op in ops {
+                // ⭐ W2 → ORM-B2: created_here 的表 → 喂进程级路由缓存
+                // (value → 所在 shard; bloom 原子只增, 多 worker/门面并发安全)
+                let sid = hash_route_op(&op, num_shards);
+                {
+                    let sh = &conn.sql_shared;
+                    let ckey = (db.to_string(), table.clone());
+                    if sh.created_here.read().unwrap().contains(&ckey) {
+                        let BatchOp::RowPut { ref values, .. } = op else { unreachable!() };
+                        for idx in schema.indexes.clone() {
+                            let ty = schema.columns[idx.col as usize].ty;
+                            if let Some(enc) =
+                                storage::sql_rows::index_val_bytes(ty, &values[idx.col as usize])
+                            {
+                                let entry = sh
+                                    .routes
+                                    .read()
+                                    .unwrap()
+                                    .get(&(ckey.0.clone(), ckey.1.clone(), idx.iid))
+                                    .cloned();
+                                if let Some(blooms) = entry {
+                                    blooms[sid].insert(&enc); // 锁外原子写
+                                }
+                            }
+                        }
+                    }
+                }
+                push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+            }
+        }
+        // ⭐ S1: DELETE / UPDATE — pk 等值单发, 其余两阶段 (SELECT 内部路径收 pk)
+        SqlStmt::Delete { .. } | SqlStmt::Update { .. } => {
+            let (table, conds, action) = match stmt {
+                SqlStmt::Delete { table, conds } => (table, conds, SqlDmlAction::Delete),
+                SqlStmt::Update { table, conds, sets } => {
+                    // 校验 + 转换 sets → (列号, ColValue)
+                    let mut out: Vec<(u16, ColValue)> = Vec::with_capacity(sets.len());
+                    for (name, v) in &sets {
+                        let Some(i) = schema.col_by_name(name) else {
+                            conn.resp_complete(
+                                seq,
+                                sql_err_bytes(conn.proto, &format!("unknown column '{name}'")),
+                            );
+                            return;
+                        };
+                        if i == schema.pk_col {
+                            conn.resp_complete(
+                                seq,
+                                sql_err_bytes(conn.proto, "cannot UPDATE PRIMARY KEY column"),
+                            );
+                            return;
+                        }
+                        let cv = match sql_to_col(schema.columns[i as usize].ty, v) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+                                return;
+                            }
+                        };
+                        if cv == ColValue::Null && !schema.columns[i as usize].nullable {
+                            conn.resp_complete(
+                                seq,
+                                sql_err_bytes(conn.proto, &format!("column '{name}' is NOT NULL")),
+                            );
+                            return;
+                        }
+                        out.push((i, cv));
+                    }
+                    (table, conds, SqlDmlAction::Update(out))
+                }
+                _ => unreachable!(),
+            };
+            match sql_plan_select(&schema, &conds) {
+                Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
+                Ok(SqlPlan::PkGet { pk }) => {
+                    // pk 等值 → 单 shard 原子, 直发 phase2
+                    conn.sql_dml_agg.insert(
+                        seq,
+                        SqlDmlAgg { remaining: 1, affected: 0, error: None, drop_key: None },
+                    );
+                    let op = sql_dml_op(db, &table, pk, &action);
+                    push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+                }
+                Ok(SqlPlan::Index { iid, lo, hi, .. }) => {
+                    // 两阶段 phase1: 复用 SELECT 广播路径收全行 (残余过滤需行值),
+                    // 完成点取 pk 发 phase2. limit 不下推 (DML 无 LIMIT).
+                    conn.sql_select_agg.insert(
+                        seq,
+                        SqlSelectAgg {
+                            remaining: num_shards,
+                            error: None,
+                            rows: Vec::new(),
+                            schema: schema.clone(),
+                            conds,
+                            limit: None,
+                            proj: Vec::new(),
+                            cover: None,
+                            unique_early: false, // DML 禁早停 (防同 seq 双 agg 并存)
+                            done: false,
+                            dml: Some(action),
+                            dml_target: Some((db.clone(), table.clone())),
+                            order: Vec::new(),
+                            offset: 0,
+                            count: false,
+                        },
+                    );
+                    let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+                    for sid in 0..num_shards {
+                        let op = BatchOp::IndexScan {
+                            db: db.clone(),
+                            table: table_arc.clone(),
+                            iid,
+                            lo: lo.clone(),
+                            hi: hi.clone(),
+                            limit: 0,
+                            with_rows: true,
+                        };
+                        push_task_grouped(
+                            conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes,
+                        );
+                    }
+                }
+                // ⭐ S2: 无可用索引的 DML (含无 WHERE 全删/全改) → 全表扫 phase1
+                Ok(SqlPlan::FullScan) => {
+                    conn.sql_select_agg.insert(
+                        seq,
+                        SqlSelectAgg {
+                            remaining: num_shards,
+                            error: None,
+                            rows: Vec::new(),
+                            schema: schema.clone(),
+                            conds,
+                            limit: None,
+                            proj: Vec::new(),
+                            cover: None,
+                            unique_early: false,
+                            done: false,
+                            dml: Some(action),
+                            dml_target: Some((db.clone(), table.clone())),
+                            order: Vec::new(),
+                            offset: 0,
+                            count: false,
+                        },
+                    );
+                    let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+                    for sid in 0..num_shards {
+                        let op = BatchOp::TableScan {
+                            db: db.clone(),
+                            table: table_arc.clone(),
+                            limit: 0,
+                        };
+                        push_task_grouped(
+                            conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes,
+                        );
+                    }
+                }
+            }
+        }
+        SqlStmt::Select { table, cols, conds, limit, order, offset, count } => {
+            // ⭐ O1: 投影列名 → 列号 (空/COUNT = 全列)
+            let proj: Vec<u16> = if cols.is_empty() {
+                (0..schema.columns.len() as u16).collect()
+            } else {
+                let mut p = Vec::with_capacity(cols.len());
+                for c in &cols {
+                    match schema.col_by_name(c) {
+                        Some(i) => p.push(i),
+                        None => {
+                            conn.resp_complete(
+                                seq,
+                                sql_err_bytes(conn.proto, &format!("unknown column '{c}'")),
+                            );
+                            return;
+                        }
+                    }
+                }
+                p
+            };
+            // ⭐ S2: ORDER BY 列名 → 列号
+            let mut order_cols: Vec<(u16, bool)> = Vec::with_capacity(order.len());
+            for (name, desc) in &order {
+                match schema.col_by_name(name) {
+                    Some(i) => order_cols.push((i, *desc)),
+                    None => {
+                        conn.resp_complete(
+                            seq,
+                            sql_err_bytes(conn.proto, &format!("unknown column '{name}'")),
+                        );
+                        return;
+                    }
+                }
+            }
+            let offset = offset.unwrap_or(0);
+            match sql_plan_select(&schema, &conds) {
+            Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
+            Ok(SqlPlan::PkGet { pk }) => {
+                conn.sql_row_ctx.insert(seq, SqlRowCtx { schema, conds, proj, count });
+                let op = BatchOp::RowGet {
+                    db: db.clone(),
+                    table: std::sync::Arc::from(table.as_str()),
+                    pk,
+                };
+                push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            }
+            // ⭐ S2: 全表扫 — 广播 TableScan + 全条件残余过滤
+            Ok(SqlPlan::FullScan) => {
+                // limit 下推仅当无条件且无排序 (下推额含 offset)
+                let shard_limit = if conds.is_empty() && order_cols.is_empty() && !count {
+                    limit.map(|l| l + offset).unwrap_or(0)
+                } else {
+                    0
+                };
+                conn.sql_select_agg.insert(
+                    seq,
+                    SqlSelectAgg {
+                        remaining: num_shards,
+                        error: None,
+                        rows: Vec::new(),
+                        schema,
+                        conds,
+                        limit,
+                        proj,
+                        cover: None,
+                        unique_early: false,
+                        done: false,
+                        dml: None,
+                        dml_target: None,
+                        order: order_cols,
+                        offset,
+                        count,
+                    },
+                );
+                let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+                for sid in 0..num_shards {
+                    let op = BatchOp::TableScan {
+                        db: db.clone(),
+                        table: table_arc.clone(),
+                        limit: shard_limit,
+                    };
+                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                }
+            }
+            Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc }) => {
+                // limit 下推: 仅当条件可被闭界完全表达且无排序
+                // (否则残余过滤/全量排序会漏行; 下推额含 offset)
+                let shard_limit = if limit_push && order_cols.is_empty() && !count {
+                    limit.map(|l| l + offset).unwrap_or(0)
+                } else {
+                    0
+                };
+                // ⭐ O1: 覆盖判定 — 投影∪条件∪排序列 ⊆ {索引列, pk 列} → 免回表
+                let idx_col = schema
+                    .indexes
+                    .iter()
+                    .find(|i| i.iid == iid)
+                    .map(|i| i.col)
+                    .expect("plan 产出的 iid 必在 schema");
+                let pk_col = schema.pk_col;
+                let in_cover = |c: u16| c == idx_col || c == pk_col;
+                let cover = (count || proj.iter().all(|&c| in_cover(c)))
+                    && order_cols.iter().all(|&(c, _)| in_cover(c))
+                    && conds
+                        .iter()
+                        .all(|c| schema.col_by_name(&c.col).is_some_and(in_cover));
+                // ⭐ W2 → ORM-B2: 等值查询 + created_here 表 → 进程级路由缓存
+                // 候选剪枝 (Arc 克隆锁外读 bloom; 无 entry / 范围查询 → 广播)
+                let candidates: Vec<usize> = {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let sh = &conn.sql_shared;
+                    let entry = eq_enc.as_ref().and_then(|_| {
+                        sh.routes
+                            .read()
+                            .unwrap()
+                            .get(&(db.to_string(), table.clone(), iid))
+                            .cloned()
+                    });
+                    match (eq_enc.as_ref(), entry) {
+                        (Some(enc), Some(blooms)) => {
+                            let c: Vec<usize> = (0..num_shards)
+                                .filter(|&s| blooms[s].may_contain(enc))
+                                .collect();
+                            if c.is_empty() {
+                                sh.route_bypassed.fetch_add(1, Relaxed);
+                            } else if c.len() < num_shards {
+                                sh.route_pruned.fetch_add(1, Relaxed);
+                            }
+                            c
+                        }
+                        _ => (0..num_shards).collect(),
+                    }
+                };
+                if candidates.is_empty() {
+                    // 零任务短路: 值从未插入过 (bloom 无假阴性保证)
+                    let bin = conn.mysql_binary.remove(&seq);
+                    let bytes = if count {
+                        render_sql_count(conn.proto, bin, 0)
+                    } else {
+                        render_sql_rows(conn.proto, bin, &schema, &proj, &[])
+                    };
+                    conn.resp_complete(seq, bytes);
+                    return;
+                }
+                conn.sql_select_agg.insert(
+                    seq,
+                    SqlSelectAgg {
+                        remaining: candidates.len(),
+                        error: None,
+                        rows: Vec::new(),
+                        schema: schema.clone(),
+                        conds,
+                        limit,
+                        proj,
+                        cover: cover.then_some((idx_col, pk_col)),
+                        // ⭐ O3: unique 索引等值 → 首个非空回包即回复
+                        // (⭐ S2: 排序/offset/count 与单行早停正交, 保持启用)
+                        unique_early: eq_enc.is_some()
+                            && schema
+                                .indexes
+                                .iter()
+                                .any(|i| i.iid == iid && i.unique),
+                        done: false,
+                        dml: None,
+                        dml_target: None,
+                        order: order_cols,
+                        offset,
+                        count,
+                    },
+                );
+                let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+                for sid in candidates {
+                    let op = BatchOp::IndexScan {
+                        db: db.clone(),
+                        table: table_arc.clone(),
+                        iid,
+                        lo: lo.clone(),
+                        hi: hi.clone(),
+                        limit: shard_limit,
+                        with_rows: !cover, // ⭐ O1: 覆盖 → shard 免回表
+                    };
+                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                }
+            }
+        }
+        }
+        SqlStmt::CreateTable { .. } => unreachable!("CREATE 在 sql_dispatch_stmt 处理"),
+        SqlStmt::DropTable { .. } => unreachable!("DROP 在 sql_dispatch_stmt 处理"),
+        SqlStmt::Use { .. } | SqlStmt::SetStub | SqlStmt::VersionStub | SqlStmt::DatabaseStub => {
+            unreachable!("工具命令在 sql_dispatch_stmt 处理")
+        }
+        // ⭐ S3: DESCRIBE — schema 本地渲染 (Field/Type/Null/Key)
+        SqlStmt::Describe { .. } => {
+            let mut rows: Vec<Vec<ColValue>> = Vec::new();
+            for (i, col) in schema.columns.iter().enumerate() {
+                let ty = match col.ty {
+                    ColType::I64 => "bigint",
+                    ColType::F64 => "double",
+                    ColType::Str => "text",
+                    ColType::Bytes => "blob",
+                };
+                let key = if i as u16 == schema.pk_col {
+                    "PRI"
+                } else if let Some(idx) = schema.indexes.iter().find(|x| x.col == i as u16) {
+                    if idx.unique { "UNI" } else { "MUL" }
+                } else {
+                    ""
+                };
+                rows.push(vec![
+                    ColValue::Bytes(col.name.as_bytes().to_vec()),
+                    ColValue::Bytes(ty.as_bytes().to_vec()),
+                    ColValue::Bytes(if col.nullable { b"YES".to_vec() } else { b"NO".to_vec() }),
+                    ColValue::Bytes(key.as_bytes().to_vec()),
+                ]);
+            }
+            let cols: [(&str, ColType); 4] = [
+                ("Field", ColType::Str),
+                ("Type", ColType::Str),
+                ("Null", ColType::Str),
+                ("Key", ColType::Str),
+            ];
+            let bin = conn.mysql_binary.remove(&seq);
+            conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cols, &rows));
+        }
+    }
+}
+
+/// SELECT 访问路径选择 (worker 过滤器核心):
+/// 1. pk 等值 → PkGet; 2. 首个命中条件的索引 → Index (界下推);
+/// 3. 无可用索引 → 报错 (v1 不做全表扫).
+fn sql_plan_select(schema: &TableSchema, conds: &[Cond]) -> Result<SqlPlan, String> {
+    for c in conds {
+        if schema.col_by_name(&c.col).is_none() {
+            return Err(format!("unknown column '{}'", c.col));
+        }
+    }
+    // 1. pk 等值点查
+    let pk_col = &schema.columns[schema.pk_col as usize];
+    if let Some(c) = conds.iter().find(|c| c.op == CmpOp::Eq && c.col == pk_col.name) {
+        let cv = sql_to_col(pk_col.ty, &c.val)?;
+        return Ok(SqlPlan::PkGet { pk: sql_pk_bytes(pk_col.ty, &cv)? });
+    }
+    // 2. 首个有条件命中的索引 (界下推; 开界值多包含由残余过滤兜底)
+    for idx in &schema.indexes {
+        let col = &schema.columns[idx.col as usize];
+        let mut lo: Option<ColValue> = None;
+        let mut hi: Option<ColValue> = None;
+        let mut hit = false;
+        for c in conds.iter().filter(|c| c.col == col.name) {
+            let cv_of = |v: &SqlValue| sql_to_col(col.ty, v);
+            match c.op {
+                CmpOp::Eq => {
+                    hit = true;
+                    let cv = cv_of(&c.val)?;
+                    lo = Some(cv.clone());
+                    hi = Some(cv);
+                }
+                CmpOp::Gt | CmpOp::Ge => {
+                    hit = true;
+                    if lo.is_none() {
+                        lo = Some(cv_of(&c.val)?);
+                    }
+                }
+                CmpOp::Lt | CmpOp::Le => {
+                    hit = true;
+                    if hi.is_none() {
+                        hi = Some(cv_of(&c.val)?);
+                    }
+                }
+                // ⭐ S2: IN → [min, max] 闭界超集 (保序编码字节比较取极值),
+                // 残余过滤精确; Ne 无剪枝价值, 不算命中
+                CmpOp::In => {
+                    hit = true;
+                    if lo.is_none() && hi.is_none() {
+                        let mut min: Option<ColValue> = None;
+                        let mut max: Option<ColValue> = None;
+                        for v in &c.set {
+                            let cv = cv_of(v)?;
+                            let enc = storage::sql_rows::index_val_bytes(col.ty, &cv)
+                                .ok_or("bad IN value")?;
+                            let replace_min = min
+                                .as_ref()
+                                .and_then(|m| storage::sql_rows::index_val_bytes(col.ty, m))
+                                .is_none_or(|me| enc < me);
+                            if replace_min {
+                                min = Some(cv.clone());
+                            }
+                            let replace_max = max
+                                .as_ref()
+                                .and_then(|m| storage::sql_rows::index_val_bytes(col.ty, m))
+                                .is_none_or(|me| enc > me);
+                            if replace_max {
+                                max = Some(cv);
+                            }
+                        }
+                        lo = min;
+                        hi = max;
+                    }
+                }
+                CmpOp::Ne => {}
+            }
+        }
+        if hit {
+            // limit 可下推 ⟺ 全部条件都在本索引列且均为闭界算子
+            // (Eq/Ge/Le 的闭界下推与过滤语义一致, 不会截掉本应命中的行)
+            let limit_push = conds
+                .iter()
+                .all(|c| c.col == col.name && matches!(c.op, CmpOp::Eq | CmpOp::Ge | CmpOp::Le));
+            // ⭐ W2: 等值 (lo == hi) 时算路由缓存键 (与引擎索引值编码同源)
+            let eq_enc = match (&lo, &hi) {
+                (Some(l), Some(h)) if l == h => {
+                    storage::sql_rows::index_val_bytes(col.ty, l)
+                }
+                _ => None,
+            };
+            return Ok(SqlPlan::Index { iid: idx.iid, lo, hi, limit_push, eq_enc });
+        }
+    }
+    // ⭐ S2: 无可用索引 → 全表扫 + 残余过滤 (v1 的报错路径退役)
+    Ok(SqlPlan::FullScan)
+}
+
+/// INSERT 值列表 → 全列 ColValue (列清单缺省填 NULL; 类型转换).
+fn sql_build_row(
+    schema: &TableSchema,
+    cols: &[String],
+    vals: &[SqlValue],
+) -> Result<Vec<ColValue>, String> {
+    let n = schema.columns.len();
+    let mut out = vec![ColValue::Null; n];
+    if cols.is_empty() {
+        if vals.len() != n {
+            return Err(format!("expected {n} values, got {}", vals.len()));
+        }
+        for (i, v) in vals.iter().enumerate() {
+            out[i] = sql_to_col(schema.columns[i].ty, v)?;
+        }
+    } else {
+        for (name, v) in cols.iter().zip(vals) {
+            let i = schema
+                .col_by_name(name)
+                .ok_or_else(|| format!("unknown column '{name}'"))? as usize;
+            out[i] = sql_to_col(schema.columns[i].ty, v)?;
+        }
+    }
+    Ok(out)
+}
+
+/// SQL 字面量 → 列值 (Int 可升 F64; 类型不符报错).
+/// ⭐ P1: 数值列收到 Str → 尝试文本解析 (PG 文本参数按目标类型转换语义).
+fn sql_to_col(ty: ColType, v: &SqlValue) -> Result<ColValue, String> {
+    Ok(match (ty, v) {
+        (_, SqlValue::Null) => ColValue::Null,
+        (_, SqlValue::Param(_)) => return Err("unbound parameter".into()),
+        (ColType::I64, SqlValue::Int(i)) => ColValue::I64(*i),
+        (ColType::F64, SqlValue::Int(i)) => ColValue::F64(*i as f64),
+        (ColType::F64, SqlValue::Float(f)) => ColValue::F64(*f),
+        (ColType::Str | ColType::Bytes, SqlValue::Str(s)) => ColValue::Bytes(s.clone()),
+        (ColType::I64, SqlValue::Str(s)) => std::str::from_utf8(s)
+            .ok()
+            .and_then(|t| t.trim().parse::<i64>().ok())
+            .map(ColValue::I64)
+            .ok_or("invalid integer text for bigint column")?,
+        (ColType::F64, SqlValue::Str(s)) => std::str::from_utf8(s)
+            .ok()
+            .and_then(|t| t.trim().parse::<f64>().ok())
+            .map(ColValue::F64)
+            .ok_or("invalid float text for double column")?,
+        _ => return Err(format!("type mismatch: {v:?} not assignable to {ty:?} column")),
+    })
+}
+
+/// pk 列值 → 存储 pk 字节 (数值保序编码, 字节串原样; NULL/空串非法).
+fn sql_pk_bytes(ty: ColType, v: &ColValue) -> Result<Vec<u8>, String> {
+    match (ty, v) {
+        (ColType::I64, ColValue::I64(i)) => Ok(storage::keyspace::encode_idx(*i).to_vec()),
+        (ColType::F64, ColValue::F64(f)) => Ok(storage::keyspace::encode_f64_ordered(*f).to_vec()),
+        (ColType::Str | ColType::Bytes, ColValue::Bytes(b)) if !b.is_empty() => Ok(b.clone()),
+        (_, ColValue::Null) => Err("PRIMARY KEY must not be NULL".into()),
+        _ => Err("bad PRIMARY KEY value".into()),
+    }
+}
+
+/// 行值 vs 全部 WHERE 条件 (AND; NULL 列比较恒 false — SQL 语义).
+fn sql_eval_conds(schema: &TableSchema, values: &[ColValue], conds: &[Cond]) -> bool {
+    use std::cmp::Ordering;
+    for c in conds {
+        let Some(i) = schema.col_by_name(&c.col) else {
+            return false; // plan 已校验, 防御
+        };
+        let cv = &values[i as usize];
+        // ⭐ S2: IN — 集合任一相等 (NULL 列恒 false)
+        if c.op == CmpOp::In {
+            if !c.set.iter().any(|v| sql_cmp(cv, v) == Some(Ordering::Equal)) {
+                return false;
+            }
+            continue;
+        }
+        let ord = sql_cmp(cv, &c.val);
+        let pass = match ord {
+            None => false,
+            Some(o) => match c.op {
+                CmpOp::Eq => o == Ordering::Equal,
+                CmpOp::Gt => o == Ordering::Greater,
+                CmpOp::Ge => o != Ordering::Less,
+                CmpOp::Lt => o == Ordering::Less,
+                CmpOp::Le => o != Ordering::Greater,
+                CmpOp::Ne => o != Ordering::Equal, // ⭐ S2
+                CmpOp::In => unreachable!(),
+            },
+        };
+        if !pass {
+            return false;
+        }
+    }
+    true
+}
+
+/// 列值与字面量比较 (数值跨型比较; NULL/类型不符 → None = 条件 false).
+/// ⭐ P1: 数值列 vs 文本 → 按文本数字解析比较 (PG 文本参数弱类型, 与 sql_to_col 一致).
+fn sql_cmp(cv: &ColValue, sv: &SqlValue) -> Option<std::cmp::Ordering> {
+    match (cv, sv) {
+        (ColValue::Null, _) => None,
+        (ColValue::I64(a), SqlValue::Int(b)) => Some(a.cmp(b)),
+        (ColValue::I64(a), SqlValue::Float(b)) => (*a as f64).partial_cmp(b),
+        (ColValue::F64(a), SqlValue::Int(b)) => a.partial_cmp(&(*b as f64)),
+        (ColValue::F64(a), SqlValue::Float(b)) => a.partial_cmp(b),
+        (ColValue::Bytes(a), SqlValue::Str(b)) => Some(a.as_slice().cmp(b.as_slice())),
+        (ColValue::I64(a), SqlValue::Str(s)) => {
+            let t = std::str::from_utf8(s).ok()?.trim();
+            if let Ok(b) = t.parse::<i64>() {
+                Some(a.cmp(&b))
+            } else {
+                (*a as f64).partial_cmp(&t.parse::<f64>().ok()?)
+            }
+        }
+        (ColValue::F64(a), SqlValue::Str(s)) => {
+            a.partial_cmp(&std::str::from_utf8(s).ok()?.trim().parse::<f64>().ok()?)
+        }
+        _ => None,
+    }
+}
+
+/// ⭐ S4: SQL 错误 → per-proto 字节 (PG 带 SQLSTATE + ReadyForQuery;
+/// ⭐ H3: HTTP 按消息映射 4xx/5xx JSON).
+fn sql_err_bytes(proto: ProtocolKind, msg: &str) -> Vec<u8> {
+    if proto == ProtocolKind::Http {
+        let status = if msg.contains("duplicate key") {
+            409
+        } else if msg.contains("unknown column")
+            || msg.contains("Unknown database")
+            || msg.contains("expected")
+            || msg.contains("unexpected")
+            || msg.contains("unterminated")
+            || msg.contains("unknown type")
+            || msg.contains("no schema")
+        {
+            400
+        } else {
+            500
+        };
+        crate::metrics::HTTP_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return crate::protocol::http::build_response(
+            status,
+            &crate::protocol::http::error_body(msg),
+            crate::http_config::cors_origin(),
+            true,
+        );
+    }
+    if proto == ProtocolKind::Pg {
+        let code = if msg.contains("unknown column") {
+            "42703"
+        } else if msg.contains("duplicate key") {
+            "23505"
+        } else if msg.contains("Unknown database") {
+            "3D000"
+        } else if msg.contains("expected")
+            || msg.contains("unexpected")
+            || msg.contains("unterminated")
+            || msg.contains("unknown type")
+        {
+            "42601"
+        } else {
+            "XX000"
+        };
+        let mut out = crate::protocol::pg::build_error(code, msg);
+        out.extend_from_slice(&crate::protocol::pg::build_ready());
+        out
+    } else {
+        mysql_err_packet(msg)
+    }
+}
+
+/// ⭐ S4: DML OK → per-proto 字节 (PG: CommandComplete tag + ReadyForQuery;
+/// ⭐ H3: HTTP {"affected": n}).
+fn sql_ok_bytes(proto: ProtocolKind, affected: u64) -> Vec<u8> {
+    if proto == ProtocolKind::Http {
+        return crate::protocol::http::build_response(
+            200,
+            &serde_json::to_vec(&serde_json::json!({ "affected": affected }))
+                .unwrap_or_default(),
+            crate::http_config::cors_origin(),
+            true,
+        );
+    }
+    if proto == ProtocolKind::Pg {
+        let mut out =
+            crate::protocol::pg::build_command_complete(&format!("OK {affected}"));
+        out.extend_from_slice(&crate::protocol::pg::build_ready());
+        out
+    } else {
+        crate::protocol::mysql::build_ok(1, affected)
+    }
+}
+
+/// ⭐ S4: 结果集 → per-proto 字节 (PG 尾随 ReadyForQuery;
+/// ⭐ H3: HTTP {"columns": [...], "rows": [[...]]}).
+fn sql_rows_bytes(
+    proto: ProtocolKind,
+    binary: bool,
+    cols: &[(&str, ColType)],
+    rows: &[Vec<ColValue>],
+) -> Vec<u8> {
+    // ⭐ P2: COM_STMT_EXECUTE 的结果集必须用二进制协议行
+    if binary && proto == ProtocolKind::Sql {
+        return crate::protocol::mysql::build_binary_result_set(cols, rows);
+    }
+    if proto == ProtocolKind::Http {
+        let columns: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+        let jrows: Vec<Vec<serde_json::Value>> = rows
+            .iter()
+            .map(|r| r.iter().map(col_to_json).collect())
+            .collect();
+        return crate::protocol::http::build_response(
+            200,
+            &serde_json::to_vec(&serde_json::json!({ "columns": columns, "rows": jrows }))
+                .unwrap_or_default(),
+            crate::http_config::cors_origin(),
+            true,
+        );
+    }
+    if proto == ProtocolKind::Pg {
+        let mut out = crate::protocol::pg::build_result_set(cols, rows);
+        out.extend_from_slice(&crate::protocol::pg::build_ready());
+        out
+    } else {
+        crate::protocol::mysql::build_result_set(1, cols, rows)
+    }
+}
+
+/// ⭐ H3: 列值 → JSON (Bytes 优先 UTF-8 字符串, 非法回退 base64 字符串).
+fn col_to_json(v: &ColValue) -> serde_json::Value {
+    match v {
+        ColValue::Null => serde_json::Value::Null,
+        ColValue::I64(x) => serde_json::json!(x),
+        ColValue::F64(x) => serde_json::json!(x),
+        ColValue::Bytes(b) => match std::str::from_utf8(b) {
+            Ok(s) => serde_json::json!(s),
+            Err(_) => serde_json::json!(crate::protocol::http::base64_encode(b)),
+        },
+    }
+}
+
+/// SELECT 结果渲染 (列定义/行值按投影序; per-proto 编码).
+fn render_sql_rows(
+    proto: ProtocolKind,
+    binary: bool,
+    schema: &TableSchema,
+    proj: &[u16],
+    rows: &[Vec<ColValue>],
+) -> Vec<u8> {
+    let cols: Vec<(&str, ColType)> = proj
+        .iter()
+        .map(|&i| {
+            let c = &schema.columns[i as usize];
+            (c.name.as_str(), c.ty)
+        })
+        .collect();
+    let proj_rows: Vec<Vec<ColValue>> = rows
+        .iter()
+        .map(|r| proj.iter().map(|&i| r[i as usize].clone()).collect())
+        .collect();
+    sql_rows_bytes(proto, binary, &cols, &proj_rows)
+}
+
+/// ⭐ O1: 覆盖索引值重建 — 索引条目的原值字节 → 列值 (与 keyspace 编码同源).
+/// 数值 = 8B 保序编码; 字节串 = 原字节. 长度不符 → None (防御).
+fn col_from_ordered_bytes(ty: ColType, raw: &[u8]) -> Option<ColValue> {
+    match ty {
+        ColType::I64 => raw
+            .try_into()
+            .ok()
+            .map(|b| ColValue::I64(storage::keyspace::decode_idx(b))),
+        ColType::F64 => raw
+            .try_into()
+            .ok()
+            .map(|b| ColValue::F64(storage::keyspace::decode_f64_ordered(b))),
+        ColType::Str | ColType::Bytes => Some(ColValue::Bytes(raw.to_vec())),
+    }
+}
+
+/// ⭐ S1: DML phase1 完成 — 全条件过滤取 pk (rows 取走清空; 去重防跨 shard 幽灵重复).
+fn collect_dml_pks(agg: &mut SqlSelectAgg) -> Result<Vec<Vec<u8>>, String> {
+    let rows = std::mem::take(&mut agg.rows);
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut pks = Vec::new();
+    for (_, pk, rb) in &rows {
+        let values = storage::row::decode_row(&agg.schema, rb).map_err(|e| e.to_string())?;
+        if sql_eval_conds(&agg.schema, &values, &agg.conds) && seen.insert(pk.clone()) {
+            pks.push(pk.clone());
+        }
+    }
+    Ok(pks)
+}
+
+/// ⭐ S1: phase2 op 构造 (每 pk 一发, 按 pk 路由).
+fn sql_dml_op(
+    db: &std::sync::Arc<str>,
+    table: &str,
+    pk: Vec<u8>,
+    action: &SqlDmlAction,
+) -> BatchOp {
+    match action {
+        SqlDmlAction::Delete => BatchOp::RowDelete {
+            db: db.clone(),
+            table: std::sync::Arc::from(table),
+            pk,
+        },
+        SqlDmlAction::Update(sets) => BatchOp::RowUpdate {
+            db: db.clone(),
+            table: std::sync::Arc::from(table),
+            pk,
+            sets: sets.clone(),
+        },
+    }
+}
+
+/// ⭐ S2: ORDER BY 比较 (多列; NULL 按 asc 排最后, desc 时相反 — PG 默认行为).
+fn sql_order_cmp(a: &[ColValue], b: &[ColValue], order: &[(u16, bool)]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for &(col, desc) in order {
+        let (av, bv) = (&a[col as usize], &b[col as usize]);
+        let o = match (av, bv) {
+            (ColValue::Null, ColValue::Null) => Ordering::Equal,
+            (ColValue::Null, _) => Ordering::Greater,
+            (_, ColValue::Null) => Ordering::Less,
+            (ColValue::I64(x), ColValue::I64(y)) => x.cmp(y),
+            (ColValue::F64(x), ColValue::F64(y)) => x.total_cmp(y),
+            (ColValue::I64(x), ColValue::F64(y)) => (*x as f64).total_cmp(y),
+            (ColValue::F64(x), ColValue::I64(y)) => x.total_cmp(&(*y as f64)),
+            (ColValue::Bytes(x), ColValue::Bytes(y)) => x.cmp(y),
+            _ => Ordering::Equal, // 异型防御 (schema 同列不应发生)
+        };
+        let o = if desc { o.reverse() } else { o };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// ⭐ S2: COUNT(*) 单行结果集.
+fn render_sql_count(proto: ProtocolKind, binary: bool, n: u64) -> Vec<u8> {
+    sql_rows_bytes(
+        proto,
+        binary,
+        &[("COUNT(*)", ColType::I64)],
+        &[vec![ColValue::I64(n as i64)]],
+    )
+}
+
+/// SELECT 聚合完成渲染: (val, pk) 排序 → 覆盖重建或 decode → 残余过滤
+/// → ⭐ S2: ORDER BY → OFFSET → LIMIT → 投影/COUNT 结果集.
+/// (⭐ O3: 早停时提前调用, agg.rows 取走清空)
+fn render_select_agg(proto: ProtocolKind, binary: bool, agg: &mut SqlSelectAgg) -> Vec<u8> {
+    if let Some(e) = agg.error.take() {
+        return sql_err_bytes(proto, &e);
+    }
+    // 全局序: (索引值, pk); 残余过滤全条件 (下推界是超集, 过滤幂等)
+    let mut rows = std::mem::take(&mut agg.rows);
+    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    // 提前截断仅当: 非 COUNT 且无 ORDER BY (排序需全量; 截断额 = offset+limit)
+    let early_cut: Option<usize> = if agg.count || !agg.order.is_empty() {
+        None
+    } else {
+        agg.limit.map(|l| (l + agg.offset) as usize)
+    };
+    let mut out_rows: Vec<Vec<ColValue>> = Vec::new();
+    let mut err: Option<String> = None;
+    for (val, pk, rb) in &rows {
+        // ⭐ O1: 覆盖索引 — 免回表, 行值从 (val, pk) 重建
+        // (覆盖判定保证过滤/投影/排序只引用这两列, 其余列置 Null 不会被读)
+        let decoded = if let Some((idx_col, pk_col)) = agg.cover {
+            let n = agg.schema.columns.len();
+            let iv = col_from_ordered_bytes(agg.schema.columns[idx_col as usize].ty, val);
+            let pv = col_from_ordered_bytes(agg.schema.columns[pk_col as usize].ty, pk);
+            match (iv, pv) {
+                (Some(iv), Some(pv)) => {
+                    let mut values = vec![ColValue::Null; n];
+                    values[idx_col as usize] = iv;
+                    values[pk_col as usize] = pv;
+                    Ok(values)
+                }
+                _ => Err("bad covered index entry".to_string()),
+            }
+        } else {
+            storage::row::decode_row(&agg.schema, rb).map_err(|e| e.to_string())
+        };
+        match decoded {
+            Ok(values) => {
+                if sql_eval_conds(&agg.schema, &values, &agg.conds) {
+                    out_rows.push(values);
+                    if let Some(cut) = early_cut
+                        && out_rows.len() >= cut
+                    {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(e) = err {
+        return sql_err_bytes(proto, &e);
+    }
+    // ⭐ S2: COUNT(*) — 计数不受 ORDER/OFFSET/LIMIT 影响
+    if agg.count {
+        return render_sql_count(proto, binary, out_rows.len() as u64);
+    }
+    if !agg.order.is_empty() {
+        out_rows.sort_by(|a, b| sql_order_cmp(a, b, &agg.order));
+    }
+    let start = (agg.offset as usize).min(out_rows.len());
+    let end = match agg.limit {
+        Some(l) => (start + l as usize).min(out_rows.len()),
+        None => out_rows.len(),
+    };
+    render_sql_rows(proto, binary, &agg.schema, &agg.proj, &out_rows[start..end])
+}
+
+// =====================================================================
+// ⭐ Z2 (MySQL wire 门面): 帧循环 — 握手/登录状态机 + COM_QUERY
+// =====================================================================
+
+/// 伪随机 salt (可打印区间 0x21..0x7E, 兼容各客户端对 NUL 敏感的解析).
+fn mysql_gen_salt(conn_id: u64, worker_id: u32) -> [u8; 20] {
+    let mut x = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9)
+        ^ (conn_id.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ ((worker_id as u64) << 32);
+    let mut salt = [0u8; 20];
+    for b in salt.iter_mut() {
+        // splitmix64 步进
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        *b = 0x21 + (z % 93) as u8; // 0x21..=0x7D
+    }
+    salt
+}
+
+/// MySQL 帧输入循环: 登录阶段就地回包; 认证后 COM_QUERY 走既有
+/// SQL 规划器 (占 conn.next_seq 进重排缓冲, 响应包 seq 恒从 1 起 —
+/// COM_QUERY 请求包 seq 恒为 0).
+#[allow(clippy::too_many_arguments)]
+fn process_sql_input(
+    conn: &mut ConnState,
+    conn_id: u64,
+    worker_id: u32,
+    sql_password: &Option<String>,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+) {
+    use crate::protocol::mysql as my;
+    let mut cursor = 0usize;
+    while let Some((pkt_seq, n, payload)) = my::read_packet(&conn.read_buf[cursor..]) {
+        cursor += n;
+        if conn.close_after_flush {
+            break;
+        }
+        let Some(st) = conn.mysql.as_ref() else {
+            break; // 防御: 非 mysql 状态的 Sql conn 不存在
+        };
+        let (phase, salt) = (st.phase, st.salt);
+        let pwd = sql_password.as_deref().unwrap_or("");
+        match phase {
+            // ---- 等 HandshakeResponse41 ----
+            0 => match my::parse_handshake_response(&payload) {
+                Ok(login) => {
+                    // ⭐ S5: 登录带 database → 认证通过后切库 (不存在 1049 断连)
+                    let want_db = login.database.clone().filter(|d| !d.is_empty());
+                    let db_ok = |name: &str| {
+                        name == default_db.as_ref() || db_view.id_of(name).is_some()
+                    };
+                    if let Some(d) = &want_db
+                        && !db_ok(d)
+                    {
+                        conn.send_bytes(&my::build_err(
+                            pkt_seq.wrapping_add(1),
+                            1049,
+                            &format!("Unknown database '{d}'"),
+                        ));
+                        conn.close_after_flush = true;
+                        continue;
+                    }
+                    let native = login
+                        .plugin
+                        .as_deref()
+                        .is_none_or(|p| p == "mysql_native_password");
+                    if !native || (login.auth_resp.is_empty() && !pwd.is_empty()) {
+                        // 客户端默认 caching_sha2 (8.x) 或未带凭据 → 切换插件重试
+                        conn.send_bytes(&my::build_auth_switch(pkt_seq.wrapping_add(1), &salt));
+                        if let Some(st) = conn.mysql.as_mut() {
+                            st.phase = 1;
+                            st.pending_db = want_db;
+                        }
+                    } else if my::native_password_ok(&salt, &login.auth_resp, pwd) {
+                        conn.send_bytes(&my::build_ok(pkt_seq.wrapping_add(1), 0));
+                        if let Some(d) = want_db {
+                            conn.current_db = std::sync::Arc::from(d.as_str());
+                        }
+                        if let Some(st) = conn.mysql.as_mut() {
+                            st.phase = 2;
+                        }
+                    } else {
+                        conn.send_bytes(&my::build_err(
+                            pkt_seq.wrapping_add(1),
+                            1045,
+                            "Access denied",
+                        ));
+                        conn.close_after_flush = true;
+                    }
+                }
+                Err(e) => {
+                    conn.send_bytes(&my::build_err(pkt_seq.wrapping_add(1), 1043, &e));
+                    conn.close_after_flush = true;
+                }
+            },
+            // ---- 等 AuthSwitch 响应 (payload = 裸 native token) ----
+            1 => {
+                if my::native_password_ok(&salt, &payload, pwd) {
+                    conn.send_bytes(&my::build_ok(pkt_seq.wrapping_add(1), 0));
+                    // ⭐ S5: 二段认证通过 → 应用登录时的 database
+                    let pending = conn.mysql.as_mut().and_then(|st| st.pending_db.take());
+                    if let Some(d) = pending {
+                        conn.current_db = std::sync::Arc::from(d.as_str());
+                    }
+                    if let Some(st) = conn.mysql.as_mut() {
+                        st.phase = 2;
+                    }
+                } else {
+                    conn.send_bytes(&my::build_err(
+                        pkt_seq.wrapping_add(1),
+                        1045,
+                        "Access denied",
+                    ));
+                    conn.close_after_flush = true;
+                }
+            }
+            // ---- 已认证: 命令阶段 ----
+            _ => match payload.first() {
+                Some(&my::COM_QUERY) => {
+                    let seq = conn.next_seq;
+                    conn.next_seq += 1;
+                    let cur_db = conn.current_db.clone();
+                    match sql::parse(&payload[1..]) {
+                        Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
+                        Ok(stmt) => sql_dispatch_stmt(
+                            conn, conn_id, seq, worker_id, &cur_db, default_db, db_view,
+                            shard_inboxes, num_shards, stmt,
+                        ),
+                    }
+                }
+                Some(&my::COM_PING) => {
+                    // 占 seq 保序 (与在途 COM_QUERY 的 FIFO 一致)
+                    let seq = conn.next_seq;
+                    conn.next_seq += 1;
+                    conn.resp_complete(seq, my::build_ok(pkt_seq.wrapping_add(1), 0));
+                }
+                // ⭐ S5: COM_INIT_DB (mysql cli 的 `USE x`) — 真切库
+                Some(&my::COM_INIT_DB) => {
+                    let seq = conn.next_seq;
+                    conn.next_seq += 1;
+                    let name = String::from_utf8_lossy(&payload[1..]).into_owned();
+                    let ok = name == default_db.as_ref() || db_view.id_of(&name).is_some();
+                    if ok {
+                        conn.current_db = std::sync::Arc::from(name.as_str());
+                        conn.resp_complete(seq, my::build_ok(pkt_seq.wrapping_add(1), 0));
+                    } else {
+                        conn.resp_complete(
+                            seq,
+                            my::build_err(
+                                pkt_seq.wrapping_add(1),
+                                1049,
+                                &format!("Unknown database '{name}'"),
+                            ),
+                        );
+                    }
+                }
+                // ⭐ P2: 预处理语句族
+                Some(&my::COM_STMT_PREPARE) => {
+                    let seq = conn.next_seq;
+                    conn.next_seq += 1;
+                    match sql::parse_prepared(&payload[1..]) {
+                        Ok((stmt, params)) => {
+                            let id = conn.next_stmt_id;
+                            conn.next_stmt_id += 1;
+                            conn.mysql_stmts.insert(id, MyPrepared { stmt, params, types: None });
+                            conn.resp_complete(seq, my::build_stmt_prepare_ok(id, params));
+                        }
+                        Err(e) => conn.resp_complete(seq, mysql_err_packet(&e)),
+                    }
+                }
+                Some(&my::COM_STMT_EXECUTE) => {
+                    let seq = conn.next_seq;
+                    conn.next_seq += 1;
+                    // stmt_id 先探 (解参需要 params 数)
+                    let stmt_id = if payload.len() >= 5 {
+                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]])
+                    } else {
+                        0
+                    };
+                    let Some(prep) = conn.mysql_stmts.get_mut(&stmt_id) else {
+                        conn.resp_complete(seq, my::build_err(1, 1243, "unknown statement id"));
+                        continue;
+                    };
+                    // ⭐ ORM-C: 解参后直接对模板绑定 (bind_params 单次深拷贝),
+                    // 省掉此前绕借用的 prep.stmt.clone() 整次拷贝
+                    let bound = my::parse_stmt_execute(&payload, prep.params, &mut prep.types)
+                        .and_then(|(_, vals)| sql::bind_params(&prep.stmt, &vals));
+                    match bound {
+                        Ok(stmt) => {
+                            // SELECT 类结果需二进制结果集 (渲染点按标记分流)
+                            conn.mysql_binary.insert(seq);
+                            let cur_db = conn.current_db.clone();
+                            sql_dispatch_stmt(
+                                conn, conn_id, seq, worker_id, &cur_db, default_db, db_view,
+                                shard_inboxes, num_shards, stmt,
+                            );
+                        }
+                        Err(e) => conn.resp_complete(seq, mysql_err_packet(&e)),
+                    }
+                }
+                Some(&my::COM_STMT_CLOSE) => {
+                    // 无响应命令 (不占 seq)
+                    if payload.len() >= 5 {
+                        let id =
+                            u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                        conn.mysql_stmts.remove(&id);
+                    }
+                }
+                Some(&my::COM_STMT_RESET) => {
+                    let seq = conn.next_seq;
+                    conn.next_seq += 1;
+                    conn.resp_complete(seq, my::build_ok(1, 0));
+                }
+                Some(&my::COM_QUIT) => {
+                    conn.close_after_flush = true;
+                }
+                _ => {
+                    let seq = conn.next_seq;
+                    conn.next_seq += 1;
+                    conn.resp_complete(seq, my::build_err(1, 1047, "unsupported command"));
+                }
+            },
+        }
+    }
+    if cursor > 0 {
+        conn.read_buf.drain(..cursor);
+    }
+}
+
+/// ⭐ S4: PostgreSQL wire 帧循环 — startup (SSLRequest 拒绝/参数解析) →
+/// cleartext 认证 → simple Query. 每语句回复自带 ReadyForQuery (sql_*_bytes).
+#[allow(clippy::too_many_arguments)]
+fn process_pg_input(
+    conn: &mut ConnState,
+    conn_id: u64,
+    worker_id: u32,
+    sql_password: &Option<String>,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+) {
+    use crate::protocol::pg;
+    let pwd = sql_password.as_deref().unwrap_or("");
+    let mut cursor = 0usize;
+    loop {
+        if conn.close_after_flush {
+            break;
+        }
+        match conn.pg_phase {
+            // ---- 等 StartupMessage (无 type 帧) ----
+            0 => {
+                let Some((n, payload)) = pg::read_startup_frame(&conn.read_buf[cursor..])
+                else {
+                    break;
+                };
+                cursor += n;
+                if payload.len() == 4 {
+                    let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    match code {
+                        // SSL/GSS 协商 → 'N' 拒绝, 客户端回落明文继续 startup
+                        pg::SSL_REQUEST_CODE | pg::GSSENC_REQUEST_CODE => {
+                            conn.send_bytes(b"N");
+                            continue;
+                        }
+                        pg::CANCEL_REQUEST_CODE => {
+                            conn.close_after_flush = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                match pg::parse_startup(payload) {
+                    Ok((_user, database)) => {
+                        // database 参数 → 切库 (不存在直接拒绝断连)
+                        if let Some(dbn) = database
+                            && !dbn.is_empty()
+                            && dbn != default_db.as_ref()
+                        {
+                            if db_view.id_of(&dbn).is_some() {
+                                conn.current_db = std::sync::Arc::from(dbn.as_str());
+                            } else {
+                                conn.send_bytes(&pg::build_error(
+                                    "3D000",
+                                    &format!("database \"{dbn}\" does not exist"),
+                                ));
+                                conn.close_after_flush = true;
+                                break;
+                            }
+                        }
+                        if pwd.is_empty() {
+                            conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
+                            conn.pg_phase = 2;
+                        } else {
+                            conn.send_bytes(&pg::build_auth_cleartext());
+                            conn.pg_phase = 1;
+                        }
+                    }
+                    Err(e) => {
+                        conn.send_bytes(&pg::build_error("08P01", &e));
+                        conn.close_after_flush = true;
+                    }
+                }
+            }
+            // ---- 等 PasswordMessage ----
+            1 => {
+                let Some((n, ty, payload)) = pg::read_frame(&conn.read_buf[cursor..]) else {
+                    break;
+                };
+                cursor += n;
+                if ty == b'p' && pg::parse_password(payload) == pwd {
+                    conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
+                    conn.pg_phase = 2;
+                } else {
+                    conn.send_bytes(&pg::build_error(
+                        "28P01",
+                        "password authentication failed",
+                    ));
+                    conn.close_after_flush = true;
+                }
+            }
+            // ---- 已认证: simple Query ----
+            _ => {
+                let Some((n, ty, payload)) = pg::read_frame(&conn.read_buf[cursor..]) else {
+                    break;
+                };
+                cursor += n;
+                match ty {
+                    b'Q' => {
+                        // 语句预处理: NUL 截断 + trim + 剥尾分号 (多语句报错)
+                        let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+                        let text = String::from_utf8_lossy(&payload[..end]);
+                        let trimmed = text.trim().trim_end_matches(';').trim();
+                        let seq = conn.next_seq;
+                        conn.next_seq += 1;
+                        if trimmed.is_empty() {
+                            // EmptyQueryResponse + ReadyForQuery
+                            let mut out = Vec::new();
+                            out.push(b'I');
+                            out.extend_from_slice(&4u32.to_be_bytes());
+                            out.extend_from_slice(&pg::build_ready());
+                            conn.resp_complete(seq, out);
+                        } else if trimmed.contains(';') {
+                            conn.resp_complete(
+                                seq,
+                                sql_err_bytes(
+                                    ProtocolKind::Pg,
+                                    "multi-statement query is unsupported",
+                                ),
+                            );
+                        } else {
+                            let cur_db = conn.current_db.clone();
+                            match sql::parse(trimmed.as_bytes()) {
+                                Err(e) => conn
+                                    .resp_complete(seq, sql_err_bytes(ProtocolKind::Pg, &e)),
+                                Ok(stmt) => sql_dispatch_stmt(
+                                    conn, conn_id, seq, worker_id, &cur_db, default_db,
+                                    db_view, shard_inboxes, num_shards, stmt,
+                                ),
+                            }
+                        }
+                    }
+                    b'X' => {
+                        conn.close_after_flush = true;
+                    }
+                    // ---- ⭐ P3: 扩展查询协议 (Parse..Sync 批次) ----
+                    b'P' => match pg::parse_parse(payload) {
+                        Ok((name, query, oids)) => match sql::parse_prepared(&query) {
+                            Ok((stmt, params)) => {
+                                conn.pg_stmts.insert(name, PgPrepared { stmt, params, oids });
+                                let pc = pg::build_parse_complete();
+                                conn.pg_batch.prefix.extend_from_slice(&pc);
+                            }
+                            Err(e) => {
+                                if conn.pg_batch.error.is_none() {
+                                    conn.pg_batch.error = Some(e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            if conn.pg_batch.error.is_none() {
+                                conn.pg_batch.error = Some(e);
+                            }
+                        }
+                    },
+                    b'B' => {
+                        if conn.pg_batch.error.is_some() {
+                            continue; // skip-to-Sync
+                        }
+                        let r = pg::parse_bind(payload).and_then(|bind| {
+                            let prep = conn
+                                .pg_stmts
+                                .get(&bind.statement)
+                                .ok_or_else(|| format!("unknown statement '{}'", bind.statement))?;
+                            if bind.binary_results {
+                                return Err("binary result format is unsupported".into());
+                            }
+                            if bind.params.len() != prep.params as usize {
+                                return Err(format!(
+                                    "expected {} parameters, got {}",
+                                    prep.params,
+                                    bind.params.len()
+                                ));
+                            }
+                            let mut vals = Vec::with_capacity(bind.params.len());
+                            for (i, raw) in bind.params.iter().enumerate() {
+                                let oid = prep.oids.get(i).copied().unwrap_or(0);
+                                vals.push(pg::decode_param(
+                                    raw.as_deref(),
+                                    bind.formats.get(i).copied().unwrap_or(0),
+                                    oid,
+                                )?);
+                            }
+                            sql::bind_params(&prep.stmt, &vals)
+                        });
+                        match r {
+                            Ok(stmt) => {
+                                conn.pg_batch.bound = Some(stmt);
+                                let bc = pg::build_bind_complete();
+                                conn.pg_batch.prefix.extend_from_slice(&bc);
+                            }
+                            Err(e) => conn.pg_batch.error = Some(e),
+                        }
+                    }
+                    b'D' => {
+                        if conn.pg_batch.error.is_some() {
+                            continue;
+                        }
+                        // Describe(statement) → ParameterDescription + NoData
+                        // (列描述延迟到结果流 RowDescription — pgx/node-postgres
+                        //  的 Describe(portal) 流由结果自带 T 满足).
+                        if let Ok((b'S', name)) = pg::parse_target(payload)
+                            && let Some(prep) = conn.pg_stmts.get(&name)
+                        {
+                            let pd = pg::build_param_description(&prep.oids, prep.params);
+                            conn.pg_batch.prefix.extend_from_slice(&pd);
+                            let nd = pg::build_no_data();
+                            conn.pg_batch.prefix.extend_from_slice(&nd);
+                        }
+                    }
+                    b'E' => {
+                        conn.pg_batch.has_execute = true;
+                    }
+                    b'C' => {
+                        // Close (语句/portal) → CloseComplete
+                        if let Ok((b'S', name)) = pg::parse_target(payload) {
+                            conn.pg_stmts.remove(&name);
+                        }
+                        let cc = pg::build_close_complete();
+                        conn.pg_batch.prefix.extend_from_slice(&cc);
+                    }
+                    b'H' => {
+                        // Flush: v1 以 Sync 为响应边界 (asyncpg 依赖 Flush 的
+                        // 路径记录为 gap)
+                    }
+                    b'S' => {
+                        let batch = std::mem::take(&mut conn.pg_batch);
+                        let seq = conn.next_seq;
+                        conn.next_seq += 1;
+                        if let Some(e) = batch.error {
+                            let mut out = batch.prefix;
+                            out.extend_from_slice(&pg::build_error("42601", &e));
+                            out.extend_from_slice(&pg::build_ready());
+                            conn.resp_complete(seq, out);
+                        } else if batch.has_execute && let Some(bound) = batch.bound {
+                            // 结果主体 (T+D+C+Z / C+Z) 由既有渲染产出,
+                            // 前缀在 resp_complete 单点拼接
+                            conn.pg_ext.insert(seq, batch.prefix);
+                            let cur_db = conn.current_db.clone();
+                            sql_dispatch_stmt(
+                                conn,
+                                conn_id,
+                                seq,
+                                worker_id,
+                                &cur_db,
+                                default_db,
+                                db_view,
+                                shard_inboxes,
+                                num_shards,
+                                bound,
+                            );
+                        } else {
+                            let mut out = batch.prefix;
+                            out.extend_from_slice(&pg::build_ready());
+                            conn.resp_complete(seq, out);
+                        }
+                    }
+                    // Parse/Bind/... 扩展协议未支持; 其它消息容错回错误不断连
+                    _ => {
+                        let seq = conn.next_seq;
+                        conn.next_seq += 1;
+                        conn.resp_complete(
+                            seq,
+                            sql_err_bytes(
+                                ProtocolKind::Pg,
+                                "extended query protocol is unsupported",
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if cursor > 0 {
+        conn.read_buf.drain(..cursor);
+    }
+}
+
+/// ⭐ H1: HTTP/1.1 REST 帧循环 — preflight / Bearer 鉴权 / 路由分发.
+/// keep-alive pipeline 复用 seq 重排 (每请求一 seq); Connection: close →
+/// close_after_flush (pending 回复出完再关).
+#[allow(clippy::too_many_arguments)]
+fn process_http_input(
+    conn: &mut ConnState,
+    conn_id: u64,
+    worker_id: u32,
+    http_token: &Option<String>,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    limits: &KvLimits,
+    num_shards_total: usize,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+) {
+    use crate::protocol::http as h;
+    let cors = crate::http_config::cors_origin();
+    let mut cursor = 0usize;
+    loop {
+        if conn.close_after_flush {
+            break;
+        }
+        match h::parse_request(&conn.read_buf[cursor..]) {
+            Ok(None) => break,
+            Err((code, msg)) => {
+                crate::metrics::HTTP_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let seq = conn.next_seq;
+                conn.next_seq += 1;
+                conn.resp_complete(seq, h::build_response(code, &h::error_body(msg), cors, false));
+                conn.close_after_flush = true;
+                break;
+            }
+            Ok(Some((n, req))) => {
+                cursor += n;
+                crate::metrics::HTTP_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !req.keep_alive {
+                    conn.close_after_flush = true;
+                }
+                handle_http_request(
+                    conn, conn_id, worker_id, req, http_token, default_db, db_view, limits,
+                    num_shards_total, shard_inboxes, num_shards,
+                );
+            }
+        }
+    }
+    if cursor > 0 {
+        conn.read_buf.drain(..cursor);
+    }
+}
+
+/// 单请求路由分发 (worker 本地端点就地渲染, KV/SQL 走 shard 任务).
+#[allow(clippy::too_many_arguments)]
+fn handle_http_request(
+    conn: &mut ConnState,
+    conn_id: u64,
+    worker_id: u32,
+    req: crate::protocol::http::HttpRequest,
+    http_token: &Option<String>,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    limits: &KvLimits,
+    num_shards_total: usize,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+) {
+    use crate::protocol::http as h;
+    use std::sync::atomic::Ordering::Relaxed;
+    let cors = crate::http_config::cors_origin();
+    let seq = conn.next_seq;
+    conn.next_seq += 1;
+    let ka = req.keep_alive;
+    let fail = |conn: &mut ConnState, seq, code: u16, msg: &str| {
+        crate::metrics::HTTP_ERRORS.fetch_add(1, Relaxed);
+        conn.resp_complete(seq, h::build_response(code, &h::error_body(msg), cors, ka));
+    };
+    // OPTIONS preflight (免鉴权)
+    if req.method == "OPTIONS" {
+        conn.resp_complete(seq, h::build_preflight(cors, ka));
+        return;
+    }
+    // Bearer 鉴权 (白名单: /metrics /v1/status — 监控接入惯例)
+    if let Some(token) = http_token
+        && req.path != "/metrics"
+        && req.path != "/v1/status"
+    {
+        let ok = req
+            .authorization
+            .as_deref()
+            .and_then(|a| a.strip_prefix("Bearer "))
+            .is_some_and(|t| t == token);
+        if !ok {
+            fail(conn, seq, 401, "unauthorized");
+            return;
+        }
+    }
+    // db 选择: query 参数 (KV) / body 字段 (SQL); 缺省 = default_db
+    let resolve_db = |name: Option<&str>| -> Result<std::sync::Arc<str>, String> {
+        match name.filter(|s| !s.is_empty()) {
+            None => Ok(conn_default(default_db)),
+            Some(d) if d == default_db.as_ref() || db_view.id_of(d).is_some() => {
+                Ok(std::sync::Arc::from(d))
+            }
+            Some(d) => Err(format!("Unknown database '{d}'")),
+        }
+    };
+    match (req.method.as_str(), req.path.as_str()) {
+        // ---- ⭐ H4: 可观测性端点 (worker 本地零任务) ----
+        ("GET", "/metrics") => {
+            let m = format!(
+                "# TYPE nexusdb_http_requests_total counter\n\
+                 nexusdb_http_requests_total {}\n\
+                 # TYPE nexusdb_http_errors_total counter\n\
+                 nexusdb_http_errors_total {}\n\
+                 # TYPE nexusdb_sql_queries_total counter\n\
+                 nexusdb_sql_queries_total {}\n\
+                 # TYPE nexusdb_kv_ops_total counter\n\
+                 nexusdb_kv_ops_total {}\n\
+                 # TYPE nexusdb_uptime_seconds gauge\n\
+                 nexusdb_uptime_seconds {}\n",
+                crate::metrics::HTTP_REQUESTS.load(Relaxed),
+                crate::metrics::HTTP_ERRORS.load(Relaxed),
+                crate::metrics::SQL_QUERIES.load(Relaxed),
+                crate::metrics::KV_OPS.load(Relaxed),
+                crate::metrics::uptime_seconds(),
+            );
+            conn.resp_complete(seq, h::build_text_response(200, m.as_bytes(), ka));
+        }
+        ("GET", "/v1/status") => {
+            let body = serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_seconds": crate::metrics::uptime_seconds(),
+                "num_shards": num_shards_total,
+                "protocols": {"binary": 5433, "resp": 6379, "mysql": 5434, "pg": 5435, "http": 6778},
+            });
+            conn.resp_complete(
+                seq,
+                h::build_response(200, &serde_json::to_vec(&body).unwrap_or_default(), cors, ka),
+            );
+        }
+        ("GET", "/v1/debug/sql-cache") => {
+            let body = {
+                use std::sync::atomic::Ordering::Relaxed;
+                let sh = &conn.sql_shared;
+                serde_json::json!({
+                    "worker_schemas": conn.sql_cache.borrow().schemas.len(),
+                    "routes": sh.routes.read().unwrap().len(),
+                    "created_here": sh.created_here.read().unwrap().len(),
+                    "ddl_epoch": sh.ddl_epoch.load(Relaxed),
+                    "route_pruned": sh.route_pruned.load(Relaxed),
+                    "route_bypassed": sh.route_bypassed.load(Relaxed),
+                })
+            };
+            conn.resp_complete(
+                seq,
+                h::build_response(200, &serde_json::to_vec(&body).unwrap_or_default(), cors, ka),
+            );
+        }
+        // ---- ⭐ H3: SQL ----
+        ("POST", "/v1/sql") => {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&req.body);
+            let Ok(body) = parsed else {
+                fail(conn, seq, 400, "body must be JSON");
+                return;
+            };
+            let Some(query) = body.get("query").and_then(|q| q.as_str()) else {
+                fail(conn, seq, 400, "missing 'query' field");
+                return;
+            };
+            let db = match resolve_db(body.get("db").and_then(|d| d.as_str())) {
+                Ok(d) => d,
+                Err(e) => {
+                    fail(conn, seq, 400, &e);
+                    return;
+                }
+            };
+            match sql::parse(query.as_bytes()) {
+                Err(e) => conn.resp_complete(seq, sql_err_bytes(ProtocolKind::Http, &e)),
+                Ok(stmt) => sql_dispatch_stmt(
+                    conn, conn_id, seq, worker_id, &db, default_db, db_view, shard_inboxes,
+                    num_shards, stmt,
+                ),
+            }
+        }
+        // ---- ⭐ H2: KV ----
+        (m, p) if p.starts_with("/v1/kv/") => {
+            let rest = &p["/v1/kv/".len()..];
+            let Some((table_raw, key_raw)) = rest.split_once('/') else {
+                fail(conn, seq, 404, "expected /v1/kv/{table}/{key}");
+                return;
+            };
+            let table = String::from_utf8_lossy(&h::percent_decode(table_raw)).into_owned();
+            let key = h::percent_decode(key_raw);
+            if table.is_empty() || key.is_empty() {
+                fail(conn, seq, 400, "empty table or key");
+                return;
+            }
+            if key.len() > limits.max_key_bytes {
+                fail(conn, seq, 400, "key too long");
+                return;
+            }
+            let db = match resolve_db(h::query_param(&req.query, "db")) {
+                Ok(d) => d,
+                Err(e) => {
+                    fail(conn, seq, 400, &e);
+                    return;
+                }
+            };
+            let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+            crate::metrics::KV_OPS.fetch_add(1, Relaxed);
+            let (op, kv) = match m {
+                "GET" => (
+                    BatchOp::Get { db, table: table_arc, key },
+                    HttpKvOp::Get,
+                ),
+                "DELETE" => (
+                    BatchOp::Delete { db, table: table_arc, key },
+                    HttpKvOp::Delete,
+                ),
+                "PUT" | "POST" => {
+                    // body: {"value": <string|number>} — tag 与 RESP 同源
+                    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+                        fail(conn, seq, 400, "body must be JSON");
+                        return;
+                    };
+                    let stored = match body.get("value") {
+                        Some(serde_json::Value::String(s)) => crate::value_codec::encode_value(
+                            shard_manager::request::VALUE_TAG_RAW,
+                            s.as_bytes(),
+                        ),
+                        Some(v) if v.is_i64() => {
+                            shard_manager::value_num::encode_i64(v.as_i64().unwrap())
+                        }
+                        Some(v) if v.is_f64() => {
+                            shard_manager::value_num::encode_f64(v.as_f64().unwrap())
+                        }
+                        _ => {
+                            fail(conn, seq, 400, "missing 'value' (string or number)");
+                            return;
+                        }
+                    };
+                    if stored.len().saturating_sub(1) > limits.max_value_bytes {
+                        fail(conn, seq, 400, "value too long");
+                        return;
+                    }
+                    (
+                        BatchOp::Put { db, table: table_arc, key, val: stored },
+                        HttpKvOp::Put,
+                    )
+                }
+                _ => {
+                    fail(conn, seq, 405, "method not allowed");
+                    return;
+                }
+            };
+            conn.http_ctx.insert(seq, HttpReqCtx { op: kv, keep_alive: ka });
+            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+        }
+        _ => fail(conn, seq, 404, "not found"),
+    }
+}
+
+/// db 缺省 helper (borrow checker 拆分用).
+fn conn_default(default_db: &std::sync::Arc<str>) -> std::sync::Arc<str> {
+    default_db.clone()
+}
+
+/// SQL 错误 → MySQL ERR 包 (seq 1; 错误码按消息粗分类).
+fn mysql_err_packet(msg: &str) -> Vec<u8> {
+    let code = if msg.contains("unknown column") {
+        1054
+    } else if msg.contains("Unknown database") {
+        1049
+    } else if msg.contains("expected") || msg.contains("unexpected") || msg.contains("unterminated")
+    {
+        1064
+    } else if msg.contains("Access denied") {
+        1045
+    } else {
+        1105
+    };
+    crate::protocol::mysql::build_err(1, code, msg)
 }

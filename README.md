@@ -15,7 +15,9 @@
 ## 核心特性
 
 **协议层**
-- **双协议监听**: Binary 自研协议 5433 端口 + RESP2 (Redis 兼容) 6379 端口, 均含 `KvLimits` 协议层长度拦截, RESP 层开启 `TCP_NODELAY`
+- **五协议监听**: RESP2 6379 + **REST (HTTP/1.1 JSON + CORS + Bearer) 6778** + SQL 双门面 (MySQL wire 5434 / PostgreSQL wire 5435, 共内核) + Binary 5433 (内部), 均含 `KvLimits` 协议层长度拦截, TCP_NODELAY
+- **可观测性**: `/metrics` (Prometheus) + `/v1/status` + `/v1/debug/*` (进程级原子计数, 热路径零锁)
+- **SQL 能力**: CREATE/INSERT 多行/SELECT (投影·ORDER BY·COUNT·IN·BETWEEN·LIKE·全表扫)/UPDATE/DELETE/DROP/USE/DESCRIBE; 本地二级索引 + 双层布隆剪枝 + 覆盖索引/UNIQUE 早停
 - **统一记录编码 + value type tag**: 网络门面写入统一附加 tag, storage 层不感知, 新协议接入零存储改动
 - **多 db / 多表物理隔离**: `{block_root}/{db_name}/shard_{N}/` 目录; db 切换走 MetaPage vpid 0 索引
 
@@ -36,7 +38,7 @@
 - **大 value 溢出页 (≤ 1MB)**: 超 inline 阈值 (~4KB) 自动切成 16KB 溢出页 + 13B 描述符, 0 拷贝到现有 GC
 
 **质量**
-- **700+ 单元/集成测试, `cargo clippy --all-targets` 0 警告**
+- **700+ 单元/集成测试 (当前 784), `cargo clippy --all-targets` 0 警告**
 
 ---
 
@@ -270,10 +272,11 @@ Overflow 数据页:
 | 协议 | 端口 | 状态 | 说明 |
 |---|---|---|---|
 | RESP2 (Redis 兼容) | 6379 | ✅ 完整 | **五大数据结构 + Geo + Bitmap** 全命令面, 清单见下表; 大 value 溢出页自动走 |
-| Binary (自研) | 5433 | ✅ 完整 | Request/Response + BatchOp (Put/Get/Delete 同 key) + TravelTree; 多客户端 + ReplyBus |
-| PostgreSQL (wire) | - | 🚧 设计路线 | 见 [DESIGN.md §10](./DESIGN.md) |
-| MySQL (wire) | - | 🚧 设计路线 | 同上 |
-| MongoDB (BSON) | - | 🚧 设计路线 | 同上 |
+| **HTTP REST** | **6778** | ✅ | **KV + SQL JSON 接口** + CORS + Bearer 鉴权 + `/metrics` (Prometheus); AI 工具/Web 前端/监控接入, 见 REST 节 |
+| **MySQL (wire)** | **5434** | ✅ SQL 子集 | **mysql cli 直连** + `mysql_native_password` 登录 (AuthSwitch 兜底); 语法见下方 SQL 门面节 |
+| **PostgreSQL (wire)** | **5435** | ✅ SQL 子集 | **psql 直连** + cleartext 认证 (SSLRequest 拒绝回落); 与 MySQL 门面**共内核**, 同库互读写 |
+| Binary (自研) | 5433 | ⚠️ 内部 | 内部协议 (测试/压测工具); 对外接入请用 REST/RESP/SQL 门面, 后续版本默认禁用 |
+| MongoDB (BSON) | - | 🚧 设计路线 | 见 [DESIGN.md §10](./DESIGN.md) |
 
 ### RESP 命令面 (2026-07-28)
 
@@ -286,9 +289,100 @@ Overflow 数据页:
 | ZSet | ZADD/ZREM/ZSCORE/ZMSCORE/ZCARD/ZCOUNT/ZINCRBY, ZRANGE/ZREVRANGE/ZRANGEBYSCORE/ZRANK/ZREVRANK (双索引), ZPOPMIN/ZPOPMAX, ZINTERSTORE/ZUNIONSTORE (SUM, 无 weights) |
 | Geo | GEOADD/GEOPOS/GEODIST/GEOSEARCH (FROMLONLAT+BYRADIUS; 52-bit geohash 复用 ZSet 双索引) |
 | Bitmap | SETBIT/GETBIT/BITCOUNT/BITPOS (BYTE 粒度; 复用 String 字节) |
-| 连接 | PING/ECHO/AUTH/QUIT/HELLO/SELECT/COMMAND (pipeline FIFO 重排, TCP_NODELAY) |
+| 连接 | PING/ECHO/AUTH/QUIT/HELLO/**SELECT** (选库)/COMMAND (pipeline FIFO 重排, TCP_NODELAY) |
 
 > 未支持 (记录在案): TTL 族 (EXPIRE/SET EX·PX·NX·XX)、跨 key 原子 (BITOP/SMOVE/LMOVE/BLPOP)、ZSTORE 的 WEIGHTS/AGGREGATE、Stream、HyperLogLog; MSETNX/Set 代数/*STORE 跨 shard 非原子.
+
+### 分库分表 (2026-07-29)
+
+引擎天然多 db 多表, RESP 侧的映射约定:
+
+- **选库 — `SELECT n`**: db 持久化附带数字 id (`DbNameResolver`, name↔id 双向, 各 shard 2PC 同步副本)。KV 客户端用数字 id, SQL 门面用 name, 协议层统一翻译。per-connection 状态, 断连重置; 越界回 `-ERR DB index is out of range`。**不自动建库** — 配置 `precreate_dbs = N` 启动时预建 `db1..dbN`
+- **选表 — key 冒号前缀**: `SET user:1000 x` → 表 `user` key `1000`; 无冒号 → default 表。只拆**第一个**冒号 (`user:1000:profile` → 表 `user` key `1000:profile`); 表名限 `[A-Za-z0-9_.-]{1,64}`, 非法前缀 (空/二进制/超长) 时整个 key 落 default 表。协议无连接状态, 跨表 MGET/MSET/SINTERSTORE 合法
+- **惰性建表**: 表首次被写/读时由所在 shard 数据面自动创建 (本地幂等, 免 2PC), 崩溃恢复完整。注: `list_tables` 各 shard 视图可能不一致 (惰性建表固有)
+
+### SQL 门面 (MySQL wire 5434 + PostgreSQL wire 5435, 2026-07-30)
+
+**双门面共内核**: 同一套解析器/规划器/聚合状态机, 仅 framing 与结果集编码按协议分流; 两门面读写同一数据, mysql 写 psql 读实测一致。分端口 (MySQL 服务端先发言 vs PG 客户端先发言, 共端口需嗅探, 不值)。
+
+**预处理语句 (ORM 接轨)**: `?` (MySQL) / `$n` (PG) 占位符, AST 模板绑定 (零注入面); MySQL COM_STMT_* (二进制参数/结果集) + PG 扩展查询协议 (Parse/Bind/Describe/Execute/Sync)。实测驱动: mysql-connector-python (prepared=True)、psycopg3; Go database/sql、JDBC、mysql2、node-postgres、pgx 同协议路径。asyncpg (Flush 时序依赖) 暂不保证。
+
+```bash
+mysql -h127.0.0.1 -P5434 -uroot -ps3cret --default-auth=mysql_native_password
+psql "host=127.0.0.1 port=5435 user=root dbname=default password=s3cret"
+```
+
+**语法子集**:
+
+```sql
+CREATE TABLE users (id BIGINT PRIMARY KEY, email VARCHAR(64) UNIQUE,
+                    name TEXT NOT NULL, score DOUBLE PRECISION, INDEX(name), INDEX(score));
+INSERT INTO users VALUES (1,'a@x','alice',95.5), (2,'b@x','bob',80.0);  -- 多行
+SELECT * FROM users WHERE id = 1;                          -- pk 点查 (单 shard)
+SELECT name, id FROM users WHERE name = 'alice';           -- 覆盖索引免回表
+SELECT id FROM users WHERE score BETWEEN 80 AND 99 AND name != 'bob'
+  ORDER BY score DESC, id LIMIT 10 OFFSET 5;
+SELECT COUNT(*) FROM users WHERE name IN ('alice', 'bob');
+SELECT * FROM users WHERE email LIKE 'a%';                 -- 前缀 LIKE → 范围
+SELECT * FROM users WHERE note = 'x';                      -- 无索引 → 全表扫+过滤
+UPDATE users SET score = 99.0, name = 'al' WHERE id = 1;   -- 部分列更新
+DELETE FROM users WHERE score < 60;                        -- 索引/全表条件删
+DROP TABLE users;  USE db1;  DESCRIBE users;               -- 工具命令
+```
+
+类型: `INT/BIGINT/SMALLINT/BOOLEAN → I64`, `DOUBLE [PRECISION]/FLOAT/REAL → F64`, `TEXT/VARCHAR(n)/CHAR(n) → Str`, `BLOB/BYTEA → Bytes`。
+
+**执行模型 (本地二级索引 + 双层剪枝)**:
+
+- 索引行与数据行**同 shard 共存** (按 pk hash 路由) — 写入单 shard 原子, 无跨 shard 协调
+- `WHERE pk =` → 单 shard; 索引列 → 广播"本地索引扫 + 本地回表"一跳闭环; 无索引 → 全表扫 + 残余过滤
+- **双层布隆剪枝** (等值): worker 路由缓存零任务短路 + shard 本地 bloom O(1) 拒绝, 只增不减构造性无假阴性
+- 覆盖索引 (投影∪条件∪排序 ⊆ 索引列+pk) 免回表; UNIQUE 等值首命中早停
+- DELETE/UPDATE: pk 等值单 shard 原子; 索引/扫描条件两阶段 (先收 pk 再逐 pk 下发, 非原子, 记录 gap)
+
+**SQL 基线** (5000 行 ×2 索引表, 4 连接, MySQL wire 全链路):
+
+| 场景 | 吞吐 | p50 |
+|---|---|---|
+| pk 点查 | ~57K qps | 55µs |
+| UNIQUE 等值 (早停) | ~37K qps | 60µs |
+| 等值 miss (零任务短路) | ~62K qps | 35µs |
+| 等值 100 行 (覆盖索引) | ~4-5.7K qps | 0.7ms |
+| ORDER BY + LIMIT (索引 100 行) | ~2.9K qps | 1.2ms |
+| DELETE / INSERT (pk) | ~11K qps | 0.11ms |
+| 全表扫 5K 行 (+过滤/COUNT) | ~70 qps | 55ms |
+
+> SQL gap (记录在案): 无 JOIN / GROUP BY / OR / 子查询 / 事务 / ALTER / 预处理语句 / TLS / SCRAM (PG 仅 cleartext); LIKE 仅前缀模式; **UNIQUE 跨 shard 漏检** (探测仅本 shard); DELETE/UPDATE 两阶段与多行 INSERT 非原子; ORDER BY 无 top-k (全量排序); schema 广播非原子 (幂等重试)。
+
+### REST 门面 (HTTP/1.1, 6778, 2026-07-30)
+
+零依赖手写 HTTP/1.1 (keep-alive, 无 chunked/TLS/HTTP2), 面向 AI 工具 / Web 前端 / 监控接入; 与其余门面读写同一数据。
+
+```bash
+# KV (value: 字符串或数值; 数值走原生二进制 tag, 与 RESP 互通)
+curl -X PUT localhost:6778/v1/kv/user/alice -d '{"value":"hello"}'
+curl localhost:6778/v1/kv/user/alice          # {"value":"hello"}  (404 = 不存在)
+curl -X DELETE localhost:6778/v1/kv/user/alice # {"deleted":true}
+# SQL (完整语法子集同 MySQL/PG 门面)
+curl -X POST localhost:6778/v1/sql -d '{"query":"SELECT * FROM rt WHERE id = 1", "db":"可选"}'
+# → {"columns":["id","v"],"rows":[[1,"x"]]} | {"affected":n} | 4xx/5xx {"error":"..."}
+# 可观测性 (免鉴权)
+curl localhost:6778/metrics       # Prometheus 文本 (requests/errors/sql/kv/uptime)
+curl localhost:6778/v1/status     # {"version","uptime_seconds","num_shards","protocols"}
+curl localhost:6778/v1/debug/sql-cache  # worker 路由缓存统计 (需鉴权)
+```
+
+- **CORS**: `http_cors_origin = "*"` 或具体 origin → 响应带 Allow-Origin, OPTIONS preflight 回 204 全套头; 空 = 不发
+- **鉴权**: `http_token` 非空 → 除 `/metrics` `/v1/status` 外要求 `Authorization: Bearer <token>` (401 拒绝)
+- **错误映射**: 语法/未知列/未知库 → 400, duplicate key → 409, 引擎错误 → 500; KV 不存在 → 404
+- 基线 (4 连接 keep-alive): KV GET/PUT ~10.4K rps, SQL pk 点查 ~11.3K rps (p50 0.25ms; 管理/集成面, 高吞吐走 RESP)
+- gap: 无 chunked (仅 Content-Length) / 无流式大结果集 (SELECT 全量 JSON) / 单 worker
+
+
+```
+redis-cli -n 1 set user:1000 alice   # 库 db1, 表 user, key 1000
+redis-cli set counter 5              # 默认库, default 表
+```
 
 设计哲学: **统一记录编码 + value type tag** 已预留 (`TAG_RAW/TAG_I64/TAG_F64/TAG_STR/TAG_DOC`), 新协议接入**无需改 storage 层**, 只需添加 `crates/network/src/protocol/<x>/` parser + adapter.
 
@@ -302,6 +396,13 @@ Overflow 数据页:
 [server]
 listen_addr = "0.0.0.0:5433"     # Binary 协议
 redis_addr = "0.0.0.0:6379"      # RESP (空字符串 = 禁用)
+sql_addr = "0.0.0.0:5434"        # SQL 门面 MySQL wire (空字符串 = 禁用)
+sql_worker_count = 1             # MySQL/PG 门面 worker 数 (ORM 连接池场景调 2-8; 16 连接 4 worker ≈ 2.5x)
+pg_addr = "0.0.0.0:5435"         # SQL 门面 PostgreSQL wire (空字符串 = 禁用)
+http_addr = "0.0.0.0:6778"       # REST 门面 (空字符串 = 禁用)
+http_cors_origin = ""            # CORS Allow-Origin ("*"/具体 origin, 空 = 不发)
+http_token = ""                  # REST Bearer token (空 = 免鉴权)
+sql_password = ""                # SQL 登录密码, 两门面共用 (空 = 免密)
 redis_password = ""              # AUTH 密码
 max_key_bytes = 1024             # key 上限 (协议层拦截)
 max_value_bytes = 1048576        # value 上限 (>4KB 自动走溢出页)
@@ -314,6 +415,7 @@ chunk_cache_size = 16            # ChunkList LRU 容量
 create_if_missing = true
 default_db = "default"           # 启动默认 db
 default_table = "default"        # 启动默认 table
+precreate_dbs = 0                # 预建 db1..dbN 供 SELECT n 选库 (0 = 只有默认库)
 
 [log]
 level = "info"                   # error|warn|info|debug|trace

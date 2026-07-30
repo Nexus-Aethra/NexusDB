@@ -4,6 +4,13 @@
 listen_addr = "0.0.0.0:5433"
 worker_count = 2
 redis_addr = "0.0.0.0:6379"     # RESP (Redis 兼容) 监听地址, 空 = 禁用
+sql_addr = "0.0.0.0:5434"       # SQL 门面 (MySQL wire) 监听地址, 空 = 禁用
+sql_worker_count = 1            # MySQL/PG 门面 worker 数 (ORM 连接池并发场景可调 2-8)
+pg_addr = "0.0.0.0:5435"        # SQL 门面 (PostgreSQL wire) 监听地址, 空 = 禁用
+http_addr = "0.0.0.0:6778"      # REST 门面 (HTTP/1.1 JSON) 监听地址, 空 = 禁用
+http_cors_origin = ""           # CORS Allow-Origin ("*" 或具体 origin, 空 = 不发 CORS 头)
+http_token = ""                 # REST Bearer token (空 = 免鉴权; /metrics /v1/status 恒免)
+sql_password = ""               # SQL 登录密码 (两门面共用), 空 = 免密
 redis_password = ""             # RESP AUTH 密码, 空 = 不启用认证
 max_key_bytes = 1024            # key 长度上限 (协议层拦截)
 max_value_bytes = 1048576       # value 长度上限 (>~4000B 自动走溢出页, 上限 1MB)
@@ -16,6 +23,7 @@ chunk_cache_size = 16
 create_if_missing = true
 default_db = "default"
 default_table = "default"
+precreate_dbs = 0              # 预建 db1..dbN 供 RESP `SELECT n` 选库 (0 = 只有默认库)
 
 [log]
 level = "info"                 # error|warn|info|debug|trace

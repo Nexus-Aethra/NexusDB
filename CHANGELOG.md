@@ -10,6 +10,224 @@
 
 ---
 
+## 2026-07-31 会话 (F59: ORM 性能专项 — SQL 门面多 worker 化)
+
+### 交付总览 (计划 A-D)
+
+| # | 交付 | 文件 |
+|---|------|------|
+| A | Rust 客户端归因: prepared 服务端净差 **0.90x** (上轮 0.62x 系 Python 客户端开销) → 预规划缓存 gate 未过不做; 单 worker 饱和 ~135K qps (8 连接起平) | `sql_e2e.rs` (bench_* ignored) |
+| B1 | IndexBloom 原子化: `Vec<u64>` → `Vec<AtomicU64>` (fetch_or AcqRel / load Acquire), `&self` 写 | `storage/index_bloom.rs` |
+| B2 | 缓存分层 (用户方案): **schema per-worker 零锁** + 进程级 **DDL epoch** 失效 (AtomicU64, DROP +1, 每语句一次 load 比对陈旧即清) ; **routes/created_here 进程级** `SqlSharedRoutes` (per-worker 必假阴性 — INSERT 分散多 worker) | `network/worker.rs`, `server.rs`, `lib.rs` |
+| B3 | `sql_worker_count` 配置 (默认 1) 应用 MySQL+PG 门面; HTTP 保持 1 | `config`, `main.rs` |
+| C | COM_STMT_EXECUTE 借用重构省一次 AST 深拷贝 (bind_params 单拷贝) | `worker.rs` |
+
+### 关键设计
+
+- **热路径零锁**: 每语句 = 1 次 epoch load + bloom 原子读; routes RwLock 仅保护 map 结构 (读取克隆 Arc 锁外操作), created_here 读锁 DDL 低频
+- **NetworkServerConfig.sql_shared 必填注入** (同 ShardManager 集群的全部 SQL 门面必须同一实例 — 跨门面 INSERT/SELECT 一致性; e2e 各测试独立实例防串台); 拒绝全局 OnceLock (测试进程内多集群共享会让 created_here 误判存量表 → 假阴性)
+- **单 SQL worker 前提正式解除** (W 轮红线语义平移到进程级: 只增禁驱逐 / created_here 门槛 / 回退广播 shard bloom 兜底)
+- epoch 只在 DROP 递增 (CREATE 新表不作废旧缓存); DROP+重建换 schema 的旧 schema 解码错行为被 epoch 阻断 (多 worker e2e 覆盖)
+
+### 验收
+
+- **并发吞吐**: 16 连接 pk 点查 1 worker 100K → **4 worker 254K qps (2.5x)**; 单连接延迟不变
+- 多 worker e2e: 2 worker 跨连接 CREATE→INSERT 分散→等值 SELECT 完整 (per-worker bloom 必挂的场景) + DROP/重建 epoch 失效跨 worker 正确
+- 实机 `sql_worker_count = 4`: mysql-connector prepared + psycopg3 双驱动全通 (跨门面共享路由缓存)
+- 回归: net+sm+cfg 165 + storage 467 = **632/0**, clippy 0; String mixed 234K 无回退 (bloom 原子化零感知)
+
+---
+
+## 2026-07-30 会话四 (F58: 预处理语句 — MySQL COM_STMT_* + PG 扩展查询协议)
+
+### 交付总览 (计划 P1-P4)
+
+| # | 交付 | 文件 |
+|---|------|------|
+| P1 | SQL 层参数化: `?`/`$n` 占位符 → `SqlValue::Param` + `bind_params` AST 模板深拷贝绑定 | `sql.rs` (parse_prepared 新入口), `worker.rs` (sql_to_col/sql_cmp 弱类型放宽) |
+| P2 | MySQL COM_STMT_PREPARE/EXECUTE/CLOSE/RESET: 二进制参数解码 + **二进制结果集** | `mysql.rs`, `worker.rs` (mysql_stmts 注册表 + mysql_binary seq 标记) |
+| P3 | PG 扩展查询协议: Parse/Bind/Describe/Execute/Close/Sync | `pg.rs`, `worker.rs` (PgBatch 批次 + resp_complete 前缀单点拼接) |
+| P4 | 验收: e2e 手写双协议客户端 + **真实驱动实测** (mysql-connector prepared / psycopg3) | `sql_e2e.rs`, `pg_e2e.rs` |
+
+### 关键设计
+
+- **AST 模板 + 绑定** (拒绝文本代入重解析 — 零转义面/注入面): Param 泄漏到执行层由 sql_to_col 防御报错; ?/$n 混用报错; LIMIT/OFFSET 位置不支持占位 (语法位, 记录)
+- **弱类型转换**: PG 文本参数一律 SqlValue::Str, 目标列 I64/F64 时文本解析 (sql_to_col **和 sql_cmp 两处都要放宽** — 只改前者会导致残余过滤静默滤掉全部行, e2e 抓到); 二进制参数按 Parse 声明 OID 解码 (int2/4/8, float4/8, bool, text/varchar/bytea)
+- **MySQL**: prepare 回 num_columns=0 (列定义延迟到 execute 结果集自描述, 免 prepare 期 schema 异步化); execute 结果集 = 二进制协议行 (0x00 头 + NULL bitmap 位偏移+2 + LONGLONG/DOUBLE LE + lenenc) — 渲染分流 = `sql_rows_bytes(proto, binary, ..)` 加 bool 维度, seq 级 `mysql_binary` 标记 (各渲染点 remove, agg drained 时清防泄漏)
+- **PG 扩展协议批次 = 单 seq**: Parse..Sync 累积 (PgBatch: prefix 字节 + bound 语句 + error skip-to-Sync), Sync 触发 dispatch; **前缀 ([ParseComplete][BindComplete][ParamDesc][NoData]...) 在 resp_complete 单点拼接** — 结果主体 (T+D+C+Z) 复用 simple query 渲染零改动; Describe(statement) 回 t+NoData (列描述由结果流 RowDescription 满足 psycopg3/node-postgres flow)
+- **驱动噪声**: `SET @@session...` 含 '@' 在 tokenize 前整吞 (mysql-connector 握手后必发, 实测暴露)
+
+### 实测
+
+- **mysql-connector-python (use_pure, prepared=True)**: 建表/参数化 INSERT (含 NULL)/SELECT (二进制结果集 + NULL bitmap)/UPDATE/DELETE 全通; C 扩展实现连接失败为驱动侧问题 (errmsg 属性 bug), 纯 Python 协议路径全对
+- **psycopg3 (默认扩展协议)**: %s 参数化 INSERT/SELECT/COUNT 全通; 与 MySQL 门面同表互读 ✓
+- **prepared vs 文本性能 (诚实)**: 单连接点查 text 30.5K vs prepared 19K qps (0.62x) — 客户端二进制编码开销 > 服务端省 parse (手写解析器本就 <10µs); prepared 的价值 = 注入安全 + ORM 生态兼容, 非吞吐
+- 回归: net+sm+cfg 164/0 (新增 mysql_prepared_statements + pg_extended_query e2e), clippy 0; asyncpg (Flush 依赖) 明确不保证 (记录)
+
+---
+
+## 2026-07-30 会话三 (F57: REST 门面 HTTP/1.1 + CORS + 可观测性)
+
+### 交付总览 (计划 H1-H5)
+
+| # | 交付 | 文件 |
+|---|------|------|
+| H1 | 零依赖 HTTP/1.1 基建: 增量解析/keep-alive/CORS preflight/Bearer 鉴权 | `protocol/http.rs` (新), `worker.rs`, `config`, `main.rs` (第五监听 **6778**, 用户拍板避开 8080) |
+| H2 | KV REST: GET/PUT/DELETE `/v1/kv/{table}/{key}?db=` (tag 感知 JSON, 与 RESP 互通) | `worker.rs` (http_ctx 簿记 + 回包渲染钩子) |
+| H3 | SQL REST: POST `/v1/sql` — 共内核**第四门面** (渲染分流 sql_*_bytes 加 Http 分支) | `worker.rs` |
+| H4 | 可观测性: `/metrics` (Prometheus) + `/v1/status` + `/v1/debug/sql-cache`; 进程级 AtomicU64 指标 | `lib.rs` (metrics/http_config 模块), `worker.rs` 打点 |
+| H5 | 验收: http_e2e 3 测试 + curl 实机 + 四协议互联 + 基线 | `tests/http_e2e.rs` (新) |
+
+### 关键设计
+
+- **手写 HTTP/1.1** (不引 hyper/axum/tokio; serde_json 为唯一新依赖): 增量解析 (不完整 None 续读), 头 16KB/431 + body 1MB/413 上限, **chunked 拒 501** (仅 Content-Length, 记录); keep-alive pipeline 复用 seq 重排 (每请求一 seq); Connection: close → close_after_flush (pending 出完再关)
+- **CORS**: `http_cors_origin` 进程级 OnceLock (单 HTTP server 语义, 免 NetworkServerConfig 破坏面); OPTIONS preflight 就地 204 全套头
+- **鉴权**: `http_token` 复用 WorkerConfig.auth_password 通道 = Bearer token; `/metrics` `/v1/status` 白名单免鉴权 (监控惯例)
+- **KV tag 互通**: PUT value JSON number → encode_i64/f64 (数值原生二进制), string → TAG_RAW — 与 RESP 完全同源; GET 按 tag 渲染 JSON number/string, 非法 UTF-8 → base64 + encoding 标记
+- **SQL 第四门面零内核改动**: sql_err_bytes Http 分支按消息映射 400/409/500 JSON; Binary 降级"内部协议" (README, 零代码改动)
+- **指标**: 静态 AtomicU64 relaxed (HTTP/SQL/KV 计数 + uptime); RESP 热路径仅 dispatch 入口一次 fetch_add, memtier 复测无回退
+
+### 测试快照
+
+- net+sm+cfg **161 passed / 0 failed** (新增 http_e2e 3: 全流程/Bearer/连接语义; http.rs 单测 5), clippy 0; storage 未触碰 (零改动)
+- 实机 curl: KV/SQL/preflight (204+Allow-*)/metrics/status 全对; **四协议互联**: redis 写→REST 读 / REST 写→redis 读 / REST 建表→mysql 读, 全一致
+- 基线: REST KV GET/PUT ~10.4K rps, SQL pk ~11.3K rps (p50 0.25ms, 4 连接单 worker); String mixed 228K 无回退 (打点零影响)
+
+---
+
+## 2026-07-30 会话二 (F56: SQL 补全 DML/SELECT/方言 + PostgreSQL wire 门面)
+
+### 交付总览 (计划 S1-S5)
+
+| # | 交付 | 文件 |
+|---|------|------|
+| S1 | DML: DELETE / UPDATE SET / 多行 INSERT / DROP TABLE | `sql.rs`, `worker.rs`, `sql_rows.rs` (row_update/drop_table_sql), `request.rs+manager.rs` (RowUpdate/DropTableOp) |
+| S2 | SELECT 扩展: 全表扫 / ORDER BY / OFFSET / COUNT(\*) / IN / BETWEEN / != / LIKE 前缀 | `sql.rs`, `worker.rs`, `keyspace.rs` (split_string), `sql_rows.rs` (table_scan_rows_local), TableScan op |
+| S3 | 方言别名 (DOUBLE PRECISION/VARCHAR(n)/BYTEA/BOOLEAN) + USE / DESCRIBE / SET·version() stub | `sql.rs`, `worker.rs` |
+| S4 | **PostgreSQL wire 门面 (5435)**: psql 直连 + cleartext 认证 + 渲染 per-proto 分流 | `protocol/pg.rs` (新), `worker.rs`, `config`, `main.rs` |
+| S5 | mysql cli 实机暴露修复: COM_INIT_DB 真切库 / 登录 database 字段 / SELECT DATABASE() | `worker.rs`, `sql.rs` |
+
+### 关键设计
+
+- **双门面单内核**: MySQL(5434)/PG(5435) 共用 SqlStmt/规划器/聚合状态机; 渲染收敛为 `sql_err_bytes/sql_ok_bytes/sql_rows_bytes(proto, ..)` 三个 per-proto 编码器 (PG 每回复尾随 ReadyForQuery). **分端口决策**: MySQL 服务端先发言 vs PG 客户端先发言, 共端口需超时嗅探 (延迟税+误判), 不值
+- **DML 原子性分级**: pk 等值 → 单 shard 原子 (RowUpdate 在 shard 端读-改-写, 继承 UNIQUE 校验/索引跟随); 索引/扫描条件 → **两阶段** (phase1 复用 SELECT 聚合收全行过滤取 pk — `SqlSelectAgg.dml` 标记, DML 禁早停保证 phase1 全量回齐后才发 phase2, 同 seq 双聚合不并存; phase2 逐 pk 分发 `SqlDmlAgg` 计数 affected). 非原子, 与 *STORE 同级 gap
+- **全表扫**: TableScan 广播 op, shard 扫 `[S]` 前缀只收 TAG_ROW (跳过混入 KV 行), pk 批量回读 (LeafGuide); 规划器无索引 fallback (报错路径退役), 无 WHERE 无排序时 limit+offset 下推
+- **新算子不改树形**: BETWEEN → Ge+Le, LIKE 'p%' → [p, p+1) 字节范围 (与 starts_with 精确等价; 全 0xFF 退化只留下界) — 均**解析期 desugar**; IN → CmpOp::In (Cond.set), 索引列取 [min,max] 保序编码极值下推 + 残余精确; != 纯残余
+- **ORDER BY**: 聚合完成点排序 (多列/DESC; NULL asc 排最后 desc 相反 = PG 默认), OFFSET 排序后截断; 有排序时 shard limit 一律不下推, 无 top-k (记录). 覆盖判定并入排序列
+- **DROP TABLE 三层清理**: 引擎 (物理 + schema 镜像/bloom/复合提示 `purge_table_state`) + worker 缓存 (schemas/routes/created_here) — e2e 验证重建同名表零幽灵
+- **PG wire 子集**: SSLRequest/GSSENC → 'N' 拒绝回落; StartupMessage database 参数校验切库; cleartext (28P01) — SCRAM/TLS/扩展查询协议 (Parse/Bind) 明确不做; OID 映射 int8/float8/text/bytea; CommandComplete tag = "OK n" (非标准, psql 原样显示)
+
+### 实机验收插曲 (真客户端暴露的三个 stub 债)
+
+- mysql cli 的 `USE x` 走 **COM_INIT_DB** 而非 COM_QUERY — 原 stub 假 OK 不切库 → 真实现 (校验 + conn.current_db)
+- USE 后 cli 自动发 `SELECT DATABASE()` → 解析失败断连 → DatabaseStub 单行回显
+- 登录报文 `--database` 字段一直被忽略 → 认证通过后应用 (AuthSwitch 二段经 `MysqlState.pending_db` 传递)
+- psql 的 dbname 几乎必带 (缺省 = user 名) → default 库名特判 (隐式库不入 resolver)
+
+### 测试快照
+
+- workspace: **net+sm+cfg 153 + storage+page+sched 647 = 800 passed / 0 failed**, clippy 0
+- e2e 新增: `pg_e2e.rs` 3 测试 (手写 PG 客户端: SSL 拒绝/auth 成败/全流程/多语句拒绝) + sql_e2e 扩至 7 (DML 全流程/SELECT 扩展/方言工具)
+- 实机: **psql 16 + mysql 8.4 同库交叉读写一致**; kill -9 (等 12s 刷盘) 恢复正确; 优雅重启跨门面数据一致
+- 性能: pk 57K / DELETE+INSERT 11K / ORDER BY+LIMIT 2.9K / 全表扫 5K 行 ~70 qps·55ms (新基线项); String mixed 229K 无回退
+
+---
+
+## 2026-07-30 会话 (SQL 体系: 索引基建 → MySQL wire 门面 → 双层剪枝 → 三项优化)
+
+### 交付总览
+
+| # | 交付 | 文件 |
+|---|------|------|
+| F50 | SQL 索引基建: schema/row 编码 + 本地二级索引 + IndexScan 广播 | `storage/schema.rs+row.rs+sql_rows.rs+index_bloom.rs+keyspace.rs+btree.rs`, `shard_manager`, `network` |
+| F51 | SQL INSERT/SELECT: 解析器 + worker 查询规划 (pk 点查/索引广播/残余过滤) | `network/protocol/sql.rs`, `network/worker.rs` |
+| F52 | MySQL wire 门面 (5434): 握手/mysql_native_password 登录/COM_QUERY/结果集 | `network/protocol/mysql.rs`, `network/worker.rs`, `config`, `main.rs` |
+| F53 | 双层布隆剪枝: shard 本地 index bloom + worker 索引路由缓存 | `storage/index_bloom.rs+sql_rows.rs+collections.rs`, `network/worker.rs` |
+| F54 | 回表批量化 + schema worker 级缓存 | `storage/sql_rows.rs`, `network/worker.rs` |
+| F55 | 三项优化: 投影列/覆盖索引 + 复合写批量化 + UNIQUE 索引/早停 | `sql.rs`, `worker.rs`, `schema.rs`, `sql_rows.rs`, `collections.rs`, `engine.rs` |
+
+### F50: SQL 索引基建
+
+- **schema**: 表内 `[$]` 保留行持久化 + engine 常驻镜像 lazy load (无 schema = 纯 KV 表零回归); ShardManager 控制面 + 数据面 SetSchemaOp 双通道分发
+- **row 编码**: `[TAG_ROW=0x07][ver][null bitmap][定长列区][变长偏移][变长数据]`; row 行复用 String 命名空间 `[S][klen][pk]` (pk 点查 = 既有热路径)
+- **索引行**: `[I][iid u32 BE][型别字节+保序值][PK]` → 空值 (ZSet score 索引同构); 数值 8B 保序编码, 字符串**转义终结符** (`0x00→0x00FF` + 尾 `0x0000`, memcmp 保序, **不用长度前缀** — 破坏字典序)
+- **本地二级索引 (核心决策)**: 索引行与 row 同 shard (按 PK 路由, shard 端 row_put 内部维护) → 写单 shard 原子; **禁止两跳**: IndexScan 广播 → shard 内 "索引扫 + 本地回表" 闭环, worker 只聚合; 范围扫底座 `btree_scan_from` (start ≠ prefix)
+- gap: NULL 不入索引 (IS NULL 全表扫); crash 窗口 row 落/索引未落 (回表 miss 跳过兜底)
+
+### F51: SQL INSERT/SELECT (查询规划)
+
+- 手写零依赖解析器 (`sql.rs`): CREATE TABLE / INSERT / SELECT, '单引号' ('' 转义)
+- worker 规划: `WHERE pk=` → RowGet 单 shard; 索引列命中 → IndexScan 广播 (界下推, 开界下推闭界 + **全条件残余过滤**兜底); 无索引 → ERR (无全表扫); limit 下推仅当全部条件在选中索引列且 Eq/Ge/Le
+- schema conn 级缓存 (F54 升 worker 级), miss 经 GetSchemaOp + sql_pending 挂起续跑; UPDATE = 同 pk INSERT 覆盖 (row_put 自动换索引行)
+
+### F52: MySQL wire 门面 (mysql cli 直连 + auth)
+
+- 5434 端口 (config `sql_addr`/`sql_password`): HandshakeV10 主动发 (splitmix 可打印 salt) → HandshakeResponse41 → `mysql_native_password` (手写 SHA1, RFC 3174 向量单测) + **AuthSwitchRequest 兜底** (8.x caching_sha2 客户端自动切换); 密码错 1045 断连
+- COM_QUERY/PING/INIT_DB/QUIT; 老式 EOF 文本结果集 (列定义取 schema, lenenc, NULL=0xFB); 错误码 1064/1054/1105
+- 复用 epoll + seq 重排 + SQL 聚合钩子 (`ProtocolKind::Sql`); mysql 8.4 cli 实测全通
+- 演进注记: 曾短暂落地自定义行文本协议 (Y2) 作过渡, 同会话内被 MySQL wire 整体替换
+- gap: 无 TLS / COM_STMT_* / USE 切库 / 16MB 分片包; RESP 端口回归纯 Redis (SELECT 严格选库, 无 CREATE/INSERT)
+
+### F53: 双层布隆剪枝 (等值查询)
+
+- **shard 本地** (`index_bloom.rs`, 每 shard 每 (db,table,iid) 一个 64K bit 位图, FNV k=2): 等值扫 shard 端 O(1) 拒绝 (免 BTree travel); set_schema 建空 bloom / row_put 喂值 / **开库随 rebuild_composite_counts 扫 [I] 重建** → 重启后剪枝仍生效
+- **worker 路由缓存** (`SqlWorkerCache.routes`, per-shard 只增 bloom): INSERT 喂 (value→shard), 等值 SELECT 只向候选 shard 分派, 候选空 → **零任务**直接回空
+- **正确性红线 (双层同构)**: 只增不减 (禁精确 map+LRU — 驱逐重积 = 假阴性漏行); worker 层仅 `created_here` 的表启用 (CREATE 时刻零数据 = 空 bloom 完备), 重启/存量表回退广播由 shard 层兜底; 单 SQL worker 前提
+- 实测: eq miss 86µs (shard 拒) → 35µs (零任务, 62K qps)
+
+### F54: 回表批量化 + schema worker 级
+
+- `index_scan_local/entries_local` 回表: 逐 pk travel → `table_get_many` (排序 + LeafGuide 区间复用); 等值百行 1.0K→2.4K qps (p50 3.6→1.6ms)
+- schema 缓存 conn 级 → worker 级共享 (`Rc<RefCell<SqlWorkerCache>>`, ConnState 持 clone 零签名扩散)
+
+### F55: 三项优化 (投影/覆盖 + 复合写 + UNIQUE)
+
+- **O1 投影+覆盖索引**: `SELECT a, b`; 投影∪条件列 ⊆ {索引列, pk} → `with_rows=false` 免回表, 行值从 (val, pk) 保序编码重建 (worker 与 keyspace 严格同源). 等值百行 3.1K→**5.7K**, 范围 →**6.7K qps (3.3x)**
+- **O2 复合写放大**: `kind_of` 探测反转 (先 [#] meta, 已存在 key 2→1 探); HSET/SADD/ZADD 探在+写入批量化 (`get/put_physical_many`). 分散写 HSET 97→**124K**, SADD 76→**232K (3x)**, ZADD 44→**76K**
+- **O3 UNIQUE**: `col TYPE UNIQUE` (隐含 NOT NULL, IndexDef.unique 序列化 +1B); row_put **写前**本 shard 探测拒 duplicate key (无半写); worker 等值早停 (首个非空即回复, agg 保留至回包收齐防迟到重复 complete). unique 点查 **36.7K qps / 60µs** (≈pk 级)
+- **gap: UNIQUE 跨 shard 漏检** (探测仅本 shard, e2e 实证; 真全局唯一需广播探测/全局索引)
+
+### 本轮 gotchas
+
+- **crash 测试 kill 前必须等 >10s** 周期刷盘窗口, 否则未落盘写丢失会被误判为功能 bug (W3 验收插曲)
+- **repro_verify_storage 间歇 hang** (全量套件序列内偶发, 单独跑 12s 过; 与业务改动无关, 杀掉重跑即可)
+- mysql cli 分词会剥引号 — SQL 字面量含空格/引号必须走独立端口原文直达 (放弃 RESP 通道 SQL 的根因之一)
+
+### 测试快照
+
+- workspace: **storage 33 suites/467 + net+sm+page+sched 46 suites/317 = 784 passed / 0 failed**, clippy 0
+- 实机: mysql cli 8.4 全流程 + kill -9 恢复 (数据/索引/bloom 重建一致); memtier String mixed 217K (历史波动区间 189-313K 内)
+
+---
+
+## 2026-07-29 会话补记 (F49: 纯 String 表跳过复合类型探测, 修性能回退)
+
+- **现象**: mixed 1:1 (4×8 pipeline16) 掉到 ~189-219K (07-28 基线 ~249K)
+- **A/B 定位** (临时短路热路径逐项测): 去 SET `purge_composite_if_any` 探测 219K→253K; 再去 GET-miss WRONGTYPE 探测 →292K. **根因是 F45/U2 引入的复合类型探测在纯 String 热路径的固定成本** (每 SET/GET-miss/DEL 各多一次 `[#]key` BTree 点查), 非本轮分库分表改动 (memchr/Arc clone 都极轻)
+- **F49 修复**: `StorageEngine` 加**单调提示位** `composite_tables: HashMap<db, HashSet<table>>` — 复合写入口 (hash_set/set_add/zset_add/put_list_meta 等) `mark_composite`, 开库 `rebuild_composite_counts` 扫到 `[#]` 行时重建. 纯 String 表 (`!has_composite`) 的 SET purge / GET-miss WRONGTYPE / DEL 探测**全部跳过** (零额外点查). false positive 无害 (仅多一次探测), 语义完全保留 (有复合类型的表仍正确 WRONGTYPE / purge)
+- **效果**: mixed 1:1 回到 ~253-313K (抖动区间, 已达/超 07-28 基线); redis-cli 验证 SET 覆盖 hash 仍正确 purge + WRONGTYPE
+- 回归: storage 32 suites/444 + net/sm 15 suites/118 全绿, clippy 0
+
+---
+
+## 2026-07-29 会话 (RESP 分库分表: SELECT id 翻译 + key 冒号前缀选表 + 惰性建表)
+
+### 交付总览
+
+| # | 交付 | 文件 |
+|---|------|------|
+| F48 | RESP 分库 (SELECT n ↔ DbId 翻译) + 分表 (table:key 冒号前缀) + shard 数据面惰性建表 | `storage/engine.rs+registry.rs`, `shard_manager/request.rs+manager.rs`, `network/worker.rs+resp.rs+server.rs`, `config`, `main.rs` |
+
+### F48: RESP 分库分表
+
+- **选表 (key 冒号前缀, 协议无状态)**: 所有 RESP 命令 key 按**第一个 `:`** 拆 `table:key`; 无冒号 → default 表. 表名限 `[A-Za-z0-9_.-]{1,64}`, 不匹配 (空/二进制/超长前缀) → 整 key 落 default 表 (防二进制 key 撞 `:` 产生垃圾表). 只拆第一个冒号 (`user:1000:profile` → 表 `user`). 实现: **`push_task` 单点重写** (`BatchOp::table_key_mut()`) 覆盖全部单 key 命令; MGET/MSET/MSETNX 分组键 shard → **(shard, table)**; Set 代数/*STORE 源 key 逐个解析 (天然跨表), dst 解析后存 agg; `ConnState.table_cache` 前缀→Arc 复用免热路径分配
+- **选库 (SELECT n ↔ DbId)**: 复用存储层既有 `DbNameResolver` (name↔u32, MetaPage 头 1024B 持久化, create_db 2PC 全 shard 同序副本) — **KV 用数字 id, SQL 未来用 name, 协议层统一翻译成 name 传 worker** (BatchOp/路由/引擎零改动). 新增 `ShardManager::DbDirView` (RwLock 双向 map, open 时从 shard 0 拉取 / create_db 后刷新, 只含**真实已创建**的库); `ConnState.current_db` per-connection (断连重置); 越界 → `-ERR DB index is out of range`; 配置 `precreate_dbs = N` 启动预建 db1..dbN. **不自动建库** (库是重资源: 物理目录 + 2PC)
+- **惰性建表 (shard 数据面)**: op 执行前 `engine.ensure_table` (registry 缓存命中 = 纯内存查表; miss 则该 shard 本地 create_table, 幂等) — **不走 2PC 控制面**, shard 间物理隔离无需协调. 代价: list_tables 各 shard 视图可能不一致 (RESP 不暴露, 记录在案)
+- **顺手重构**: `BatchOp::locator()` 单源 (db,table,key) 提取 — 收敛 manager 两处路由 + worker `hash_route_op` 三份 40+ 变体重复 match (净删 ~200 行); *STORE 二阶段 (db,table) 存 agg 快照 (防 pipeline 中 SELECT 切库后错库)
+- 验证: **75 suites / 739 passed / 0 failed** + clippy 0; e2e 新增 resp_t_table_routing (跨表 MGET/MSET/*STORE/边界前缀) + resp_d_select_db (库隔离/越界/断连重置); redis-cli `-n 1/-n 2` 实机隔离 + 冒号分表 + 惰性建表; kill -9 后自动建的表/双库数据/resolver id 映射全恢复; memtier 189K (基线区间内, 无冒号 key 仅 +1 次 memchr)
+
+---
+
 ## 2026-07-28 会话 (Redis 数据结构体系: 五大类型 + 统一 meta + Geo/Bitmap)
 
 ### 修复/交付总览

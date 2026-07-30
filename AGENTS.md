@@ -20,9 +20,51 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
   - `crates/network` — 网络层: acceptor + epoll worker + **双协议门面 (Binary + RESP2/Redis 兼容含 AUTH)** + KvLimits 校验 + value type tag (✅)
   - `crates/shard_manager` — 多 shard 控制器 + hash 路由 + 2PC + **TaskInbox/TaskReplyBus 直连架构** (✅)
   - `crates/config` (TOML) / `crates/logging` (nlog, io_uring 协程融合 logger) (✅)
-  - 根 binary `src/main.rs` — 服务器入口: `nexusdb --config nexusdb.toml`, Binary(5433) + RESP(6379) 双监听, 信号优雅退出
+  - 根 binary `src/main.rs` — 服务器入口: `nexusdb --config nexusdb.toml`, Binary(5433, 内部) + RESP(6379) + MySQL wire(5434) + PostgreSQL wire(5435) + REST HTTP(6778) 五监听, 信号优雅退出
 
 ## 当前进度
+
+### 2026-07-31 会话总览 (F59, 细节见 CHANGELOG)
+
+- **ORM 性能专项 — SQL 门面多 worker 化**: `sql_worker_count` 配置 (MySQL+PG 门面, 默认 1); **单 SQL worker 前提正式解除** — schema 缓存 per-worker 零锁 + 进程级 DDL epoch 失效 (DROP +1, 每语句一次 load); routes bloom/created_here 进程级 `SqlSharedRoutes` (IndexBloom 原子位图化 fetch_or 无锁; per-worker 会假阴性漏行). 热路径零锁 (1 epoch load + bloom 原子读)
+- **归因**: prepared 服务端净差仅 0.90x (上轮 0.62x 是 Python 客户端开销); 单 worker 饱和 ~135K → **4 worker 16 连接 254K qps (2.5x)**
+- **gotcha**: NetworkServerConfig.sql_shared 必填 — 同集群全部 SQL 门面必须同一实例 (跨门面一致性), e2e 各测试独立实例 (全局 OnceLock 会串台致假阴性)
+- 回归 632/0 + clippy 0; 实机 4 worker 双驱动全通; String 234K 无回退
+
+### 2026-07-30 会话四总览 (F58, 细节见 CHANGELOG)
+
+- **预处理语句 (ORM 接轨)**: SQL 层 `?`/`$n` → `SqlValue::Param` + `bind_params` AST 绑定 (拒文本代入, 零注入面); MySQL COM_STMT_PREPARE/EXECUTE/CLOSE (二进制参数 + **二进制结果集**, prepare 报 num_columns=0); PG 扩展查询协议 (Parse/Bind/Describe/Execute/Sync 批次 = 单 seq, 前缀在 resp_complete 单点拼接)
+- **gotcha**: 弱类型文本参数要同时放宽 sql_to_col **和 sql_cmp** (漏一边 = 残余过滤静默滤光); mysql-connector 握手后必发 `SET @@session...` ('@' 需在 tokenize 前吞); prepared 吞吐低于文本 (0.62x, 客户端编码开销) — 价值在安全与生态
+- 实测: **mysql-connector (prepared=True) + psycopg3 (扩展协议) 双驱动全通**; 回归 164/0 + clippy 0; asyncpg (Flush 依赖) 不保证
+
+### 2026-07-30 会话三总览 (F57, 细节见 CHANGELOG)
+
+- **REST 门面 (6778)**: 零依赖手写 HTTP/1.1 (`protocol/http.rs`; 增量解析/keep-alive/chunked 拒 501) + CORS (进程级 OnceLock 配置 + OPTIONS preflight) + Bearer 鉴权 (复用 auth_password 通道, /metrics /v1/status 白名单); KV `GET/PUT/DELETE /v1/kv/{table}/{key}` (tag 感知 JSON, 与 RESP 数值互通) + SQL `POST /v1/sql` (共内核第四门面, sql_*_bytes 加 Http 分支); serde_json 为唯一新依赖
+- **可观测性**: `/metrics` Prometheus + `/v1/status` + `/v1/debug/sql-cache`; 进程级 AtomicU64 relaxed 打点 (RESP dispatch 一次 fetch_add, String 基线无回退)
+- **Binary 5433 降级为内部协议** (README; 代码零改动, 测试/压测工具仍用)
+- 测试快照: net+sm+cfg 161/0 (新增 http_e2e 3), clippy 0; curl 实机 + 四协议互联 (redis↔REST↔mysql) 全通; REST 基线 KV ~10.4K / SQL pk ~11.3K rps
+
+### 2026-07-30 会话二总览 (F56, 细节见 CHANGELOG)
+
+- **SQL 补全 + PG 门面**: DELETE/UPDATE SET/多行 INSERT/DROP TABLE (pk 单 shard 原子, 索引条件两阶段收 pk 非原子); 全表扫 (无索引 fallback)/ORDER BY/OFFSET/COUNT(\*)/IN/BETWEEN/!=/LIKE 前缀 (BETWEEN·LIKE 解析期 desugar 成范围); 方言别名 + USE/DESCRIBE; **PostgreSQL wire 门面 5435** (psql 直连, cleartext auth, 与 MySQL 门面共内核 — 渲染收敛 `sql_{err,ok,rows}_bytes(proto,..)`)
+- **gotcha (真客户端 stub 债)**: mysql cli 的 USE 走 COM_INIT_DB 不走 COM_QUERY; USE 后自动发 `SELECT DATABASE()`; 登录 database 字段要在 AuthSwitch 二段后应用; psql dbname 缺省 = user 名, default 隐式库需特判
+- 测试快照: **800 passed / 0 failed** (新增 pg_e2e 3 + sql_e2e 扩至 7), clippy 0; psql 16 + mysql 8.4 交叉读写实机全通
+
+### 2026-07-30 会话总览 (F50-F55, 细节见 CHANGELOG)
+
+- **F50 SQL 索引基建**: schema (`[$]` 行 + 常驻镜像) + row 编码 (`TAG_ROW` null bitmap + 变长偏移) + 索引行 `[I][iid][保序值][PK]` (字符串转义终结符, **不用长度前缀**); **本地二级索引** — 索引行与 row 同 shard (按 PK 路由), **禁止两跳** (IndexScan 广播 → shard 内扫+回表闭环)
+- **F51 SQL INSERT/SELECT**: 零依赖解析器 + worker 查询规划 (pk 点查单发 / 索引广播 + 界下推 + 全条件残余过滤 / limit 条件下推)
+- **F52 MySQL wire 门面**: 5434 端口 mysql cli 直连, `mysql_native_password` + AuthSwitch 兜底 (手写 SHA1), COM_QUERY/结果集; config `sql_addr`/`sql_password`
+- **F53 双层布隆剪枝**: shard 本地 bloom (开库重建, 免 BTree travel) + worker 路由缓存 (`created_here` 表零任务短路). **gotcha: 两层都必须只增不减 — 精确 map+LRU 驱逐重积 = 假阴性漏行**
+- **F54/F55 性能**: 回表批量化 (LeafGuide 复用) + 投影/覆盖索引 (免回表 3.3x) + 复合写批量化 (SADD 3x) + UNIQUE 索引 (约束先行 + 等值早停 60µs)
+- **gotcha: crash 测试 kill 前必须等 >10s 刷盘窗口**; repro_verify_storage 间歇 hang (杀掉重跑即可); **UNIQUE 跨 shard 漏检** (探测仅本 shard, 记录 gap)
+- 测试快照: **79 suites / 784 passed / 0 failed**, clippy 0; SQL: 覆盖 eq 5.7K / unique 点查 36.7K / pk 43K qps
+
+### 2026-07-29 会话总览 (F48, 细节见 CHANGELOG)
+
+- **F48 RESP 分库分表**: 分表 = key 冒号前缀 `table:key` (协议无状态, `push_task` 单点重写 + `BatchOp::table_key_mut()`; 表名限 `[A-Za-z0-9_.-]{1,64}`, 非法前缀整 key 落 default 表); 分库 = `SELECT n` 经 `DbDirView` (resolver name↔DbId 内存镜像, 只含真实已建库) 翻译成 db name, `ConnState.current_db` per-connection; **惰性建表** = shard 数据面 op 前 `ensure_table` (本地建, 免 2PC). **gotcha: 建库仍是重资源不自动建 (`precreate_dbs` 配置预建); list_tables 各 shard 视图可能不一致 (惰性建表固有)**
+- 顺手重构: `BatchOp::locator()` 单源提取, 净删 ~200 行三份重复路由 match
+- 测试快照: **75 suites / 739 passed / 0 failed**, clippy 0; memtier 189K (无回退)
 
 ### 2026-07-28 会话总览 (F45-F47, 细节见 CHANGELOG)
 
@@ -84,8 +126,10 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 - **持久化**: 多 db 物理隔离 (`{block_root}/{db_name}/shard_{N}/`); reopen recover; **自动持久化** (chunk 满 swap + 周期 10s/256 写); **异步 chunk 落盘** (FlushJob 协程 + 有界背压 MAX_INFLIGHT=8); data→meta 刷盘顺序不变量
 - **异步**: 全 async; 自实现协程调度器 + io_uring 后端 (服务器默认 io_uring)
 - **多 shard**: hash 路由 + TaskInbox/TaskReplyBus 直连 (worker→shard→worker, 零 client 线程); 跨 key 命令 worker 端分组聚合
-- **协议层**: RESP2 命令面覆盖五大结构 + Geo/Bitmap (清单见 README); 自家二进制协议; KvLimits (key≤1024/value≤1MB); value type tag (数值原生二进制)
-- **测试**: workspace 75 suites / 736 passed / 0 failed; clippy 0 警告
+- **分库分表 (RESP)**: `SELECT n` 选库 (DbNameResolver id↔name 翻译, per-connection; `precreate_dbs` 预建) + key 冒号前缀 `table:key` 选表 (无状态, 非法前缀落 default 表) + shard 数据面惰性建表
+- **协议层**: RESP2 命令面覆盖五大结构 + Geo/Bitmap (清单见 README); 自家二进制协议; **SQL 双门面 (MySQL wire 5434 + PostgreSQL wire 5435, 共内核)** — CREATE/INSERT 多行/SELECT (投影·ORDER BY·COUNT·IN·BETWEEN·LIKE·全表扫)/UPDATE/DELETE/DROP/USE/DESCRIBE; KvLimits (key≤1024/value≤1MB); value type tag (数值原生二进制)
+- **SQL 索引**: schema/row 编码 + 本地二级索引 (与 row 同 shard, 禁两跳) + 双层布隆剪枝 (shard 本地 + worker 路由) + 覆盖索引/UNIQUE 早停; 查询规划在 worker (pk 单发/索引广播/全表扫 fallback/残余过滤)
+- **测试**: workspace 800 passed / 0 failed; clippy 0 警告
 
 **还没支持** (下一步 gap):
 - **TTL/过期** (EXPIRE/TTL/PERSIST + SET 的 EX/PX/NX/XX) — 明确后置的生命周期机制
