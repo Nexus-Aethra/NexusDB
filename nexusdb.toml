@@ -20,6 +20,7 @@ block_root = "./data"
 num_shards = 6
 io_backend = "io_uring"        # "stdfs" | "io_uring"
 chunk_cache_size = 16
+wal_mode = "periodic"          # WAL 档位: off (无) | periodic (每秒 fsync, 窗口 ~1s) | strict (回复前 fsync, 零丢失)
 create_if_missing = true
 default_db = "default"
 default_table = "default"

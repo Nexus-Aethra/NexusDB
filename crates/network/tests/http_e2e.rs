@@ -23,6 +23,7 @@ fn start_http_server(token: Option<&str>) -> (NetworkServer, Arc<ShardManager>) 
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
     let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
     mgr.create_db("app").expect("create db");

@@ -24,6 +24,41 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 
 ## 当前进度
 
+### 2026-07-31 会话九总览 (F67, 细节见 CHANGELOG)
+
+- **两表 hash JOIN** (worker 完成点): `A [INNER|LEFT] JOIN B ON a.x=b.y` — JOIN 逻辑全在 worker, shard 只本地单表扫+谓词/投影下推, fan-in 后 build/probe (右建表、左探测). **零新增跨线程** (无 shard↔shard, 不碰 Scheduler 契约); gather 复用 SqlSelectAgg fan-in 模板
+- 下推: 左表谓词恒下推, 右表 INNER 下推/LEFT 留 worker 残余; finish 总重应用全 WHERE (下推仅优化不影响正确性); 投影只回引用列 (ProjRows)
+- 新协议: `BatchOp::ScanFiltered` + `BatchResult::ProjRows` + `ScanPred/PredOp` (定于 storage::sql_rows 避分层, request.rs re-export); 解析用独立 `SqlStmt::SelectJoin` 隔离单表路径
+- 实机: mysql-connector + psycopg3 INNER/LEFT/下推/重名列/`*` 全正确跨协议一致; 回归全绿 + clippy 0
+- **已知限制**: v1 仅两表单 equi ON; 多表/多 ON/RIGHT/FULL/CROSS/USING/子查询/OR 不支持; JOIN 输入全扫不走索引; 单侧 gather 256K 行上限
+- gotcha: LEFT 的右表谓词绝不能下推 (null 扩展前误删); 固定右建表左探测保 LEFT 驱动順序
+
+### 2026-07-31 会话八总览 (F66, 细节见 CHANGELOG)
+
+- **系统表虚拟化** (GUI/ORM 反射): worker 层拦截 `information_schema.*` / `pg_catalog.*` / `SHOW` → 从活元数据合成虚拟表, 复用 SELECT 完成点 (过滤/投影/排序/三门面渲染). 数据源: DbDirView 列 db + CatalogDump BatchOp (任意单 shard 列当前 db 全表+schema, schema 每 shard 全副本)
+- 支持: information_schema (tables/columns/key_column_usage/schemata); pg_catalog flat 单表 (pg_namespace/pg_class/pg_attribute); SHOW [FULL] TABLES/COLUMNS + SHOW CREATE TABLE (重建 MySQL DDL) + SHOW DATABASES; 反引号标识符; `SELECT @@var` stub (parse_prepared tokenize 前拦, '@' 不过 tokenizer)
+- 实机: SQLAlchemy 2.x + PyMySQL `inspect()` 全链路通 (get_table_names 走 SHOW FULL TABLES, get_columns 走 SHOW CREATE TABLE; pk/unique 反射正确). 回归全绿 + clippy 0
+- **已知限制**: psql `\d`/`\dt` (pg_catalog 多表 JOIN) 不完整 (无 JOIN, 留后); v1 仅反射 current_db; 系统表只读
+- gotcha: CatalogDump locator table 为空 → ensure_table 报 btree 空键; 无表名元 op 跳过 ensure_table
+
+### 2026-07-31 会话七总览 (F65, 细节见 CHANGELOG)
+
+- **全局跨 shard UNIQUE**: opt-in `GLOBAL UNIQUE` 列 — 唯一值按 hash 路由到 email-shard 占坑 (持久化物理行 `[U][iid][enc_val]`→`[state][txn_id][pk]`, 行本身即 prepare 记录自带 WAL); worker 顺序状态机 Reserve→Verify→Write→Confirm; pk-shard 行为真相源, 冲突时回查行懒校对 (删后重插自愈); 不复用 DDL 2PC 协调器
+- 边界: 事务内写/UPDATE 全局唯一列/多行 INSERT → v1 拒绝; 普通 UNIQUE 仍本 shard best-effort
+- 验收: 旗舰"不同 pk 同 email 必拒 1062"; 实机 mysql-connector IntegrityError + psycopg3 UniqueViolation 跨协议一致; 顺手修 SQLSTATE 映射 (ORM 异常分类); 回归全绿 + clippy 0
+
+### 2026-07-31 会话六总览 (F64, 细节见 CHANGELOG)
+
+- **首次端到端正确性检验**: 真实驱动 (mysql-connector + psycopg3) 订单系统工作流组合压全功能 + 跨协议一致性, 20 项全过. 发现并修复: (a) 事务内 UPDATE 的 RYOW (resolve_ryow 重放同 pk 缓冲 op, NeedBase 读盘+overlay); (b) duplicate key errno 1105→1062 (ER_DUP_ENTRY)
+- 新增回归 mysql_txn_ryow_update; 确认 UNIQUE 跨 shard 漏检为文档化 gap (单 shard 正常)
+- 回归 net 全绿 + storage+sm+cfg 537/0 + clippy 0
+
+### 2026-07-31 会话五总览 (F63, 细节见 CHANGELOG)
+
+- **GROUP BY 聚合族**: SELECT 投影扩展为列/聚合函数 (COUNT/SUM/AVG/MIN/MAX) + GROUP BY 多列 + HAVING + 裸聚合 (全表单桶); worker 完成点纯内存分桶 (Accum 累加器, NULL 忽略, 空集 SUM/AVG→NULL, 分桶上限 64K), shard/存储/协议零改动; 合成结果集复用 sql_rows_bytes 三门面统一
+- 边界: 不做表达式聚合/DISTINCT/GROUP_CONCAT/别名 AS/窗口函数; shard 端部分聚合下推留 v2 (当前全量收行)
+- 验收: 实机 mysql-connector + psycopg3 GROUP BY/HAVING/AVG/ORDER BY 聚合列全通; 回归 829/0 + clippy 0
+
 ### 2026-07-31 会话四总览 (F62, 细节见 CHANGELOG)
 
 - **事务 v2 多隔离级别**: SET [SESSION] TRANSACTION / BEGIN 尾缀四级语法 (RU→RC, RR→Serializable 归并); SERIALIZABLE = OCC backward validation (pk 点查记 read_set crc32 指纹, TxnApply 预检重读比对, 冲突 40001/1213); READ ONLY (25006/1792); SAVEPOINT/ROLLBACK TO/RELEASE (ops 水位截断, E 态 ROLLBACK TO 恢复 — SQLAlchemy 标准路径); 仍零锁零 MVCC 零调度器改造

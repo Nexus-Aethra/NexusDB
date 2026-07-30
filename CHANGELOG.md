@@ -10,6 +10,187 @@
 
 ---
 
+## 2026-07-31 会话九 (F67: 两表 hash JOIN, worker 完成点)
+
+解决长期 gap: 跨 shard JOIN. 方案 = **JOIN 逻辑全在 worker (每连接单线程);
+shard 只做本地单表扫+过滤+投影, fan-in 到 worker 后 build/probe**; 无 shard↔shard,
+零新增跨线程原语, 不碰 Scheduler 同线程契约.
+
+### 交付总览
+
+| # | 交付 | 文件 |
+|---|---|---|
+| J1 | SelectJoin AST + 表别名 + 限定列 QualCol + JOIN/ON 解析 (独立变体隔离) | protocol/sql.rs |
+| J2 | ScanPred/PredOp (定于 storage 避分层) + BatchOp::ScanFiltered + BatchResult::ProjRows + table_scan_filtered_local | storage/sql_rows.rs, request.rs, manager.rs |
+| J3 | SqlJoinCtx 顺序状态机 (补 schema → GatherLeft → GatherRight) | worker.rs |
+| J4 | hash join (右建表、左探测) + LEFT NULL 扩展 + 残余 WHERE + 输出列 + ORDER/LIMIT + 渲染 | worker.rs |
+| J5 | e2e (mysql_join_two_tables) + mysql/pg 驱动实机 + 回归 + 文档 | tests/sql_e2e.rs |
+
+### 支持能力
+
+- **两表 `A [INNER|LEFT] JOIN B ON a.x = b.y`** (单 equi 条件); 表别名 `[AS] alias`; 限定列 `alias.col`
+- **谓词下推**: 左表谓词恒下推; 右表谓词 INNER 下推 / LEFT 留 worker 残余 (保标准语义); finish 总会再残余全 WHERE (下推仅优化, 不影响正确性)
+- **投影下推**: 各表只回 (输出 ∪ ON 键 ∪ WHERE ∪ ORDER) 引用列 (ProjRows 省带宽)
+- SELECT * → 展开左右全列, 列头 `alias.col` 限定避重名; ORDER BY/LIMIT/OFFSET; 反向 ON (b.y=a.x) 等价
+- 安全上限: 单侧 gather > 256K 行 → 报错止 OOM
+
+### 跨线程账 (零新增)
+
+worker→shard (现有 fan-out) + shard→worker (现有 reply_bus); 无 shard↔shard; 新增全为
+worker 单线程内纯计算 (建表/探测), 无锁无跨线程. gather 复用 SqlSelectAgg fan-in 模板.
+
+### 实机验收
+
+mysql-connector + psycopg3 双驱动 INNER/LEFT/下推/重名列/`*` 全正确, 跨协议一致.
+
+### 边界 / 已知限制 (文档化)
+
+- v1 仅两表单 equi ON; 多表(≥3)/多 ON 条件/RIGHT/FULL/CROSS/USING/子查询/OR 不支持
+- JOIN 输入全表扫 (带下推), 不走索引; 大结果吃 worker 内存 (有上限, 无流式)
+- 无一致快照 (两侧 gather 时间差, 既有架构限制, 非 JOIN 新引入)
+- 解析用独立 SelectJoin 变体隔离, 单表 Select 路径零改动; tokenizer 支持反引号/点号
+
+### gotcha
+
+- **分层**: BatchOp 在 shard_manager (storage 上层), 下推谓词不能用 network::Cond → ScanPred/PredOp 定于 storage::sql_rows, request.rs re-export
+- **候选词向量下推 vs 正确性解耦**: finish 必须总重新应用全 WHERE, 下推只是带宽优化; LEFT 的右表谓词绝不能下推 (会在 null 扩展前错误删行)
+- **LEFT 驱动侧稳定**: 固定右表 build、左表 probe, 保 LEFT 左驱动順序
+
+---
+
+## 2026-07-31 会话八 (F66: information_schema / SHOW 系统表虚拟化)
+
+解决 GUI 工具 / ORM 反射依赖的系统元数据可见性. 方案 = **worker 层拦截系统表
+查询 + 从活元数据合成虚拟表结果集** (复用 SELECT 完成点: 过滤/投影/排序/渲染).
+
+### 交付总览
+
+| # | 交付 | 文件 |
+|---|---|---|
+| C1 | SystemQuery 解析 (information_schema.* / pg_catalog.* 大小写不敏) + parse_select_tail 抽取 | protocol/sql.rs |
+| C2 | CatalogDump BatchOp (任意单 shard 列当前 db 全表+schema) + BatchResult::Catalog | request.rs / manager.rs |
+| C3 | worker 合成器 sysq_render_catalog / sysq_render_dblist / sysq_finish + sql_sysq 挂起 | worker.rs |
+| C4 | e2e (mysql_information_schema + mysql_show_commands) + SQLAlchemy 实机反射 | tests/sql_e2e.rs |
+
+### 支持的系统表 / 命令
+
+- **information_schema**: `tables` / `columns` / `key_column_usage` / `schemata`
+- **pg_catalog** (flat 单表, 无 JOIN): `pg_namespace` / `pg_class` / `pg_attribute`
+- **SHOW** (MySQL 方言反射真路径): `SHOW [FULL] TABLES [FROM db]` / `SHOW [FULL] COLUMNS FROM t` /
+  `SHOW CREATE TABLE t` (重建 MySQL DDL) / `SHOW DATABASES|SCHEMAS` / 其他 SHOW → 空结果 stub
+- **反引号标识符** `` `name` `` (tokenizer) — SQLAlchemy `SHOW ... FROM \`db\`` 必需
+- **`SELECT @@var`** 系统变量 stub (transaction_isolation/version/sql_mode/…) — SQLAlchemy 方言初始化探测;
+  '@' 不过 tokenizer, 在 parse_prepared tokenize 前拦
+
+### 实机验收 (SQLAlchemy 2.x + PyMySQL)
+
+`inspect(engine)` 全链路通: `get_table_names()` (SHOW FULL TABLES) / `get_columns()`
+(SHOW CREATE TABLE 解析) / `get_pk_constraint()` / `get_unique_constraints()` 全正确
+(列类型 INTEGER/TEXT/DOUBLE, pk=id, unique=sku).
+
+### 边界 / 已知限制 (文档化)
+
+- **psql `\d` / `\dt` (pg_catalog 多表 JOIN) 不完整** — 需 JOIN, 留后; information_schema 单表反射可用
+- v1 仅反射 current_db (跨 db information_schema 查询限当前库)
+- pg_catalog 表为 flat 单表数据 (可直接 SELECT), 不支持 psql 依赖的 OID JOIN 语义
+- 系统表只读虚拟 (无 DML); 复杂 WHERE (子查询/OR) 不支持
+- 虚拟列均按 Str 输出 (ordinal_position 数字也用字符串, 与 MySQL information_schema 惯例一致)
+
+### gotcha
+
+- **CatalogDump locator table 为空**: ShardTask 执行前的 `ensure_table(db, table)` 遇空表名会
+  报 "empty key is reserved for sentinel" (btree 空键). 修复: 无表名的元 op (table 空) 跳过 ensure_table.
+- **SQLAlchemy MySQL 不走 information_schema**: get_table_names 走 `SHOW FULL TABLES`, get_columns 走
+  `SHOW CREATE TABLE` (从 DDL 正则解析). information_schema 是跨标准备选, SHOW 才是 MySQL ORM 真路径.
+
+---
+
+## 2026-07-31 会话七 (F65: 全局跨 shard UNIQUE 约束)
+
+解决长期文档化 gap: UNIQUE 跨 shard 漏检. 方案 = **opt-in `GLOBAL UNIQUE` 列**
++ email-shard 占坑 + 数据面 worker 编排 + 懒校对自愈.
+
+### 交付总览 (计划 U1-U5)
+
+| # | 交付 | 文件 |
+|---|------|------|
+| U1 | schema `IndexDef.global` + `GLOBAL UNIQUE` 语法 (列级, 隐含 NOT NULL, 不可为 pk); FMT_VER 1→2 (decode 兼容 v1); `TableSchema::new` 加 global_unique_cols 参 | `schema.rs`, `sql.rs` |
+| U2 | 占坑行 `[U][iid][enc_val]`→`[state][txn_id][pk]` (自带 WAL); 单线程原子 unique_reserve/steal/confirm/release; BatchOp ReserveUnique/StealUnique/ConfirmUnique/ReleaseUnique + shard 端 exec | `keyspace.rs`, `sql_rows.rs`, `request.rs`, `manager.rs` |
+| U3 | worker 顺序状态机 `SqlUniqueIns` (Reserve→Verify→Write→Confirm, 至多一个在途 op, 每 reply 推进一步); autocommit 单行 INSERT 全流程; 事务内写/UPDATE 全局唯一列 → v1 边界拒绝 | `worker.rs` |
+| U4 | 懒校对: reserve 遇 COMMITTED 冲突 → Verify 回查持有者 pk-shard 行; 行存且值匹配→真冲突拒, 否则 stale→抢占 (删后重插自愈); PENDING 冲突→拒 (在飞保护) | `worker.rs` |
+| U5 | e2e + 实机双驱动; 顺手修 SQLSTATE 映射 (ORM 异常分类) | tests, `mysql.rs` |
+
+### 关键设计
+
+- **不复用 DDL 2PC 协调器** (控制面 MVP/无 pending 态/内存态): 占坑 = email-shard 一条持久化物理行 (行本身即 prepare 记录, 自带 WAL 崩溃重放)
+- **pk-shard 的行 = 唯一真相源**, 占坑行是二手 hint; 任何坑状态都可被回查行推翻
+- **email-shard 单线程 = check-and-reserve 原子** (并发同值串行化, 无锁): 第一个占 PENDING, 第二个见 PENDING 即拒
+- **新命名空间 `U`** (0x55, 避开 S/H/L/T/Z/#/$/I); enc_val 复用索引值编码, 路由与 pk 独立
+
+### 验收
+
+- **旗舰**: 多 shard 下不同 pk (落不同 shard) 同 email → 必拒 1062 (之前的 gap 场景); 遍历多 pk 全拒; 不同 email 各自成功; 幂等重插; 删后重插自愈
+- **实机**: mysql-connector → `IntegrityError`(errno 1062), psycopg3 → `UniqueViolation`(23505), 跨协议全局唯一一致 (MySQL 写 PG 拒重)
+- **顺手修复 SQLSTATE 映射**: build_err 按 errno 发正确 SQLSTATE (1062→23000/1213→40001/…), 之前恒发 HY000 导致 ORM 将 UNIQUE 冲突误归 DatabaseError 而非 IntegrityError
+- 回归: net e2e 全绿 + storage+sm+cfg 537/0, clippy 0
+
+### v1 边界 (文档化)
+
+- 每个 global unique 写多 2-3 次跨 shard 往返 (reserve+write+confirm), 写延迟↑ — opt-in 付费, 普通表零影响
+- 事务内写全局唯一表 / UPDATE 全局唯一列 / 多行 INSERT → v1 拒绝 (非静默破坏); 多列联合全局唯一 / 在线加 GLOBAL UNIQUE → 留后
+- PENDING 在飞窗口内并发插同值第二个被拒 (客户端重试即成); stale 坑懒清 (不主动 GC)
+
+---
+
+## 2026-07-31 会话六 (F64: 端到端正确性检验 + 两项修复)
+
+首次真实驱动 (mysql-connector + psycopg3) 端到端正确性检验: 订单系统工作流组合压全部功能 (schema/UNIQUE/事务原子性/SERIALIZABLE/GROUP BY/预处理/跨协议/索引) + 跨协议一致性. 发现并修复两项:
+
+| # | 问题 | 根因 | 修复 |
+|---|------|------|------|
+| F64a | 事务内 UPDATE 后 pk 点查读不到自己的改动 (RYOW 破破) | v1 的 RYOW 仅覆盖 INSERT/DELETE (index 单下标), UPDATE 直通读盘 | `resolve_ryow` 重放同 pk 全部缓冲 op → Resolved(纯内存态)/NeedBase(读盘基行+overlay 叠加 sets); SqlRowCtx.ryow_overlay 在消费点叠加 |
+| F64b | duplicate key 错误码返 1105 (非 MySQL 标准) | mysql_err_packet 漏映射 (PG 侧有 23505, MySQL 侧无) | 补 `duplicate key → 1062` (ER_DUP_ENTRY, ORM 据此识别 IntegrityError) |
+
+### 验收
+
+- 端到端 20 项检验全过 (含转账原子性/总额守恒、SERIALIZABLE 冲突捕获、GROUP BY/HAVING/AVG 报表、注入参数作字面值、MySQL↔PG 跨协议读写一致)
+- 新增回归 e2e: `mysql_txn_ryow_update` (UPDATE overlay / 多次叠加 / INSERT→UPDATE 链 / UPDATE→DELETE / 跨连接隔离); `mysql_unique_index` errno 断言改 1062
+- 回归: net e2e 全绿 + storage+sm+cfg 537/0, clippy 0
+- **确认的文档化 gap** (非本轮引入): UNIQUE 全局跨 shard 漏检 (探测仅本 shard, 单 shard 正常拒绝)
+
+---
+
+## 2026-07-31 会话五 (F63: GROUP BY 聚合族)
+
+### 交付总览 (计划 G1-G4)
+
+| # | 交付 | 文件 |
+|---|------|------|
+| G1 | 解析扩展: `SelectItem::{Col, Agg{func,col}}` + `AggFn{Count/Sum/Avg/Min/Max}` (label 方法统一列头/HAVING/ORDER 匹配); SqlStmt::Select `cols:Vec<String>` → `items` + `group_by` + `having`; 旧 `count:bool` 退役; 解析校验非聚合项 ∈ group_by | `sql.rs` |
+| G2 | worker 分桶完成点: `Accum` 累加器 (Count/SumI\|F+seen/Avg/Min/Max, NULL 忽略, SUM 溢出报错, 空集 SUM/AVG→NULL); 自包含类型标记组键编码 (NULL 归一组); WHERE→分桶→HAVING→ORDER→OFFSET/LIMIT; 分桶上限 64K | `worker.rs` |
+| G3 | 合成结果集渲染 — 复用 `sql_rows_bytes` 三门面统一 (render_sql_count 收编为单列特例); 合成列头 ("SUM(amt)") 动态列定义 | `worker.rs` |
+| G4 | e2e (mysql_group_by_aggregates / pg_group_by_aggregates) + 实机双驱动 | tests |
+
+### 关键设计
+
+- 落在最便宜的位置: SELECT 数据流已有 shard 收行→worker 聚合→完成点 (ORDER/COUNT/LIMIT 均在此), GROUP BY = 完成点插一步分桶 — shard/存储/协议帧零改动
+- 含聚合/group_by 的 SELECT 走广播扫描/索引路径 (PkGet 降级广播 — 聚合需全量行); COUNT(*) 无 GROUP BY 保留旧特例路径 (零回归)
+- 裸聚合 = 全表单桶退化 (SELECT SUM(x) FROM t 与 GROUP BY 同代码); 空表无 group_by 输出单行 (COUNT=0 其余 NULL — PG 语义)
+
+### 边界 (文档化)
+
+- 不做: 表达式聚合 SUM(a+b) (无表达式系统) / COUNT(DISTINCT) / GROUP_CONCAT / 别名 AS / GROUP BY 位置引用 / 窗口函数
+- shard 端部分聚合下推 (COUNT/SUM 分配律) 留 v2 性能轮; 当前全量收行 (内存与 ORDER BY 现状一致)
+- HAVING/ORDER 列名用聚合原文匹配 (大写归一), 不支持别名
+
+### 验收
+
+- e2e: 裸聚合 (COUNT/SUM/AVG/MIN/MAX + WHERE 索引路径) / COUNT(col) 忽 NULL / 空结果单行 / GROUP BY 单多列 / HAVING / ORDER BY 聚合列 DESC+LIMIT / 非聚合项不在 group_by 报错 / SUM 非数值报错 / 旧 COUNT(*) 不回归 — 全过
+- **实机**: mysql-connector + psycopg3 跑 GROUP BY/HAVING/AVG/ORDER BY 聚合列, 结果与定义一致
+- 回归: others 353 + storage 476 = **829/0**, clippy 0
+
+---
+
 ## 2026-07-31 会话四 (F62: 事务 v2 — 多隔离级别标准 + OCC 验证 + SAVEPOINT)
 
 ### 交付总览 (计划 V1-V4)

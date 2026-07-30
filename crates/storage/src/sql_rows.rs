@@ -30,6 +30,86 @@ fn se(e: impl std::fmt::Display) -> RegistryError {
 /// 索引扫描条目: (索引原值, pk, row_bytes; 覆盖索引时 row 为空).
 pub type IndexEntry = (Vec<u8>, Vec<u8>, Vec<u8>);
 
+/// ⭐ F67 (JOIN): 下推谓词算子 (与 network CmpOp 一一对应; 定于 storage 避分层反向).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    In,
+}
+
+/// ⭐ F67 (JOIN): 下推到 shard 本地执行的谓词 `列号 op 值` (AND 连接).
+/// In 时 val 忽略、用 set; 其余用 val、set 空. 列号由 worker 按各表 schema 解析.
+#[derive(Debug, Clone)]
+pub struct ScanPred {
+    pub col: u16,
+    pub op: PredOp,
+    pub val: ColValue,
+    pub set: Vec<ColValue>,
+}
+
+/// ⭐ F67 (JOIN): ColValue 跨型比较 (语义与 worker sql_cmp 一致: 数值跨 I64/F64,
+/// Bytes 字典序, 数值列对 Bytes 按解析; NULL → None 不匹配). a=列值, b=谓词值.
+fn cmp_colval(a: &ColValue, b: &ColValue) -> Option<std::cmp::Ordering> {
+    use ColValue::*;
+    match (a, b) {
+        (Null, _) | (_, Null) => None,
+        (I64(x), I64(y)) => Some(x.cmp(y)),
+        (I64(x), F64(y)) => (*x as f64).partial_cmp(y),
+        (F64(x), I64(y)) => x.partial_cmp(&(*y as f64)),
+        (F64(x), F64(y)) => x.partial_cmp(y),
+        (Bytes(x), Bytes(y)) => Some(x.as_slice().cmp(y.as_slice())),
+        (I64(x), Bytes(s)) => {
+            let t = std::str::from_utf8(s).ok()?.trim();
+            if let Ok(y) = t.parse::<i64>() {
+                Some(x.cmp(&y))
+            } else {
+                (*x as f64).partial_cmp(&t.parse::<f64>().ok()?)
+            }
+        }
+        (F64(x), Bytes(s)) => {
+            x.partial_cmp(&std::str::from_utf8(s).ok()?.trim().parse::<f64>().ok()?)
+        }
+        _ => None,
+    }
+}
+
+/// ⭐ F67 (JOIN): 单行过谓词集 (AND; NULL 列恒 false, 与 sql_eval_conds 同义).
+fn row_pass_preds(cols: &[ColValue], preds: &[ScanPred]) -> bool {
+    use std::cmp::Ordering;
+    for p in preds {
+        let Some(cv) = cols.get(p.col as usize) else {
+            return false;
+        };
+        if p.op == PredOp::In {
+            if !p.set.iter().any(|v| cmp_colval(cv, v) == Some(Ordering::Equal)) {
+                return false;
+            }
+            continue;
+        }
+        let pass = match cmp_colval(cv, &p.val) {
+            None => false,
+            Some(o) => match p.op {
+                PredOp::Eq => o == Ordering::Equal,
+                PredOp::Ne => o != Ordering::Equal,
+                PredOp::Gt => o == Ordering::Greater,
+                PredOp::Ge => o != Ordering::Less,
+                PredOp::Lt => o == Ordering::Less,
+                PredOp::Le => o != Ordering::Greater,
+                PredOp::In => unreachable!(),
+            },
+        };
+        if !pass {
+            return false;
+        }
+    }
+    true
+}
+
 /// 单索引的 (iid, 编码值 | None-NULL) 快照 (update/delete 时对比新旧).
 type IndexValSnapshot = Vec<(u32, Option<Vec<u8>>)>;
 
@@ -241,6 +321,124 @@ impl StorageEngine {
         }
     }
 
+    // =================================================================
+    // ⭐ F65: 全局 UNIQUE 占坑原语 (在 email-shard 上; 单线程原子 check-and-reserve)
+    // 占坑行: key `[U][iid][enc_val]` → value `[state][txn_id u64 LE][pk]`
+    // =================================================================
+
+    /// 占坑结果 (worker 编排依据).
+    /// db/table 不存在时先 ensure_table (占坑行与 row 同表名空间).
+    async fn unique_slot_get(
+        &mut self,
+        db: &str,
+        table: &str,
+        iid: u32,
+        enc_val: &[u8],
+    ) -> Result<Option<(u8, u64, Vec<u8>)>, RegistryError> {
+        let key = ks::unique_slot_key(iid, enc_val);
+        match self.get_physical(db, table, &key).await? {
+            Some(v) if v.len() >= 9 => {
+                let state = v[0];
+                let txn = u64::from_le_bytes(v[1..9].try_into().unwrap());
+                Ok(Some((state, txn, v[9..].to_vec())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn unique_slot_val(state: u8, txn_id: u64, pk: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(9 + pk.len());
+        v.push(state);
+        v.extend_from_slice(&txn_id.to_le_bytes());
+        v.extend_from_slice(pk);
+        v
+    }
+
+    /// ⭐ F65: check-and-reserve (单线程原子). 返回:
+    /// - `Ok(None)`: 占坑成功 (写入 PENDING) 或幂等重入 (同 pk 已 COMMITTED)
+    /// - `Ok(Some((state, holder_txn, holder_pk)))`: 冲突, 现有坑信息 (worker 决定校对/拒)
+    pub async fn unique_reserve(
+        &mut self,
+        db: &str,
+        table: &str,
+        iid: u32,
+        enc_val: &[u8],
+        pk: &[u8],
+        txn_id: u64,
+    ) -> Result<Option<(u8, u64, Vec<u8>)>, RegistryError> {
+        self.ensure_table(db, table).await?;
+        match self.unique_slot_get(db, table, iid, enc_val).await? {
+            None => {
+                let key = ks::unique_slot_key(iid, enc_val);
+                let val = Self::unique_slot_val(1, txn_id, pk); // PENDING
+                self.put_physical(db, table, &key, &val).await?;
+                Ok(None)
+            }
+            // 同 pk 已 COMMITTED → 幂等
+            Some((2, _, holder)) if holder == pk => Ok(None),
+            // 其他情形 (COMMITTED 异 pk / PENDING) → 冲突, 交 worker 处理
+            Some(slot) => Ok(Some(slot)),
+        }
+    }
+
+    /// ⭐ F65: 强制抢占 (worker 回查行确认 stale 后) — 覆写为本 txn PENDING.
+    pub async fn unique_steal(
+        &mut self,
+        db: &str,
+        table: &str,
+        iid: u32,
+        enc_val: &[u8],
+        pk: &[u8],
+        txn_id: u64,
+    ) -> Result<(), RegistryError> {
+        self.ensure_table(db, table).await?;
+        let key = ks::unique_slot_key(iid, enc_val);
+        let val = Self::unique_slot_val(1, txn_id, pk);
+        self.put_physical(db, table, &key, &val).await
+    }
+
+    /// ⭐ F65: PENDING→COMMITTED (写行成功后; 仅 txn+pk 匹配才转, 防误转).
+    pub async fn unique_confirm(
+        &mut self,
+        db: &str,
+        table: &str,
+        iid: u32,
+        enc_val: &[u8],
+        pk: &[u8],
+        txn_id: u64,
+    ) -> Result<(), RegistryError> {
+        if let Some((_, txn, holder)) = self.unique_slot_get(db, table, iid, enc_val).await?
+            && txn == txn_id
+            && holder == pk
+        {
+            let key = ks::unique_slot_key(iid, enc_val);
+            let val = Self::unique_slot_val(2, txn_id, pk); // COMMITTED
+            self.put_physical(db, table, &key, &val).await?;
+        }
+        Ok(())
+    }
+
+    /// ⭐ F65: 删坑 (abort 回滚 / DELETE 清坑). txn_id!=0 时仅匹配才删 (防误删);
+    /// txn_id==0 无条件删 (DELETE 行时清坑, 不关心是谁的 txn).
+    pub async fn unique_release(
+        &mut self,
+        db: &str,
+        table: &str,
+        iid: u32,
+        enc_val: &[u8],
+        txn_id: u64,
+    ) -> Result<(), RegistryError> {
+        let del = match self.unique_slot_get(db, table, iid, enc_val).await? {
+            Some((_, txn, _)) => txn_id == 0 || txn == txn_id,
+            None => false,
+        };
+        if del {
+            let key = ks::unique_slot_key(iid, enc_val);
+            self.delete_physical(db, table, &key).await?;
+        }
+        Ok(())
+    }
+
     /// 删一行 (含全部索引行). 返回是否存在.
     pub async fn row_delete(
         &mut self,
@@ -341,6 +539,43 @@ impl StorageEngine {
                 && rb.first() == Some(&row::TAG_ROW)
             {
                 out.push((Vec::new(), pk.clone(), rb));
+            }
+        }
+        Ok(())
+    }
+
+    /// ⭐ F67 (JOIN): 带谓词+投影下推的本地全表扫. decode 行 → preds
+    /// AND 过滤 (NULL 恒 false) → 按 proj 取列 → 收集投影行. limit 0 = 不限
+    /// (应在过滤后计数, 但本版 limit 仅无谓词时下推, 有谓词时传 0).
+    pub async fn table_scan_filtered_local(
+        &mut self,
+        db: &str,
+        table: &str,
+        preds: &[ScanPred],
+        proj: &[u16],
+        limit: usize,
+        out: &mut Vec<Vec<ColValue>>,
+    ) -> Result<(), RegistryError> {
+        let Some(schema) = self.get_schema(db, table).await? else {
+            return Ok(());
+        };
+        // 复用全表扫拿 (空 val, pk, row_bytes); 无谓词时下推 limit
+        let scan_limit = if preds.is_empty() { limit } else { 0 };
+        let mut raw: Vec<IndexEntry> = Vec::new();
+        self.table_scan_rows_local(db, table, scan_limit, &mut raw).await?;
+        for (_v, _pk, rb) in raw {
+            let cols = match row::decode_row(&schema, &rb) {
+                Ok(c) => c,
+                Err(_) => continue, // 坏行跳过 (防御)
+            };
+            if !row_pass_preds(&cols, preds) {
+                continue;
+            }
+            let projected: Vec<ColValue> =
+                proj.iter().map(|&i| cols.get(i as usize).cloned().unwrap_or(ColValue::Null)).collect();
+            out.push(projected);
+            if limit > 0 && out.len() >= limit {
+                break;
             }
         }
         Ok(())

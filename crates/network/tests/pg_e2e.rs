@@ -655,3 +655,37 @@ fn pg_serializable_conflict() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+// ===== ⭐ GROUP BY 聚合族 (F63): PG 门面 =====
+
+#[test]
+fn pg_group_by_aggregates() {
+    let (server, mgr) = start_pg_server(None);
+    let mut c = PgConn::login(&server, None, false).expect("login");
+    c.query("CREATE TABLE pg_sales (id INT PRIMARY KEY, region TEXT NOT NULL, amt DOUBLE)");
+    for (id, r, a) in [(1, "east", "10.0"), (2, "east", "20.0"), (3, "west", "5.0")] {
+        c.query(&format!("INSERT INTO pg_sales VALUES ({id}, '{r}', {a})"));
+    }
+    // 裸聚合列头合成 (COUNT/SUM)
+    match c.query("SELECT COUNT(*), SUM(amt) FROM pg_sales") {
+        PgResult::Rows(cols, rows) => {
+            assert_eq!(cols, vec!["COUNT(*)".to_string(), "SUM(amt)".to_string()]);
+            assert_eq!(rows, vec![vec![Some("3".into()), Some("35".into())]]);
+        }
+        other => panic!("{other:?}"),
+    }
+    // GROUP BY + ORDER BY 聚合列
+    assert_eq!(
+        c.query("SELECT region, COUNT(*) FROM pg_sales GROUP BY region ORDER BY region"),
+        PgResult::Rows(
+            vec!["region".into(), "COUNT(*)".into()],
+            vec![
+                vec![Some("east".into()), Some("2".into())],
+                vec![Some("west".into()), Some("1".into())],
+            ]
+        )
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}

@@ -20,6 +20,7 @@ fn make_mgr() -> (tempfile::TempDir, std::sync::Arc<ShardManager>) {
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 16,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
     let mgr = ShardManager::open(opts).expect("open");
     mgr.create_db("bench").unwrap();

@@ -136,6 +136,11 @@ impl DbDirView {
         self.inner.read().expect("db_view lock").by_name.get(name).copied()
     }
 
+    /// ⭐ F66: 全部 db 名 (information_schema.schemata / pg_namespace 合成).
+    pub fn all_names(&self) -> Vec<Arc<str>> {
+        self.inner.read().expect("db_view lock").by_id.values().cloned().collect()
+    }
+
     /// 当前库数 (测试/诊断).
     pub fn len(&self) -> usize {
         self.inner.read().expect("db_view lock").by_id.len()
@@ -1874,6 +1879,9 @@ fn exec_task_op(
         crate::request::BatchOp::TableScan { ref db, ref table, limit } => {
             exec_table_scan(e, db, table, limit)
         }
+        crate::request::BatchOp::ScanFiltered { ref db, ref table, ref preds, ref proj, limit } => {
+            exec_scan_filtered(e, db, table, preds, proj, limit)
+        }
         crate::request::BatchOp::IndexScan {
             ref db, ref table, iid, ref lo, ref hi, limit, with_rows,
         } => exec_index_scan(
@@ -1889,6 +1897,50 @@ fn exec_task_op(
         // shard 单线程 = 批内零并发穿插; 预检失败整批拒绝 (零部分应用);
         // wal_barrier 由 caller (ShardTask 臂) 在回复前统一执行.
         crate::request::BatchOp::TxnApply { ops, read_set } => exec_txn_apply(e, ops, read_set),
+        // ⭐ F65: 全局 UNIQUE 占坑原语 (email-shard 单线程原子)
+        crate::request::BatchOp::ReserveUnique { db, table, iid, enc_val, pk, txn_id } => {
+            match block_on_io(e.unique_reserve(&db, &table, iid, &enc_val, &pk, txn_id)) {
+                Ok(None) => crate::request::BatchResult::ReserveOk,
+                Ok(Some((state, holder_txn, holder_pk))) => {
+                    crate::request::BatchResult::ReserveConflict { state, holder_txn, holder_pk }
+                }
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::StealUnique { db, table, iid, enc_val, pk, txn_id } => {
+            match block_on_io(e.unique_steal(&db, &table, iid, &enc_val, &pk, txn_id)) {
+                Ok(()) => crate::request::BatchResult::ReserveOk,
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ConfirmUnique { db, table, iid, enc_val, pk, txn_id } => {
+            match block_on_io(e.unique_confirm(&db, &table, iid, &enc_val, &pk, txn_id)) {
+                Ok(()) => crate::request::BatchResult::PutOk,
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ReleaseUnique { db, table, iid, enc_val, txn_id } => {
+            match block_on_io(e.unique_release(&db, &table, iid, &enc_val, txn_id)) {
+                Ok(()) => crate::request::BatchResult::PutOk,
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        // ⭐ F66: catalog 快照 — 列当前 db 全表 + schema (任意单 shard).
+        crate::request::BatchOp::CatalogDump { db } => {
+            let tables = match e.list_tables(&db) {
+                Ok(t) => t,
+                Err(err) => return crate::request::BatchResult::Error(err.to_string()),
+            };
+            let mut out = Vec::with_capacity(tables.len());
+            for t in tables {
+                match block_on_io(e.get_schema(&db, &t)) {
+                    Ok(Some(sc)) => out.push((t, sc.encode())),
+                    Ok(None) => {} // 无 schema 的纯 KV 表不入 catalog
+                    Err(err) => return crate::request::BatchResult::Error(err.to_string()),
+                }
+            }
+            crate::request::BatchResult::Catalog(out)
+        }
     }
 }
 
@@ -1903,6 +1955,23 @@ fn exec_table_scan(
     let mut out = Vec::new();
     match block_on_io(e.table_scan_rows_local(db, table, limit as usize, &mut out)) {
         Ok(()) => BatchResult::Rows(out),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ F67 (JOIN): 带谓词+投影下推的全表扫 → ProjRows.
+fn exec_scan_filtered(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    preds: &[crate::request::ScanPred],
+    proj: &[u16],
+    limit: u32,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    let mut out = Vec::new();
+    match block_on_io(e.table_scan_filtered_local(db, table, preds, proj, limit as usize, &mut out)) {
+        Ok(()) => BatchResult::ProjRows(out),
         Err(err) => BatchResult::Error(err.to_string()),
     }
 }
@@ -2599,6 +2668,12 @@ fn shard_thread_main(
                             let r = match op {
                                 // ⭐ 事务批 (管理面 Batch 兼容臂; 热路径走 ShardTask)
                                 BatchOp::TxnApply { ops, read_set } => exec_txn_apply(e, ops, read_set),
+                                // ⭐ F65: 占坑 op (管理面兼容; 热路径走 ShardTask → exec_task_op)
+                                op @ (BatchOp::ReserveUnique { .. }
+                                | BatchOp::StealUnique { .. }
+                                | BatchOp::ConfirmUnique { .. }
+                                | BatchOp::ReleaseUnique { .. }
+                                | BatchOp::CatalogDump { .. }) => exec_task_op(e, op),
                                 BatchOp::Put { db, table, key, val } => {
                                     match block_on_io(e.table_put(&db, &table, &key, &val)) {
                                         Ok(_) => BatchResult::PutOk,
@@ -2919,6 +2994,9 @@ fn shard_thread_main(
                                 BatchOp::TableScan { db, table, limit } => {
                                     exec_table_scan(e, &db, &table, limit)
                                 }
+                                BatchOp::ScanFiltered { db, table, preds, proj, limit } => {
+                                    exec_scan_filtered(e, &db, &table, &preds, &proj, limit)
+                                }
                                 BatchOp::IndexScan { db, table, iid, lo, hi, limit, with_rows } => {
                                     exec_index_scan(
                                         e, &db, &table, iid, lo.as_ref(), hi.as_ref(), limit,
@@ -2973,10 +3051,13 @@ fn shard_thread_main(
                 let strict = e.wal_mode() == storage::wal::WalMode::Strict;
                 let mut held: Vec<(u32, crate::request::TaskResult)> = Vec::new();
                 for task in tasks {
-                    // ⭐ T1: 惰性建表 (已存在 = registry 纯内存查表)
+                    // ⭐ T1: 惰性建表 (已存在 = registry 纯内存查表);
+                    // ⭐ F66: CatalogDump 等无表名的元 op 跳过 (table 空)
                     {
                         let (db, table, _) = task.op.locator();
-                        if let Err(err) = block_on_io(e.ensure_table(db, table)) {
+                        if !table.is_empty()
+                            && let Err(err) = block_on_io(e.ensure_table(db, table))
+                        {
                             reply_bus_set.get(task.worker_id).push(crate::request::TaskResult {
                                 conn_id: task.conn_id,
                                 req_id: task.req_id,

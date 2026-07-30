@@ -190,8 +190,9 @@ pub enum RespCommand {
     Command,
     /// HELLO [proto] → proto=2/缺省回最小 map; proto=3 回 -NOPROTO
     Hello(Option<Vec<u8>>),
-    /// SELECT idx → 本地回 +OK (单 db 语义, 忽略)
-    Select,
+    /// SELECT idx → per-connection 切库 (idx 经 DbDirView 翻译成 db name;
+    /// 越界回 -ERR DB index is out of range)
+    Select { idx: i64 },
     /// 未知命令 → -ERR unknown command
     Unknown(String),
     /// 命令参数个数错误 → -ERR wrong number of arguments
@@ -1381,7 +1382,16 @@ fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespCommand {
         "QUIT" => RespCommand::Quit,
         "COMMAND" => RespCommand::Command,
         "HELLO" => RespCommand::Hello(if arity >= 2 { Some(owned(1)) } else { None }),
-        "SELECT" => RespCommand::Select,
+        "SELECT" => {
+            // ⭐ Y2: SQL 已迁独立端口, SELECT 回归纯 Redis 选库语义
+            if arity != 2 {
+                return RespCommand::WrongArity("select".into());
+            }
+            let Some(idx) = parse_i64(arg(1)) else {
+                return RespCommand::InvalidInt("select".into());
+            };
+            RespCommand::Select { idx }
+        }
         other => RespCommand::Unknown(other.to_ascii_lowercase()),
     }
 }

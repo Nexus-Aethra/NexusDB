@@ -22,6 +22,7 @@ fn opts_for(tmp: &tempfile::TempDir) -> OpenOptions {
         chunk_cache_size: 4,
         io_backend: IoBackend::StdFs,
         io_config: IoBackendConfig::default(),
+        wal_mode: Default::default(),
     }
 }
 

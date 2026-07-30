@@ -46,6 +46,7 @@ fn put_get_roundtrip() {
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
     let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
     mgr.create_db("app").expect("create db");
@@ -62,6 +63,7 @@ fn put_get_roundtrip() {
         limits: network::KvLimits::default(),
         auth_password: None,
         worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let addr = server.local_addr();
@@ -141,6 +143,7 @@ fn multi_request_single_connection() {
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
     let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
     mgr.create_db("d").expect("create db");
@@ -157,6 +160,7 @@ fn multi_request_single_connection() {
         limits: network::KvLimits::default(),
         auth_password: None,
         worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
     };
     let server = NetworkServer::start(cfg).expect("start");
     let addr = server.local_addr();
@@ -202,6 +206,7 @@ fn multi_connection_concurrent() {
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
     let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
     mgr.create_db("d").expect("create db");
@@ -218,6 +223,7 @@ fn multi_connection_concurrent() {
         limits: network::KvLimits::default(),
         auth_password: None,
         worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
     };
     let server = NetworkServer::start(cfg).expect("start");
     let addr = server.local_addr();

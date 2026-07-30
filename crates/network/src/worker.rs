@@ -23,7 +23,9 @@ use crossbeam_channel::Receiver;
 use shard_manager::{BatchOp, BatchResult, SharedTaskInbox, SharedTaskReplyBus, ShardTask};
 
 use crate::acceptor::NewConn;
-use crate::protocol::sql::{self, CmpOp, Cond, SqlStmt, SqlValue};
+use crate::protocol::sql::{
+    self, CmpOp, Cond, JoinCond, JoinItem, JoinKind, QualCol, SqlStmt, SqlValue,
+};
 use crate::protocol::{
     BinaryProtocol, DecodeOutcome, KvLimits, Protocol, Request, RespCodec, RespCommand, Response,
     SetAlgOp, validate_kv, validate_request,
@@ -268,6 +270,8 @@ struct SqlSelectAgg {
     /// ⭐ S1: DML 两阶段 — Some 时本聚合是 DELETE/UPDATE 的 phase1
     /// (收行过滤取 pk, 完成后发 phase2 而非渲染结果集).
     dml: Option<SqlDmlAction>,
+    /// ⭐ G2 (F63): 广义聚合计划 (Some = GROUP BY/聚合函数路径).
+    agg_spec: Option<AggSpec>,
     /// ⭐ S1: phase2 发送目标 (db, table).
     dml_target: Option<(std::sync::Arc<str>, String)>,
     /// ⭐ S2: ORDER BY (列号, desc); 非空时 shard limit 不下推 (需全量排序).
@@ -284,6 +288,45 @@ enum SqlDmlAction {
     Delete,
     Update(Vec<(u16, ColValue)>),
 }
+
+/// ⭐ F67 (JOIN): 两表 hash join 顺序状态机阶段.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinPhase {
+    FetchLeftSchema,
+    FetchRightSchema,
+    GatherLeft,
+    GatherRight,
+}
+
+/// ⭐ F67 (JOIN): 两表 INNER/LEFT 等值 hash join 上下文 (worker 完成点执行).
+/// 顺序: 补两表 schema → GatherLeft (广播 ScanFiltered) → GatherRight → hash join 渲染.
+struct SqlJoinCtx {
+    db: std::sync::Arc<str>,
+    left_table: std::sync::Arc<str>,
+    left_alias: String,
+    right_table: std::sync::Arc<str>,
+    right_alias: String,
+    kind: JoinKind,
+    on_left: QualCol,
+    on_right: QualCol,
+    items: Vec<JoinItem>,
+    conds: Vec<JoinCond>,
+    order: Vec<(QualCol, bool)>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    left_schema: Option<std::sync::Arc<TableSchema>>,
+    right_schema: Option<std::sync::Arc<TableSchema>>,
+    phase: JoinPhase,
+    remaining: usize,
+    /// 下推投影列号 (各表全 schema 列号; 与 *_rows 每行的位置一一对应).
+    left_proj: Vec<u16>,
+    right_proj: Vec<u16>,
+    left_rows: Vec<Vec<ColValue>>,
+    right_rows: Vec<Vec<ColValue>>,
+}
+
+/// ⭐ F67 (JOIN): 单侧 gather 行数上限 (止 worker OOM; 超限报错).
+const JOIN_MAX_ROWS: usize = 262_144;
 
 /// ⭐ 事务 v1 (F61): conn 层事务缓冲 — BEGIN..COMMIT 间写语句截流,
 /// shard/调度器零事务状态 (时间维度: 交互式间隙不占 shard;
@@ -332,6 +375,33 @@ struct SqlTxnAgg {
     error: Option<String>,
 }
 
+/// ⭐ F65: 全局 UNIQUE INSERT 编排状态机 (autocommit 单行).
+/// 顺序推进: 逐列 Reserve → (committed 冲突时) Verify → 写行 → 逐列 Confirm.
+/// 至多一个在途 shard op, 每个 reply 推进一步 (契合 worker 事件驱动).
+struct SqlUniqueIns {
+    db: std::sync::Arc<str>,
+    table: String,
+    schema: std::sync::Arc<TableSchema>,
+    pk: Vec<u8>,
+    values: Vec<ColValue>,
+    /// 待处理的全局唯一列: (iid, enc_val).
+    guc: Vec<(u32, Vec<u8>)>,
+    txn_id: u64,
+    phase: UniquePhase,
+    /// 当前处理到 guc 的下标 (reserve/confirm 阶段逐个推进).
+    idx: usize,
+    /// 已成功 reserve/steal 的列数 (回滚时 release guc[0..reserved]).
+    reserved: usize,
+}
+
+#[derive(PartialEq)]
+enum UniquePhase {
+    Reserve,
+    Verify,
+    Write,
+    Confirm,
+}
+
 /// ⭐ S1: DML 计数聚合 (INSERT 多行 / DELETE/UPDATE phase2 / DROP 广播).
 /// 完成 → OK affected=n; DeleteExisted(true) 与 PutOk 各计 1.
 struct SqlDmlAgg {
@@ -353,6 +423,8 @@ struct SqlRowCtx {
     count: bool,
     /// ⭐ v2 (F62): OCC 读集记录坐标 (SERIALIZABLE 事务内的 pk 点查).
     read_key: Option<(String, String, Vec<u8>)>,
+    /// ⭐ RYOW (F63): 事务内 UPDATE 基于已提交盘行时, 读盘后叠加的 sets.
+    ryow_overlay: Vec<(u16, ColValue)>,
 }
 
 /// schema 缓存 miss 时挂起的语句 (GetSchemaOp 结果到达后续跑).
@@ -500,6 +572,12 @@ struct ConnState {
     txn_failed: bool,
     /// ⭐ 事务 v1 (F61): COMMIT 聚合 (seq → 多 shard TxnApply 计数).
     sql_txn_agg: HashMap<u64, SqlTxnAgg>,
+    /// ⭐ F65: 全局 UNIQUE INSERT 编排 (seq → 状态机).
+    sql_unique_ins: HashMap<u64, SqlUniqueIns>,
+    /// ⭐ F66: 系统表查询挂起 (seq → spec; CatalogDump 回来后合成).
+    sql_sysq: HashMap<u64, SysQuerySpec>,
+    /// ⭐ F67 (JOIN): 两表 hash join 顺序状态机 (seq → ctx).
+    sql_join: HashMap<u64, SqlJoinCtx>,
     /// ⭐ v2 (F62): 连接级默认隔离级别/读写属性 (SET SESSION TRANSACTION).
     default_iso: sql::TxnIso,
     default_ro: bool,
@@ -628,6 +706,9 @@ impl ConnState {
             txn: None,
             txn_failed: false,
             sql_txn_agg: HashMap::new(),
+            sql_unique_ins: HashMap::new(),
+            sql_sysq: HashMap::new(),
+            sql_join: HashMap::new(),
             default_iso: sql::TxnIso::default(),
             default_ro: false,
             sql_select_agg: HashMap::new(),
@@ -2406,6 +2487,34 @@ fn handle_resp_shard_result(
         conn.resp_complete(seq, bytes);
         return;
     }
+    // ⭐ F65: 全局 UNIQUE 占坑状态机推进 (优先于其他聚合器)
+    if sql_unique_drive(conn, conn_id, seq, worker_id, result, shard_inboxes, num_shards) {
+        return;
+    }
+    // ⭐ F66: 系统表 CatalogDump 回调 → 合成虚拟表
+    if let Some(spec) = conn.sql_sysq.remove(&seq) {
+        let bin = conn.mysql_binary.remove(&seq);
+        let bytes = match result {
+            BatchResult::Catalog(entries) => {
+                // decode schema 字节 (跳过坏的)
+                let decoded: Vec<(String, TableSchema)> = entries
+                    .iter()
+                    .filter_map(|(t, b)| {
+                        TableSchema::decode(b).ok().map(|s| (t.clone(), s))
+                    })
+                    .collect();
+                sysq_render_catalog(conn.proto, bin, &spec, &conn.current_db.clone(), &decoded)
+            }
+            BatchResult::Error(e) => sql_err_bytes(conn.proto, e),
+            _ => sql_err_bytes(conn.proto, "unexpected catalog reply"),
+        };
+        conn.resp_complete(seq, bytes);
+        return;
+    }
+    // ⭐ F67 (JOIN): 两表 hash join 状态机推进 (schema 拉取 / 两轮 gather / 完成点)
+    if sql_join_drive(conn, conn_id, seq, worker_id, result, shard_inboxes, num_shards) {
+        return;
+    }
     // ⭐ X3: SQL 钩子 — schema 拉取续跑 (挂起语句在 schema 到达后继续规划)
     if let Some(pending) = conn.sql_pending.remove(&seq) {
         match result {
@@ -2458,15 +2567,25 @@ fn handle_resp_shard_result(
         let bytes = match result {
             BatchResult::GetValue(Some(row)) => {
                 match storage::row::decode_row(&ctx.schema, row) {
-                    Ok(values) if sql_eval_conds(&ctx.schema, &values, &ctx.conds) => {
-                        if ctx.count {
-                            render_sql_count(conn.proto, bin, 1)
+                    Ok(mut values) => {
+                        // ⭐ RYOW (F63): 事务内 UPDATE 基于此盘行 → 叠加未提交 sets
+                        for (ci, cv) in &ctx.ryow_overlay {
+                            if let Some(slot) = values.get_mut(*ci as usize) {
+                                *slot = cv.clone();
+                            }
+                        }
+                        if sql_eval_conds(&ctx.schema, &values, &ctx.conds) {
+                            if ctx.count {
+                                render_sql_count(conn.proto, bin, 1)
+                            } else {
+                                render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[values])
+                            }
+                        } else if ctx.count {
+                            render_sql_count(conn.proto, bin, 0)
                         } else {
-                            render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[values])
+                            render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[])
                         }
                     }
-                    Ok(_) if ctx.count => render_sql_count(conn.proto, bin, 0),
-                    Ok(_) => render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[]),
                     Err(e) => sql_err_bytes(conn.proto, &e.to_string()),
                 }
             }
@@ -3025,6 +3144,12 @@ fn handle_resp_shard_result(
     let bytes = match result {
         // ⭐ 事务 v1: TxnApplied 只出现在 SQL 门面 (上方 sql_txn_agg 已拦截)
         BatchResult::TxnApplied(_) => codec.encode_error("unexpected txn reply"),
+        // ⭐ F65: 占坑结果只出现在 SQL 门面 (sql_unique_drive 已拦截)
+        BatchResult::ReserveOk | BatchResult::ReserveConflict { .. } => {
+            codec.encode_error("unexpected unique reply")
+        }
+        BatchResult::Catalog(_) => codec.encode_error("unexpected catalog reply"),
+        BatchResult::ProjRows(_) => codec.encode_error("unexpected join reply"),
         BatchResult::PutOk | BatchResult::MultiPutOk => codec.encode_ok(),
         BatchResult::GetValue(None) => codec.encode_nil(),
         BatchResult::GetValue(Some(stored)) => {
@@ -3201,6 +3326,9 @@ fn batch_result_to_response(result: &BatchResult) -> Response {
     match result {
         BatchResult::PutOk => Response::PutOk,
         BatchResult::TxnApplied(_) => Response::PutOk, // 事务批不走 Binary 门面
+        BatchResult::ReserveOk | BatchResult::ReserveConflict { .. } => Response::PutOk, // 占坑不走 Binary
+        BatchResult::Catalog(_) => Response::PutOk, // catalog 不走 Binary
+        BatchResult::ProjRows(_) => Response::PutOk, // JOIN 不走 Binary
         BatchResult::GetValue(None) => Response::Get(None),
         BatchResult::GetValue(Some(stored)) => {
             let (_tag, payload) = decode_value(stored);
@@ -3465,7 +3593,76 @@ fn feed_route_bloom(
     }
 }
 
-/// ⭐ v2 (F62): SERIALIZABLE 事务内的 pk 点查 → 读集记录坐标
+/// ⭐ 事务 RYOW (F63 正确性): 重放事务内同一 pk 的全部缓冲 op,
+/// 得出该 pk 的未提交最终态. 返回:
+/// - `Resolved(Some(values))`: 纯内存可定 (首 op 是 RowPut 或 Delete)
+/// - `Resolved(None)`: 最终被删
+/// - `NeedBase(sets)`: 首 op 是基于已提交行的 UPDATE, 需读盘基行再叠加 sets
+enum RyowState {
+    Resolved(Option<Vec<ColValue>>),
+    NeedBase(Vec<(u16, ColValue)>),
+}
+
+fn resolve_ryow(txn: &TxnState, tkey: &(String, String, Vec<u8>)) -> Option<RyowState> {
+    // 收集该 pk 的全部缓冲 op (保序)
+    let ops: Vec<&BatchOp> = txn
+        .ops
+        .iter()
+        .filter(|op| {
+            let (d, t, k) = op.locator();
+            d == tkey.0 && t == tkey.1 && k == tkey.2.as_slice()
+        })
+        .collect();
+    if ops.is_empty() {
+        return None;
+    }
+    let mut cur: Option<Vec<ColValue>> = None; // 纯内存态
+    let mut pending_sets: Vec<(u16, ColValue)> = Vec::new(); // 基于盘行的叠加
+    let mut based_on_disk = false;
+    for op in ops {
+        match op {
+            BatchOp::RowPut { values, .. } => {
+                cur = Some(values.clone());
+                pending_sets.clear();
+                based_on_disk = false;
+            }
+            BatchOp::RowDelete { .. } => {
+                // 删后态确定 — 后续同 pk op 只可能是再 INSERT (RowPut 覆盖),
+                // 由循环继续处理; 此处仅重置
+                cur = None;
+                pending_sets.clear();
+                based_on_disk = false;
+            }
+            BatchOp::RowUpdate { sets, .. } => {
+                if let Some(v) = cur.as_mut() {
+                    for (ci, cv) in sets {
+                        if let Some(slot) = v.get_mut(*ci as usize) {
+                            *slot = cv.clone();
+                        }
+                    }
+                } else {
+                    // 基于已提交盘行: 累积 sets (后写覆盖前写)
+                    based_on_disk = true;
+                    for (ci, cv) in sets {
+                        if let Some(e) = pending_sets.iter_mut().find(|(c, _)| c == ci) {
+                            e.1 = cv.clone();
+                        } else {
+                            pending_sets.push((*ci, cv.clone()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if based_on_disk {
+        Some(RyowState::NeedBase(pending_sets))
+    } else {
+        Some(RyowState::Resolved(cur))
+    }
+}
+
+/// ⭐ v2 (F63 正确性): SERIALIZABLE 事务内的 pk 点查 → 读集记录坐标
 /// (RC/非事务回 None 零开销).
 fn sql_read_key(
     conn: &ConnState,
@@ -3738,6 +3935,57 @@ fn sql_dispatch_stmt(
                 ),
             );
         }
+        // ⭐ F66: `SELECT @@var` 系统变量 — 回合理值单行 (SQLAlchemy 初始化)
+        SqlStmt::SystemVarStub { vars } => {
+            let bin = conn.mysql_binary.remove(&seq);
+            let vals: Vec<(String, String)> = vars
+                .iter()
+                .map(|v| {
+                    let key = v.rsplit('.').next().unwrap_or(v).to_ascii_lowercase();
+                    let val = match key.as_str() {
+                        "transaction_isolation" | "tx_isolation" => "READ-COMMITTED",
+                        "version" => "8.0.0-nexusdb",
+                        "version_comment" => "NexusDB",
+                        "sql_mode" => "",
+                        "lower_case_table_names" => "0",
+                        "autocommit" => "1",
+                        "max_allowed_packet" => "16777216",
+                        "character_set_client" | "character_set_connection"
+                        | "character_set_results" => "utf8mb4",
+                        _ => "",
+                    };
+                    (format!("@@{v}"), val.to_string())
+                })
+                .collect();
+            let cols: Vec<(&str, ColType)> =
+                vals.iter().map(|(n, _)| (n.as_str(), ColType::Str)).collect();
+            let row: Vec<ColValue> =
+                vals.iter().map(|(_, val)| ColValue::Bytes(val.as_bytes().to_vec())).collect();
+            conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cols, &[row]));
+        }
+        // ⭐ F66: 系统表查询 (information_schema / pg_catalog 虚拟表)
+        SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset } => {
+            let spec = SysQuerySpec { catalog, table, cols, conds, order, limit, offset };
+            // 纯 db 列表的虚拟表 (schemata / pg_namespace) → 零任务直接合成;
+            // 需表/列元数据的 → 发 CatalogDump 挂起
+            if spec.needs_catalog() {
+                conn.sql_sysq.insert(seq, spec);
+                let op = BatchOp::CatalogDump { db: db.clone() };
+                let sid = hash_route_key(db, "", &[], num_shards);
+                push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+            } else {
+                let dbs: Vec<String> =
+                    db_view.all_names().iter().map(|s| s.to_string()).collect();
+                // default 库隐式不入 resolver — 补入
+                let mut dbs = dbs;
+                if !dbs.iter().any(|d| d.as_str() == default_db.as_ref()) {
+                    dbs.push(default_db.to_string());
+                }
+                let bin = conn.mysql_binary.remove(&seq);
+                let bytes = sysq_render_dblist(conn.proto, bin, &spec, &dbs);
+                conn.resp_complete(seq, bytes);
+            }
+        }
         SqlStmt::Use { db: name } => {
             // 校验存在 (default 库隐式不入 resolver, 特判)
             if name.as_str() == default_db.as_ref() || db_view.id_of(&name).is_some() {
@@ -3791,6 +4039,59 @@ fn sql_dispatch_stmt(
                 push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
             }
         }
+        // ⭐ F67 (JOIN): 两表 hash join — 建 ctx → 补 schema/gather 顺序启动
+        SqlStmt::SelectJoin {
+            left_table,
+            left_alias,
+            kind,
+            right_table,
+            right_alias,
+            on_left,
+            on_right,
+            items,
+            conds,
+            order,
+            limit,
+            offset,
+        } => {
+            let ls = conn
+                .sql_cache
+                .borrow()
+                .schemas
+                .get(&(db.to_string(), left_table.clone()))
+                .cloned();
+            let rs = conn
+                .sql_cache
+                .borrow()
+                .schemas
+                .get(&(db.to_string(), right_table.clone()))
+                .cloned();
+            let ctx = SqlJoinCtx {
+                db: db.clone(),
+                left_table: std::sync::Arc::from(left_table.as_str()),
+                left_alias,
+                right_table: std::sync::Arc::from(right_table.as_str()),
+                right_alias,
+                kind,
+                on_left,
+                on_right,
+                items,
+                conds,
+                order,
+                limit,
+                offset,
+                left_schema: ls,
+                right_schema: rs,
+                phase: JoinPhase::GatherLeft,
+                remaining: 0,
+                left_proj: Vec::new(),
+                right_proj: Vec::new(),
+                left_rows: Vec::new(),
+                right_rows: Vec::new(),
+            };
+            conn.sql_join.insert(seq, ctx);
+            sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
+        }
         // ⭐ S1: DROP TABLE — 无需 schema, 数据面广播删表
         SqlStmt::DropTable { table } => {
             conn.sql_dml_agg.insert(
@@ -3811,7 +4112,1154 @@ fn sql_dispatch_stmt(
     }
 }
 
-/// schema 就绪后的 DML 规划执行 (INSERT / SELECT).
+/// ⭐ F67 (JOIN): 限定列 → (is_left, col_idx). 未知限定符/列/歧义 → Err.
+fn sql_join_resolve(ctx: &SqlJoinCtx, qc: &QualCol) -> Result<(bool, u16), String> {
+    let ls = ctx.left_schema.as_ref().expect("schema ready");
+    let rs = ctx.right_schema.as_ref().expect("schema ready");
+    match &qc.qualifier {
+        Some(q) => {
+            if q.eq_ignore_ascii_case(&ctx.left_alias) {
+                ls.col_by_name(&qc.col)
+                    .map(|i| (true, i))
+                    .ok_or_else(|| format!("unknown column '{}.{}'", q, qc.col))
+            } else if q.eq_ignore_ascii_case(&ctx.right_alias) {
+                rs.col_by_name(&qc.col)
+                    .map(|i| (false, i))
+                    .ok_or_else(|| format!("unknown column '{}.{}'", q, qc.col))
+            } else {
+                Err(format!("unknown table qualifier '{q}'"))
+            }
+        }
+        None => {
+            let li = ls.col_by_name(&qc.col);
+            let ri = rs.col_by_name(&qc.col);
+            match (li, ri) {
+                (Some(_), Some(_)) => Err(format!("ambiguous column '{}' (qualify it)", qc.col)),
+                (Some(i), None) => Ok((true, i)),
+                (None, Some(i)) => Ok((false, i)),
+                (None, None) => Err(format!("unknown column '{}'", qc.col)),
+            }
+        }
+    }
+}
+
+/// ⭐ F67 (JOIN): 规划 — 校验所有限定名 + 算两侧下推投影列 (含 items/on/order/conds 引用).
+/// 返回 (left_proj, right_proj). items 空 (`*`) → 两侧全列.
+fn sql_join_plan(ctx: &SqlJoinCtx) -> Result<(Vec<u16>, Vec<u16>), String> {
+    let ls = ctx.left_schema.as_ref().expect("schema ready");
+    let rs = ctx.right_schema.as_ref().expect("schema ready");
+    let mut lset: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    let mut rset: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    let add = |is_left: bool, idx: u16, ls: &mut std::collections::BTreeSet<u16>, rs: &mut std::collections::BTreeSet<u16>| {
+        if is_left { ls.insert(idx); } else { rs.insert(idx); }
+    };
+    // ON 键 (两侧各一; 校验分属不同表)
+    let (a_left, a_idx) = sql_join_resolve(ctx, &ctx.on_left)?;
+    let (b_left, b_idx) = sql_join_resolve(ctx, &ctx.on_right)?;
+    if a_left == b_left {
+        return Err("JOIN ON must reference both tables".into());
+    }
+    add(a_left, a_idx, &mut lset, &mut rset);
+    add(b_left, b_idx, &mut lset, &mut rset);
+    // 投影项
+    if ctx.items.is_empty() {
+        for i in 0..ls.columns.len() as u16 { lset.insert(i); }
+        for i in 0..rs.columns.len() as u16 { rset.insert(i); }
+    } else {
+        for it in &ctx.items {
+            let JoinItem::Col(qc) = it;
+            let (is_left, idx) = sql_join_resolve(ctx, qc)?;
+            add(is_left, idx, &mut lset, &mut rset);
+        }
+    }
+    // WHERE / ORDER 引用列
+    for c in &ctx.conds {
+        let (is_left, idx) = sql_join_resolve(ctx, &c.col)?;
+        add(is_left, idx, &mut lset, &mut rset);
+    }
+    for (qc, _) in &ctx.order {
+        let (is_left, idx) = sql_join_resolve(ctx, qc)?;
+        add(is_left, idx, &mut lset, &mut rset);
+    }
+    Ok((lset.into_iter().collect(), rset.into_iter().collect()))
+}
+
+/// ⭐ F67 (JOIN): 启动 — 补缺失 schema (单 shard GetSchemaOp) 或直接进 GatherLeft.
+fn sql_join_kickoff(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+) {
+    let (need_left, need_right, db, ltab, rtab) = {
+        let c = conn.sql_join.get(&seq).expect("join ctx");
+        (
+            c.left_schema.is_none(),
+            c.right_schema.is_none(),
+            c.db.clone(),
+            c.left_table.clone(),
+            c.right_table.clone(),
+        )
+    };
+    if need_left || need_right {
+        let (phase, table) = if need_left {
+            (JoinPhase::FetchLeftSchema, ltab)
+        } else {
+            (JoinPhase::FetchRightSchema, rtab)
+        };
+        {
+            let c = conn.sql_join.get_mut(&seq).unwrap();
+            c.phase = phase;
+            c.remaining = 1;
+        }
+        let sid = hash_route_key(&db, &table, &[], num_shards);
+        let op = BatchOp::GetSchemaOp { db, table };
+        push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+        return;
+    }
+    sql_join_begin_gather(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
+}
+
+/// ⭐ F67 (JOIN): 两 schema 就绪 → 规划 → 广播左表 ScanFiltered.
+fn sql_join_begin_gather(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+) {
+    let plan = { sql_join_plan(conn.sql_join.get(&seq).expect("join ctx")) };
+    match plan {
+        Err(e) => {
+            conn.sql_join.remove(&seq);
+            conn.mysql_binary.remove(&seq);
+            conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+            return;
+        }
+        Ok((lproj, rproj)) => {
+            let c = conn.sql_join.get_mut(&seq).unwrap();
+            c.left_proj = lproj;
+            c.right_proj = rproj;
+            c.phase = JoinPhase::GatherLeft;
+            c.remaining = num_shards;
+            c.left_rows.clear();
+        }
+    }
+    sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, true);
+}
+
+/// ⭐ F67 (JOIN): 广播一侧的 ScanFiltered (谓词下推: 左侧恒下推; 右侧仅 INNER 下推).
+/// 下推仅优化; finish 总会再残余过滤全部 WHERE, 故跳过不可译译的谓词安全.
+fn sql_join_broadcast(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    is_left: bool,
+) {
+    let (db, table, preds, proj) = {
+        let c = conn.sql_join.get(&seq).expect("join ctx");
+        let push = is_left || c.kind == JoinKind::Inner;
+        let (schema, proj) = if is_left {
+            (c.left_schema.as_ref().unwrap(), c.left_proj.clone())
+        } else {
+            (c.right_schema.as_ref().unwrap(), c.right_proj.clone())
+        };
+        let mut preds: Vec<shard_manager::ScanPred> = Vec::new();
+        if push {
+            for cond in &c.conds {
+                let Ok((cis_left, cidx)) = sql_join_resolve(c, &cond.col) else { continue };
+                if cis_left != is_left {
+                    continue;
+                }
+                let ty = schema.columns[cidx as usize].ty;
+                let op = match cond.op {
+                    CmpOp::Eq => shard_manager::PredOp::Eq,
+                    CmpOp::Ne => shard_manager::PredOp::Ne,
+                    CmpOp::Gt => shard_manager::PredOp::Gt,
+                    CmpOp::Ge => shard_manager::PredOp::Ge,
+                    CmpOp::Lt => shard_manager::PredOp::Lt,
+                    CmpOp::Le => shard_manager::PredOp::Le,
+                    CmpOp::In => shard_manager::PredOp::In,
+                };
+                if cond.op == CmpOp::In {
+                    let set: Vec<ColValue> =
+                        cond.set.iter().filter_map(|v| sql_to_col(ty, v).ok()).collect();
+                    if set.len() == cond.set.len() {
+                        preds.push(shard_manager::ScanPred { col: cidx, op, val: ColValue::Null, set });
+                    }
+                } else if let Ok(val) = sql_to_col(ty, &cond.val) {
+                    preds.push(shard_manager::ScanPred { col: cidx, op, val, set: Vec::new() });
+                }
+            }
+        }
+        let table = if is_left { c.left_table.clone() } else { c.right_table.clone() };
+        (c.db.clone(), table, preds, proj)
+    };
+    for sid in 0..num_shards {
+        let op = BatchOp::ScanFiltered {
+            db: db.clone(),
+            table: table.clone(),
+            preds: preds.clone(),
+            proj: proj.clone(),
+            limit: 0,
+        };
+        push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+    }
+}
+
+/// ⭐ F67 (JOIN): handle_resp 认领 — 按 phase 推进. 返回 true = 已处理此 seq.
+fn sql_join_drive(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    result: &BatchResult,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+) -> bool {
+    if !conn.sql_join.contains_key(&seq) {
+        return false;
+    }
+    // 错误: 直接终止
+    if let BatchResult::Error(e) = result {
+        let msg = e.clone();
+        conn.sql_join.remove(&seq);
+        conn.mysql_binary.remove(&seq);
+        conn.resp_complete(seq, sql_err_bytes(conn.proto, &msg));
+        return true;
+    }
+    let phase = conn.sql_join.get(&seq).unwrap().phase;
+    match phase {
+        JoinPhase::FetchLeftSchema | JoinPhase::FetchRightSchema => {
+            let bytes = match result {
+                BatchResult::GetValue(Some(b)) => b.clone(),
+                BatchResult::GetValue(None) => {
+                    conn.sql_join.remove(&seq);
+                    conn.mysql_binary.remove(&seq);
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(conn.proto, "table has no schema (not a SQL table)"),
+                    );
+                    return true;
+                }
+                _ => {
+                    conn.sql_join.remove(&seq);
+                    conn.mysql_binary.remove(&seq);
+                    conn.resp_complete(seq, sql_err_bytes(conn.proto, "unexpected schema reply"));
+                    return true;
+                }
+            };
+            match TableSchema::decode(&bytes) {
+                Ok(s) => {
+                    let schema = std::sync::Arc::new(s);
+                    let (db, table, is_left) = {
+                        let c = conn.sql_join.get_mut(&seq).unwrap();
+                        let is_left = c.phase == JoinPhase::FetchLeftSchema;
+                        if is_left {
+                            c.left_schema = Some(schema.clone());
+                            (c.db.clone(), c.left_table.clone(), true)
+                        } else {
+                            c.right_schema = Some(schema.clone());
+                            (c.db.clone(), c.right_table.clone(), false)
+                        }
+                    };
+                    let _ = is_left;
+                    conn.sql_cache
+                        .borrow_mut()
+                        .schemas
+                        .insert((db.to_string(), table.to_string()), schema);
+                    // 继续补下一个或进 gather
+                    sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
+                }
+                Err(e) => {
+                    conn.sql_join.remove(&seq);
+                    conn.mysql_binary.remove(&seq);
+                    conn.resp_complete(seq, sql_err_bytes(conn.proto, &format!("bad schema: {e}")));
+                }
+            }
+            true
+        }
+        JoinPhase::GatherLeft | JoinPhase::GatherRight => {
+            let rows = match result {
+                BatchResult::ProjRows(r) => r.clone(),
+                _ => Vec::new(),
+            };
+            let (done, overflow) = {
+                let c = conn.sql_join.get_mut(&seq).unwrap();
+                if c.phase == JoinPhase::GatherLeft {
+                    c.left_rows.extend(rows);
+                } else {
+                    c.right_rows.extend(rows);
+                }
+                c.remaining = c.remaining.saturating_sub(1);
+                let of = c.left_rows.len() > JOIN_MAX_ROWS || c.right_rows.len() > JOIN_MAX_ROWS;
+                (c.remaining == 0, of)
+            };
+            if overflow {
+                conn.sql_join.remove(&seq);
+                conn.mysql_binary.remove(&seq);
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, "JOIN result too large (row cap exceeded)"),
+                );
+                return true;
+            }
+            if done {
+                let go_right = conn.sql_join.get(&seq).unwrap().phase == JoinPhase::GatherLeft;
+                if go_right {
+                    {
+                        let c = conn.sql_join.get_mut(&seq).unwrap();
+                        c.phase = JoinPhase::GatherRight;
+                        c.remaining = num_shards;
+                        c.right_rows.clear();
+                    }
+                    sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, false);
+                } else {
+                    sql_join_finish(conn, seq);
+                }
+            }
+            true
+        }
+    }
+}
+
+/// ⭐ F67 (JOIN): 两侧 gather 完成 → hash join (右建表、左探测) + 残余 WHERE
+/// + 输出列 + ORDER/OFFSET/LIMIT + 三门面渲染.
+fn sql_join_finish(conn: &mut ConnState, seq: u64) {
+    let ctx = conn.sql_join.remove(&seq).expect("join ctx");
+    let bin = conn.mysql_binary.remove(&seq);
+    let ls = ctx.left_schema.as_ref().unwrap();
+    let rs = ctx.right_schema.as_ref().unwrap();
+    // ON 键 → 各侧列号 + 在 proj 中的位置
+    let (a_left, a_idx) = sql_join_resolve(&ctx, &ctx.on_left).unwrap();
+    let (_b_left, b_idx) = sql_join_resolve(&ctx, &ctx.on_right).unwrap();
+    let (l_key_idx, r_key_idx) = if a_left { (a_idx, b_idx) } else { (b_idx, a_idx) };
+    let l_key_pos = ctx.left_proj.iter().position(|&c| c == l_key_idx).unwrap();
+    let r_key_pos = ctx.right_proj.iter().position(|&c| c == r_key_idx).unwrap();
+    // 右表建 hash: key 字节 → 右行下标列表
+    let mut hash: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    for (ri, row) in ctx.right_rows.iter().enumerate() {
+        if let Some(k) = join_key(&row[r_key_pos]) {
+            hash.entry(k).or_default().push(ri);
+        }
+    }
+    // 残余 WHERE (全部 conds; 与下推幂等, LEFT 的右表谓词仅在此生效)
+    let null = ColValue::Null;
+    let val_of = |is_left: bool, cidx: u16, lrow: &[ColValue], rrow: Option<&Vec<ColValue>>| -> ColValue {
+        if is_left {
+            let pos = ctx.left_proj.iter().position(|&c| c == cidx).unwrap();
+            lrow[pos].clone()
+        } else {
+            match rrow {
+                Some(r) => {
+                    let pos = ctx.right_proj.iter().position(|&c| c == cidx).unwrap();
+                    r[pos].clone()
+                }
+                None => null.clone(),
+            }
+        }
+    };
+    let pass_conds = |lrow: &[ColValue], rrow: Option<&Vec<ColValue>>| -> bool {
+        for cond in &ctx.conds {
+            let Ok((is_left, cidx)) = sql_join_resolve(&ctx, &cond.col) else { return false };
+            let cv = val_of(is_left, cidx, lrow, rrow);
+            if !join_cond_pass(&cv, cond) {
+                return false;
+            }
+        }
+        true
+    };
+    // 探测: 左驱动 (INNER 跳未命中, LEFT 未命中补 None)
+    let mut pairs: Vec<(usize, Option<usize>)> = Vec::new();
+    for (li, lrow) in ctx.left_rows.iter().enumerate() {
+        let matched = join_key(&lrow[l_key_pos]).and_then(|k| hash.get(&k));
+        match matched {
+            Some(ris) => {
+                for &ri in ris {
+                    if pass_conds(lrow, Some(&ctx.right_rows[ri])) {
+                        pairs.push((li, Some(ri)));
+                    }
+                }
+            }
+            None => {
+                if ctx.kind == JoinKind::Left && pass_conds(lrow, None) {
+                    pairs.push((li, None));
+                }
+            }
+        }
+    }
+    // ORDER BY (resolve → 取值比较; 倒序逐键稳定排序)
+    for (qc, desc) in ctx.order.iter().rev() {
+        if let Ok((is_left, cidx)) = sql_join_resolve(&ctx, qc) {
+            pairs.sort_by(|a, b| {
+                let av = val_of(is_left, cidx, &ctx.left_rows[a.0], a.1.map(|i| &ctx.right_rows[i]));
+                let bv = val_of(is_left, cidx, &ctx.left_rows[b.0], b.1.map(|i| &ctx.right_rows[i]));
+                let o = cmp_colvalue(&av, &bv);
+                if *desc { o.reverse() } else { o }
+            });
+        }
+    }
+    // OFFSET / LIMIT
+    let start = (ctx.offset.unwrap_or(0) as usize).min(pairs.len());
+    let end = match ctx.limit {
+        Some(l) => (start + l as usize).min(pairs.len()),
+        None => pairs.len(),
+    };
+    let pairs = &pairs[start..end];
+    // 输出列计划: (列头, is_left, col_idx)
+    let mut out_plan: Vec<(String, bool, u16)> = Vec::new();
+    if ctx.items.is_empty() {
+        for (i, col) in ls.columns.iter().enumerate() {
+            out_plan.push((format!("{}.{}", ctx.left_alias, col.name), true, i as u16));
+        }
+        for (i, col) in rs.columns.iter().enumerate() {
+            out_plan.push((format!("{}.{}", ctx.right_alias, col.name), false, i as u16));
+        }
+    } else {
+        for it in &ctx.items {
+            let JoinItem::Col(qc) = it;
+            let (is_left, idx) = sql_join_resolve(&ctx, qc).unwrap();
+            let label = match &qc.qualifier {
+                Some(q) => format!("{}.{}", q, qc.col),
+                None => qc.col.clone(),
+            };
+            out_plan.push((label, is_left, idx));
+        }
+    }
+    let cols: Vec<(&str, ColType)> = out_plan
+        .iter()
+        .map(|(label, is_left, idx)| {
+            let ty = if *is_left {
+                ls.columns[*idx as usize].ty
+            } else {
+                rs.columns[*idx as usize].ty
+            };
+            (label.as_str(), ty)
+        })
+        .collect();
+    let rows: Vec<Vec<ColValue>> = pairs
+        .iter()
+        .map(|(li, ri)| {
+            let lrow = &ctx.left_rows[*li];
+            let rrow = ri.map(|i| &ctx.right_rows[i]);
+            out_plan
+                .iter()
+                .map(|(_, is_left, idx)| val_of(*is_left, *idx, lrow, rrow))
+                .collect()
+        })
+        .collect();
+    conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cols, &rows));
+}
+
+/// ⭐ F67 (JOIN): join key 规范化字节 (类型 tag + 值; NULL → None 不匹配).
+fn join_key(cv: &ColValue) -> Option<Vec<u8>> {
+    match cv {
+        ColValue::Null => None,
+        ColValue::I64(i) => {
+            let mut k = Vec::with_capacity(9);
+            k.push(0);
+            k.extend_from_slice(&i.to_le_bytes());
+            Some(k)
+        }
+        ColValue::F64(f) => {
+            let mut k = Vec::with_capacity(9);
+            k.push(1);
+            k.extend_from_slice(&f.to_bits().to_le_bytes());
+            Some(k)
+        }
+        ColValue::Bytes(b) => {
+            let mut k = Vec::with_capacity(1 + b.len());
+            k.push(2);
+            k.extend_from_slice(b);
+            Some(k)
+        }
+    }
+}
+
+/// ⭐ F67 (JOIN): 单条 WHERE 残余判定 (NULL 列恒 false, 与 sql_eval_conds 同义).
+fn join_cond_pass(cv: &ColValue, cond: &JoinCond) -> bool {
+    use std::cmp::Ordering;
+    if cond.op == CmpOp::In {
+        return cond.set.iter().any(|v| sql_cmp(cv, v) == Some(Ordering::Equal));
+    }
+    match sql_cmp(cv, &cond.val) {
+        None => false,
+        Some(o) => match cond.op {
+            CmpOp::Eq => o == Ordering::Equal,
+            CmpOp::Ne => o != Ordering::Equal,
+            CmpOp::Gt => o == Ordering::Greater,
+            CmpOp::Ge => o != Ordering::Less,
+            CmpOp::Lt => o == Ordering::Less,
+            CmpOp::Le => o != Ordering::Greater,
+            CmpOp::In => unreachable!(),
+        },
+    }
+}
+
+/// ⭐ F65: 提取 schema 的全局唯一列 (iid, col); 空 = 无全局唯一.
+fn schema_global_unique(schema: &TableSchema) -> Vec<(u32, u16)> {
+    schema
+        .indexes
+        .iter()
+        .filter(|i| i.unique && i.global)
+        .map(|i| (i.iid, i.col))
+        .collect()
+}
+
+/// ⭐ F65: 从 row values 算出各全局唯一列的 (iid, enc_val); NULL 列跳过 (不占坑).
+fn row_global_unique_encs(
+    schema: &TableSchema,
+    values: &[ColValue],
+) -> Vec<(u32, Vec<u8>)> {
+    schema_global_unique(schema)
+        .into_iter()
+        .filter_map(|(iid, col)| {
+            let ty = schema.columns[col as usize].ty;
+            storage::sql_rows::index_val_bytes(ty, &values[col as usize]).map(|enc| (iid, enc))
+        })
+        .collect()
+}
+
+/// ⭐ F65: 向 email-shard 发一个占坑 op (按 enc_val 路由).
+#[allow(clippy::too_many_arguments)]
+fn push_unique_op(
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    db: &std::sync::Arc<str>,
+    table: &str,
+    op: BatchOp,
+    enc_val: &[u8],
+    num_shards: usize,
+    shard_inboxes: &[SharedTaskInbox],
+) {
+    let sid = hash_route_key(db, table, enc_val, num_shards);
+    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+}
+
+/// ⭐ F65: 启动 autocommit 单行 INSERT 的占坑编排 (已知含全局唯一列).
+/// 发第一个 ReserveUnique, 后续由 sql_unique_drive 推进.
+#[allow(clippy::too_many_arguments)]
+fn sql_unique_ins_start(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    db: &std::sync::Arc<str>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    schema: std::sync::Arc<TableSchema>,
+    table: String,
+    pk: Vec<u8>,
+    values: Vec<ColValue>,
+) {
+    let guc = row_global_unique_encs(&schema, &values);
+    // guc 不可能为空 (caller 已判 has_global_unique); 但 NULL 值会使其空 —
+    // 全局唯一列隐含 NOT NULL, 实际不会空; 防御性处理: 空则直写行
+    if guc.is_empty() {
+        let op = BatchOp::RowPut {
+            db: db.clone(),
+            table: std::sync::Arc::from(table.as_str()),
+            pk,
+            values,
+        };
+        let sid = hash_route_op(&op, num_shards);
+        push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+        conn.sql_dml_agg.insert(
+            seq,
+            SqlDmlAgg { remaining: 1, affected: 0, error: None, drop_key: None },
+        );
+        return;
+    }
+    let txn_id = seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1; // 非 0 的伪唯 txn 标记
+    let first = guc[0].clone();
+    let st = SqlUniqueIns {
+        db: db.clone(),
+        table,
+        schema,
+        pk: pk.clone(),
+        values,
+        guc,
+        txn_id,
+        phase: UniquePhase::Reserve,
+        idx: 0,
+        reserved: 0,
+    };
+    let tbl = st.table.clone();
+    conn.sql_unique_ins.insert(seq, st);
+    let op = BatchOp::ReserveUnique {
+        db: db.clone(),
+        table: std::sync::Arc::from(tbl.as_str()),
+        iid: first.0,
+        enc_val: first.1.clone(),
+        pk,
+        txn_id,
+    };
+    push_unique_op(conn_id, seq, worker_id, db, &tbl, op, &first.1, num_shards, shard_inboxes);
+}
+
+/// ⭐ F65: 占坑状态机推进 (在 handle_resp_shard_result 内命中 seq 时调).
+/// 返回 true = 已处理此 reply (不再走后续聚合器).
+#[allow(clippy::too_many_arguments)]
+fn sql_unique_drive(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    result: &BatchResult,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+) -> bool {
+    if !conn.sql_unique_ins.contains_key(&seq) {
+        return false;
+    }
+    let proto = conn.proto;
+    let mut st = conn.sql_unique_ins.remove(&seq).expect("just checked");
+
+    // 回滚 helper: release 已占的 guc[0..reserved], 然后回错
+    let rollback_and_err = |conn: &mut ConnState, st: &SqlUniqueIns, msg: String| {
+        for (iid, enc) in st.guc.iter().take(st.reserved) {
+            let op = BatchOp::ReleaseUnique {
+                db: st.db.clone(),
+                table: std::sync::Arc::from(st.table.as_str()),
+                iid: *iid,
+                enc_val: enc.clone(),
+                txn_id: st.txn_id,
+            };
+            // fire-and-forget release (seq=0 不等回复; 用专用低优先无聚合)
+            let sid = hash_route_key(&st.db, &st.table, enc, num_shards);
+            push_task_grouped(conn_id, 0, worker_id, sid as u32, sid, op, shard_inboxes);
+        }
+        let bin = conn.mysql_binary.remove(&seq);
+        let _ = bin;
+        conn.resp_complete(seq, sql_err_bytes(proto, &msg));
+    };
+
+    match st.phase {
+        UniquePhase::Reserve => match result {
+            BatchResult::ReserveOk => {
+                st.reserved += 1;
+                st.idx += 1;
+                if st.idx < st.guc.len() {
+                    // 发下一列 reserve
+                    let (iid, enc) = st.guc[st.idx].clone();
+                    let pk = st.pk.clone();
+                    let (db, tbl, txn) = (st.db.clone(), st.table.clone(), st.txn_id);
+                    conn.sql_unique_ins.insert(seq, st);
+                    let op = BatchOp::ReserveUnique {
+                        db: db.clone(),
+                        table: std::sync::Arc::from(tbl.as_str()),
+                        iid,
+                        enc_val: enc.clone(),
+                        pk,
+                        txn_id: txn,
+                    };
+                    push_unique_op(conn_id, seq, worker_id, &db, &tbl, op, &enc, num_shards, shard_inboxes);
+                } else {
+                    // 全部 reserve 完→写行
+                    st.phase = UniquePhase::Write;
+                    let op = BatchOp::RowPut {
+                        db: st.db.clone(),
+                        table: std::sync::Arc::from(st.table.as_str()),
+                        pk: st.pk.clone(),
+                        values: st.values.clone(),
+                    };
+                    let sid = hash_route_op(&op, num_shards);
+                    conn.sql_unique_ins.insert(seq, st);
+                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                }
+            }
+            BatchResult::ReserveConflict { state, holder_pk, .. } => {
+                if *state == 2 {
+                    // COMMITTED 冲突 → Verify: 回查持有者行是否真存在
+                    st.phase = UniquePhase::Verify;
+                    let hp = holder_pk.clone();
+                    let op = BatchOp::RowGet {
+                        db: st.db.clone(),
+                        table: std::sync::Arc::from(st.table.as_str()),
+                        pk: hp,
+                    };
+                    let sid = hash_route_op(&op, num_shards);
+                    conn.sql_unique_ins.insert(seq, st);
+                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                } else {
+                    // PENDING 冲突 (在飞) → 拒 (客户端重试)
+                    rollback_and_err(conn, &st, "duplicate key on global unique column".into());
+                }
+            }
+            BatchResult::Error(e) => rollback_and_err(conn, &st, e.clone()),
+            _ => rollback_and_err(conn, &st, "unexpected reserve reply".into()),
+        },
+        UniquePhase::Verify => {
+            // 回查结果: 持有者行存在且含本 enc_val → 真冲突; 否则 stale → 抢占
+            let cur = &st.guc[st.idx];
+            let holder_has = matches!(result, BatchResult::GetValue(Some(row))
+                if row_has_index_val(&st.schema, row, cur.0, &cur.1));
+            if holder_has {
+                rollback_and_err(conn, &st, "duplicate key on global unique column".into());
+            } else {
+                // stale 坑 → 抢占, 继续当前列
+                st.phase = UniquePhase::Reserve;
+                let (iid, enc) = st.guc[st.idx].clone();
+                let pk = st.pk.clone();
+                let (db, tbl, txn) = (st.db.clone(), st.table.clone(), st.txn_id);
+                conn.sql_unique_ins.insert(seq, st);
+                let op = BatchOp::StealUnique {
+                    db: db.clone(),
+                    table: std::sync::Arc::from(tbl.as_str()),
+                    iid,
+                    enc_val: enc.clone(),
+                    pk,
+                    txn_id: txn,
+                };
+                push_unique_op(conn_id, seq, worker_id, &db, &tbl, op, &enc, num_shards, shard_inboxes);
+            }
+        }
+        UniquePhase::Write => match result {
+            BatchResult::PutOk => {
+                // 写行成功 → 逐列 confirm
+                st.phase = UniquePhase::Confirm;
+                st.idx = 0;
+                let (iid, enc) = st.guc[0].clone();
+                let pk = st.pk.clone();
+                let (db, tbl, txn) = (st.db.clone(), st.table.clone(), st.txn_id);
+                conn.sql_unique_ins.insert(seq, st);
+                let op = BatchOp::ConfirmUnique {
+                    db: db.clone(),
+                    table: std::sync::Arc::from(tbl.as_str()),
+                    iid,
+                    enc_val: enc.clone(),
+                    pk,
+                    txn_id: txn,
+                };
+                push_unique_op(conn_id, seq, worker_id, &db, &tbl, op, &enc, num_shards, shard_inboxes);
+            }
+            BatchResult::Error(e) => rollback_and_err(conn, &st, e.clone()),
+            _ => rollback_and_err(conn, &st, "unexpected rowput reply".into()),
+        },
+        UniquePhase::Confirm => {
+            // confirm ack (PutOk); 逐列推进, 全部完 → 回 OK
+            st.idx += 1;
+            if st.idx < st.guc.len() {
+                let (iid, enc) = st.guc[st.idx].clone();
+                let pk = st.pk.clone();
+                let (db, tbl, txn) = (st.db.clone(), st.table.clone(), st.txn_id);
+                conn.sql_unique_ins.insert(seq, st);
+                let op = BatchOp::ConfirmUnique {
+                    db: db.clone(),
+                    table: std::sync::Arc::from(tbl.as_str()),
+                    iid,
+                    enc_val: enc.clone(),
+                    pk,
+                    txn_id: txn,
+                };
+                push_unique_op(conn_id, seq, worker_id, &db, &tbl, op, &enc, num_shards, shard_inboxes);
+            } else {
+                let bin = conn.mysql_binary.remove(&seq);
+                let _ = bin;
+                conn.resp_complete(seq, sql_ok_bytes(proto, 1));
+            }
+        }
+    }
+    true
+}
+
+/// ⭐ F65: 判断 row 字节的指定 iid 列值是否等于 enc_val (Verify 用).
+fn row_has_index_val(schema: &TableSchema, row: &[u8], iid: u32, enc_val: &[u8]) -> bool {
+    let Ok(values) = storage::row::decode_row(schema, row) else {
+        return false;
+    };
+    schema.indexes.iter().find(|i| i.iid == iid).is_some_and(|idx| {
+        let ty = schema.columns[idx.col as usize].ty;
+        storage::sql_rows::index_val_bytes(ty, &values[idx.col as usize])
+            .is_some_and(|e| e == enc_val)
+    })
+}
+
+/// ⭐ F66: 系统表查询规格 (解析产物, worker 合成虚拟表用).
+struct SysQuerySpec {
+    catalog: String,
+    table: String,
+    cols: Vec<String>,
+    conds: Vec<Cond>,
+    order: Vec<(String, bool)>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+impl SysQuerySpec {
+    /// 需要表/列元数据 (发 CatalogDump); 否则仅 db 列表.
+    fn needs_catalog(&self) -> bool {
+        !matches!(
+            (self.catalog.as_str(), self.table.as_str()),
+            ("information_schema", "schemata")
+                | ("pg_catalog", "pg_namespace")
+                | ("__show__", "databases")
+                | ("__show__", "__empty__")
+        )
+    }
+}
+
+/// ⭐ F66: ColType → information_schema.columns 的 data_type 字符串.
+fn coltype_sql_name(ty: ColType) -> &'static str {
+    match ty {
+        ColType::I64 => "bigint",
+        ColType::F64 => "double",
+        ColType::Str => "text",
+        ColType::Bytes => "blob",
+    }
+}
+
+/// ⭐ F66: 用合成列名+行跑完成点 (过滤/投影/排序/截断) → 三门面渲染.
+/// 虚拟列均为 Str; 行值用 ColValue::Bytes (NULL 用 ColValue::Null).
+fn sysq_finish(
+    proto: ProtocolKind,
+    binary: bool,
+    spec: &SysQuerySpec,
+    all_cols: &[&str],
+    mut rows: Vec<Vec<ColValue>>,
+) -> Vec<u8> {
+    // 合成 schema (全 Str) 用于 WHERE 过滤 + 投影 + 排序列定位
+    let schema = TableSchema {
+        version: 1,
+        columns: all_cols
+            .iter()
+            .map(|n| storage::schema::Column {
+                name: n.to_string(),
+                ty: ColType::Str,
+                nullable: true,
+            })
+            .collect(),
+        pk_col: 0,
+        indexes: Vec::new(),
+        next_iid: 0,
+    };
+    // WHERE 残余过滤 (复用 sql_eval_conds; 跳过 `__` 前缀的内部标记 cond 如 __table__,
+    // 它们已在生成器里处理; 未知真实列的条件 → 不匹配则滤掉)
+    let real_conds: Vec<Cond> =
+        spec.conds.iter().filter(|c| !c.col.starts_with("__")).cloned().collect();
+    rows.retain(|r| sql_eval_conds(&schema, r, &real_conds));
+    // ORDER BY (按输出列字典序; 未知列忽略)
+    for (name, desc) in spec.order.iter().rev() {
+        if let Some(ci) = all_cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+            rows.sort_by(|a, b| {
+                let o = cmp_colvalue(&a[ci], &b[ci]);
+                if *desc { o.reverse() } else { o }
+            });
+        }
+    }
+    // OFFSET / LIMIT
+    let start = (spec.offset.unwrap_or(0) as usize).min(rows.len());
+    let end = match spec.limit {
+        Some(l) => (start + l as usize).min(rows.len()),
+        None => rows.len(),
+    };
+    let rows = &rows[start..end];
+    // 投影: cols 空 = 全列; 否则按名选 (未知列 → 全 NULL 列)
+    if spec.cols.is_empty() {
+        let cols: Vec<(&str, ColType)> = all_cols.iter().map(|c| (*c, ColType::Str)).collect();
+        sql_rows_bytes(proto, binary, &cols, rows)
+    } else {
+        let idxs: Vec<Option<usize>> = spec
+            .cols
+            .iter()
+            .map(|c| all_cols.iter().position(|a| a.eq_ignore_ascii_case(c)))
+            .collect();
+        let cols: Vec<(&str, ColType)> =
+            spec.cols.iter().map(|c| (c.as_str(), ColType::Str)).collect();
+        let proj: Vec<Vec<ColValue>> = rows
+            .iter()
+            .map(|r| {
+                idxs.iter()
+                    .map(|oi| oi.and_then(|i| r.get(i).cloned()).unwrap_or(ColValue::Null))
+                    .collect()
+            })
+            .collect();
+        sql_rows_bytes(proto, binary, &cols, &proj)
+    }
+}
+
+fn sbytes(s: &str) -> ColValue {
+    ColValue::Bytes(s.as_bytes().to_vec())
+}
+
+/// ⭐ F66: db 列表类虚拟表 (schemata / pg_namespace) — 零任务合成.
+fn sysq_render_dblist(
+    proto: ProtocolKind,
+    binary: bool,
+    spec: &SysQuerySpec,
+    dbs: &[String],
+) -> Vec<u8> {
+    let (all_cols, rows): (Vec<&str>, Vec<Vec<ColValue>>) =
+        match (spec.catalog.as_str(), spec.table.as_str()) {
+            ("information_schema", "schemata") => (
+                vec!["catalog_name", "schema_name", "default_character_set_name"],
+                dbs.iter()
+                    .map(|d| vec![sbytes("def"), sbytes(d), sbytes("utf8mb4")])
+                    .collect(),
+            ),
+            ("pg_catalog", "pg_namespace") => (
+                vec!["nspname", "oid"],
+                dbs.iter()
+                    .enumerate()
+                    .map(|(i, d)| vec![sbytes(d), sbytes(&(i as u32 + 1).to_string())])
+                    .collect(),
+            ),
+            // ⭐ F66: SHOW DATABASES — 单列 "Database"
+            ("__show__", "databases") => (
+                vec!["Database"],
+                dbs.iter().map(|d| vec![sbytes(d)]).collect(),
+            ),
+            // ⭐ F66: 其他 SHOW stub → 空
+            ("__show__", "__empty__") => (vec![""], vec![]),
+            _ => (vec![], vec![]),
+        };
+    sysq_finish(proto, binary, spec, &all_cols, rows)
+}
+
+/// ⭐ F66: 需 catalog 快照的虚拟表合成 (tables/columns/key_column_usage/pg_*).
+/// `entries` = CatalogDump 回的 (table_name, TableSchema).
+fn sysq_render_catalog(
+    proto: ProtocolKind,
+    binary: bool,
+    spec: &SysQuerySpec,
+    db: &str,
+    entries: &[(String, TableSchema)],
+) -> Vec<u8> {
+    let key = (spec.catalog.as_str(), spec.table.as_str());
+    // ⭐ F66: SHOW TABLES 动态列名 (函数级存活, 避免每次查询泄漏)
+    let tables_in = format!("Tables_in_{db}");
+    let (all_cols, rows): (Vec<&str>, Vec<Vec<ColValue>>) = match key {
+        // ⭐ F66: SHOW [FULL] TABLES — 列名 Tables_in_<db> [+ Table_type]
+        ("__show__", "tables") | ("__show__", "full_tables") => {
+            let full = spec.table == "full_tables";
+            let mut rows = Vec::new();
+            for (t, _) in entries {
+                if full {
+                    rows.push(vec![sbytes(t), sbytes("BASE TABLE")]);
+                } else {
+                    rows.push(vec![sbytes(t)]);
+                }
+            }
+            if full {
+                (vec![tables_in.as_str(), "Table_type"], rows)
+            } else {
+                (vec![tables_in.as_str()], rows)
+            }
+        }
+        // ⭐ F66: SHOW [FULL] COLUMNS FROM t — Field/Type/Null/Key/Default/Extra
+        ("__show__", "columns") | ("__show__", "full_columns") => {
+            let full = spec.table == "full_columns";
+            // 从 __table__ cond 取目标表名
+            let target = spec
+                .conds
+                .iter()
+                .find(|c| c.col == "__table__")
+                .and_then(|c| match &c.val {
+                    crate::protocol::sql::SqlValue::Str(b) => {
+                        Some(String::from_utf8_lossy(b).to_string())
+                    }
+                    _ => None,
+                });
+            let mut rows = Vec::new();
+            for (t, sc) in entries {
+                if let Some(tt) = &target
+                    && !t.eq_ignore_ascii_case(tt)
+                {
+                    continue;
+                }
+                for (i, c) in sc.columns.iter().enumerate() {
+                    let key = if i as u16 == sc.pk_col {
+                        "PRI"
+                    } else if let Some(idx) = sc.indexes.iter().find(|x| x.col == i as u16) {
+                        if idx.unique { "UNI" } else { "MUL" }
+                    } else {
+                        ""
+                    };
+                    let mut row = vec![
+                        sbytes(&c.name),
+                        sbytes(coltype_sql_name(c.ty)),
+                        sbytes(if c.nullable { "YES" } else { "NO" }),
+                        sbytes(key),
+                        ColValue::Null, // Default
+                        sbytes(""),     // Extra
+                    ];
+                    if full {
+                        row.push(ColValue::Null); // Collation
+                        row.push(sbytes("select,insert,update,references")); // Privileges
+                        row.push(sbytes("")); // Comment
+                    }
+                    rows.push(row);
+                }
+            }
+            if full {
+                (
+                    vec![
+                        "Field", "Type", "Null", "Key", "Default", "Extra", "Collation",
+                        "Privileges", "Comment",
+                    ],
+                    rows,
+                )
+            } else {
+                (vec!["Field", "Type", "Null", "Key", "Default", "Extra"], rows)
+            }
+        }
+        // ⭐ F66: SHOW CREATE TABLE t — 重建 MySQL DDL (SQLAlchemy 从此解析列)
+        ("__show__", "create_table") => {
+            let target = spec
+                .conds
+                .iter()
+                .find(|c| c.col == "__table__")
+                .and_then(|c| match &c.val {
+                    crate::protocol::sql::SqlValue::Str(b) => {
+                        Some(String::from_utf8_lossy(b).to_string())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut rows = Vec::new();
+            if let Some((t, sc)) = entries.iter().find(|(t, _)| t.eq_ignore_ascii_case(&target)) {
+                let mut lines: Vec<String> = Vec::new();
+                for (i, c) in sc.columns.iter().enumerate() {
+                    let ty = match c.ty {
+                        ColType::I64 => "int",
+                        ColType::F64 => "double",
+                        ColType::Str => "text",
+                        ColType::Bytes => "blob",
+                    };
+                    let nullness = if i as u16 == sc.pk_col || !c.nullable {
+                        " NOT NULL".to_string()
+                    } else {
+                        " DEFAULT NULL".to_string()
+                    };
+                    lines.push(format!("  `{}` {}{}", c.name, ty, nullness));
+                }
+                let pkc = &sc.columns[sc.pk_col as usize].name;
+                lines.push(format!("  PRIMARY KEY (`{pkc}`)"));
+                for idx in &sc.indexes {
+                    let cn = &sc.columns[idx.col as usize].name;
+                    if idx.unique {
+                        lines.push(format!("  UNIQUE KEY `{cn}` (`{cn}`)"));
+                    } else {
+                        lines.push(format!("  KEY `{cn}` (`{cn}`)"));
+                    }
+                }
+                let ddl = format!(
+                    "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+                    t,
+                    lines.join(",\n")
+                );
+                rows.push(vec![sbytes(t), sbytes(&ddl)]);
+            }
+            (vec!["Table", "Create Table"], rows)
+        }
+        ("information_schema", "tables") => (
+            vec!["table_catalog", "table_schema", "table_name", "table_type"],
+            entries
+                .iter()
+                .map(|(t, _)| {
+                    vec![sbytes("def"), sbytes(db), sbytes(t), sbytes("BASE TABLE")]
+                })
+                .collect(),
+        ),
+        ("information_schema", "columns") => {
+            let cols = vec![
+                "table_catalog",
+                "table_schema",
+                "table_name",
+                "column_name",
+                "ordinal_position",
+                "is_nullable",
+                "data_type",
+                "column_default",
+            ];
+            let mut rows = Vec::new();
+            for (t, sc) in entries {
+                for (i, c) in sc.columns.iter().enumerate() {
+                    rows.push(vec![
+                        sbytes("def"),
+                        sbytes(db),
+                        sbytes(t),
+                        sbytes(&c.name),
+                        sbytes(&(i + 1).to_string()),
+                        sbytes(if c.nullable { "YES" } else { "NO" }),
+                        sbytes(coltype_sql_name(c.ty)),
+                        ColValue::Null,
+                    ]);
+                }
+            }
+            (cols, rows)
+        }
+        ("information_schema", "key_column_usage") => {
+            let cols = vec![
+                "table_schema",
+                "table_name",
+                "column_name",
+                "constraint_name",
+                "ordinal_position",
+            ];
+            let mut rows = Vec::new();
+            for (t, sc) in entries {
+                // pk
+                let pkc = &sc.columns[sc.pk_col as usize].name;
+                rows.push(vec![
+                    sbytes(db),
+                    sbytes(t),
+                    sbytes(pkc),
+                    sbytes("PRIMARY"),
+                    sbytes("1"),
+                ]);
+                // unique 索引
+                for idx in sc.indexes.iter().filter(|i| i.unique) {
+                    let cn = &sc.columns[idx.col as usize].name;
+                    rows.push(vec![
+                        sbytes(db),
+                        sbytes(t),
+                        sbytes(cn),
+                        sbytes(&format!("uniq_{cn}")),
+                        sbytes("1"),
+                    ]);
+                }
+            }
+            (cols, rows)
+        }
+        ("pg_catalog", "pg_class") => (
+            vec!["relname", "relkind", "oid"],
+            entries
+                .iter()
+                .enumerate()
+                .map(|(i, (t, _))| {
+                    vec![sbytes(t), sbytes("r"), sbytes(&(i as u32 + 1).to_string())]
+                })
+                .collect(),
+        ),
+        ("pg_catalog", "pg_attribute") => {
+            let cols = vec!["attrelid", "attname", "attnum", "attnotnull"];
+            let mut rows = Vec::new();
+            for (ri, (_, sc)) in entries.iter().enumerate() {
+                for (i, c) in sc.columns.iter().enumerate() {
+                    rows.push(vec![
+                        sbytes(&(ri as u32 + 1).to_string()),
+                        sbytes(&c.name),
+                        sbytes(&(i + 1).to_string()),
+                        sbytes(if c.nullable { "f" } else { "t" }),
+                    ]);
+                }
+            }
+            (cols, rows)
+        }
+        // 未知系统表 → 空结果 (工具探测容错)
+        _ => (vec!["unknown"], vec![]),
+    };
+    sysq_finish(proto, binary, spec, &all_cols, rows)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sql_run_dml(
     conn: &mut ConnState,
@@ -3856,6 +5304,18 @@ fn sql_run_dml(
             // ⭐ 事务 v1 (F61): 事务中 INSERT 截流进 write_set (喂 bloom
             // 照旧 — rollback 只多假阳性), 立即回 OK, commit 时原子应用
             if conn.txn.is_some() {
+                // ⭐ F65 v1 边界: 全局唯一表不支持事务内写 (占坑需在 commit 编排,
+                // 未实现; 拒绝而非静默破坏全局唯一性)
+                if schema.indexes.iter().any(|i| i.unique && i.global) {
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(
+                            conn.proto,
+                            "INSERT into GLOBAL UNIQUE table inside a transaction not supported (v1); use autocommit",
+                        ),
+                    );
+                    return;
+                }
                 let n = ops.len() as u64;
                 for op in ops {
                     let sid = hash_route_op(&op, num_shards);
@@ -3877,6 +5337,39 @@ fn sql_run_dml(
                     drop_key: None,
                 },
             );
+            // ⭐ F65: 含全局唯一列且单行 autocommit → 走占坑编排
+            let has_gu = schema.indexes.iter().any(|i| i.unique && i.global);
+            if has_gu {
+                if ops.len() != 1 {
+                    conn.sql_dml_agg.remove(&seq);
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(
+                            conn.proto,
+                            "multi-row INSERT into GLOBAL UNIQUE table not supported (v1)",
+                        ),
+                    );
+                    return;
+                }
+                conn.sql_dml_agg.remove(&seq); // 占坑编排自己管回复
+                let BatchOp::RowPut { pk, values, .. } = ops.into_iter().next().unwrap() else {
+                    unreachable!()
+                };
+                // 喂 bloom (与普通路径一致)
+                let probe = BatchOp::RowPut {
+                    db: db.clone(),
+                    table: std::sync::Arc::from(table.as_str()),
+                    pk: pk.clone(),
+                    values: values.clone(),
+                };
+                let sid = hash_route_op(&probe, num_shards);
+                feed_route_bloom(conn, db, &table, &schema, &probe, sid);
+                sql_unique_ins_start(
+                    conn, conn_id, seq, worker_id, db, shard_inboxes, num_shards, schema, table,
+                    pk, values,
+                );
+                return;
+            }
             for op in ops {
                 // ⭐ W2 → ORM-B2: created_here 的表 → 喂进程级路由缓存
                 // (value → 所在 shard; bloom 原子只增, 多 worker/门面并发安全)
@@ -3904,6 +5397,18 @@ fn sql_run_dml(
                             conn.resp_complete(
                                 seq,
                                 sql_err_bytes(conn.proto, "cannot UPDATE PRIMARY KEY column"),
+                            );
+                            return;
+                        }
+                        // ⭐ F65 v1 边界: 不支持 UPDATE 全局唯一列 (需輁坑; 未实现)
+                        if schema.indexes.iter().any(|idx| idx.col == i && idx.unique && idx.global)
+                        {
+                            conn.resp_complete(
+                                seq,
+                                sql_err_bytes(
+                                    conn.proto,
+                                    "UPDATE of GLOBAL UNIQUE column not supported (v1); DELETE + INSERT instead",
+                                ),
                             );
                             return;
                         }
@@ -3969,6 +5474,7 @@ fn sql_run_dml(
                             order: Vec::new(),
                             offset: 0,
                             count: false,
+                            agg_spec: None,
                         },
                     );
                     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -4007,6 +5513,7 @@ fn sql_run_dml(
                             order: Vec::new(),
                             offset: 0,
                             count: false,
+                            agg_spec: None,
                         },
                     );
                     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -4023,7 +5530,33 @@ fn sql_run_dml(
                 }
             }
         }
-        SqlStmt::Select { table, cols, conds, limit, order, offset, count } => {
+        SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having } => {
+            // ⭐ G1/G2 (F63): 投影分型 — 纯列 / COUNT(*) 特例 (旧路径) /
+            // 广义聚合 (分桶完成点)
+            let has_agg = items.iter().any(|i| matches!(i, sql::SelectItem::Agg { .. }));
+            let count = has_agg
+                && items.len() == 1
+                && group_by.is_empty()
+                && having.is_empty()
+                && order.is_empty()
+                && matches!(
+                    items[0],
+                    sql::SelectItem::Agg { func: sql::AggFn::Count, col: None }
+                );
+            if (has_agg || !group_by.is_empty()) && !count {
+                sql_run_agg_select(
+                    conn, conn_id, seq, worker_id, db, shard_inboxes, num_shards, schema,
+                    table, items, conds, group_by, having, order, limit, offset,
+                );
+                return;
+            }
+            let cols: Vec<String> = items
+                .iter()
+                .filter_map(|i| match i {
+                    sql::SelectItem::Col(c) => Some(c.clone()),
+                    sql::SelectItem::Agg { .. } => None, // 仅 COUNT(*) 特例可达
+                })
+                .collect();
             // ⭐ O1: 投影列名 → 列号 (空/COUNT = 全列)
             let proj: Vec<u16> = if cols.is_empty() {
                 (0..schema.columns.len() as u16).collect()
@@ -4066,11 +5599,11 @@ fn sql_run_dml(
                 // 读已提交版本 — v1 文档化)
                 if let Some(txn) = conn.txn.as_ref() {
                     let tkey = (db.to_string(), table.clone(), pk.clone());
-                    if let Some(&i) = txn.index.get(&tkey) {
-                        let bin = conn.mysql_binary.remove(&seq);
-                        let bytes = match &txn.ops[i] {
-                            BatchOp::RowPut { values, .. } => {
-                                if sql_eval_conds(&schema, values, &conds) {
+                    match resolve_ryow(txn, &tkey) {
+                        Some(RyowState::Resolved(state)) => {
+                            let bin = conn.mysql_binary.remove(&seq);
+                            let bytes = match state {
+                                Some(values) if sql_eval_conds(&schema, &values, &conds) => {
                                     if count {
                                         render_sql_count(conn.proto, bin, 1)
                                     } else {
@@ -4079,47 +5612,45 @@ fn sql_run_dml(
                                             bin,
                                             &schema,
                                             &proj,
-                                            std::slice::from_ref(values),
+                                            std::slice::from_ref(&values),
                                         )
                                     }
-                                } else if count {
-                                    render_sql_count(conn.proto, bin, 0)
-                                } else {
-                                    render_sql_rows(conn.proto, bin, &schema, &proj, &[])
                                 }
-                            }
-                            BatchOp::RowDelete { .. } => {
-                                if count {
-                                    render_sql_count(conn.proto, bin, 0)
-                                } else {
-                                    render_sql_rows(conn.proto, bin, &schema, &proj, &[])
-                                }
-                            }
-                            // RowUpdate 等: 直通读盘 (不在此臂处理)
-                            _ => {
-                                let read_key = sql_read_key(conn, db, &table, &pk);
-                                conn.sql_row_ctx.insert(
-                                    seq,
-                                    SqlRowCtx { schema, conds, proj, count, read_key },
-                                );
-                                let op = BatchOp::RowGet {
-                                    db: db.clone(),
-                                    table: std::sync::Arc::from(table.as_str()),
-                                    pk,
-                                };
-                                push_task(
-                                    conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards,
-                                );
-                                return;
-                            }
-                        };
-                        conn.resp_complete(seq, bytes);
-                        return;
+                                _ if count => render_sql_count(conn.proto, bin, 0),
+                                _ => render_sql_rows(conn.proto, bin, &schema, &proj, &[]),
+                            };
+                            conn.resp_complete(seq, bytes);
+                            return;
+                        }
+                        Some(RyowState::NeedBase(overlay)) => {
+                            let read_key = sql_read_key(conn, db, &table, &pk);
+                            conn.sql_row_ctx.insert(
+                                seq,
+                                SqlRowCtx {
+                                    schema,
+                                    conds,
+                                    proj,
+                                    count,
+                                    read_key,
+                                    ryow_overlay: overlay,
+                                },
+                            );
+                            let op = BatchOp::RowGet {
+                                db: db.clone(),
+                                table: std::sync::Arc::from(table.as_str()),
+                                pk,
+                            };
+                            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+                            return;
+                        }
+                        None => {}
                     }
                 }
                 let read_key = sql_read_key(conn, db, &table, &pk);
-                conn.sql_row_ctx
-                    .insert(seq, SqlRowCtx { schema, conds, proj, count, read_key });
+                conn.sql_row_ctx.insert(
+                    seq,
+                    SqlRowCtx { schema, conds, proj, count, read_key, ryow_overlay: Vec::new() },
+                );
                 let op = BatchOp::RowGet {
                     db: db.clone(),
                     table: std::sync::Arc::from(table.as_str()),
@@ -4153,6 +5684,7 @@ fn sql_run_dml(
                         order: order_cols,
                         offset,
                         count,
+                        agg_spec: None,
                     },
                 );
                 let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -4249,6 +5781,7 @@ fn sql_run_dml(
                         order: order_cols,
                         offset,
                         count,
+                        agg_spec: None,
                     },
                 );
                 let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -4278,7 +5811,13 @@ fn sql_run_dml(
         | SqlStmt::Release { .. } => {
             unreachable!("事务语句在 sql_dispatch_stmt 处理")
         }
-        SqlStmt::Use { .. } | SqlStmt::SetStub | SqlStmt::VersionStub | SqlStmt::DatabaseStub => {
+        SqlStmt::Use { .. }
+        | SqlStmt::SetStub
+        | SqlStmt::VersionStub
+        | SqlStmt::DatabaseStub
+        | SqlStmt::SystemQuery { .. }
+        | SqlStmt::SystemVarStub { .. }
+        | SqlStmt::SelectJoin { .. } => {
             unreachable!("工具命令在 sql_dispatch_stmt 处理")
         }
         // ⭐ S3: DESCRIBE — schema 本地渲染 (Field/Type/Null/Key)
@@ -4767,6 +6306,434 @@ fn render_sql_count(proto: ProtocolKind, binary: bool, n: u64) -> Vec<u8> {
     )
 }
 
+/// ⭐ G2 (F63): 广义聚合 SELECT — 列名解析/类型校验/计划构建后广播
+/// (索引可用时 IndexScan, 否则 TableScan; PkGet 也降级广播 — 聚合需全量行,
+/// 单行情形低频可接受).
+#[allow(clippy::too_many_arguments)]
+fn sql_run_agg_select(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    db: &std::sync::Arc<str>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    schema: std::sync::Arc<TableSchema>,
+    table: String,
+    items: Vec<sql::SelectItem>,
+    conds: Vec<Cond>,
+    group_by: Vec<String>,
+    having: Vec<Cond>,
+    order: Vec<(String, bool)>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) {
+    let fail = |conn: &mut ConnState, msg: String| {
+        conn.resp_complete(seq, sql_err_bytes(conn.proto, &msg));
+    };
+    // 输出项解析 (列号 + label + 输出类型)
+    let mut spec_items: Vec<AggItem> = Vec::with_capacity(items.len());
+    for it in &items {
+        match it {
+            sql::SelectItem::Col(c) => {
+                let Some(i) = schema.col_by_name(c) else {
+                    return fail(conn, format!("unknown column '{c}'"));
+                };
+                spec_items.push(AggItem {
+                    label: c.clone(),
+                    kind: AggItemKind::Col(i),
+                    out_ty: schema.columns[i as usize].ty,
+                });
+            }
+            sql::SelectItem::Agg { func, col } => {
+                let ci = match col {
+                    Some(c) => match schema.col_by_name(c) {
+                        Some(i) => Some(i),
+                        None => return fail(conn, format!("unknown column '{c}'")),
+                    },
+                    None => None,
+                };
+                let src_ty = ci.map(|i| schema.columns[i as usize].ty);
+                // SUM/AVG 仅数值列
+                if matches!(func, sql::AggFn::Sum | sql::AggFn::Avg)
+                    && !matches!(src_ty, Some(ColType::I64) | Some(ColType::F64))
+                {
+                    return fail(
+                        conn,
+                        format!("{} requires a numeric column", func.label(col.as_deref())),
+                    );
+                }
+                let out_ty = match func {
+                    sql::AggFn::Count => ColType::I64,
+                    sql::AggFn::Sum => src_ty.unwrap_or(ColType::I64),
+                    sql::AggFn::Avg => ColType::F64,
+                    sql::AggFn::Min | sql::AggFn::Max => src_ty.unwrap_or(ColType::Bytes),
+                };
+                spec_items.push(AggItem {
+                    label: func.label(col.as_deref()),
+                    kind: AggItemKind::Agg { func: *func, col: ci },
+                    out_ty,
+                });
+            }
+        }
+    }
+    // 组键列号
+    let mut group_idx: Vec<u16> = Vec::with_capacity(group_by.len());
+    for g in &group_by {
+        match schema.col_by_name(g) {
+            Some(i) => group_idx.push(i),
+            None => return fail(conn, format!("unknown column '{g}'")),
+        }
+    }
+    // 输出列定位 helper: label 大小写归一匹配
+    let find_out = |name: &str| -> Option<usize> {
+        spec_items.iter().position(|it| it.label.eq_ignore_ascii_case(name))
+    };
+    // HAVING → (输出下标, op, val)
+    let mut having_out = Vec::with_capacity(having.len());
+    for h in having {
+        let Some(idx) = find_out(&h.col) else {
+            return fail(
+                conn,
+                format!("HAVING column '{}' must appear in the select list", h.col),
+            );
+        };
+        having_out.push((idx, h.op, h.val));
+    }
+    // ORDER BY → (输出下标, desc)
+    let mut order_out = Vec::with_capacity(order.len());
+    for (name, desc) in &order {
+        let Some(idx) = find_out(name) else {
+            return fail(
+                conn,
+                format!("ORDER BY column '{name}' must appear in the select list"),
+            );
+        };
+        order_out.push((idx, *desc));
+    }
+    let spec = AggSpec { items: spec_items, group_idx, having: having_out, order: order_out };
+    // 广播: 索引计划可用则 IndexScan (界下推), 否则 TableScan (含 PkGet 降级)
+    let plan = sql_plan_select(&schema, &conds);
+    conn.sql_select_agg.insert(
+        seq,
+        SqlSelectAgg {
+            remaining: num_shards,
+            error: None,
+            rows: Vec::new(),
+            schema: schema.clone(),
+            conds,
+            limit,
+            proj: Vec::new(),
+            cover: None,
+            unique_early: false, // 聚合需全量, 禁早停
+            done: false,
+            dml: None,
+            dml_target: None,
+            order: Vec::new(), // 排序在 agg_spec.order (输出列域)
+            offset: offset.unwrap_or(0),
+            count: false,
+            agg_spec: Some(spec),
+        },
+    );
+    let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+    for sid in 0..num_shards {
+        let op = match &plan {
+            Ok(SqlPlan::Index { iid, lo, hi, .. }) => BatchOp::IndexScan {
+                db: db.clone(),
+                table: table_arc.clone(),
+                iid: *iid,
+                lo: lo.clone(),
+                hi: hi.clone(),
+                limit: 0,
+                with_rows: true,
+            },
+            _ => BatchOp::TableScan { db: db.clone(), table: table_arc.clone(), limit: 0 },
+        };
+        push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+    }
+}
+
+/// ⭐ G2 (F63): 聚合计划 — dispatch 时列名已解析为列号/输出下标.
+struct AggSpec {
+    /// 输出列序 (label 供列头与 HAVING/ORDER 匹配).
+    items: Vec<AggItem>,
+    /// 组键列号 (空 = 全表单桶).
+    group_idx: Vec<u16>,
+    /// HAVING: (输出列下标, 算子, 右值).
+    having: Vec<(usize, sql::CmpOp, sql::SqlValue)>,
+    /// ORDER BY: (输出列下标, desc).
+    order: Vec<(usize, bool)>,
+}
+
+struct AggItem {
+    label: String,
+    kind: AggItemKind,
+    out_ty: ColType,
+}
+
+enum AggItemKind {
+    /// 组键列直出 (必 ∈ group_by, 解析层已校验).
+    Col(u16),
+    Agg { func: sql::AggFn, col: Option<u16> },
+}
+
+/// ⭐ G2 (F63): 聚合累加器 (NULL 忽略, COUNT(*) 除外; SUM 整列溢出报错).
+enum Accum {
+    CountStar(u64),
+    CountCol(u64),
+    SumI { acc: i64, seen: bool },
+    SumF { acc: f64, seen: bool },
+    Avg { sum: f64, n: u64 },
+    Min(Option<ColValue>),
+    Max(Option<ColValue>),
+}
+
+impl Accum {
+    fn new(func: sql::AggFn, col: Option<u16>, col_ty: Option<ColType>) -> Self {
+        match func {
+            sql::AggFn::Count if col.is_none() => Accum::CountStar(0),
+            sql::AggFn::Count => Accum::CountCol(0),
+            sql::AggFn::Sum => match col_ty {
+                Some(ColType::F64) => Accum::SumF { acc: 0.0, seen: false },
+                _ => Accum::SumI { acc: 0, seen: false },
+            },
+            sql::AggFn::Avg => Accum::Avg { sum: 0.0, n: 0 },
+            sql::AggFn::Min => Accum::Min(None),
+            sql::AggFn::Max => Accum::Max(None),
+        }
+    }
+
+    fn feed(&mut self, v: &ColValue) -> Result<(), String> {
+        match self {
+            Accum::CountStar(n) => *n += 1,
+            Accum::CountCol(n) => {
+                if !matches!(v, ColValue::Null) {
+                    *n += 1;
+                }
+            }
+            Accum::SumI { acc, seen } => match v {
+                ColValue::I64(x) => {
+                    *acc = acc.checked_add(*x).ok_or("SUM overflow (BIGINT)")?;
+                    *seen = true;
+                }
+                ColValue::Null => {}
+                _ => return Err("SUM requires a numeric column".into()),
+            },
+            Accum::SumF { acc, seen } => match v {
+                ColValue::F64(x) => {
+                    *acc += x;
+                    *seen = true;
+                }
+                ColValue::I64(x) => {
+                    *acc += *x as f64;
+                    *seen = true;
+                }
+                ColValue::Null => {}
+                _ => return Err("SUM requires a numeric column".into()),
+            },
+            Accum::Avg { sum, n } => match v {
+                ColValue::F64(x) => {
+                    *sum += x;
+                    *n += 1;
+                }
+                ColValue::I64(x) => {
+                    *sum += *x as f64;
+                    *n += 1;
+                }
+                ColValue::Null => {}
+                _ => return Err("AVG requires a numeric column".into()),
+            },
+            Accum::Min(cur) => {
+                if !matches!(v, ColValue::Null)
+                    && cur.as_ref().is_none_or(|c| cmp_colvalue(v, c).is_lt())
+                {
+                    *cur = Some(v.clone());
+                }
+            }
+            Accum::Max(cur) => {
+                if !matches!(v, ColValue::Null)
+                    && cur.as_ref().is_none_or(|c| cmp_colvalue(v, c).is_gt())
+                {
+                    *cur = Some(v.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> ColValue {
+        match self {
+            Accum::CountStar(n) | Accum::CountCol(n) => ColValue::I64(n as i64),
+            // SUM 空集 → NULL (SQL 语义)
+            Accum::SumI { seen: false, .. } | Accum::SumF { seen: false, .. } => ColValue::Null,
+            Accum::SumI { acc, .. } => ColValue::I64(acc),
+            Accum::SumF { acc, .. } => ColValue::F64(acc),
+            Accum::Avg { n: 0, .. } => ColValue::Null,
+            Accum::Avg { sum, n } => ColValue::F64(sum / n as f64),
+            Accum::Min(v) | Accum::Max(v) => v.unwrap_or(ColValue::Null),
+        }
+    }
+}
+
+/// 同型 ColValue 全序比较 (Null 最小; 异型按枚举序 — 同列值不会异型).
+fn cmp_colvalue(a: &ColValue, b: &ColValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a, b) {
+        (ColValue::Null, ColValue::Null) => Equal,
+        (ColValue::Null, _) => Less,
+        (_, ColValue::Null) => Greater,
+        (ColValue::I64(x), ColValue::I64(y)) => x.cmp(y),
+        (ColValue::F64(x), ColValue::F64(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        (ColValue::I64(x), ColValue::F64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
+        (ColValue::F64(x), ColValue::I64(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
+        (ColValue::Bytes(x), ColValue::Bytes(y)) => x.cmp(y),
+        (ColValue::I64(_) | ColValue::F64(_), ColValue::Bytes(_)) => Less,
+        (ColValue::Bytes(_), ColValue::I64(_) | ColValue::F64(_)) => Greater,
+    }
+}
+
+/// 分桶数上限 (防内存失控).
+const AGG_MAX_GROUPS: usize = 64 * 1024;
+
+/// ⭐ G2 (F63): 分桶聚合完成点 — 已过滤行 → 分桶 → 累加 → HAVING →
+/// ORDER → OFFSET/LIMIT → 合成结果集 (sql_rows_bytes 三门面统一).
+fn render_agg_groups(
+    proto: ProtocolKind,
+    binary: bool,
+    spec: &AggSpec,
+    rows: Vec<Vec<ColValue>>,
+    offset: u32,
+    limit: Option<u32>,
+) -> Vec<u8> {
+    // 分桶: 组键 = 各列保序编码级联 (NULL 归一组, 0x00 标记); BTreeMap =
+    // 无 ORDER BY 时输出按组键序 (确定性)
+    let mut buckets: std::collections::BTreeMap<Vec<u8>, (Vec<ColValue>, Vec<Accum>)> =
+        std::collections::BTreeMap::new();
+    let new_accums = |first_row: &[ColValue]| -> Vec<Accum> {
+        let _ = first_row;
+        spec.items
+            .iter()
+            .map(|it| match &it.kind {
+                AggItemKind::Col(_) => Accum::CountStar(0), // 占位不用 (代表值直出)
+                AggItemKind::Agg { func, col } => {
+                    Accum::new(*func, *col, if it.out_ty == ColType::F64 {
+                        Some(ColType::F64)
+                    } else {
+                        Some(ColType::I64)
+                    })
+                }
+            })
+            .collect()
+    };
+    // 无 group_by = 全表单桶 (空表也输出一行 — PG 语义)
+    if spec.group_idx.is_empty() {
+        buckets.insert(Vec::new(), (Vec::new(), new_accums(&[])));
+    }
+    for values in &rows {
+        let mut key = Vec::new();
+        for &gi in &spec.group_idx {
+            // 自包含类型标记编码 (只求相等性 + 确定序; 代表值另存)
+            match &values[gi as usize] {
+                ColValue::Null => key.push(0u8), // NULL 归一组
+                ColValue::I64(x) => {
+                    key.push(1u8);
+                    key.extend_from_slice(&((*x as u64) ^ (1u64 << 63)).to_be_bytes());
+                }
+                ColValue::F64(x) => {
+                    key.push(2u8);
+                    key.extend_from_slice(&x.to_bits().to_be_bytes());
+                }
+                ColValue::Bytes(b) => {
+                    key.push(3u8);
+                    key.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                    key.extend_from_slice(b);
+                }
+            }
+        }
+        if !buckets.contains_key(&key) && buckets.len() >= AGG_MAX_GROUPS {
+            return sql_err_bytes(proto, "too many groups (limit 65536)");
+        }
+        let entry = buckets
+            .entry(key)
+            .or_insert_with(|| (values.clone(), new_accums(values)));
+        for (it, acc) in spec.items.iter().zip(entry.1.iter_mut()) {
+            if let AggItemKind::Agg { col, .. } = &it.kind {
+                let v = match col {
+                    Some(ci) => &values[*ci as usize],
+                    None => &ColValue::I64(1), // COUNT(*) 任意非 Null
+                };
+                if let Err(e) = acc.feed(v) {
+                    return sql_err_bytes(proto, &e);
+                }
+            }
+        }
+    }
+    // 桶 → 输出行
+    let mut out: Vec<Vec<ColValue>> = Vec::with_capacity(buckets.len());
+    for (_, (rep, accums)) in buckets {
+        let mut row = Vec::with_capacity(spec.items.len());
+        let mut accums = accums.into_iter();
+        for it in &spec.items {
+            match &it.kind {
+                AggItemKind::Col(ci) => {
+                    accums.next(); // 跳过占位累加器
+                    row.push(rep.get(*ci as usize).cloned().unwrap_or(ColValue::Null));
+                }
+                AggItemKind::Agg { .. } => {
+                    row.push(accums.next().expect("accum 与 items 同长").finish());
+                }
+            }
+        }
+        out.push(row);
+    }
+    // HAVING (输出列比较)
+    out.retain(|row| {
+        spec.having.iter().all(|(idx, op, val)| {
+            let rhs = match val {
+                sql::SqlValue::Int(x) => ColValue::I64(*x),
+                sql::SqlValue::Float(x) => ColValue::F64(*x),
+                sql::SqlValue::Str(s) => ColValue::Bytes(s.clone()),
+                _ => return false,
+            };
+            let ord = cmp_colvalue(&row[*idx], &rhs);
+            if matches!(row[*idx], ColValue::Null) {
+                return false; // NULL 不满足任何比较 (SQL 语义)
+            }
+            match op {
+                sql::CmpOp::Eq => ord.is_eq(),
+                sql::CmpOp::Ne => ord.is_ne(),
+                sql::CmpOp::Gt => ord.is_gt(),
+                sql::CmpOp::Ge => ord.is_ge(),
+                sql::CmpOp::Lt => ord.is_lt(),
+                sql::CmpOp::Le => ord.is_le(),
+                sql::CmpOp::In => false, // HAVING 不支持 IN (解析层已拦)
+            }
+        })
+    });
+    // ORDER BY 输出列
+    if !spec.order.is_empty() {
+        out.sort_by(|a, b| {
+            for (idx, desc) in &spec.order {
+                let ord = cmp_colvalue(&a[*idx], &b[*idx]);
+                if !ord.is_eq() {
+                    return if *desc { ord.reverse() } else { ord };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+    // OFFSET / LIMIT
+    let start = (offset as usize).min(out.len());
+    let end = match limit {
+        Some(l) => (start + l as usize).min(out.len()),
+        None => out.len(),
+    };
+    // 合成结果集 (render_sql_count 同源路径, 三门面统一)
+    let cols: Vec<(&str, ColType)> =
+        spec.items.iter().map(|it| (it.label.as_str(), it.out_ty)).collect();
+    sql_rows_bytes(proto, binary, &cols, &out[start..end])
+}
+
 /// SELECT 聚合完成渲染: (val, pk) 排序 → 覆盖重建或 decode → 残余过滤
 /// → ⭐ S2: ORDER BY → OFFSET → LIMIT → 投影/COUNT 结果集.
 /// (⭐ O3: 早停时提前调用, agg.rows 取走清空)
@@ -4777,8 +6744,9 @@ fn render_select_agg(proto: ProtocolKind, binary: bool, agg: &mut SqlSelectAgg) 
     // 全局序: (索引值, pk); 残余过滤全条件 (下推界是超集, 过滤幂等)
     let mut rows = std::mem::take(&mut agg.rows);
     rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    // 提前截断仅当: 非 COUNT 且无 ORDER BY (排序需全量; 截断额 = offset+limit)
-    let early_cut: Option<usize> = if agg.count || !agg.order.is_empty() {
+    // 提前截断仅当: 非 COUNT/聚合 且无 ORDER BY (排序/聚合需全量)
+    let early_cut: Option<usize> = if agg.count || !agg.order.is_empty() || agg.agg_spec.is_some()
+    {
         None
     } else {
         agg.limit.map(|l| (l + agg.offset) as usize)
@@ -4823,6 +6791,10 @@ fn render_select_agg(proto: ProtocolKind, binary: bool, agg: &mut SqlSelectAgg) 
     }
     if let Some(e) = err {
         return sql_err_bytes(proto, &e);
+    }
+    // ⭐ G2 (F63): 广义聚合 — 已过滤行交给分桶聚合完成点
+    if let Some(spec) = agg.agg_spec.take() {
+        return render_agg_groups(proto, binary, &spec, out_rows, agg.offset, agg.limit);
     }
     // ⭐ S2: COUNT(*) — 计数不受 ORDER/OFFSET/LIMIT 影响
     if agg.count {
@@ -5627,6 +7599,8 @@ fn conn_default(default_db: &std::sync::Arc<str>) -> std::sync::Arc<str> {
 fn mysql_err_packet(msg: &str) -> Vec<u8> {
     let code = if msg.contains("unknown column") {
         1054
+    } else if msg.contains("duplicate key") {
+        1062 // ER_DUP_ENTRY — UNIQUE 冲突 (ORM 据此识别 IntegrityError)
     } else if msg.contains("serialization failure") {
         1213 // MySQL deadlock/serialization 惯用重试码
     } else if msg.contains("read-only transaction") {

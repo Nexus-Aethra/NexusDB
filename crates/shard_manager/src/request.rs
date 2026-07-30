@@ -152,6 +152,9 @@ pub enum ShardRequest {
     },
 }
 
+/// ⭐ F67 (JOIN): 下推谓词类型定义在 storage (避分层反向), 此处 re-export.
+pub use storage::sql_rows::{PredOp, ScanPred};
+
 /// 单个 batch 操作 (不带 reply, batch 整体回复).
 ///
 /// ⭐ 热路径优化: db/table 用 `Arc<str>` — worker 每 op 仅引用计数,
@@ -292,12 +295,61 @@ pub enum BatchOp {
     /// ⭐ S2: 广播 op — 全表扫 (`[S]` 前缀收 TAG_ROW 行, 跳过纯 KV 行).
     /// 回 Rows ((空 val, pk, row)); limit 每 shard 本地生效 (0 = 不限).
     TableScan { db: std::sync::Arc<str>, table: std::sync::Arc<str>, limit: u32 },
+    /// ⭐ F67 (JOIN): 广播 op — 带谓词+投影下推的全表扫. shard 本地
+    /// decode 行 → preds AND 过滤 (NULL 恒 false) → 按 proj 取列 → 回 ProjRows.
+    /// 与 TableScan 同路广播; proj 空 = 不取列 (仅计数形态, 本版不用).
+    ScanFiltered {
+        db: std::sync::Arc<str>,
+        table: std::sync::Arc<str>,
+        preds: Vec<ScanPred>,
+        proj: Vec<u16>,
+        limit: u32,
+    },
     /// ⭐ 事务 v1 (F61): COMMIT 原子批 — worker 把 conn 层 write_set 按 shard
     /// 分组后每 shard 一个; shard 单线程保证批内无并发穿插 (先验后写 +
     /// wal_barrier 后回复). 组内 op 同 shard (worker 路由保证).
     /// ⭐ v2 (F62): read_set = OCC backward validation 输入 (SERIALIZABLE 档
     /// 事务内读过的行指纹, 预检阶段重读比对, 变了回 40001).
     TxnApply { ops: Vec<BatchOp>, read_set: Vec<ReadCheck> },
+    /// ⭐ F65: 全局 UNIQUE 占坑 — 路由键 = enc_val (落 email-shard).
+    /// 回 ReserveOk / ReserveConflict{state, holder_txn, holder_pk}.
+    ReserveUnique {
+        db: std::sync::Arc<str>,
+        table: std::sync::Arc<str>,
+        iid: u32,
+        enc_val: Vec<u8>,
+        pk: Vec<u8>,
+        txn_id: u64,
+    },
+    /// ⭐ F65: 强制抢占 (worker 回查确认 stale 后).
+    StealUnique {
+        db: std::sync::Arc<str>,
+        table: std::sync::Arc<str>,
+        iid: u32,
+        enc_val: Vec<u8>,
+        pk: Vec<u8>,
+        txn_id: u64,
+    },
+    /// ⭐ F65: PENDING→COMMITTED (写行成功后).
+    ConfirmUnique {
+        db: std::sync::Arc<str>,
+        table: std::sync::Arc<str>,
+        iid: u32,
+        enc_val: Vec<u8>,
+        pk: Vec<u8>,
+        txn_id: u64,
+    },
+    /// ⭐ F65: 删坑 (abort / DELETE 清坑; txn_id=0 无条件删).
+    ReleaseUnique {
+        db: std::sync::Arc<str>,
+        table: std::sync::Arc<str>,
+        iid: u32,
+        enc_val: Vec<u8>,
+        txn_id: u64,
+    },
+    /// ⭐ F66: catalog 快照 — 列一个 db 的全部表名 + schema 字节 (任意单 shard,
+    /// schema 每 shard 全副本). 回 Catalog(Vec<(table, schema_bytes)>).
+    CatalogDump { db: std::sync::Arc<str> },
     /// ⭐ 广播 op: caller 对**每个 shard** 各发一份 (不走 hash 路由),
     /// shard 内闭环 "本地索引扫 → 本地回表", 回 Rows; 界为闭区间,
     /// limit 每 shard 本地生效 (0 = 不限), 聚合方归并后截断.
@@ -384,9 +436,20 @@ impl BatchOp {
             IndexScan { db, table, .. } | DropTableOp { db, table } | TableScan { db, table, .. } => {
                 (db.as_ref(), table.as_ref(), &[])
             }
+            // ⭐ F67 (JOIN): 广播 op, 不走 locator 路由 (兵底空 key)
+            ScanFiltered { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ 事务批: 取第一个 op 的 locator (组内同 shard, 仅兼容用;
             // ensure_table 在 shard 端逐 op 处理)
             TxnApply { ops, .. } => ops.first().map(|o| o.locator()).unwrap_or(("", "", &[])),
+            // ⭐ F65: 占坑 op 按 enc_val 路由到 email-shard (与 pk 路由独立)
+            ReserveUnique { db, table, enc_val, .. }
+            | StealUnique { db, table, enc_val, .. }
+            | ConfirmUnique { db, table, enc_val, .. }
+            | ReleaseUnique { db, table, enc_val, .. } => {
+                (db.as_ref(), table.as_ref(), enc_val.as_slice())
+            }
+            // ⭐ F66: catalog dump 任意单 shard (空 key 路由)
+            CatalogDump { db } => (db.as_ref(), "", &[]),
             SetSchemaOp { db, table, .. } | GetSchemaOp { db, table } => {
                 (db.as_ref(), table.as_ref(), &[])
             }
@@ -464,9 +527,15 @@ impl BatchOp {
             // ⭐ Q5: SQL row op 的 pk 是二进制主键, 不参与 RESP 冒号选表
             RowPut { .. } | RowGet { .. } | RowDelete { .. } | RowUpdate { .. }
             | IndexScan { .. } | DropTableOp { .. } | TableScan { .. } => None,
+            ScanFiltered { .. } => None,
             // ⭐ X2: schema op 无 key
             SetSchemaOp { .. } | GetSchemaOp { .. } => None,
             TxnApply { .. } => None,
+            ReserveUnique { .. }
+            | StealUnique { .. }
+            | ConfirmUnique { .. }
+            | ReleaseUnique { .. } => None,
+            CatalogDump { .. } => None,
         }
     }
 }
@@ -516,6 +585,14 @@ pub enum BatchResult {
     Rows(Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>),
     /// ⭐ 事务 v1 (F61): TxnApply 完成 (应用的 op 数).
     TxnApplied(u64),
+    /// ⭐ F65: 占坑成功 (写入 PENDING 或幂等重入).
+    ReserveOk,
+    /// ⭐ F65: 占坑冲突 — 现有坑 (state 1=PENDING/2=COMMITTED, 持有者 txn/pk).
+    ReserveConflict { state: u8, holder_txn: u64, holder_pk: Vec<u8> },
+    /// ⭐ F66: catalog 快照 — (table_name, schema_bytes) 列表.
+    Catalog(Vec<(String, Vec<u8>)>),
+    /// ⭐ F67 (JOIN): ScanFiltered 结果 — 只含投影列值的行 (省带宽, worker 免 decode).
+    ProjRows(Vec<Vec<storage::row::ColValue>>),
     Error(String),
 }
 

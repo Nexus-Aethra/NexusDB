@@ -47,17 +47,19 @@ impl StorageEngine {
         table: &str,
         key: &[u8],
     ) -> Result<Option<u8>, RegistryError> {
-        if self
-            .get_physical(db, table, &ks::encode_string(key))
-            .await?
-            .is_some()
-        {
-            return Ok(Some(ks::KIND_STRING));
-        }
-        Ok(self
+        // ⭐ O2: 先探 `[#]` meta (复合 op 大概率命中, 命中即返 —
+        // meta 与 String 行互斥不变量保证正确), miss 再探 String 行.
+        // 已存在复合 key 的类型检查 2 → 1 次点查.
+        if let Some(v) = self
             .get_physical(db, table, &ks::encode_type_meta(key))
             .await?
-            .and_then(|v| v.first().copied()))
+        {
+            return Ok(v.first().copied());
+        }
+        Ok(self
+            .get_physical(db, table, &ks::encode_string(key))
+            .await?
+            .map(|_| ks::KIND_STRING))
     }
 
     /// 复合 op 的 WRONGTYPE 判据: key 以其他类型存在 → Err(WrongType).
@@ -68,6 +70,11 @@ impl StorageEngine {
         key: &[u8],
         want: u8,
     ) -> Result<(), RegistryError> {
+        // ⭐ Q4 (SQL 索引): 有 schema 的表是 row 表, 复合命令一律 WRONGTYPE.
+        // get_schema 镜像缓存后为纯内存查表, 不增热路径点查.
+        if self.get_schema(db, table).await?.is_some() {
+            return Err(RegistryError::WrongType);
+        }
         match self.kind_of(db, table, key).await? {
             Some(k) if k != want => Err(RegistryError::WrongType),
             _ => Ok(()),
@@ -93,6 +100,7 @@ impl StorageEngine {
 
     /// HSET 多 field: 返回**新增** field 数 (Redis HSET 语义).
     /// value 已带 `[tag][payload]` (与 String 同约定, 溢出页自动).
+    /// ⭐ O2: 探在/写入批量化 (LeafGuide 区间复用, 多 field 摊薄树遍历).
     pub async fn hash_set(
         &mut self,
         db: &str,
@@ -101,21 +109,32 @@ impl StorageEngine {
         pairs: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<i64, RegistryError> {
         self.ensure_kind(db, table, key, ks::KIND_HASH).await?;
+        self.mark_composite(db, table); // ⭐ F49: 复合写入口打标
+        let fks: Vec<Vec<u8>> = pairs
+            .iter()
+            .map(|(f, _)| ks::encode_data(ks::KIND_HASH, key, f))
+            .collect();
+        let refs: Vec<&[u8]> = fks.iter().map(|k| k.as_slice()).collect();
+        let existing = self.get_physical_many(db, table, &refs).await?;
+        // 批内同 field 重复: 只有首次未在算新增 (后写覆盖前写)
+        let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
         let mut added = 0u64;
-        for (field, value) in pairs {
-            let fk = ks::encode_data(ks::KIND_HASH, key, field);
-            let existed = self.get_physical(db, table, &fk).await?.is_some();
-            self.put_physical(db, table, &fk, value).await?;
-            if !existed {
+        for (i, (f, _)) in pairs.iter().enumerate() {
+            if existing[i].is_none() && seen.insert(f.as_slice()) {
                 added += 1;
             }
         }
+        let mut writes: Vec<(Vec<u8>, &[u8])> = fks
+            .into_iter()
+            .zip(pairs.iter().map(|(_, v)| v.as_slice()))
+            .collect();
+        let meta_val;
         if added > 0 {
-            let mk = ks::encode_type_meta(key);
             let count = self.hash_meta(db, table, key).await?.unwrap_or(0);
-            self.put_physical(db, table, &mk, &enc_meta_val(ks::KIND_HASH, count + added))
-                .await?;
+            meta_val = enc_meta_val(ks::KIND_HASH, count + added);
+            writes.push((ks::encode_type_meta(key), &meta_val));
         }
+        self.put_physical_many(db, table, &writes).await?;
         Ok(added as i64)
     }
 
@@ -129,6 +148,7 @@ impl StorageEngine {
         value: &[u8],
     ) -> Result<i64, RegistryError> {
         self.ensure_kind(db, table, key, ks::KIND_HASH).await?;
+        self.mark_composite(db, table); // ⭐ F49
         let fk = ks::encode_data(ks::KIND_HASH, key, field);
         if self.get_physical(db, table, &fk).await?.is_some() {
             return Ok(0);
@@ -271,10 +291,13 @@ impl StorageEngine {
         if got.is_some() {
             return Ok(got);
         }
-        if self
-            .get_physical(db, table, &ks::encode_type_meta(key))
-            .await?
-            .is_some()
+        // ⭐ PERF (F49): 表内从未写过复合类型 → 不可能 WRONGTYPE, 跳过探测
+        // (纯 String 表的 GET miss 恢复零额外点查)
+        if self.has_composite(db, table)
+            && self
+                .get_physical(db, table, &ks::encode_type_meta(key))
+                .await?
+                .is_some()
         {
             return Err(RegistryError::WrongType);
         }
@@ -292,10 +315,14 @@ impl StorageEngine {
     ) -> Result<bool, RegistryError> {
         let s_existed = self.table_delete(db, table, key).await?;
         // 统一类型 meta: 1 次探测即知 kind, 命中则 purge 整个复合结构
-        let kind = self
-            .get_physical(db, table, &ks::encode_type_meta(key))
-            .await?
-            .and_then(|v| v.first().copied());
+        // ⭐ F49: 纯 String 表跳过探测 (零额外点查)
+        let kind = if self.has_composite(db, table) {
+            self.get_physical(db, table, &ks::encode_type_meta(key))
+                .await?
+                .and_then(|v| v.first().copied())
+        } else {
+            None
+        };
         if let Some(kind) = kind {
             self.purge_key_data(db, table, key, kind).await?;
             return Ok(true);
@@ -365,25 +392,35 @@ impl StorageEngine {
         members: &[Vec<u8>],
     ) -> Result<i64, RegistryError> {
         self.ensure_kind(db, table, key, ks::KIND_SET).await?;
+        self.mark_composite(db, table); // ⭐ F49
+        // ⭐ O2: 探在/写入批量化 (LeafGuide 区间复用)
+        let mks: Vec<Vec<u8>> = members
+            .iter()
+            .map(|m| ks::encode_data(ks::KIND_SET, key, m))
+            .collect();
+        let refs: Vec<&[u8]> = mks.iter().map(|k| k.as_slice()).collect();
+        let existing = self.get_physical_many(db, table, &refs).await?;
+        let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let mut writes: Vec<(Vec<u8>, &[u8])> = Vec::new();
         let mut added = 0u64;
-        for m in members {
-            let mk = ks::encode_data(ks::KIND_SET, key, m);
-            if self.get_physical(db, table, &mk).await?.is_none() {
+        for (i, m) in members.iter().enumerate() {
+            if existing[i].is_none() && seen.insert(m.as_slice()) {
                 // 1B 占位值 (存在即成员; 避免空 value 边界)
-                self.put_physical(db, table, &mk, &[1u8]).await?;
+                writes.push((mks[i].clone(), &[1u8]));
                 added += 1;
             }
         }
+        let meta_val;
         if added > 0 {
-            let meta_k = ks::encode_type_meta(key);
             let count = self
-                .get_physical(db, table, &meta_k)
+                .get_physical(db, table, &ks::encode_type_meta(key))
                 .await?
                 .map(|v| dec_meta_count(&v))
                 .unwrap_or(0);
-            self.put_physical(db, table, &meta_k, &enc_meta_val(ks::KIND_SET, count + added))
-                .await?;
+            meta_val = enc_meta_val(ks::KIND_SET, count + added);
+            writes.push((ks::encode_type_meta(key), &meta_val));
         }
+        self.put_physical_many(db, table, &writes).await?;
         Ok(added as i64)
     }
 
@@ -537,6 +574,7 @@ impl StorageEngine {
         head: i64,
         tail: i64,
     ) -> Result<(), RegistryError> {
+        self.mark_composite(db, table); // ⭐ F49 (List 全部写路径的单点)
         let mut v = Vec::with_capacity(25);
         v.push(ks::KIND_LIST);
         v.extend_from_slice(&count.to_le_bytes());
@@ -1091,16 +1129,38 @@ impl StorageEngine {
         pairs: &[(f64, Vec<u8>)],
     ) -> Result<i64, RegistryError> {
         self.ensure_kind(db, table, key, ks::KIND_ZSET).await?;
+        self.mark_composite(db, table); // ⭐ F49
         let mut count = self.zset_count(db, table, key).await?.unwrap_or(0);
+        // ⭐ O2: 旧 score 批量读 (index1) + 写入批量化; 删旧 index2 仍逐条
+        // (delete 无批量基建, 记录). 批内同 member 重复: 后写覆盖, 逐项处理
+        // 时用本地 last_score 跟踪保证 index2 一致.
+        let idx1s: Vec<Vec<u8>> = pairs
+            .iter()
+            .map(|(_, m)| ks::encode_data(ks::KIND_ZSET, key, m))
+            .collect();
+        let refs: Vec<&[u8]> = idx1s.iter().map(|k| k.as_slice()).collect();
+        let olds = self.get_physical_many(db, table, &refs).await?;
+        let dec_score = |v: &[u8]| -> Option<f64> {
+            v.try_into().ok().map(f64::from_le_bytes)
+        };
+        // member → 本批内最新已处理 score (覆盖旧盘上值)
+        let mut last: std::collections::HashMap<&[u8], f64> = std::collections::HashMap::new();
+        let mut score_bytes: Vec<[u8; 8]> = Vec::with_capacity(pairs.len());
+        let mut writes: Vec<(Vec<u8>, &[u8])> = Vec::new();
         let mut added = 0u64;
-        for (score, member) in pairs {
-            let idx1 = ks::encode_data(ks::KIND_ZSET, key, member);
-            match self.zset_score_of(db, table, key, member).await? {
+        // 先算删除集与新增数 (删除必须先于批量写提交, 防同批新旧行乱序)
+        for (i, (score, member)) in pairs.iter().enumerate() {
+            let prev = last
+                .get(member.as_slice())
+                .copied()
+                .or_else(|| olds[i].as_deref().and_then(dec_score));
+            match prev {
+                Some(old) if old == *score => {
+                    last.insert(member.as_slice(), *score);
+                    score_bytes.push(score.to_le_bytes());
+                    continue;
+                }
                 Some(old) => {
-                    if old == *score {
-                        continue; // 无变化
-                    }
-                    // 删旧 score 行
                     self.delete_physical(
                         db,
                         table,
@@ -1110,25 +1170,28 @@ impl StorageEngine {
                 }
                 None => added += 1,
             }
-            self.put_physical(db, table, &idx1, &score.to_le_bytes()).await?;
-            self.put_physical(
-                db,
-                table,
-                &ks::encode_zscore(key, ks::encode_f64_ordered(*score), member),
-                &[1u8],
-            )
-            .await?;
+            last.insert(member.as_slice(), *score);
+            score_bytes.push(score.to_le_bytes());
         }
+        // 批量写: index1 (member→score LE) + index2 (score→member 占位)
+        for (i, (score, member)) in pairs.iter().enumerate() {
+            // 批内重复 member: 只写最终 score 的行 (last 判定)
+            if last.get(member.as_slice()) != Some(score) {
+                continue;
+            }
+            writes.push((idx1s[i].clone(), &score_bytes[i]));
+            writes.push((
+                ks::encode_zscore(key, ks::encode_f64_ordered(*score), member),
+                &[1u8],
+            ));
+        }
+        let meta_val;
         if added > 0 {
             count += added;
-            self.put_physical(
-                db,
-                table,
-                &ks::encode_type_meta(key),
-                &enc_meta_val(ks::KIND_ZSET, count),
-            )
-            .await?;
+            meta_val = enc_meta_val(ks::KIND_ZSET, count);
+            writes.push((ks::encode_type_meta(key), &meta_val));
         }
+        self.put_physical_many(db, table, &writes).await?;
         Ok(added as i64)
     }
 
@@ -1442,6 +1505,34 @@ impl StorageEngine {
                 let Some(root) = self.open_table(&db, &table).await? else {
                     continue;
                 };
+                // ⭐ Y1: 顺路重建 SQL 表的索引 bloom — 探 [$] schema 行,
+                // 有则扫全部 [I] 索引行喂 bloom (重启后剪枝照样生效, 无假阴性)
+                if self
+                    .get_physical(&db, &table, &ks::encode_schema_row())
+                    .await?
+                    .is_some()
+                {
+                    let mut entries: Vec<(u32, Vec<u8>)> = Vec::new();
+                    crate::registry::table_scan_prefix(
+                        self.pager_mut(),
+                        root,
+                        &[ks::KIND_INDEX],
+                        &mut |k, _v| {
+                            if k.len() >= 5
+                                && let Some(iid_raw) = k.get(1..5)
+                                && let Some((ev, _)) = ks::split_index_val(&k[5..])
+                            {
+                                let iid = u32::from_be_bytes(iid_raw.try_into().expect("4B"));
+                                entries.push((iid, ev.to_vec()));
+                            }
+                            ControlFlow::Continue(())
+                        },
+                    )
+                    .await?;
+                    for (iid, ev) in entries {
+                        self.bloom_entry(&db, &table, iid).insert(&ev);
+                    }
+                }
                 // 1. 收集本表全部类型 meta 物理 key
                 let mut metas: Vec<Vec<u8>> = Vec::new();
                 crate::registry::table_scan_prefix(
@@ -1455,6 +1546,10 @@ impl StorageEngine {
                 )
                 .await?;
                 // 2. 逐个重算
+                if !metas.is_empty() {
+                    // ⭐ F49: 开库重建复合类型提示位 (热路径探测跳过的依据)
+                    self.mark_composite(&db, &table);
+                }
                 for mk in metas {
                     let Some(ukey) = ks::split_type_meta(&mk).map(|k| k.to_vec()) else {
                         continue;

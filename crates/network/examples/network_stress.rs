@@ -87,6 +87,7 @@ fn main() {
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 16,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
 
     println!("[setup] opening ShardManager with {num_shards} shards...");
@@ -110,6 +111,7 @@ fn main() {
         limits: network::KvLimits::default(),
         auth_password: None,
         worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
     })
     .expect("NetworkServer::start");
     let addr = server.local_addr();
