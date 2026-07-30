@@ -10,6 +10,89 @@
 
 ---
 
+## 2026-07-31 会话十一 (F69: OR/NOT/括号 谓词表达式树)
+
+WHERE 从 AND-only 的 `Vec<Cond>` 升级为泛型谓词树 `Pred<C>`(Leaf/And/Or/Not),
+支持 OR/NOT/括号嵌套, 覆盖单表 SELECT/DELETE/UPDATE/HAVING 与 JOIN 全路径。
+(分阶段路线: Phase 1 JOIN 族 F68 ✓, 本轮 Phase 2; Phase 3 = 子查询, 另计划)
+
+### 交付总览
+
+| # | 交付 | 文件 |
+|---|---|---|
+| O1 | 泛型 `Pred<C>` + as_conjuncts/leaves/map/try_map/is_true + parse_where 改递归下降 (OR<AND<NOT<primary, 括号复用 LParen) | protocol/sql.rs |
+| O2 | 5 个 `Vec<Cond>` 字段 + JoinCond + HAVING → `Pred`; bind_params 递归 try_map; parse_show/parse_join 适配 | protocol/sql.rs |
+| O3 | sql_eval_conds → eval_cond_leaf + eval_pred 递归 (5 调用点); sql_plan_select 含 OR/NOT → FullScan 回退; JOIN eval_join_pred; HAVING eval_having_pred; sysq eval_pred_sysq | worker.rs |
+| O4 | sql_join_broadcast/index_hint 下推用 as_conjuncts (含 OR → 空下推全扫) | worker.rs |
+| O5 | e2e (mysql_or_predicates + mysql_or_join_having) + mysql/pg 驱动实机 + 回归 + 文档 | tests/sql_e2e.rs |
+
+### 支持能力
+
+- `WHERE a=1 OR b=2` / `(a=1 OR a=2) AND c>0` / `NOT (x=5)` / 任意嵌套括号
+- 覆盖 SELECT / DELETE / UPDATE / JOIN WHERE / HAVING; 优先级 OR<AND<NOT<比较/括号
+- **核心机制**: `Pred::as_conjuncts()` — 纯 leaf 合取返回平铺列表, 索引界/下推/bloom 原 AND 优化路径不变; 含 OR/NOT → None → FullScan/空下推, 完成点 eval_pred 递归残余保正确
+- Cond 原样作 Pred::Leaf (sql_cmp/BETWEEN/LIKE desugar 均不动; desugar 产物 → And(leaves))
+
+### 实机验收
+
+mysql-connector + psycopg3: OR/NOT/嵌套括号/纯 AND 索引回退/DELETE·UPDATE OR/JOIN WHERE OR/HAVING OR 全正确, 跨协议一致.
+
+### 边界 / 已知限制 (Phase 2)
+
+- 含 OR/NOT 的查询不走索引 (全表扫 + 递归残余); 纯 AND 保持索引优化 (已知取舍)
+- OR 不下推到 shard (JOIN/单表下推遇 OR 全扫; shard row_pass_preds 仍平铺 AND, 未改)
+- 不做: OR-同列范围 → 索引并集扫; shard 侧谓词树下推; 子查询 (= Phase 3)
+- NOT 语义: NULL 比较为 false, NOT false = true (二值简化, 与现有 NULL 恒 false 取舍一致; 与严格三值逻辑可能有差异)
+
+### gotcha
+
+- **as_conjuncts 解耦优化与正确性**: 所有 AND-假设代码 (索引界推导/下推/bloom/覆盖判定) 都通过 as_conjuncts 提平铺列表; 叶子列名校验用 leaves() (不论结构) — OR 查询也能报未知列
+- **系统表 __ 内部叶子**: eval_pred_sysq 将 `__` 前缀叶子视为真 (生成器已处理)
+- HAVING 有独立求值器 (输出列下标域) — AggSpec.having 改 `Pred<(usize,op,val)>`, eval_having_pred 递归
+
+---
+
+## 2026-07-31 会话十 (F68: JOIN 族完备化 Phase 1)
+
+F67 两表 hash join 泛化为 **N 表左深 + 多条件 ON + RIGHT/FULL/CROSS/USING + 索引驱动 gather**。
+仍 worker 完成点执行、零新增跨线程。(分阶段路线: Phase 2 = OR 谓词树; Phase 3 = 子查询, 均另计划)
+
+### 交付总览
+
+| # | 交付 | 文件 |
+|---|---|---|
+| A1 | AST 泛化: `SelectJoin{from, joins: Vec<JoinClause>}` + TableRef + OnPred(Eq/Cmp) + JoinKind(+Right/Full/Cross) + parse (N join/多 ON/USING/CROSS) | protocol/sql.rs |
+| A2/A3 | SqlJoinCtx N 表状态机 (逐表补 schema → 逐表 Gather) + 左深迭代 hash join (宽行折叠) + 全 kind 语义 | worker.rs |
+| A4 | ScanFiltered 加 index_hint + storage IndexHint + 索引范围扫 gather | storage/sql_rows.rs, request.rs, manager.rs, worker.rs |
+| A5 | e2e (mysql_join_family) + mysql/pg 驱动实机 + 回归 + 文档 | tests/sql_e2e.rs |
+
+### 支持能力
+
+- **N 表左深** `a JOIN b ON.. JOIN c ON..` (书写顺序折叠, 无重排)
+- **多条件 ON** `ON a.x=b.x AND a.y=b.y` (组合 hash 键) + 非等值残余 `AND a.t>b.t` (匹配时判定)
+- **RIGHT** (未匹配右行补左 NULL) / **FULL** (双侧补) / **CROSS** (笛卡尔) / **USING(c)** (糖 → 未限定左侧 Eq, 按 join 位置作用域解析优先前序表)
+- **索引驱动 gather**: 某表 WHERE 命中索引列 Eq/范围 → shard 走索引范围扫缩候选 (过度近似闭界 + 残余 preds 精确), 否则全扫
+- 输出 `*` 展开各表全列 (列头 alias.col); ORDER/LIMIT/OFFSET; 行数上限每折叠步保护
+
+### 实机验收
+
+mysql-connector + psycopg3 双驱动: 3 表/RIGHT/FULL/CROSS/USING/多 ON/索引驱动 全正确, 跨协议一致.
+
+### 边界 / 已知限制 (Phase 1)
+
+- WHERE 仍 AND-only (OR = Phase 2); 无子查询 (= Phase 3)
+- ON 至少一个等值对 (非 CROSS); JOIN 输入不做索引嵌套循环 (仅索引范围扫 gather)
+- 大结果吃 worker 内存 (JOIN_MAX_ROWS 262144 上限, 无流式); 无一致快照
+- USING 列在 `*` 不合并 (双表均出; 标准应合并, v1 小偏差)
+
+### gotcha
+
+- **宽行折叠**: acc = 已连接各表投影列拼接; col_offset[t] 定位; 外连接 null 扩展填 ColValue::Null 到对应切片
+- **USING/未限定 ON 操作数**: 全局解析会歧义 → 专用 sql_join_resolve_on 按 join 位置限作用域 (未限定优先前序表, 取最后)
+- **测试陷阱**: JOIN 结果内存中构建, 同键多行顺序取决于跨 shard gather 到达顺序 (非确定); e2e 断言必须用完整 ORDER BY
+
+---
+
 ## 2026-07-31 会话九 (F67: 两表 hash JOIN, worker 完成点)
 
 解决长期 gap: 跨 shard JOIN. 方案 = **JOIN 逻辑全在 worker (每连接单线程);

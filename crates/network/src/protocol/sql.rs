@@ -79,6 +79,69 @@ pub struct Cond {
     pub set: Vec<SqlValue>,
 }
 
+/// ⭐ F69: 谓词表达式树 (AND/OR/NOT/括号) — 泛型于叶子类型 C.
+/// WHERE 用 `Pred<Cond>`, JOIN WHERE 用 `Pred<JoinCond>`, HAVING 用下标域叶子.
+/// 无 WHERE = `And(vec![])` (恒真).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pred<C> {
+    Leaf(C),
+    And(Vec<Pred<C>>),
+    Or(Vec<Pred<C>>),
+    Not(Box<Pred<C>>),
+}
+
+impl<C> Pred<C> {
+    /// 纯 leaf 合取 (无 Or/Not) → Some(平铺叶子); 含 Or/Not → None.
+    /// 供索引界推导/下推/bloom 等 AND-优化路径提取平铺列表.
+    pub fn as_conjuncts(&self) -> Option<Vec<&C>> {
+        match self {
+            Pred::Leaf(c) => Some(vec![c]),
+            Pred::And(v) => {
+                let mut out = Vec::new();
+                for p in v {
+                    out.extend(p.as_conjuncts()?);
+                }
+                Some(out)
+            }
+            Pred::Or(_) | Pred::Not(_) => None,
+        }
+    }
+
+    /// 全部叶子 (不论结构; 覆盖索引列名收集用).
+    pub fn leaves(&self) -> Vec<&C> {
+        match self {
+            Pred::Leaf(c) => vec![c],
+            Pred::And(v) | Pred::Or(v) => v.iter().flat_map(|p| p.leaves()).collect(),
+            Pred::Not(b) => b.leaves(),
+        }
+    }
+
+    /// 恒真 (空 AND) — 等价于无 WHERE.
+    pub fn is_true(&self) -> bool {
+        matches!(self, Pred::And(v) if v.is_empty())
+    }
+
+    /// 递归换叶子类型 (Cond → JoinCond 复用).
+    pub fn map<D>(&self, f: &impl Fn(&C) -> D) -> Pred<D> {
+        match self {
+            Pred::Leaf(c) => Pred::Leaf(f(c)),
+            Pred::And(v) => Pred::And(v.iter().map(|p| p.map(f)).collect()),
+            Pred::Or(v) => Pred::Or(v.iter().map(|p| p.map(f)).collect()),
+            Pred::Not(b) => Pred::Not(Box::new(b.map(f))),
+        }
+    }
+
+    /// 递归换叶子 (可失败; bind_params 占位符替换用).
+    pub fn try_map<D, E>(&self, f: &impl Fn(&C) -> Result<D, E>) -> Result<Pred<D>, E> {
+        Ok(match self {
+            Pred::Leaf(c) => Pred::Leaf(f(c)?),
+            Pred::And(v) => Pred::And(v.iter().map(|p| p.try_map(f)).collect::<Result<_, _>>()?),
+            Pred::Or(v) => Pred::Or(v.iter().map(|p| p.try_map(f)).collect::<Result<_, _>>()?),
+            Pred::Not(b) => Pred::Not(Box::new(b.try_map(f)?)),
+        })
+    }
+}
+
 /// ⭐ F67 (JOIN): 限定列名 `[表/别名.]列`. qualifier=None 表示未限定.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QualCol {
@@ -96,11 +159,39 @@ impl QualCol {
     }
 }
 
-/// ⭐ F67 (JOIN): JOIN 种类 (v1 仅 INNER / LEFT).
+/// ⭐ F67/F68 (JOIN): JOIN 种类.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKind {
     Inner,
     Left,
+    /// ⭐ F68: 未匹配右行补左 NULL.
+    Right,
+    /// ⭐ F68: 双侧未匹配都补 NULL.
+    Full,
+    /// ⭐ F68: 笛卡尔积 (无 ON).
+    Cross,
+}
+
+/// ⭐ F68 (JOIN): 表引用 `表名 [AS] 别名` (无别名时 alias = 表名).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRef {
+    pub table: String,
+    pub alias: String,
+}
+
+/// ⭐ F68 (JOIN): 单个 ON 谓词. Eq 供组合 hash 键; Cmp = 非等值 col-col 残余.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnPred {
+    Eq(QualCol, QualCol),
+    Cmp { left: QualCol, op: CmpOp, right: QualCol },
+}
+
+/// ⭐ F68 (JOIN): 一个 JOIN 子句 (左深链中的一步). CROSS 时 on 空.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub table: TableRef,
+    pub on: Vec<OnPred>,
 }
 
 /// ⭐ F67 (JOIN): 投影项 (v1 无聚合/输出别名). 空 items = `*`.
@@ -130,17 +221,17 @@ pub enum SqlStmt {
     Select {
         table: String,
         items: Vec<SelectItem>,
-        conds: Vec<Cond>,
+        conds: Pred<Cond>,
         limit: Option<u32>,
         order: Vec<(String, bool)>,
         offset: Option<u32>,
         group_by: Vec<String>,
-        having: Vec<Cond>,
+        having: Pred<Cond>,
     },
     /// ⭐ S1: DELETE FROM t WHERE ... (WHERE 必带 — 全删由全表扫路径支撑).
-    Delete { table: String, conds: Vec<Cond> },
+    Delete { table: String, conds: Pred<Cond> },
     /// ⭐ S1: UPDATE t SET c=v[, ...] WHERE ... (禁改 pk 列, 规划层拦).
-    Update { table: String, sets: Vec<(String, SqlValue)>, conds: Vec<Cond> },
+    Update { table: String, sets: Vec<(String, SqlValue)>, conds: Pred<Cond> },
     /// ⭐ S1: DROP TABLE t.
     DropTable { table: String },
     /// ⭐ S3: USE db — 连接级切库 (worker 校验存在).
@@ -159,7 +250,7 @@ pub enum SqlStmt {
         catalog: String,
         table: String,
         cols: Vec<String>,
-        conds: Vec<Cond>,
+        conds: Pred<Cond>,
         order: Vec<(String, bool)>,
         limit: Option<u32>,
         offset: Option<u32>,
@@ -167,18 +258,13 @@ pub enum SqlStmt {
     /// ⭐ F66: `SELECT @@var [, @@var2]` 系统变量 (SQLAlchemy/驱动初始化探测).
     /// vars = 去 @@ 的变量名列表; worker 回合理值单行.
     SystemVarStub { vars: Vec<String> },
-    /// ⭐ F67 (JOIN): 两表 INNER/LEFT 等值 JOIN — worker 侧 hash join.
-    /// 别名无时 = 表名; items 空 = `*` 展开左右全列.
+    /// ⭐ F67/F68 (JOIN): N 表左深 hash join — worker 侧执行.
+    /// 别名无时 = 表名; items 空 = `*` 展开各表全列; joins 为左深链.
     SelectJoin {
-        left_table: String,
-        left_alias: String,
-        kind: JoinKind,
-        right_table: String,
-        right_alias: String,
-        on_left: QualCol,
-        on_right: QualCol,
+        from: TableRef,
+        joins: Vec<JoinClause>,
         items: Vec<JoinItem>,
-        conds: Vec<JoinCond>,
+        conds: Pred<JoinCond>,
         order: Vec<(QualCol, bool)>,
         limit: Option<u32>,
         offset: Option<u32>,
@@ -709,19 +795,15 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
             other => Ok(other.clone()),
         }
     };
-    let bind_conds = |conds: &[Cond]| -> Result<Vec<Cond>, String> {
-        conds
-            .iter()
-            .map(|c| {
-                Ok(Cond {
-                    col: c.col.clone(),
-                    op: c.op,
-                    val: subst(&c.val)?,
-                    set: c.set.iter().map(&subst).collect::<Result<_, _>>()?,
-                })
-            })
-            .collect()
+    let bind_cond = |c: &Cond| -> Result<Cond, String> {
+        Ok(Cond {
+            col: c.col.clone(),
+            op: c.op,
+            val: subst(&c.val)?,
+            set: c.set.iter().map(&subst).collect::<Result<_, _>>()?,
+        })
     };
+    let bind_conds = |pred: &Pred<Cond>| -> Result<Pred<Cond>, String> { pred.try_map(&bind_cond) };
     Ok(match stmt {
         SqlStmt::Insert { table, cols, rows } => SqlStmt::Insert {
             table: table.clone(),
@@ -755,44 +837,25 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
                 .collect::<Result<_, _>>()?,
             conds: bind_conds(conds)?,
         },
-        // ⭐ F67 (JOIN): 替换 WHERE 限定条件里的占位符
-        SqlStmt::SelectJoin {
-            left_table,
-            left_alias,
-            kind,
-            right_table,
-            right_alias,
-            on_left,
-            on_right,
-            items,
-            conds,
-            order,
-            limit,
-            offset,
-        } => SqlStmt::SelectJoin {
-            left_table: left_table.clone(),
-            left_alias: left_alias.clone(),
-            kind: *kind,
-            right_table: right_table.clone(),
-            right_alias: right_alias.clone(),
-            on_left: on_left.clone(),
-            on_right: on_right.clone(),
-            items: items.clone(),
-            conds: conds
-                .iter()
-                .map(|c| {
+        // ⭐ F67/F68 (JOIN): 替换 WHERE 限定条件里的占位符 (ON/from/joins 无字面量)
+        SqlStmt::SelectJoin { from, joins, items, conds, order, limit, offset } => {
+            SqlStmt::SelectJoin {
+                from: from.clone(),
+                joins: joins.clone(),
+                items: items.clone(),
+                conds: conds.try_map(&|c: &JoinCond| {
                     Ok::<_, String>(JoinCond {
                         col: c.col.clone(),
                         op: c.op,
                         val: subst(&c.val)?,
                         set: c.set.iter().map(&subst).collect::<Result<_, _>>()?,
                     })
-                })
-                .collect::<Result<_, _>>()?,
-            order: order.clone(),
-            limit: *limit,
-            offset: *offset,
-        },
+                })?,
+                order: order.clone(),
+                limit: *limit,
+                offset: *offset,
+            }
+        }
         // 无参数位的语句原样克隆
         other => other.clone(),
     })
@@ -957,108 +1020,144 @@ fn parse_insert(p: &mut P) -> Result<SqlStmt, String> {
 /// WHERE 子句 (AND 平铺; caller 决定是否必带).
 /// ⭐ S2: BETWEEN → Ge+Le, LIKE 'p%' → 前缀范围 (解析期 desugar);
 /// IN → CmpOp::In (set); `!=`/`<>` → Ne.
-fn parse_where(p: &mut P) -> Result<Vec<Cond>, String> {
-    let mut conds = Vec::new();
+fn parse_where(p: &mut P) -> Result<Pred<Cond>, String> {
     if p.try_kw("WHERE") {
+        parse_or_expr(p)
+    } else {
+        Ok(Pred::And(Vec::new())) // 无 WHERE = 恒真
+    }
+}
+
+/// ⭐ F69: OR 层 (最低优先级).
+fn parse_or_expr(p: &mut P) -> Result<Pred<Cond>, String> {
+    let mut terms = vec![parse_and_expr(p)?];
+    while p.try_kw("OR") {
+        terms.push(parse_and_expr(p)?);
+    }
+    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Pred::Or(terms) })
+}
+
+/// ⭐ F69: AND 层.
+fn parse_and_expr(p: &mut P) -> Result<Pred<Cond>, String> {
+    let mut terms = vec![parse_not_expr(p)?];
+    while p.try_kw("AND") {
+        terms.push(parse_not_expr(p)?);
+    }
+    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Pred::And(terms) })
+}
+
+/// ⭐ F69: NOT 层.
+fn parse_not_expr(p: &mut P) -> Result<Pred<Cond>, String> {
+    if p.try_kw("NOT") {
+        Ok(Pred::Not(Box::new(parse_not_expr(p)?)))
+    } else {
+        parse_primary(p)
+    }
+}
+
+/// ⭐ F69: primary = `( <or_expr> )` | 单个比较叶子.
+fn parse_primary(p: &mut P) -> Result<Pred<Cond>, String> {
+    if p.peek() == Some(&Tok::LParen) {
+        p.next()?;
+        let inner = parse_or_expr(p)?;
+        p.expect(&Tok::RParen, ")")?;
+        Ok(inner)
+    } else {
+        parse_where_atom(p)
+    }
+}
+
+/// ⭐ F69: 单个比较谓词 `col op val / IN / BETWEEN / LIKE`.
+/// BETWEEN/LIKE desugar 产物 (多条) 包为 `And(vec![Leaf,..])`; 单条 → `Leaf`.
+fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
+    let mut conds: Vec<Cond> = Vec::new();
+    let col = p.ident()?;
+    // IN (v, ...)
+    if p.try_kw("IN") {
+        p.expect(&Tok::LParen, "(")?;
+        let mut set = Vec::new();
         loop {
-            let col = p.ident()?;
-            // IN (v, ...)
-            if p.try_kw("IN") {
-                p.expect(&Tok::LParen, "(")?;
-                let mut set = Vec::new();
-                loop {
-                    let v = p.value()?;
-                    if v == SqlValue::Null {
-                        return Err("NULL is not valid in IN list".into());
-                    }
-                    set.push(v);
-                    match p.next()? {
-                        Tok::Comma => continue,
-                        Tok::RParen => break,
-                        other => return Err(format!("expected ',' or ')', got {other:?}")),
-                    }
-                }
-                if set.is_empty() {
-                    return Err("empty IN list".into());
-                }
-                conds.push(Cond { col, op: CmpOp::In, val: SqlValue::Null, set });
-            } else if p.try_kw("BETWEEN") {
-                // BETWEEN a AND b → col >= a AND col <= b
-                let a = p.value()?;
-                p.kw("AND")?;
-                let b = p.value()?;
-                if a == SqlValue::Null || b == SqlValue::Null {
-                    return Err("NULL is not a valid comparison bound".into());
-                }
-                conds.push(Cond { col: col.clone(), op: CmpOp::Ge, val: a, set: vec![] });
-                conds.push(Cond { col, op: CmpOp::Le, val: b, set: vec![] });
-            } else if p.try_kw("LIKE") {
-                // 仅前缀模式 'p%' → [p, p+1) 字节范围 (与 starts_with 精确等价);
-                // 无 '%' → 等值; 其它模式报错 (v1)
-                let SqlValue::Str(pat) = p.value()? else {
-                    return Err("LIKE pattern must be a string".into());
-                };
-                let pct = pat.iter().position(|&b| b == b'%');
-                match pct {
-                    None => {
-                        conds.push(Cond {
-                            col,
-                            op: CmpOp::Eq,
-                            val: SqlValue::Str(pat),
-                            set: vec![],
-                        });
-                    }
-                    Some(i) if i == pat.len() - 1 => {
-                        let prefix = pat[..i].to_vec();
-                        if prefix.is_empty() {
-                            // LIKE '%' = 恒真, 不产条件
-                        } else {
-                            conds.push(Cond {
-                                col: col.clone(),
-                                op: CmpOp::Ge,
-                                val: SqlValue::Str(prefix.clone()),
-                                set: vec![],
-                            });
-                            // 上界 = 前缀末个非 0xFF 字节 +1 截断; 全 0xFF → 无上界
-                            let mut hi = prefix;
-                            while hi.last() == Some(&0xFF) {
-                                hi.pop();
-                            }
-                            if let Some(last) = hi.last_mut() {
-                                *last += 1;
-                                conds.push(Cond {
-                                    col,
-                                    op: CmpOp::Lt,
-                                    val: SqlValue::Str(hi),
-                                    set: vec![],
-                                });
-                            }
-                        }
-                    }
-                    _ => return Err("LIKE supports only prefix patterns ('abc%')".into()),
-                }
-            } else {
-                let op = match p.next()? {
-                    Tok::Eq => CmpOp::Eq,
-                    Tok::Gt => CmpOp::Gt,
-                    Tok::Ge => CmpOp::Ge,
-                    Tok::Lt => CmpOp::Lt,
-                    Tok::Le => CmpOp::Le,
-                    Tok::Ne => CmpOp::Ne,
-                    other => return Err(format!("expected comparison operator, got {other:?}")),
-                };
-                let val = p.value()?;
-                if val == SqlValue::Null {
-                    return Err("NULL is not a valid comparison bound".into());
-                }
-                conds.push(Cond { col, op, val, set: vec![] });
+            let v = p.value()?;
+            if v == SqlValue::Null {
+                return Err("NULL is not valid in IN list".into());
             }
-            if !p.try_kw("AND") {
-                break;
+            set.push(v);
+            match p.next()? {
+                Tok::Comma => continue,
+                Tok::RParen => break,
+                other => return Err(format!("expected ',' or ')', got {other:?}")),
             }
         }
+        if set.is_empty() {
+            return Err("empty IN list".into());
+        }
+        conds.push(Cond { col, op: CmpOp::In, val: SqlValue::Null, set });
+    } else if p.try_kw("BETWEEN") {
+        // BETWEEN a AND b → col >= a AND col <= b (内部 AND 在此消费)
+        let a = p.value()?;
+        p.kw("AND")?;
+        let b = p.value()?;
+        if a == SqlValue::Null || b == SqlValue::Null {
+            return Err("NULL is not a valid comparison bound".into());
+        }
+        conds.push(Cond { col: col.clone(), op: CmpOp::Ge, val: a, set: vec![] });
+        conds.push(Cond { col, op: CmpOp::Le, val: b, set: vec![] });
+    } else if p.try_kw("LIKE") {
+        // 仅前缀模式 'p%' → [p, p+1) 字节范围 (与 starts_with 精确等价);
+        // 无 '%' → 等值; 其它模式报错 (v1)
+        let SqlValue::Str(pat) = p.value()? else {
+            return Err("LIKE pattern must be a string".into());
+        };
+        let pct = pat.iter().position(|&b| b == b'%');
+        match pct {
+            None => {
+                conds.push(Cond { col, op: CmpOp::Eq, val: SqlValue::Str(pat), set: vec![] });
+            }
+            Some(i) if i == pat.len() - 1 => {
+                let prefix = pat[..i].to_vec();
+                if prefix.is_empty() {
+                    // LIKE '%' = 恒真, 不产条件
+                } else {
+                    conds.push(Cond {
+                        col: col.clone(),
+                        op: CmpOp::Ge,
+                        val: SqlValue::Str(prefix.clone()),
+                        set: vec![],
+                    });
+                    // 上界 = 前缀末个非 0xFF 字节 +1 截断; 全 0xFF → 无上界
+                    let mut hi = prefix;
+                    while hi.last() == Some(&0xFF) {
+                        hi.pop();
+                    }
+                    if let Some(last) = hi.last_mut() {
+                        *last += 1;
+                        conds.push(Cond { col, op: CmpOp::Lt, val: SqlValue::Str(hi), set: vec![] });
+                    }
+                }
+            }
+            _ => return Err("LIKE supports only prefix patterns ('abc%')".into()),
+        }
+    } else {
+        let op = match p.next()? {
+            Tok::Eq => CmpOp::Eq,
+            Tok::Gt => CmpOp::Gt,
+            Tok::Ge => CmpOp::Ge,
+            Tok::Lt => CmpOp::Lt,
+            Tok::Le => CmpOp::Le,
+            Tok::Ne => CmpOp::Ne,
+            other => return Err(format!("expected comparison operator, got {other:?}")),
+        };
+        let val = p.value()?;
+        if val == SqlValue::Null {
+            return Err("NULL is not a valid comparison bound".into());
+        }
+        conds.push(Cond { col, op, val, set: vec![] });
     }
-    Ok(conds)
+    // 单条 → Leaf; 多条 (BETWEEN/LIKE desugar) → And; 空 (LIKE '%') → 恒真
+    Ok(match conds.len() {
+        1 => Pred::Leaf(conds.pop().unwrap()),
+        _ => Pred::And(conds.into_iter().map(Pred::Leaf).collect()),
+    })
 }
 
 /// ⭐ S1: `DELETE FROM t WHERE ...`
@@ -1160,7 +1259,7 @@ fn parse_select_tail(
 fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("SHOW")?;
     let full = p.try_kw("FULL");
-    let mk = |table: &str, conds: Vec<Cond>| SqlStmt::SystemQuery {
+    let mk = |table: &str, conds: Pred<Cond>| SqlStmt::SystemQuery {
         catalog: "__show__".to_string(),
         table: table.to_string(),
         cols: Vec::new(),
@@ -1169,13 +1268,22 @@ fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
         limit: None,
         offset: None,
     };
+    // 内部标记 __table__ = 单叶子谓词
+    let table_leaf = |table: String| {
+        Pred::Leaf(Cond {
+            col: "__table__".to_string(),
+            op: CmpOp::Eq,
+            val: SqlValue::Str(table.into_bytes()),
+            set: Vec::new(),
+        })
+    };
     if p.try_kw("TABLES") {
         // [FROM|IN db] 忽略库名 (仅 current_db); 尾部可有 FROM db
         if p.try_kw("FROM") || p.try_kw("IN") {
             let _ = p.ident()?;
         }
         p.done()?;
-        Ok(mk(if full { "full_tables" } else { "tables" }, Vec::new()))
+        Ok(mk(if full { "full_tables" } else { "tables" }, Pred::And(Vec::new())))
     } else if p.try_kw("COLUMNS") || p.try_kw("FIELDS") {
         // FROM|IN t [FROM|IN db]
         if !(p.try_kw("FROM") || p.try_kw("IN")) {
@@ -1186,45 +1294,36 @@ fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
             let _ = p.ident()?;
         }
         p.done()?;
-        let conds = vec![Cond {
-            col: "__table__".to_string(),
-            op: CmpOp::Eq,
-            val: SqlValue::Str(table.into_bytes()),
-            set: Vec::new(),
-        }];
-        Ok(mk(if full { "full_columns" } else { "columns" }, conds))
+        Ok(mk(if full { "full_columns" } else { "columns" }, table_leaf(table)))
     } else if p.try_kw("DATABASES") || p.try_kw("SCHEMAS") {
         p.done()?;
-        Ok(mk("databases", Vec::new()))
+        Ok(mk("databases", Pred::And(Vec::new())))
     } else if p.try_kw("CREATE") {
         // SHOW CREATE TABLE t — SQLAlchemy MySQL 方言从 DDL 解析列
         p.kw("TABLE")?;
         let table = p.ident()?;
         p.done()?;
-        let conds = vec![Cond {
-            col: "__table__".to_string(),
-            op: CmpOp::Eq,
-            val: SqlValue::Str(table.into_bytes()),
-            set: Vec::new(),
-        }];
-        Ok(mk("create_table", conds))
+        Ok(mk("create_table", table_leaf(table)))
     } else {
         // 其他 SHOW (STATUS/VARIABLES/…) → 空结果 stub (工具探测容错)
         // 吞剩余 token
         while p.peek().is_some() {
             p.i += 1;
         }
-        Ok(mk("__empty__", Vec::new()))
+        Ok(mk("__empty__", Pred::And(Vec::new())))
     }
 }
 
-/// ⭐ F67 (JOIN): 判断左表名后是否跟着 JOIN (未来 3 token 内有 JOIN/INNER/LEFT).
+/// ⭐ F67/F68 (JOIN): 判断左表名后是否跟着 JOIN (未来 3 token 内有 join 关键字).
 /// (不消费; 覆盖 `t JOIN` / `t a JOIN` / `t AS a JOIN` 三种形态)
 fn is_join_kw(t: Option<&Tok>) -> bool {
     matches!(t, Some(Tok::Ident(s))
         if s.eq_ignore_ascii_case("JOIN")
             || s.eq_ignore_ascii_case("INNER")
-            || s.eq_ignore_ascii_case("LEFT"))
+            || s.eq_ignore_ascii_case("LEFT")
+            || s.eq_ignore_ascii_case("RIGHT")
+            || s.eq_ignore_ascii_case("FULL")
+            || s.eq_ignore_ascii_case("CROSS"))
 }
 
 fn is_join_ahead(p: &P) -> bool {
@@ -1254,29 +1353,95 @@ fn parse_opt_alias(p: &mut P) -> Option<String> {
     None
 }
 
-/// ⭐ F67 (JOIN): `left [a] [INNER|LEFT [OUTER]] JOIN right [b] ON x = y
-/// [WHERE ...] [ORDER BY ...] [LIMIT/OFFSET]`. sel_items/left_table 已由 parse_select 消费.
+/// ⭐ F68 (JOIN): 试解下一个 JOIN 种类 (已消费到 JOIN 关键字); 无则 None.
+fn parse_join_kind(p: &mut P) -> Option<JoinKind> {
+    if p.try_kw("CROSS") {
+        let _ = p.kw("JOIN");
+        Some(JoinKind::Cross)
+    } else if p.try_kw("LEFT") {
+        let _ = p.try_kw("OUTER");
+        let _ = p.kw("JOIN");
+        Some(JoinKind::Left)
+    } else if p.try_kw("RIGHT") {
+        let _ = p.try_kw("OUTER");
+        let _ = p.kw("JOIN");
+        Some(JoinKind::Right)
+    } else if p.try_kw("FULL") {
+        let _ = p.try_kw("OUTER");
+        let _ = p.kw("JOIN");
+        Some(JoinKind::Full)
+    } else if p.try_kw("INNER") {
+        let _ = p.kw("JOIN");
+        Some(JoinKind::Inner)
+    } else if p.try_kw("JOIN") {
+        Some(JoinKind::Inner)
+    } else {
+        None
+    }
+}
+
+/// ⭐ F68 (JOIN): 解 ON 谓词链 (AND 连接的 col op col; = → Eq, 其余 → Cmp).
+fn parse_on(p: &mut P) -> Result<Vec<OnPred>, String> {
+    let mut preds = Vec::new();
+    loop {
+        let left = QualCol::parse(&p.ident()?);
+        let op = p.cmp_op()?;
+        let right = QualCol::parse(&p.ident()?);
+        if op == CmpOp::Eq {
+            preds.push(OnPred::Eq(left, right));
+        } else {
+            preds.push(OnPred::Cmp { left, op, right });
+        }
+        if !p.try_kw("AND") {
+            break;
+        }
+    }
+    Ok(preds)
+}
+
+/// ⭐ F67/F68 (JOIN): `from [a] { [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN t [b]
+/// (ON <conj> | USING (c,...)) }+ [WHERE ...] [ORDER BY ...] [LIMIT/OFFSET]`.
+/// sel_items/first_table 已由 parse_select 消费.
 fn parse_join(
     p: &mut P,
     sel_items: Vec<SelectItem>,
-    left_table: String,
+    first_table: String,
 ) -> Result<SqlStmt, String> {
-    let left_alias = parse_opt_alias(p).unwrap_or_else(|| left_table.clone());
-    let kind = if p.try_kw("LEFT") {
-        let _ = p.try_kw("OUTER");
-        p.kw("JOIN")?;
-        JoinKind::Left
-    } else {
-        let _ = p.try_kw("INNER");
-        p.kw("JOIN")?;
-        JoinKind::Inner
-    };
-    let right_table = p.ident()?;
-    let right_alias = parse_opt_alias(p).unwrap_or_else(|| right_table.clone());
-    p.kw("ON")?;
-    let on_left = QualCol::parse(&p.ident()?);
-    p.expect(&Tok::Eq, "= (JOIN ON 仅支持单等值条件)")?;
-    let on_right = QualCol::parse(&p.ident()?);
+    let first_alias = parse_opt_alias(p).unwrap_or_else(|| first_table.clone());
+    let from = TableRef { table: first_table, alias: first_alias };
+    let mut joins: Vec<JoinClause> = Vec::new();
+    while let Some(kind) = parse_join_kind(p) {
+        let table = p.ident()?;
+        let alias = parse_opt_alias(p).unwrap_or_else(|| table.clone());
+        let on = if kind == JoinKind::Cross {
+            Vec::new()
+        } else if p.try_kw("USING") {
+            // USING (c[,c]) → Eq(未限定 c, 右.c); 左侧限定由 worker 解析
+            p.expect(&Tok::LParen, "(")?;
+            let mut preds = Vec::new();
+            loop {
+                let c = p.ident()?;
+                preds.push(OnPred::Eq(
+                    QualCol { qualifier: None, col: c.clone() },
+                    QualCol { qualifier: Some(alias.clone()), col: c },
+                ));
+                match p.next()? {
+                    Tok::Comma => continue,
+                    Tok::RParen => break,
+                    other => return Err(format!("expected ',' or ')' in USING, got {other:?}")),
+                }
+            }
+            preds
+        } else {
+            p.kw("ON")?;
+            let preds = parse_on(p)?;
+            if !preds.iter().any(|pr| matches!(pr, OnPred::Eq(..))) {
+                return Err("JOIN ON requires at least one equality (col = col)".into());
+            }
+            preds
+        };
+        joins.push(JoinClause { kind, table: TableRef { table, alias }, on });
+    }
     // WHERE / ORDER / LIMIT / OFFSET 复用单表解析后把列名转限定名
     let conds_raw = parse_where(p)?;
     let (order_raw, limit, offset) = parse_select_tail(p)?;
@@ -1290,25 +1455,61 @@ fn parse_join(
             }
         })
         .collect::<Result<_, _>>()?;
-    let conds = conds_raw
-        .into_iter()
-        .map(|c| JoinCond { col: QualCol::parse(&c.col), op: c.op, val: c.val, set: c.set })
-        .collect();
+    let conds = conds_raw.map(&|c: &Cond| JoinCond {
+        col: QualCol::parse(&c.col),
+        op: c.op,
+        val: c.val.clone(),
+        set: c.set.clone(),
+    });
     let order = order_raw.into_iter().map(|(s, d)| (QualCol::parse(&s), d)).collect();
-    Ok(SqlStmt::SelectJoin {
-        left_table,
-        left_alias,
-        kind,
-        right_table,
-        right_alias,
-        on_left,
-        on_right,
-        items,
-        conds,
-        order,
-        limit,
-        offset,
-    })
+    Ok(SqlStmt::SelectJoin { from, joins, items, conds, order, limit, offset })
+}
+
+/// ⭐ F69: HAVING 谓词树 (OR<AND<NOT<primary; 叶子 = 输出列 label op val).
+fn parse_having_or(p: &mut P) -> Result<Pred<Cond>, String> {
+    let mut terms = vec![parse_having_and(p)?];
+    while p.try_kw("OR") {
+        terms.push(parse_having_and(p)?);
+    }
+    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Pred::Or(terms) })
+}
+
+fn parse_having_and(p: &mut P) -> Result<Pred<Cond>, String> {
+    let mut terms = vec![parse_having_not(p)?];
+    while p.try_kw("AND") {
+        terms.push(parse_having_not(p)?);
+    }
+    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Pred::And(terms) })
+}
+
+fn parse_having_not(p: &mut P) -> Result<Pred<Cond>, String> {
+    if p.try_kw("NOT") {
+        Ok(Pred::Not(Box::new(parse_having_not(p)?)))
+    } else if p.peek() == Some(&Tok::LParen) {
+        p.next()?;
+        let inner = parse_having_or(p)?;
+        p.expect(&Tok::RParen, ")")?;
+        Ok(inner)
+    } else {
+        // 叶子: label [聚合 (形态)] op val
+        let mut label = p.ident()?;
+        if p.peek() == Some(&Tok::LParen) {
+            p.next()?;
+            label = label.to_ascii_uppercase();
+            label.push('(');
+            if p.peek() == Some(&Tok::Star) {
+                p.next()?;
+                label.push('*');
+            } else {
+                label.push_str(&p.ident()?);
+            }
+            p.expect(&Tok::RParen, ")")?;
+            label.push(')');
+        }
+        let op = p.cmp_op()?;
+        let val = p.value()?;
+        Ok(Pred::Leaf(Cond { col: label, op, val, set: Vec::new() }))
+    }
 }
 
 /// `SELECT * | COUNT(*) | c1, c2, ... FROM t [WHERE ...] [ORDER BY c [DESC], ...]
@@ -1412,32 +1613,13 @@ fn parse_select(p: &mut P) -> Result<SqlStmt, String> {
         }
     }
     // ⭐ G1 (F63): HAVING — 条件列写聚合原文 (如 SUM(x)) 或 group 列名,
-    // 与输出列 label 同规则匹配 (大写归一)
-    let mut having: Vec<Cond> = Vec::new();
-    if p.try_kw("HAVING") {
-        loop {
-            let mut label = p.ident()?;
-            if p.peek() == Some(&Tok::LParen) {
-                p.next()?;
-                label = label.to_ascii_uppercase();
-                label.push('(');
-                if p.peek() == Some(&Tok::Star) {
-                    p.next()?;
-                    label.push('*');
-                } else {
-                    label.push_str(&p.ident()?);
-                }
-                p.expect(&Tok::RParen, ")")?;
-                label.push(')');
-            }
-            let op = p.cmp_op()?;
-            let val = p.value()?;
-            having.push(Cond { col: label, op, val, set: Vec::new() });
-            if !p.try_kw("AND") {
-                break;
-            }
-        }
-    }
+    // 与输出列 label 同规则匹配 (大写归一). ⭐ F69: 支持 OR/NOT/括号.
+    let having: Pred<Cond> = if p.try_kw("HAVING") {
+        parse_having_or(p)?
+    } else {
+        Pred::And(Vec::new())
+    };
+    let has_having = !having.is_true();
     // ⭐ G1 校验: 有 group_by 时非聚合项必须 ∈ group_by (PG 语义);
     // 有聚合项时 * 投影 (items 空) 非法由 worker 拒 (需 schema 不在此层)
     if !group_by.is_empty() {
@@ -1454,7 +1636,7 @@ fn parse_select(p: &mut P) -> Result<SqlStmt, String> {
             return Err("SELECT * is not valid with GROUP BY".into());
         }
     }
-    if !having.is_empty() && !items.iter().any(|i| matches!(i, SelectItem::Agg { .. }))
+    if has_having && !items.iter().any(|i| matches!(i, SelectItem::Agg { .. }))
         && group_by.is_empty()
     {
         return Err("HAVING requires GROUP BY or aggregate function".into());
@@ -1586,18 +1768,19 @@ mod tests {
     fn select_roundtrip() {
         let s = parse(b"SELECT * FROM t WHERE a = 1 AND b >= 2.5 AND c < 'x' LIMIT 10").unwrap();
         let SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having } = s else { panic!() };
-        assert!(order.is_empty() && offset.is_none() && group_by.is_empty() && having.is_empty());
+        assert!(order.is_empty() && offset.is_none() && group_by.is_empty() && having.is_true());
         assert_eq!(table, "t");
         assert!(items.is_empty(), "* = 全列");
         assert_eq!(limit, Some(10));
-        assert_eq!(conds.len(), 3);
-        assert_eq!(conds[0], Cond { col: "a".into(), op: CmpOp::Eq, val: SqlValue::Int(1), set: vec![] });
-        assert_eq!(conds[1].op, CmpOp::Ge);
-        assert_eq!(conds[2], Cond { col: "c".into(), op: CmpOp::Lt, val: SqlValue::Str(b"x".to_vec()), set: vec![] });
+        let cj = conds.as_conjuncts().unwrap();
+        assert_eq!(cj.len(), 3);
+        assert_eq!(cj[0], &Cond { col: "a".into(), op: CmpOp::Eq, val: SqlValue::Int(1), set: vec![] });
+        assert_eq!(cj[1].op, CmpOp::Ge);
+        assert_eq!(cj[2], &Cond { col: "c".into(), op: CmpOp::Lt, val: SqlValue::Str(b"x".to_vec()), set: vec![] });
         // 无 WHERE / 无 LIMIT
         let s = parse(b"SELECT * FROM t").unwrap();
         let SqlStmt::Select { conds, limit, .. } = s else { panic!() };
-        assert!(conds.is_empty());
+        assert!(conds.is_true());
         assert_eq!(limit, None);
     }
 
@@ -1611,19 +1794,22 @@ mod tests {
         let s = parse(b"SELECT COUNT(*) FROM t WHERE a IN (1, 2, 3)").unwrap();
         let SqlStmt::Select { items, conds, .. } = s else { panic!() };
         assert_eq!(items, vec![SelectItem::Agg { func: AggFn::Count, col: None }]);
-        assert_eq!(conds[0].op, CmpOp::In);
-        assert_eq!(conds[0].set.len(), 3);
+        let cj = conds.as_conjuncts().unwrap();
+        assert_eq!(cj[0].op, CmpOp::In);
+        assert_eq!(cj[0].set.len(), 3);
         let s = parse(b"SELECT * FROM t WHERE a BETWEEN 1 AND 5 AND b != 'x'").unwrap();
         let SqlStmt::Select { conds, .. } = s else { panic!() };
-        assert_eq!(conds.len(), 3, "BETWEEN desugar 成 Ge+Le");
-        assert_eq!(conds[0].op, CmpOp::Ge);
-        assert_eq!(conds[1].op, CmpOp::Le);
-        assert_eq!(conds[2].op, CmpOp::Ne);
+        let cj = conds.as_conjuncts().unwrap();
+        assert_eq!(cj.len(), 3, "BETWEEN desugar 成 Ge+Le");
+        assert_eq!(cj[0].op, CmpOp::Ge);
+        assert_eq!(cj[1].op, CmpOp::Le);
+        assert_eq!(cj[2].op, CmpOp::Ne);
         let s = parse(b"SELECT * FROM t WHERE c LIKE 'ab%' ORDER BY a DESC, b LIMIT 3 OFFSET 6").unwrap();
         let SqlStmt::Select { conds, order, limit, offset, .. } = s else { panic!() };
-        assert_eq!(conds.len(), 2, "LIKE 前缀 desugar 成 Ge+Lt");
-        assert_eq!(conds[0].val, SqlValue::Str(b"ab".to_vec()));
-        assert_eq!(conds[1].val, SqlValue::Str(b"ac".to_vec()));
+        let cj = conds.as_conjuncts().unwrap();
+        assert_eq!(cj.len(), 2, "LIKE 前缀 desugar 成 Ge+Lt");
+        assert_eq!(cj[0].val, SqlValue::Str(b"ab".to_vec()));
+        assert_eq!(cj[1].val, SqlValue::Str(b"ac".to_vec()));
         assert_eq!(order, vec![("a".into(), true), ("b".into(), false)]);
         assert_eq!((limit, offset), (Some(3), Some(6)));
         assert!(parse(b"SELECT * FROM t WHERE c LIKE '%ab'").is_err(), "仅前缀模式");
@@ -1634,7 +1820,7 @@ mod tests {
         let s = parse(b"UPDATE t SET a = 1, b = 'x' WHERE c > 2").unwrap();
         let SqlStmt::Update { sets, conds, .. } = s else { panic!() };
         assert_eq!(sets.len(), 2);
-        assert_eq!(conds.len(), 1);
+        assert_eq!(conds.as_conjuncts().unwrap().len(), 1);
         assert_eq!(parse(b"DROP TABLE t").unwrap(), SqlStmt::DropTable { table: "t".into() });
         assert!(parse(b"SELECT * FROM t WHERE a = NULL").unwrap_err().contains("NULL"));
         assert!(parse(b"SELECT * FROM t WHERE a ! 1").is_err());
@@ -1660,8 +1846,9 @@ mod tests {
         assert_eq!(n, 2);
         let bound = bind_params(&s, &[SqlValue::Int(10), SqlValue::Int(20)]).unwrap();
         let SqlStmt::Select { conds, .. } = bound else { panic!() };
-        assert_eq!(conds[0].val, SqlValue::Int(20), "$2 → params[1]");
-        assert_eq!(conds[1].val, SqlValue::Int(10));
+        let cj = conds.as_conjuncts().unwrap();
+        assert_eq!(cj[0].val, SqlValue::Int(20), "$2 → params[1]");
+        assert_eq!(cj[1].val, SqlValue::Int(10));
         // IN / UPDATE sets 占位
         let (s, n) = parse_prepared(b"UPDATE t SET a = ? WHERE b IN (?, ?)").unwrap();
         assert_eq!(n, 3);
@@ -1669,7 +1856,7 @@ mod tests {
             bind_params(&s, &[SqlValue::Int(1), SqlValue::Int(2), SqlValue::Int(3)]).unwrap();
         let SqlStmt::Update { sets, conds, .. } = bound else { panic!() };
         assert_eq!(sets[0].1, SqlValue::Int(1));
-        assert_eq!(conds[0].set, vec![SqlValue::Int(2), SqlValue::Int(3)]);
+        assert_eq!(conds.as_conjuncts().unwrap()[0].set, vec![SqlValue::Int(2), SqlValue::Int(3)]);
         // 个数不符 / 混用 / simple query 拒绝 / LIMIT 位置拒绝
         assert!(bind_params(&s, &[SqlValue::Int(1)]).unwrap_err().contains("missing"));
         assert!(parse_prepared(b"SELECT * FROM t WHERE a = ? AND b = $1").is_err());

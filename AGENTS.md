@@ -24,6 +24,26 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 
 ## 当前进度
 
+### 2026-07-31 会话十一总览 (F69, 细节见 CHANGELOG)
+
+- **OR/NOT/括号 谓词表达式树**: WHERE 从 AND-only `Vec<Cond>` 升为泛型 `Pred<C>`(Leaf/And/Or/Not), 覆盖单表 SELECT/DELETE/UPDATE/HAVING 与 JOIN 全路径
+- 解析: parse_where 改递归下降 (OR<AND<NOT<primary, 括号复用 LParen); Cond 原样作 Pred::Leaf; BETWEEN/LIKE desugar → And(leaves)
+- 求值: eval_pred 递归 (5 调用点), JOIN eval_join_pred, HAVING eval_having_pred, 系统表 eval_pred_sysq
+- **核心机制 as_conjuncts()**: 纯 leaf 合取 → 平铺列表, 索引界推导/下推/bloom 原 AND 优化不变; 含 OR/NOT → None → sql_plan_select FullScan 回退 + 空下推, 完成点递归残余保正确 (列名校验用 leaves())
+- 实机: mysql/pg 双驱动 OR/NOT/嵌套/DELETE·UPDATE·JOIN·HAVING OR 全正确跨协议一致; 回归全绿 + clippy 0
+- **已知限制**: 含 OR/NOT 不走索引 (全扫+残余); OR 不下推 shard; NOT 二值简化 (NULL 比较 false)
+- **分阶段路线**: Phase 3 = 子查询 (FROM 派生表/IN·EXISTS/标量, 另计划)
+
+### 2026-07-31 会话十总览 (F68, 细节见 CHANGELOG)
+
+- **JOIN 族完备化 Phase 1**: F67 两表 → **N 表左深 + 多条件 ON + RIGHT/FULL/CROSS/USING + 索引驱动 gather**. 仍 worker 完成点、零新增跨线程
+- AST: `SelectJoin{from, joins: Vec<JoinClause>}` + OnPred(Eq/Cmp) + JoinKind(+Right/Full/Cross); 执行: SqlJoinCtx 逐表 gather → 左深迭代 hash join (宽行折叠, col_offset 定位, 外连接 null 扩展)
+- 索引驱动: ScanFiltered 加 index_hint (storage IndexHint); WHERE 命中索引列 Eq/范围 → 索引范围扫缩候选 (过度近似 + 残余 preds 精确)
+- 实机: mysql/pg 双驱动 3 表/RIGHT/FULL/CROSS/USING/多 ON/索引 全正确; 回归全绿 + clippy 0
+- **分阶段路线**: Phase 2 = OR (WHERE 升级谓词表达式树, 全查询路径通用); Phase 3 = 子查询 (FROM 派生表/IN·EXISTS/标量)
+- **已知限制**: WHERE 仍 AND-only; ON 需至少一等值; 不走索引嵌套循环; JOIN_MAX_ROWS 262144 上限; USING 列在 `*` 不合并
+- gotcha: USING/未限定 ON 操作数用 sql_join_resolve_on 按 join 位置限作用域; JOIN 结果同键多行顺序非确定, e2e 断言需完整 ORDER BY
+
 ### 2026-07-31 会话九总览 (F67, 细节见 CHANGELOG)
 
 - **两表 hash JOIN** (worker 完成点): `A [INNER|LEFT] JOIN B ON a.x=b.y` — JOIN 逻辑全在 worker, shard 只本地单表扫+谓词/投影下推, fan-in 后 build/probe (右建表、左探测). **零新增跨线程** (无 shard↔shard, 不碰 Scheduler 契约); gather 复用 SqlSelectAgg fan-in 模板

@@ -17,8 +17,8 @@
 **协议层**
 - **五协议监听**: RESP2 6379 + **REST (HTTP/1.1 JSON + CORS + Bearer) 6778** + SQL 双门面 (MySQL wire 5434 / PostgreSQL wire 5435, 共内核) + Binary 5433 (内部), 均含 `KvLimits` 协议层长度拦截, TCP_NODELAY
 - **可观测性**: `/metrics` (Prometheus) + `/v1/status` + `/v1/debug/*` (进程级原子计数, 热路径零锁)
-- **SQL 能力**: CREATE/INSERT 多行/SELECT (投影·ORDER BY·聚合 COUNT/SUM/AVG/MIN/MAX·GROUP BY·HAVING·IN·BETWEEN·LIKE·全表扫)/UPDATE/DELETE/DROP/USE/DESCRIBE; 本地二级索引 + 双层布隆剪枝 + 覆盖索引/UNIQUE 早停 + GLOBAL UNIQUE (跨 shard 全局唯一)
-- **JOIN (两表等值)**: `A [INNER|LEFT] JOIN B ON a.x=b.y` — worker 完成点 hash join (shard 只本地扫描, 零跨线程), 谓词+投影下推, 表别名/限定列/ORDER/LIMIT; mysql+pg 驱动实机一致 (多表/RIGHT/FULL 留后)
+- **SQL 能力**: CREATE/INSERT 多行/SELECT (投影·ORDER BY·聚合 COUNT/SUM/AVG/MIN/MAX·GROUP BY·HAVING·IN·BETWEEN·LIKE·WHERE 支持 OR/NOT/括号嵌套·全表扫)/UPDATE/DELETE/DROP/USE/DESCRIBE; 本地二级索引 + 双层布隆剪枝 + 覆盖索引/UNIQUE 早停 + GLOBAL UNIQUE (跨 shard 全局唯一)
+- **JOIN (多表等值)**: N 表左深 `INNER|LEFT|RIGHT|FULL|CROSS JOIN ... ON/USING` — worker 完成点 hash join (shard 只本地扫描, 零跨线程), 多条件 ON + 非等值残余, 谓词/投影下推 + 索引驱动 gather, 表别名/限定列/ORDER/LIMIT; mysql+pg 驱动实机一致 (OR/子查询分阶段后续)
 - **系统表 / 内省 (GUI/ORM 反射)**: information_schema (tables/columns/key_column_usage/schemata) + pg_catalog flat 单表 + SHOW [FULL] TABLES/COLUMNS/CREATE TABLE/DATABASES + 反引号标识符 + `SELECT @@var` stub; SQLAlchemy `inspect()` 实机反射通 (psql `\d` 的 pg_catalog JOIN 留后)
 - **统一记录编码 + value type tag**: 网络门面写入统一附加 tag, storage 层不感知, 新协议接入零存储改动
 - **多 db / 多表物理隔离**: `{block_root}/{db_name}/shard_{N}/` 目录; db 切换走 MetaPage vpid 0 索引

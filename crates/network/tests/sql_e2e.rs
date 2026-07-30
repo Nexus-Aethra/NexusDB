@@ -1792,8 +1792,8 @@ fn mysql_join_two_tables() {
         "INNER JOIN"
     );
 
-    // LEFT: 无订单用户补 NULL 右列
-    let r = c.query("SELECT u.name, o.amt FROM users u LEFT JOIN orders o ON u.id = o.uid ORDER BY u.id");
+    // LEFT: 无订单用户补 NULL 右列 (完整 ORDER BY 保确定顺序: u1 有两单)
+    let r = c.query("SELECT u.name, o.amt FROM users u LEFT JOIN orders o ON u.id = o.uid ORDER BY u.id, o.amt");
     assert_eq!(
         r,
         QueryResult::Rows(vec![
@@ -1831,6 +1831,186 @@ fn mysql_join_two_tables() {
 
     // 单表 SELECT 零回归
     assert_eq!(c.ids("SELECT id FROM users WHERE id = 2"), vec!["2"]);
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+// ===== ⭐ JOIN 族 Phase 1 (F68): 多表/RIGHT/FULL/CROSS/USING/多 ON/索引 =====
+
+/// 三表左深 + RIGHT/FULL/CROSS/USING + 多条件 ON + 索引驱动 gather.
+#[test]
+fn mysql_join_family() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT, age INT, INDEX(age))");
+    c.query("CREATE TABLE o (id INT PRIMARY KEY, uid INT, pid INT, amt DOUBLE)");
+    c.query("CREATE TABLE p (id INT PRIMARY KEY, pname TEXT)");
+    for i in 1..=3 {
+        c.query(&format!("INSERT INTO u VALUES ({i}, 'u{i}', {})", 20 + i));
+    }
+    c.query("INSERT INTO p VALUES (10, 'apple')");
+    c.query("INSERT INTO p VALUES (20, 'banana')");
+    c.query("INSERT INTO o VALUES (1, 1, 10, 9.9)");
+    c.query("INSERT INTO o VALUES (2, 1, 20, 5.0)");
+    c.query("INSERT INTO o VALUES (3, 3, 10, 7.7)");
+    c.query("INSERT INTO o VALUES (4, 9, 20, 1.0)"); // uid=9 无对应 user
+
+    // 三表左深
+    let r = c.query("SELECT u.name, o.amt, p.pname FROM u JOIN o ON u.id = o.uid JOIN p ON o.pid = p.id ORDER BY o.amt");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![Some("u1".into()), Some("5".into()), Some("banana".into())],
+            vec![Some("u3".into()), Some("7.7".into()), Some("apple".into())],
+            vec![Some("u1".into()), Some("9.9".into()), Some("apple".into())],
+        ]),
+        "3-table left-deep"
+    );
+
+    // RIGHT: uid=9 未匹配 → 左列 NULL
+    let r = c.query("SELECT u.name, o.id FROM u RIGHT JOIN o ON u.id = o.uid ORDER BY o.id");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![Some("u1".into()), Some("1".into())],
+            vec![Some("u1".into()), Some("2".into())],
+            vec![Some("u3".into()), Some("3".into())],
+            vec![None, Some("4".into())],
+        ]),
+        "RIGHT JOIN"
+    );
+
+    // FULL: u2 无订单 + o4 无用户 双补 NULL
+    let r = c.query("SELECT u.id, o.id FROM u FULL JOIN o ON u.id = o.uid ORDER BY u.id, o.id");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![None, Some("4".into())],
+            vec![Some("1".into()), Some("1".into())],
+            vec![Some("1".into()), Some("2".into())],
+            vec![Some("2".into()), None],
+            vec![Some("3".into()), Some("3".into())],
+        ]),
+        "FULL JOIN"
+    );
+
+    // CROSS: 3 * 2 = 6 行
+    if let QueryResult::Rows(rows) = c.query("SELECT u.id, p.id FROM u CROSS JOIN p") {
+        assert_eq!(rows.len(), 6, "CROSS cardinality");
+    } else {
+        panic!("cross");
+    }
+
+    // 多条件 ON (等值 + 非等值残余): amt > age 无一满足
+    assert_eq!(
+        c.query("SELECT o.id FROM o JOIN u ON o.uid = u.id AND o.amt > u.age"),
+        QueryResult::Rows(vec![]),
+        "multi-cond ON residual"
+    );
+
+    // 索引驱动 gather (age > 21): 结果正确 (u3 有订单 o3)
+    let r = c.query("SELECT u.id, o.amt FROM u JOIN o ON u.id = o.uid WHERE u.age > 21 ORDER BY o.amt");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("3".into()), Some("7.7".into())]]), "index-driven gather");
+
+    // USING (id): 合成等值连接
+    c.query("CREATE TABLE a (id INT PRIMARY KEY, x INT)");
+    c.query("CREATE TABLE b (id INT PRIMARY KEY, y INT)");
+    c.query("INSERT INTO a VALUES (1, 100)");
+    c.query("INSERT INTO a VALUES (2, 300)");
+    c.query("INSERT INTO b VALUES (1, 200)");
+    assert_eq!(
+        c.query("SELECT a.x, b.y FROM a JOIN b USING (id)"),
+        QueryResult::Rows(vec![vec![Some("100".into()), Some("200".into())]]),
+        "USING"
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+// ===== ⭐ OR/NOT/括号 谓词树 (F69) =====
+
+/// WHERE 支持 OR/NOT/括号嵌套 + 索引回退 + DELETE/UPDATE/JOIN 带 OR.
+#[test]
+fn mysql_or_predicates() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, INDEX(a))");
+    for (i, (a, b)) in [(1, 10), (2, 20), (3, 30), (1, 99)].iter().enumerate() {
+        c.query(&format!("INSERT INTO t VALUES ({}, {a}, {b})", i + 1));
+    }
+
+    // OR (索引列 a 上 OR → 全表扫回退, 结果正确)
+    assert_eq!(c.ids("SELECT id FROM t WHERE a = 1 OR b = 30 ORDER BY id"), vec!["1", "3", "4"]);
+    // 混合 (a=1 OR a=2) AND b>15
+    assert_eq!(c.ids("SELECT id FROM t WHERE (a = 1 OR a = 2) AND b > 15 ORDER BY id"), vec!["2", "4"]);
+    // NOT (括号)
+    assert_eq!(c.ids("SELECT id FROM t WHERE NOT (a = 1) ORDER BY id"), vec!["2", "3"]);
+    // 纯 AND 仍走索引 (零回归)
+    assert_eq!(c.ids("SELECT id FROM t WHERE a = 2"), vec!["2"]);
+    // 嵌套括号
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE (a = 3) OR (b = 10 AND a = 1) ORDER BY id"),
+        vec!["1", "3"]
+    );
+
+    // DELETE 带 OR
+    c.query("DELETE FROM t WHERE a = 1 OR b = 30");
+    assert_eq!(c.ids("SELECT id FROM t ORDER BY id"), vec!["2"]);
+
+    // UPDATE 带 OR
+    c.query("INSERT INTO t VALUES (5, 5, 5)");
+    c.query("UPDATE t SET b = 100 WHERE a = 2 OR a = 5");
+    assert_eq!(c.ids("SELECT id FROM t WHERE b = 100 ORDER BY id"), vec!["2", "5"]);
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// JOIN WHERE 带 OR (下推回退, worker 残余递归) + HAVING 带 OR.
+#[test]
+fn mysql_or_join_having() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT, age INT)");
+    c.query("CREATE TABLE o (id INT PRIMARY KEY, uid INT, amt INT)");
+    for i in 1..=3 {
+        c.query(&format!("INSERT INTO u VALUES ({i}, 'u{i}', {})", 20 + i));
+    }
+    c.query("INSERT INTO o VALUES (1, 1, 5)");
+    c.query("INSERT INTO o VALUES (2, 2, 50)");
+    c.query("INSERT INTO o VALUES (3, 3, 7)");
+
+    // JOIN WHERE 带 OR (u.age>22 OR o.amt>10)
+    let r = c.query("SELECT u.name, o.amt FROM u JOIN o ON u.id = o.uid WHERE u.age > 22 OR o.amt > 10 ORDER BY o.amt");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![Some("u3".into()), Some("7".into())],  // age 23 > 22
+            vec![Some("u2".into()), Some("50".into())], // amt 50 > 10
+        ]),
+        "JOIN WHERE OR"
+    );
+
+    // HAVING 带 OR: 分组求和后 OR 过滤
+    c.query("CREATE TABLE s (id INT PRIMARY KEY, g INT, v INT)");
+    for (i, (g, v)) in [(1, 1), (2, 5), (1, 100), (3, 3)].iter().enumerate() {
+        c.query(&format!("INSERT INTO s VALUES ({}, {g}, {v})", i + 1));
+    }
+    // g=1 → sum 101, g=2 → 5, g=3 → 3; HAVING sum>50 OR g=3
+    let r = c.query("SELECT g, SUM(v) FROM s GROUP BY g HAVING SUM(v) > 50 OR g = 3 ORDER BY g");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![Some("1".into()), Some("101".into())],
+            vec![Some("3".into()), Some("3".into())],
+        ]),
+        "HAVING OR"
+    );
 
     drop(c);
     server.shutdown().unwrap();

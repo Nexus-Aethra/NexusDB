@@ -153,7 +153,7 @@ pub enum ShardRequest {
 }
 
 /// ⭐ F67 (JOIN): 下推谓词类型定义在 storage (避分层反向), 此处 re-export.
-pub use storage::sql_rows::{PredOp, ScanPred};
+pub use storage::sql_rows::{IndexHint, PredOp, ScanPred};
 
 /// 单个 batch 操作 (不带 reply, batch 整体回复).
 ///
@@ -303,6 +303,8 @@ pub enum BatchOp {
         table: std::sync::Arc<str>,
         preds: Vec<ScanPred>,
         proj: Vec<u16>,
+        /// ⭐ F68: 索引驱动提示 (Some 时先走索引范围扫缩候选).
+        index_hint: Option<storage::sql_rows::IndexHint>,
         limit: u32,
     },
     /// ⭐ 事务 v1 (F61): COMMIT 原子批 — worker 把 conn 层 write_set 按 shard

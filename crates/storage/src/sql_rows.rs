@@ -52,6 +52,15 @@ pub struct ScanPred {
     pub set: Vec<ColValue>,
 }
 
+/// ⭐ F68 (JOIN): 索引驱动 gather 提示 — 先走索引范围扫缩候选, 再残余 preds 精确.
+/// lo/hi 为闭区间界 (None = 无界); worker 只作过度近似到界, 正确性由 preds 保证.
+#[derive(Debug, Clone)]
+pub struct IndexHint {
+    pub iid: u32,
+    pub lo: Option<ColValue>,
+    pub hi: Option<ColValue>,
+}
+
 /// ⭐ F67 (JOIN): ColValue 跨型比较 (语义与 worker sql_cmp 一致: 数值跨 I64/F64,
 /// Bytes 字典序, 数值列对 Bytes 按解析; NULL → None 不匹配). a=列值, b=谓词值.
 fn cmp_colval(a: &ColValue, b: &ColValue) -> Option<std::cmp::Ordering> {
@@ -544,26 +553,36 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// ⭐ F67 (JOIN): 带谓词+投影下推的本地全表扫. decode 行 → preds
-    /// AND 过滤 (NULL 恒 false) → 按 proj 取列 → 收集投影行. limit 0 = 不限
-    /// (应在过滤后计数, 但本版 limit 仅无谓词时下推, 有谓词时传 0).
+    /// ⭐ F67/F68 (JOIN): 带谓词+投影下推的本地扫. hint 存在时先走索引范围扫
+    /// 缩候选 pk (再回表), 否则全表扫; 两者都 decode 行 → preds AND 过滤 (NULL 恒 false)
+    /// → 按 proj 取列 → 收集. limit 0 = 不限 (无谓词且无 hint 时下推).
+    #[allow(clippy::too_many_arguments)]
     pub async fn table_scan_filtered_local(
         &mut self,
         db: &str,
         table: &str,
         preds: &[ScanPred],
         proj: &[u16],
+        hint: Option<&IndexHint>,
         limit: usize,
         out: &mut Vec<Vec<ColValue>>,
     ) -> Result<(), RegistryError> {
         let Some(schema) = self.get_schema(db, table).await? else {
             return Ok(());
         };
-        // 复用全表扫拿 (空 val, pk, row_bytes); 无谓词时下推 limit
-        let scan_limit = if preds.is_empty() { limit } else { 0 };
-        let mut raw: Vec<IndexEntry> = Vec::new();
-        self.table_scan_rows_local(db, table, scan_limit, &mut raw).await?;
-        for (_v, _pk, rb) in raw {
+        // 行来源: 有 hint 走索引范围扫回表, 否则全表扫
+        let raw_rows: Vec<Vec<u8>> = if let Some(h) = hint {
+            let pairs = self
+                .index_scan_local(db, table, h.iid, h.lo.as_ref(), h.hi.as_ref(), 0)
+                .await?;
+            pairs.into_iter().map(|(_pk, rb)| rb).collect()
+        } else {
+            let scan_limit = if preds.is_empty() { limit } else { 0 };
+            let mut raw: Vec<IndexEntry> = Vec::new();
+            self.table_scan_rows_local(db, table, scan_limit, &mut raw).await?;
+            raw.into_iter().map(|(_v, _pk, rb)| rb).collect()
+        };
+        for rb in raw_rows {
             let cols = match row::decode_row(&schema, &rb) {
                 Ok(c) => c,
                 Err(_) => continue, // 坏行跳过 (防御)
