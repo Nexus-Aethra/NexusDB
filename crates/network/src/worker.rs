@@ -327,6 +327,9 @@ struct SqlJoinCtx {
 /// ⭐ F67 (JOIN): 单侧 gather 行数上限 (止 worker OOM; 超限报错).
 const JOIN_MAX_ROWS: usize = 262_144;
 
+/// ⭐ F70 (JOIN): 键集合下推上限 (超阈退回全表扫; 海量点查劣于全扫).
+const JOIN_KEYSET_MAX: usize = 1024;
+
 /// ⭐ 事务 v1 (F61): conn 层事务缓冲 — BEGIN..COMMIT 间写语句截流,
 /// shard/调度器零事务状态 (时间维度: 交互式间隙不占 shard;
 /// 空间维度: 跨 shard 编排本就在 worker). COMMIT 时按 shard 分组为
@@ -4293,7 +4296,11 @@ fn sql_join_broadcast(
         (c.db.clone(), t.table.clone(), preds, t.proj.clone())
     };
     // ⭐ F68: 索引驱动提示 — 该表任一可索引列的 Eq/范围谓词 → 范围扫 (Eq 优先)
-    let index_hint = {
+    // ⭐ F70: key_set_hint 优先 (前序表 join 键集合 → 索引点查); 命中时不再用 index_hint
+    let key_set_hint = sql_join_keyset_hint(conn.sql_join.get(&seq).expect("join ctx"), idx);
+    let index_hint = if key_set_hint.is_some() {
+        None
+    } else {
         let c = conn.sql_join.get(&seq).expect("join ctx");
         let t = &c.tables[idx];
         let schema = t.schema.as_ref().unwrap();
@@ -4306,10 +4313,65 @@ fn sql_join_broadcast(
             preds: preds.clone(),
             proj: proj.clone(),
             index_hint: index_hint.clone(),
+            key_set_hint: key_set_hint.clone(),
             limit: 0,
         };
         push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
     }
+}
+
+/// ⭐ F70 (JOIN): 键集合下推决策 — idx>=1 且满足安全条件时, 从前序表抽取
+/// ON 等值键值集合下推为索引点查. 启用条件:
+/// - joins[idx-1].kind ∈ {Inner, Left} (RIGHT/FULL/CROSS 禁用: 语义不能丢未匹配行)
+/// - 息含单个 OnPred::Eq (多列组合键 v1 跳过)
+/// - Eq 一侧属 idx 表且该列有普通二级索引, 另一侧属前序表 ti<idx
+/// - 前序键集合去重后 <= JOIN_KEYSET_MAX (超阈退回全表扫)
+fn sql_join_keyset_hint(ctx: &SqlJoinCtx, idx: usize) -> Option<shard_manager::KeySetHint> {
+    if idx == 0 {
+        return None;
+    }
+    let jc = &ctx.joins[idx - 1];
+    if !matches!(jc.kind, JoinKind::Inner | JoinKind::Left) {
+        return None;
+    }
+    // 息含单个 Eq
+    let eqs: Vec<&sql::OnPred> =
+        jc.on.iter().filter(|o| matches!(o, sql::OnPred::Eq(..))).collect();
+    if eqs.len() != 1 {
+        return None;
+    }
+    let sql::OnPred::Eq(l, r) = eqs[0] else { return None };
+    // resolve 两侧 → (表下标, 列号)
+    let (lt, li) = sql_join_resolve_on(ctx, l, idx).ok()?;
+    let (rt, ri) = sql_join_resolve_on(ctx, r, idx).ok()?;
+    // 分辨新表侧 (idx) 与前序表侧 (ti<idx)
+    let (new_col, prev_ti, prev_col) = if lt == idx && rt < idx {
+        (li, rt, ri)
+    } else if rt == idx && lt < idx {
+        (ri, lt, li)
+    } else {
+        return None;
+    };
+    // 新表 join 列需有普通二级索引
+    let schema = ctx.tables[idx].schema.as_ref()?;
+    let iid = schema.indexes.iter().find(|i| i.col == new_col).map(|i| i.iid)?;
+    // 前序表 prev_col 在其 proj 中的位置
+    let prev_tab = &ctx.tables[prev_ti];
+    let pos = prev_tab.proj.iter().position(|&c| c == prev_col)?;
+    // 抽取去重键值 (跳 NULL); 超阈 → 退回
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut keys: Vec<ColValue> = Vec::new();
+    for row in &prev_tab.rows {
+        let cv = &row[pos];
+        let Some(kb) = join_key(cv) else { continue }; // NULL 不入键集
+        if seen.insert(kb) {
+            keys.push(cv.clone());
+            if keys.len() > JOIN_KEYSET_MAX {
+                return None; // 超阈退回全表扫
+            }
+        }
+    }
+    Some(shard_manager::KeySetHint { iid, keys })
 }
 
 /// ⭐ F68 (JOIN): 为 tables[idx] 选一个可索引谓词产索引提示 (Eq 优先, 否则范围).

@@ -1879,8 +1879,8 @@ fn exec_task_op(
         crate::request::BatchOp::TableScan { ref db, ref table, limit } => {
             exec_table_scan(e, db, table, limit)
         }
-        crate::request::BatchOp::ScanFiltered { ref db, ref table, ref preds, ref proj, ref index_hint, limit } => {
-            exec_scan_filtered(e, db, table, preds, proj, index_hint.as_ref(), limit)
+        crate::request::BatchOp::ScanFiltered { ref db, ref table, ref preds, ref proj, ref index_hint, ref key_set_hint, limit } => {
+            exec_scan_filtered(e, db, table, preds, proj, index_hint.as_ref(), key_set_hint.as_ref(), limit)
         }
         crate::request::BatchOp::IndexScan {
             ref db, ref table, iid, ref lo, ref hi, limit, with_rows,
@@ -1960,6 +1960,7 @@ fn exec_table_scan(
 }
 
 /// ⭐ F67 (JOIN): 带谓词+投影下推的全表扫 → ProjRows.
+#[allow(clippy::too_many_arguments)]
 fn exec_scan_filtered(
     e: &mut storage::StorageEngine,
     db: &str,
@@ -1967,13 +1968,14 @@ fn exec_scan_filtered(
     preds: &[crate::request::ScanPred],
     proj: &[u16],
     index_hint: Option<&storage::sql_rows::IndexHint>,
+    key_set_hint: Option<&storage::sql_rows::KeySetHint>,
     limit: u32,
 ) -> crate::request::BatchResult {
     use crate::request::BatchResult;
     let mut out = Vec::new();
-    match block_on_io(
-        e.table_scan_filtered_local(db, table, preds, proj, index_hint, limit as usize, &mut out),
-    ) {
+    match block_on_io(e.table_scan_filtered_local(
+        db, table, preds, proj, index_hint, key_set_hint, limit as usize, &mut out,
+    )) {
         Ok(()) => BatchResult::ProjRows(out),
         Err(err) => BatchResult::Error(err.to_string()),
     }
@@ -2997,8 +2999,8 @@ fn shard_thread_main(
                                 BatchOp::TableScan { db, table, limit } => {
                                     exec_table_scan(e, &db, &table, limit)
                                 }
-                                BatchOp::ScanFiltered { db, table, preds, proj, index_hint, limit } => {
-                                    exec_scan_filtered(e, &db, &table, &preds, &proj, index_hint.as_ref(), limit)
+                                BatchOp::ScanFiltered { db, table, preds, proj, index_hint, key_set_hint, limit } => {
+                                    exec_scan_filtered(e, &db, &table, &preds, &proj, index_hint.as_ref(), key_set_hint.as_ref(), limit)
                                 }
                                 BatchOp::IndexScan { db, table, iid, lo, hi, limit, with_rows } => {
                                     exec_index_scan(

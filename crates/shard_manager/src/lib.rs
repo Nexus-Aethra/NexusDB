@@ -64,6 +64,7 @@ pub use reply::{PendingReply, ReplyFuture, ReplySender};
 pub use request::{BatchOp, BatchResult, ShardId, ShardReply, ShardRequest, ShardResponse, ShardTask, TaskResult};
 pub use request::{PredOp, ScanPred};
 pub use request::IndexHint;
+pub use request::KeySetHint;
 pub use router::{HashRouter, Router};
 pub use task_inbox::{SharedTaskInbox, TaskInbox};
 pub use task_reply_bus::{ReplyBusSet, SharedTaskReplyBus, TaskReplyBus};

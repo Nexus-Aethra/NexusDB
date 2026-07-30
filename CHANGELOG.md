@@ -10,6 +10,45 @@
 
 ---
 
+## 2026-07-31 会话十二 (F70: JOIN gather 索引点查优化)
+
+纯性能优化。probe 侧表 gather 时, 用前序已 gather 表的 ON 等值键值集合下推为
+索引点查 (而非全表扫), 让 shard 只回匹配行。零跨线程、不改 JOIN 语义/结果。
+
+### 性能实机 (mysql-connector, 3000 行/表)
+
+| 查询 | 优化前 | 优化后 |
+|---|---|---|
+| `u JOIN o ON u.id=o.uid WHERE u.id=1500` (o.uid 有索引) | 16ms | **2.5ms (~6.3x)** |
+| 同上但 o.uid 无索引 (对照) | — | 10ms (正确回退全表扫) |
+| 50 键 build 侧 (u.id<50) | — | 3.0ms |
+| LEFT JOIN (右表键集合点查) | — | 2.6ms |
+
+### 交付总览
+
+| # | 交付 | 文件 |
+|---|---|---|
+| K1 | `KeySetHint{iid,keys}` 类型 + `index_multi_point_local` (逐键等值点查+bloom短路+去重+批量回表) + table_scan_filtered_local 第3路 (key_set>hint>全扫) | storage/sql_rows.rs |
+| K2 | `BatchOp::ScanFiltered` 加 key_set_hint + re-export + manager 透传 | request.rs/lib.rs/manager.rs |
+| K3 | `sql_join_keyset_hint` 决策 + sql_join_broadcast 优先键集合 | worker.rs |
+| K4 | 回归 (现有 JOIN e2e 全过验证不改语义) + 性能实机 + 文档 | — |
+
+### 启用条件 (安全边界)
+
+- 仅 **单列等值 ON** (多列组合键 v1 退回)
+- 仅 **INNER / LEFT(右表)**; RIGHT/FULL/CROSS 退回全扫 (语义: finish 无法复活 shard 过滤掉的未匹配行)
+- 新表 join 列**有普通二级索引** (无索引退回全扫, 无劣化)
+- 前序键集合去重后 **<= JOIN_KEYSET_MAX(1024)** (超阈退回全扫)
+
+### gotcha
+
+- **优化不改结果**: tables[idx].rows 变为"join 键 ∈ 前序键集"的子集, 对 INNER/LEFT 是最终输出的精确子集 (未匹配右行本就不输出) → finish/折叠零改动
+- **安全性依据 join kind 非残余兼底**: RIGHT/FULL 绝不下推 (与 F68 同原则)
+- 键集合与新表自身 WHERE preds 正交: 索引点查取候选行后仍过 row_pass_preds, AND 叠加
+- 剩余开销 (2.5ms vs pk 点查 0.05ms): JOIN 固有两轮串行 gather (u 回齐才 gather o) + 6 shard fan-out 往返, 非全表扫问题
+
+---
+
 ## 2026-07-31 会话十一 (F69: OR/NOT/括号 谓词表达式树)
 
 WHERE 从 AND-only 的 `Vec<Cond>` 升级为泛型谓词树 `Pred<C>`(Leaf/And/Or/Not),

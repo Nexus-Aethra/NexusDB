@@ -24,6 +24,15 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 
 ## 当前进度
 
+### 2026-07-31 会话十二总览 (F70, 细节见 CHANGELOG)
+
+- **JOIN gather 索引点查优化** (纯性能): probe 侧表 gather 时用前序表 ON 等值键值集合下推为索引点查, shard 只回匹配行而非全表扫。实机: 有索引 JOIN 16ms→2.5ms (~6.3x)
+- K1 KeySetHint + index_multi_point_local (逐键等值点查+bloom短路+去重+table_get_many 批量回表); table_scan_filtered_local 行来源优先级 key_set>index_hint>全扫
+- K3 sql_join_keyset_hint 决策 (worker.rs); sql_join_broadcast 命中时优先键集合不再用 index_hint
+- **启用条件**: 单列等值 ON + INNER/LEFT(右表) + 新表 join 列有索引 + 键集合<=1024; RIGHT/FULL/CROSS/多列/无索引退回全扫 (无劣化)
+- **不改语义**: 现有 JOIN e2e 全过; tables[idx].rows 变子集对 INNER/LEFT 是精确子集, finish 零改动。回归全绿+clippy 0
+- 剩余开销: JOIN 固有两轮串行 gather + 6 shard fan-out 往返 (非全扫问题)
+
 ### 2026-07-31 会话十一总览 (F69, 细节见 CHANGELOG)
 
 - **OR/NOT/括号 谓词表达式树**: WHERE 从 AND-only `Vec<Cond>` 升为泛型 `Pred<C>`(Leaf/And/Or/Not), 覆盖单表 SELECT/DELETE/UPDATE/HAVING 与 JOIN 全路径

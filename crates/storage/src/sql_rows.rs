@@ -61,6 +61,14 @@ pub struct IndexHint {
     pub hi: Option<ColValue>,
 }
 
+/// ⭐ F70 (JOIN): 键集合索引点查提示 — probe 侧只回 join 键 ∈ keys 的行.
+/// 前序已 gather 表的 ON 等值键值集合; shard 端对每键等值索引点查 (bloom 短路).
+#[derive(Debug, Clone)]
+pub struct KeySetHint {
+    pub iid: u32,
+    pub keys: Vec<ColValue>,
+}
+
 /// ⭐ F67 (JOIN): ColValue 跨型比较 (语义与 worker sql_cmp 一致: 数值跨 I64/F64,
 /// Bytes 字典序, 数值列对 Bytes 按解析; NULL → None 不匹配). a=列值, b=谓词值.
 fn cmp_colval(a: &ColValue, b: &ColValue) -> Option<std::cmp::Ordering> {
@@ -553,9 +561,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// ⭐ F67/F68 (JOIN): 带谓词+投影下推的本地扫. hint 存在时先走索引范围扫
-    /// 缩候选 pk (再回表), 否则全表扫; 两者都 decode 行 → preds AND 过滤 (NULL 恒 false)
-    /// → 按 proj 取列 → 收集. limit 0 = 不限 (无谓词且无 hint 时下推).
+    /// ⭐ F67/F68/F70 (JOIN): 带谓词+投影下推的本地扫. 行来源优先级:
+    /// key_set (多键索引点查) > hint (单区间范围扫) > 全表扫; 三者都 decode 行
+    /// → preds AND 过滤 (NULL 恒 false) → 按 proj 取列 → 收集. limit 0 = 不限.
     #[allow(clippy::too_many_arguments)]
     pub async fn table_scan_filtered_local(
         &mut self,
@@ -564,14 +572,17 @@ impl StorageEngine {
         preds: &[ScanPred],
         proj: &[u16],
         hint: Option<&IndexHint>,
+        key_set: Option<&KeySetHint>,
         limit: usize,
         out: &mut Vec<Vec<ColValue>>,
     ) -> Result<(), RegistryError> {
         let Some(schema) = self.get_schema(db, table).await? else {
             return Ok(());
         };
-        // 行来源: 有 hint 走索引范围扫回表, 否则全表扫
-        let raw_rows: Vec<Vec<u8>> = if let Some(h) = hint {
+        // 行来源: key_set 多键点查 > hint 范围扫 > 全表扫
+        let raw_rows: Vec<Vec<u8>> = if let Some(ks) = key_set {
+            self.index_multi_point_local(db, table, ks.iid, &ks.keys).await?
+        } else if let Some(h) = hint {
             let pairs = self
                 .index_scan_local(db, table, h.iid, h.lo.as_ref(), h.hi.as_ref(), 0)
                 .await?;
@@ -598,6 +609,30 @@ impl StorageEngine {
             }
         }
         Ok(())
+    }
+
+    /// ⭐ F70 (JOIN): 多键等值索引点查 — 对每键索引点查收 pk (bloom 短路免 travel),
+    /// 去重后一次 table_get_many 批量回表. 返回命中行 row_bytes.
+    pub async fn index_multi_point_local(
+        &mut self,
+        db: &str,
+        table: &str,
+        iid: u32,
+        keys: &[ColValue],
+    ) -> Result<Vec<Vec<u8>>, RegistryError> {
+        let mut pk_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut pks: Vec<Vec<u8>> = Vec::new();
+        for k in keys {
+            let hit = self.index_scan_pks_local(db, table, iid, Some(k), Some(k), 0).await?;
+            for pk in hit {
+                if pk_seen.insert(pk.clone()) {
+                    pks.push(pk);
+                }
+            }
+        }
+        let refs: Vec<&[u8]> = pks.iter().map(|p| p.as_slice()).collect();
+        let rows = self.table_get_many(db, table, &refs).await?;
+        Ok(rows.into_iter().flatten().collect())
     }
 
     // =================================================================
