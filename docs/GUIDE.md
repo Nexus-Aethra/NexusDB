@@ -1,59 +1,61 @@
-# NexusDB 功能介绍与使用文档
+# NexusDB Feature Overview & Usage Guide
 
-> 面向使用者的上手指南。设计与实现细节见 [`DESIGN.md`](../DESIGN.md);修复/演进历史见 [`CHANGELOG.md`](../CHANGELOG.md)。
+> **语言 / Language**: **English** | [简体中文](./GUIDE-CN.md)
 
-## 目录
-1. [这是什么](#1-这是什么)
-2. [快速开始](#2-快速开始)
-3. [多协议门面接入](#3-多协议门面接入)
-4. [SQL 能力与示例](#4-sql-能力与示例)
-5. [数据类型](#5-数据类型)
-6. [安全:认证与 TLS](#6-安全认证与-tls)
-7. [配置参考](#7-配置参考)
-8. [性能实测](#8-性能实测)
-9. [能力边界](#9-能力边界)
+> A user-facing getting-started guide. For design & implementation details see [`DESIGN.md`](../DESIGN.md); for fix/evolution history see [`CHANGELOG.md`](../CHANGELOG.md).
 
----
-
-## 1. 这是什么
-
-NexusDB 是一个用 Rust 2024 编写的**嵌入式单机、写密集/低延迟/高并发 KV + SQL 数据库引擎**,核心特征:
-
-- **架构**:Share-Nothing + Per-Core 线程 + io_uring 异步 I/O + 自研协程调度器(不依赖 tokio)。
-- **存储**:COW append-only + LCB-Tree 页(前缀压缩)+ 多 db/多表物理隔离 + 崩溃恢复。
-- **多协议门面(一套内核,五种接入)**:
-  - **RESP2**(Redis 兼容):五大数据结构 + Geo + Bitmap
-  - **MySQL wire**:`mysql` CLI / 驱动直连
-  - **PostgreSQL wire**:`psql` / psycopg 直连
-  - **HTTP REST**:KV + SQL JSON 接口 + Prometheus `/metrics`
-  - **Binary**(内部/压测用)
-- **SQL 子集**:DDL/DML/SELECT(JOIN、子查询、聚合、GROUP BY/HAVING、DISTINCT、表达式聚合)、事务(OCC 隔离级别 + SAVEPOINT)、本地二级索引 + 布隆剪枝 + GLOBAL UNIQUE。
-- **安全**:MySQL `caching_sha2_password` / PostgreSQL `SCRAM-SHA-256` 认证 + **rustls TLS**(opt-in)。
-
-> MySQL 和 PostgreSQL 两个门面**共用同一内核、同一份数据**,可同库互读写。
+## Table of Contents
+1. [What It Is](#1-what-it-is)
+2. [Quick Start](#2-quick-start)
+3. [Multi-Protocol Access](#3-multi-protocol-access)
+4. [SQL Capabilities & Examples](#4-sql-capabilities--examples)
+5. [Data Types](#5-data-types)
+6. [Security: Auth & TLS](#6-security-auth--tls)
+7. [Configuration Reference](#7-configuration-reference)
+8. [Measured Performance](#8-measured-performance)
+9. [Capability Boundaries](#9-capability-boundaries)
 
 ---
 
-## 2. 快速开始
+## 1. What It Is
 
-### 构建
+NexusDB is an **embedded single-node, write-heavy / low-latency / high-concurrency KV + SQL database engine** written in Rust 2024. Core characteristics:
+
+- **Architecture**: Share-Nothing + per-core threads + io_uring async I/O + a hand-written coroutine scheduler (no tokio dependency).
+- **Storage**: COW append-only + LCB-Tree pages (prefix compression) + multi-db/multi-table physical isolation + crash recovery.
+- **Multi-protocol facades (one kernel, five ways in)**:
+  - **RESP2** (Redis-compatible): five data structures + Geo + Bitmap
+  - **MySQL wire**: `mysql` CLI / driver direct connect
+  - **PostgreSQL wire**: `psql` / psycopg direct connect
+  - **HTTP REST**: KV + SQL JSON API + Prometheus `/metrics`
+  - **Binary** (internal / benchmarking)
+- **SQL subset**: DDL/DML/SELECT (JOIN, subqueries, aggregates, GROUP BY/HAVING, DISTINCT, expression aggregates), transactions (OCC isolation levels + SAVEPOINT), local secondary indexes + bloom pruning + GLOBAL UNIQUE.
+- **Security**: MySQL `caching_sha2_password` / PostgreSQL `SCRAM-SHA-256` auth + **rustls TLS** (opt-in).
+
+> The MySQL and PostgreSQL facades **share the same kernel and the same data** — you can read/write the same database across both.
+
+---
+
+## 2. Quick Start
+
+### Build
 ```bash
-# 调试构建
+# debug build
 cargo build
-# 发布构建 (性能测试/部署用)
+# release build (for perf testing / deployment)
 cargo build --release
 ```
 
-> 注:存储层 async 帧较大,运行/测试需要更大线程栈:`RUST_MIN_STACK=67108864`。
+> Note: the storage layer's async frames are large; running/testing needs a bigger thread stack: `RUST_MIN_STACK=67108864`.
 
-### 最简配置 `nexusdb.toml`
+### Minimal config `nexusdb.toml`
 ```toml
 [server]
 sql_addr = "127.0.0.1:5434"      # MySQL wire
 pg_addr  = "127.0.0.1:5435"      # PostgreSQL wire
 redis_addr = "127.0.0.1:6379"    # RESP (Redis)
 http_addr  = "127.0.0.1:6778"    # HTTP REST
-sql_password = ""                # 空 = 免密
+sql_password = ""                # empty = no auth
 
 [storage]
 block_root = "./data"
@@ -61,36 +63,36 @@ default_db = "default"
 default_table = "default"
 ```
 
-### 启动
+### Start
 ```bash
 RUST_MIN_STACK=67108864 ./target/release/NexusDB --config nexusdb.toml
 ```
-启动后日志会打印各门面监听地址。任一门面 `addr` 留空即禁用该门面。
+On startup the log prints each facade's listen address. Leaving any facade's `addr` empty disables that facade.
 
-### Docker 部署
-镜像随仓库提供 [`Dockerfile`](../Dockerfile)(多阶段:Rust builder → debian-slim)+ [`docker-compose.yml`](../docker-compose.yml)+ 容器默认配置 [`deploy/nexusdb.docker.toml`](../deploy/nexusdb.docker.toml)。
+### Docker Deployment
+The repo ships a [`Dockerfile`](../Dockerfile) (multi-stage: Rust builder → debian-slim) + [`docker-compose.yml`](../docker-compose.yml) + a container default config [`deploy/nexusdb.docker.toml`](../deploy/nexusdb.docker.toml).
 ```bash
-# 构建镜像
+# build image
 docker build -t nexusdb:latest .
 
-# 直接运行 (持久化到命名卷 nexusdb-data)
+# run directly (persist to a named volume nexusdb-data)
 docker run -d --name nexusdb \
   -p 6379:6379 -p 5434:5434 -p 5435:5435 -p 6778:6778 \
   -v nexusdb-data:/data nexusdb:latest
 
-# 或 compose 一键起
+# or one-shot with compose
 docker compose up -d
 ```
-- 数据持久化在容器 `/data`(`VOLUME`);内置 `HEALTHCHECK` 探测 HTTP `/v1/status`。
-- 覆盖配置:`-v /path/your.toml:/etc/nexusdb/nexusdb.toml`。
-- **io_uring 注意**:默认 `io_backend=io_uring`,需较新内核;若被宿主 seccomp 拦截而报 I/O 错,改配置为 `io_backend="stdfs"`(挂自定义配置),或 `docker run --security-opt seccomp=unconfined`。
-- 启用 TLS:挂证书目录并在配置里设置 `tls_cert`/`tls_key`。
+- Data persists at the container `/data` (`VOLUME`); a built-in `HEALTHCHECK` probes HTTP `/v1/status`.
+- Override config: `-v /path/your.toml:/etc/nexusdb/nexusdb.toml`.
+- **io_uring note**: default `io_backend=io_uring` needs a recent kernel; if the host seccomp blocks it and I/O errors appear, set `io_backend="stdfs"` (mount a custom config) or `docker run --security-opt seccomp=unconfined`.
+- Enable TLS: mount a cert directory and set `tls_cert`/`tls_key` in the config.
 
 ---
 
-## 3. 多协议门面接入
+## 3. Multi-Protocol Access
 
-### 3.1 RESP(Redis 兼容,默认 6379)
+### 3.1 RESP (Redis-compatible, default 6379)
 ```bash
 redis-cli -p 6379
 > SET user:1 alice
@@ -103,9 +105,9 @@ OK
 > GEOADD geo 13.361 38.115 "palermo"
 > SETBIT bm 7 1
 ```
-支持 String/Hash/List/Set/ZSet 五大结构 + Geo + Bitmap 命令面。
+Supports the String/Hash/List/Set/ZSet five structures + Geo + Bitmap command surface.
 
-### 3.2 MySQL wire(默认 5434)
+### 3.2 MySQL wire (default 5434)
 ```bash
 mysql -h127.0.0.1 -P5434 -uroot
 ```
@@ -120,7 +122,7 @@ cur.execute("INSERT INTO t VALUES (1, 'alice')")
 cur.execute("SELECT * FROM t"); print(cur.fetchall())
 ```
 
-### 3.3 PostgreSQL wire(默认 5435)
+### 3.3 PostgreSQL wire (default 5435)
 ```bash
 psql -h 127.0.0.1 -p 5435 -U root -d default
 ```
@@ -133,21 +135,21 @@ with c.cursor() as cur:
     print(cur.fetchall())
 ```
 
-### 3.4 SQLAlchemy ORM(MySQL 或 PostgreSQL 方言)
+### 3.4 SQLAlchemy ORM (MySQL or PostgreSQL dialect)
 ```python
 from sqlalchemy import create_engine, text
-# MySQL 方言
+# MySQL dialect
 eng = create_engine("mysql+mysqlconnector://root:@127.0.0.1:5434/default")
-# 或 PostgreSQL 方言
+# or PostgreSQL dialect
 # eng = create_engine("postgresql+psycopg://root:@127.0.0.1:5435/default")
 with eng.begin() as conn:
     conn.execute(text("CREATE TABLE u (id INT PRIMARY KEY, age INT)"))
     conn.execute(text("INSERT INTO u VALUES (1, 30)"))
     print(conn.execute(text("SELECT * FROM u")).fetchall())
 ```
-基础 CRUD / JOIN / 分页 / 反射 / 迁移(ADD COLUMN)实机可用。
+Basic CRUD / JOIN / pagination / reflection / migration (ADD COLUMN) work against real drivers.
 
-### 3.5 HTTP REST(默认 6778)
+### 3.5 HTTP REST (default 6778)
 ```bash
 # KV
 curl -X PUT  http://127.0.0.1:6778/v1/kv/user:1 -d 'alice'
@@ -155,14 +157,14 @@ curl http://127.0.0.1:6778/v1/kv/user:1
 # SQL (JSON)
 curl -X POST http://127.0.0.1:6778/v1/sql -H 'Content-Type: application/json' \
      -d '{"sql":"SELECT * FROM t"}'
-# 监控
-curl http://127.0.0.1:6778/metrics       # Prometheus 指标
+# monitoring
+curl http://127.0.0.1:6778/metrics       # Prometheus metrics
 curl http://127.0.0.1:6778/v1/status
 ```
 
 ---
 
-## 4. SQL 能力与示例
+## 4. SQL Capabilities & Examples
 
 ### DDL
 ```sql
@@ -171,10 +173,10 @@ CREATE TABLE users (
   name VARCHAR(64) NOT NULL,
   email TEXT,
   age INT,
-  INDEX(age),                 -- 本地二级索引
-  UNIQUE(email)               -- 唯一索引 (本 shard); 跨 shard 全局唯一用 GLOBAL UNIQUE
+  INDEX(age),                 -- local secondary index
+  UNIQUE(email)               -- unique index (this shard); use GLOBAL UNIQUE for cross-shard
 );
-ALTER TABLE users ADD COLUMN created DATE;   -- 追加可空列 (零数据重写)
+ALTER TABLE users ADD COLUMN created DATE;   -- append a nullable column (zero data rewrite)
 DESCRIBE users;
 SHOW CREATE TABLE users;
 DROP TABLE users;
@@ -187,41 +189,41 @@ UPDATE users SET age = 31 WHERE id = 1;
 DELETE FROM users WHERE age < 18;
 ```
 
-### SELECT(投影 / 过滤 / 排序 / 分页 / 别名)
+### SELECT (projection / filter / sort / pagination / alias)
 ```sql
 SELECT id, name AS n FROM users WHERE age >= 18 AND name LIKE 'a%'
-  ORDER BY age DESC LIMIT 10 OFFSET 5;          -- 或 MySQL LIMIT 5,10
-SELECT * FROM db1.users;                         -- db.table 限定名
+  ORDER BY age DESC LIMIT 10 OFFSET 5;          -- or MySQL LIMIT 5,10
+SELECT * FROM db1.users;                         -- db.table qualified name
 ```
 
-### 聚合 / GROUP BY / HAVING / DISTINCT
+### Aggregates / GROUP BY / HAVING / DISTINCT
 ```sql
 SELECT age, COUNT(*), SUM(score), AVG(score) FROM users GROUP BY age HAVING COUNT(*) > 1;
 SELECT COUNT(DISTINCT age) FROM users;
 SELECT DISTINCT age FROM users;
-SELECT SUM(price * qty) FROM orders;             -- 表达式聚合
+SELECT SUM(price * qty) FROM orders;             -- expression aggregate
 ```
 
-### JOIN / 子查询
+### JOIN / subqueries
 ```sql
 SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid;   -- INNER/LEFT/RIGHT/FULL/CROSS/USING
-SELECT * FROM users WHERE id IN (SELECT uid FROM orders);          -- 非关联 IN
-SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.uid = u.id);  -- 单等值关联 EXISTS
-SELECT * FROM (SELECT uid, SUM(amt) s FROM orders GROUP BY uid) t WHERE t.s > 100;  -- FROM 派生表
+SELECT * FROM users WHERE id IN (SELECT uid FROM orders);          -- non-correlated IN
+SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.uid = u.id);  -- single-equality correlated EXISTS
+SELECT * FROM (SELECT uid, SUM(amt) s FROM orders GROUP BY uid) t WHERE t.s > 100;  -- FROM derived table
 ```
 
-### 事务
+### Transactions
 ```sql
-BEGIN;                                  -- 或 BEGIN ISOLATION LEVEL SERIALIZABLE
+BEGIN;                                  -- or BEGIN ISOLATION LEVEL SERIALIZABLE
 UPDATE users SET age = 40 WHERE id = 1;
 SAVEPOINT sp1;
 DELETE FROM users WHERE id = 2;
 ROLLBACK TO sp1;
 COMMIT;
 ```
-OCC 隔离级别 + SAVEPOINT;单 shard 严格原子,跨 shard best-effort;DDL 在事务中被拒。
+OCC isolation levels + SAVEPOINT; single-shard strictly atomic, cross-shard best-effort; DDL rejected inside a transaction.
 
-### 系统表
+### System tables
 ```sql
 SELECT * FROM information_schema.tables;
 SELECT * FROM information_schema.columns;
@@ -230,26 +232,26 @@ SHOW TABLES; SHOW DATABASES;
 
 ---
 
-## 5. 数据类型
+## 5. Data Types
 
-| SQL 类型 | 存储 | 说明 |
+| SQL type | Storage | Notes |
 |---|---|---|
-| `INT/BIGINT/SMALLINT` | i64 | 整数 |
-| `BOOLEAN/BOOL` | i64(0/1) | 布尔;渲染 MySQL `1/0`,PG `t/f` |
-| `DOUBLE/FLOAT/REAL` | f64 | 浮点 |
-| `DECIMAL/NUMERIC(p,s)` | i128 定点 | **精确金额**(精度 ≤ 38);SUM 精确;驱动返回原生 `Decimal` |
-| `TEXT/VARCHAR(n)/CHAR(n)` | 变长字节 | 字符串 |
-| `BLOB/BYTES/BYTEA` | 变长字节 | 二进制 |
-| `DATE/TIME/TIMESTAMP/DATETIME` | i64 微秒 | 时间(UTC 裸值);驱动返回原生 `date`/`datetime` |
-| `JSON/JSONB` | 文本字节 | 半结构化(单行 < 64KB) |
-| `UUID` | 16B | 驱动返回原生 `UUID` |
+| `INT/BIGINT/SMALLINT` | i64 | integer |
+| `BOOLEAN/BOOL` | i64 (0/1) | boolean; renders `1/0` on MySQL, `t/f` on PG |
+| `DOUBLE/FLOAT/REAL` | f64 | floating point |
+| `DECIMAL/NUMERIC(p,s)` | i128 fixed-point | **exact money** (precision ≤ 38); SUM exact; drivers return native `Decimal` |
+| `TEXT/VARCHAR(n)/CHAR(n)` | variable bytes | string |
+| `BLOB/BYTES/BYTEA` | variable bytes | binary |
+| `DATE/TIME/TIMESTAMP/DATETIME` | i64 microseconds | time (naive UTC); drivers return native `date`/`datetime` |
+| `JSON/JSONB` | text bytes | semi-structured (single row < 64KB) |
+| `UUID` | 16B | drivers return native `UUID` |
 
-**类型示例:**
+**Type example:**
 ```sql
 CREATE TABLE account (
   id INT PRIMARY KEY,
   active BOOLEAN,
-  balance DECIMAL(18,2),        -- 精确金额
+  balance DECIMAL(18,2),        -- exact money
   created DATE,
   updated TIMESTAMP,
   profile JSON,
@@ -260,121 +262,121 @@ INSERT INTO account VALUES
    TIMESTAMP '2024-06-01 09:30:00', '{"vip":true}',
    '550e8400-e29b-41d4-a716-446655440000');
 
-SELECT SUM(balance) FROM account;               -- 精确 (不丢精度)
+SELECT SUM(balance) FROM account;               -- exact (no precision loss)
 SELECT id FROM account WHERE created > DATE '2024-01-01' ORDER BY created;
 SELECT id FROM account WHERE active = TRUE;
 ```
-> psycopg3 会把上表各列直接映射为 Python 的 `bool` / `Decimal` / `date` / `datetime` / `dict` / `UUID`;mysql-connector(含预处理二进制协议)返回原生 `datetime` / `Decimal`。
+> psycopg3 maps the above columns directly to Python `bool` / `Decimal` / `date` / `datetime` / `dict` / `UUID`; mysql-connector (including the prepared binary protocol) returns native `datetime` / `Decimal`.
 
 ---
 
-## 6. 安全:认证与 TLS
+## 6. Security: Auth & TLS
 
-### 6.1 认证(密码)
-配置 `sql_password` 即启用登录认证(MySQL 与 PostgreSQL 门面共用):
+### 6.1 Authentication (password)
+Setting `sql_password` enables login auth (shared by the MySQL and PostgreSQL facades):
 ```toml
 [server]
 sql_password = "s3cret"
 ```
-- **PostgreSQL 门面**:非空口令走 **SCRAM-SHA-256**(彻底消除明文口令)。
-- **MySQL 门面**:支持 `caching_sha2_password` fast-auth 与 `mysql_native_password`(挑战响应,自动兜底)。
-- 空口令 = 免密(任意用户名放行);错误口令拒绝(MySQL 1045 / PG 28P01)。
+- **PostgreSQL facade**: a non-empty password uses **SCRAM-SHA-256** (fully eliminates cleartext passwords).
+- **MySQL facade**: supports `caching_sha2_password` fast-auth and `mysql_native_password` (challenge-response, automatic fallback).
+- Empty password = no auth (any username allowed); wrong password rejected (MySQL 1045 / PG 28P01).
 
 ```python
-# psycopg 自动用 SCRAM
+# psycopg uses SCRAM automatically
 psycopg.connect("host=127.0.0.1 port=5435 user=root password=s3cret dbname=default")
-# mysql-connector 自动协商 caching_sha2 / native
+# mysql-connector negotiates caching_sha2 / native automatically
 mysql.connector.connect(host="127.0.0.1", port=5434, user="root", password="s3cret", database="default")
 ```
 
-### 6.2 TLS 传输加密(opt-in)
-配置证书 + 私钥路径即启用(**两项均非空才启用**;不配 = 纯明文,零开销):
+### 6.2 TLS transport encryption (opt-in)
+Setting cert + key paths enables TLS (**both must be non-empty**; unset = plaintext, zero overhead):
 ```toml
 [server]
-tls_cert = "/etc/nexusdb/cert.pem"   # 证书链 PEM
-tls_key  = "/etc/nexusdb/key.pem"    # 私钥 PEM (PKCS8 / PKCS1 / SEC1)
+tls_cert = "/etc/nexusdb/cert.pem"   # certificate chain PEM
+tls_key  = "/etc/nexusdb/key.pem"    # private key PEM (PKCS8 / PKCS1 / SEC1)
 ```
-生成自签证书(测试用):
+Generate a self-signed cert (for testing):
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout key.pem -out cert.pem -days 3650 \
   -subj "/CN=localhost" -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
 ```
-连接(STARTTLS 式:SQL 门面握手内升级,同端口):
+Connect (STARTTLS-style: SQL facades upgrade within the handshake, same port):
 ```python
-# PostgreSQL: sslmode=require (加密, 不验证自签证书)
+# PostgreSQL: sslmode=require (encrypt, don't verify the self-signed cert)
 psycopg.connect("host=127.0.0.1 port=5435 user=root password=s3cret dbname=default sslmode=require")
-# MySQL: 启用 SSL
+# MySQL: enable SSL
 mysql.connector.connect(host="127.0.0.1", port=5434, user="root", password="s3cret",
                         database="default", ssl_disabled=False, ssl_verify_cert=False)
 ```
-- 底层:rustls 0.23(ring 后端),TLS 1.2/1.3。
-- 未配置 TLS 的连接仍可明文接入(opt-in,向后兼容)。
-- v1 边界:无客户端证书双向认证;无 SCRAM channel binding;单一 `sql_password`(暂无 per-user 账户体系)。
+- Under the hood: rustls 0.23 (ring backend), TLS 1.2/1.3.
+- Connections without TLS can still connect in plaintext (opt-in, backward compatible).
+- v1 boundary: no client-cert mutual auth; no SCRAM channel binding; single `sql_password` (no per-user account system yet).
 
 ---
 
-## 7. 配置参考
+## 7. Configuration Reference
 
 ```toml
 [server]
-listen_addr = "0.0.0.0:5433"     # Binary 内部协议 (压测/测试)
-redis_addr  = "0.0.0.0:6379"     # RESP; 空 = 禁用
-sql_addr    = "0.0.0.0:5434"     # MySQL wire; 空 = 禁用
-pg_addr     = "0.0.0.0:5435"     # PostgreSQL wire; 空 = 禁用
-http_addr   = "0.0.0.0:6778"     # HTTP REST; 空 = 禁用
-sql_password = ""                # SQL 登录密码 (空 = 免密; 非空 PG 走 SCRAM)
-redis_password = ""              # RESP AUTH 密码
-http_cors_origin = ""            # CORS Allow-Origin ("*"/具体 origin)
-http_token = ""                  # REST Bearer token (空 = 免鉴权)
-tls_cert = ""                    # TLS 证书 PEM (两项均非空才启用 TLS)
-tls_key  = ""                    # TLS 私钥 PEM
-sql_worker_count = 1             # SQL/PG 门面 worker 数 (并发连接池可调 2-8)
-max_key_bytes = 1024             # key 上限
-max_value_bytes = 1048576        # value 上限 (>4KB 自动溢出页)
+listen_addr = "0.0.0.0:5433"     # Binary internal protocol (bench/test)
+redis_addr  = "0.0.0.0:6379"     # RESP; empty = disable
+sql_addr    = "0.0.0.0:5434"     # MySQL wire; empty = disable
+pg_addr     = "0.0.0.0:5435"     # PostgreSQL wire; empty = disable
+http_addr   = "0.0.0.0:6778"     # HTTP REST; empty = disable
+sql_password = ""                # SQL login password (empty = no auth; non-empty → PG uses SCRAM)
+redis_password = ""              # RESP AUTH password
+http_cors_origin = ""            # CORS Allow-Origin ("*"/specific origin)
+http_token = ""                  # REST Bearer token (empty = no auth)
+tls_cert = ""                    # TLS cert PEM (both must be non-empty to enable TLS)
+tls_key  = ""                    # TLS private key PEM
+sql_worker_count = 1             # SQL/PG facade worker count (2-8 for concurrent pools)
+max_key_bytes = 1024             # key cap
+max_value_bytes = 1048576        # value cap (>4KB auto overflow pages)
 
 [storage]
-block_root = "./data"            # 数据目录
+block_root = "./data"            # data directory
 default_db = "default"
 default_table = "default"
 ```
 
 ---
 
-## 8. 性能实测
+## 8. Measured Performance
 
-> 环境:release 构建,loopback,单机。数值为参考量级,非严格基准。
+> Environment: release build, loopback, single machine. Numbers are ballpark, not a strict benchmark.
 
-### RESP(Redis 门面,50 并发)
-| 操作 | 无 pipeline | pipeline=16 |
+### RESP (Redis facade, 50 concurrency)
+| Op | No pipeline | pipeline=16 |
 |---|---|---|
 | SET | ~119K qps (p50 0.31ms) | ~327K qps |
 | GET | ~156K qps (p50 0.16ms) | ~498K qps |
 
-### SQL 点操作(单连接,含驱动开销)
-| 模式 | 点 SELECT | 点 INSERT |
+### SQL point ops (single connection, includes driver overhead)
+| Mode | point SELECT | point INSERT |
 |---|---|---|
-| 明文 | ~26K qps (p50 0.036ms) | ~14K qps |
-| TLS 加密 | ~18K qps (p50 0.051ms) | ~11K qps |
+| plaintext | ~26K qps (p50 0.036ms) | ~14K qps |
+| TLS | ~18K qps (p50 0.051ms) | ~11K qps |
 
-**关于 TLS 开销**:上表是单连接、串行、极小载荷的**最坏场景**——每个操作只需几十微秒,加解密占比被放大,故 qps 下降看似 ~25-30%,但绝对延迟仅增加约 15µs(0.036→0.051ms)。真实业务:
-- 握手成本一次性(连接池长连接摊薄到接近零);
-- 稳态对称加密在有 AES-NI 时是 GB/s 级,吞吐型负载 TLS 影响通常个位数百分比;
-- **不配 TLS 则零开销**(与明文路径完全一致)。
+**On TLS overhead**: the table above is a **worst case** — single connection, serial, tiny payloads. Each op takes only tens of microseconds, so the crypto share is amplified and qps appears to drop ~25-30%, but the absolute latency only increases by ~15µs (0.036→0.051ms). In real workloads:
+- handshake cost is one-time (amortized to near zero with pooled long-lived connections);
+- steady-state symmetric encryption is GB/s-class with AES-NI, so throughput-bound workloads typically see single-digit-percent TLS impact;
+- **no TLS = zero overhead** (identical to the plaintext path).
 
 ---
 
-## 9. 能力边界
+## 9. Capability Boundaries
 
-已交付但存在 v1 限制,选型/使用时请注意:
+Delivered but with v1 limitations — keep in mind when evaluating/using:
 
-- **权限**:单一 `sql_password`,暂无 per-user 用户/角色/权限体系。
-- **TLS**:opt-in;无客户端证书双向认证、无 SCRAM channel binding。
-- **事务**:单 shard 严格原子,跨 shard best-effort;DDL 在事务中被拒。
-- **SQL**:LIKE 仅前缀模式;聚合暂不支持 GROUP_CONCAT/窗口函数;子查询剩余缺口(关联标量、多重相关 EXISTS、JOIN 右侧派生表);ORDER BY 全量排序(无 top-k)。
-- **约束**:普通 UNIQUE 为本 shard best-effort;跨 shard 全局唯一需显式 `GLOBAL UNIQUE`。
-- **备份 / HA**:暂无内置备份/PITR、复制/高可用。
-- **JSON**:文本存储,单行 < 64KB,不建 JSON 路径索引。
-- **时间**:统一 UTC 裸值,无时区转换。
+- **Permissions**: single `sql_password`, no per-user user/role/permission system yet.
+- **TLS**: opt-in; no client-cert mutual auth, no SCRAM channel binding.
+- **Transactions**: single-shard strictly atomic, cross-shard best-effort; DDL rejected inside a transaction.
+- **SQL**: LIKE prefix mode only; aggregates lack GROUP_CONCAT/window functions; remaining subquery gaps (correlated scalar, multi-correlated EXISTS, JOIN-side derived tables); ORDER BY full sort (no top-k).
+- **Constraints**: plain UNIQUE is best-effort on the local shard; use explicit `GLOBAL UNIQUE` for cross-shard uniqueness.
+- **Backup / HA**: no built-in backup/PITR, replication/high-availability yet.
+- **JSON**: text storage, single row < 64KB, no JSON path index.
+- **Time**: unified naive UTC, no timezone conversion.
 
-> 完整 gap 清单见 [`README.md`](../README.md) 的 "SQL gap" 段与 [`CHANGELOG.md`](../CHANGELOG.md)。
+> Full gap list: the "SQL gap" section of [`README.md`](../README.md) and [`CHANGELOG.md`](../CHANGELOG.md).
