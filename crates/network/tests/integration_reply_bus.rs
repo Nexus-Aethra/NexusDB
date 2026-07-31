@@ -33,6 +33,7 @@ fn make_mgr(num_shards: usize) -> (tempfile::TempDir, ShardManager) {
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
     let mgr = ShardManager::open(opts).expect("open");
     (tmp, mgr)

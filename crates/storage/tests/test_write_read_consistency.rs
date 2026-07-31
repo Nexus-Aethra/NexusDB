@@ -15,6 +15,7 @@ fn make_engine(test_name: &str) -> (tempfile::TempDir, storage::StorageEngine) {
         chunk_cache_size: 16,
         io_backend: IoBackend::StdFs,
         io_config: IoBackendConfig::default(),
+        wal_mode: Default::default(),
     };
     let rt = scheduler::SchedHandle::new(scheduler::Scheduler::new());
     rt.set_current();

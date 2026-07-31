@@ -1,0 +1,16 @@
+# 构建上下文排除 (加速 docker build, 避免把 target/ 数据/证书塞进镜像层)
+target/
+**/target/
+.git/
+.github/
+data/
+*.pem
+*.key
+*.crt
+# 开发机专用链接器配置 (Dockerfile 内也会 rm, 双保险)
+.cargo/config.toml
+.linker/
+.config/nextest.toml
+# 运行产物 / 临时
+docs/superpowers/
+*.log

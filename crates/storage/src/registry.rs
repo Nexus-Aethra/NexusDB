@@ -66,6 +66,9 @@ pub enum RegistryError {
     /// 消息文本与 Redis 一致, 协议层 encode_error 直接透传.
     #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
     WrongType,
+    /// ⭐ Q4 (SQL 索引): schema / row 编解码错误 (类型不符/截断/无 schema).
+    #[error("schema error: {0}")]
+    Schema(String),
 }
 
 impl From<page::PageError> for RegistryError {
@@ -307,6 +310,23 @@ impl DbRegistry {
         names
     }
 
+    /// ⭐ D1 (分库): 列出所有 db 的 (id, name) — 走 resolver (持久化事实源),
+    /// 供上层构建 KV 数字 id ↔ SQL name 双向翻译视图.
+    /// 只含**真实已创建**的库 (resolver 内建的 "default" 条目若未 create 则过滤,
+    /// 避免 SELECT 选到不存在的库).
+    pub fn list_dbs_with_ids(&self) -> Vec<(u32, String)> {
+        let mut out: Vec<(u32, String)> = self
+            .meta
+            .resolver()
+            .list()
+            .into_iter()
+            .filter(|(_, name)| self.dbs.contains_key(*name))
+            .map(|(id, name)| (id, name.to_string()))
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
     /// db 总数.
     pub fn db_count(&self) -> usize {
         self.dbs.len()
@@ -525,6 +545,20 @@ pub async fn table_scan_prefix<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<
     f: &mut F,
 ) -> Result<(), RegistryError> {
     crate::btree::btree_scan(pager, table_root_vpid, prefix, f)
+        .await
+        .map_err(Into::into)
+}
+
+/// ⭐ Q4 (SQL 索引): 带起点的前缀扫描 — `start >= prefix`, 用于范围查询
+/// 跳过下界之前的行 (上界由回调 Break 早停).
+pub async fn table_scan_range<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()>>(
+    pager: &mut Pager,
+    table_root_vpid: Vpid,
+    start: &[u8],
+    prefix: &[u8],
+    f: &mut F,
+) -> Result<(), RegistryError> {
+    crate::btree::btree_scan_from(pager, table_root_vpid, start, prefix, f)
         .await
         .map_err(Into::into)
 }

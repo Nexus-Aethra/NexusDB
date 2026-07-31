@@ -18,6 +18,21 @@ pub struct NexusConfig {
     pub log: LogConfig,
 }
 
+/// ⭐ S4: pg_addr 缺省 (旧配置文件无此字段时兼容).
+fn default_pg_addr() -> String {
+    "0.0.0.0:5435".to_string()
+}
+
+/// ⭐ H1: http_addr 缺省 (用户拍板 6778, 避开 8080).
+fn default_http_addr() -> String {
+    "0.0.0.0:6778".to_string()
+}
+
+/// ⭐ ORM-B3: SQL 门面 worker 数缺省.
+fn default_sql_worker_count() -> usize {
+    1
+}
+
 /// `[server]` 网络服务配置.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -30,6 +45,35 @@ pub struct ServerConfig {
     pub redis_addr: String,
     /// RESP AUTH 密码. 空字符串 = 不启用认证.
     pub redis_password: String,
+    /// ⭐ Y2: SQL 门面监听地址 (MySQL wire protocol).
+    /// 空字符串 = 禁用 SQL 门面.
+    pub sql_addr: String,
+    /// ⭐ S4: PostgreSQL wire 门面监听地址 (psql 直连).
+    /// 空字符串 = 禁用; 默认 5435 (5432 留给系统 PG, 可改).
+    #[serde(default = "default_pg_addr")]
+    pub pg_addr: String,
+    /// ⭐ Z2: SQL 门面登录密码 (mysql_native_password).
+    /// 空字符串 = 免密 (任意用户名放行).
+    pub sql_password: String,
+    /// ⭐ ORM-B3: MySQL/PG 门面 worker 数 (默认 1; ORM 连接池并发场景可调
+    /// 2-8 — 路由缓存已进程级共享, 多 worker 正确性成立).
+    #[serde(default = "default_sql_worker_count")]
+    pub sql_worker_count: usize,
+    /// ⭐ H1: HTTP REST 门面监听地址. 空 = 禁用; 默认 6778 (避开 8080 撞车区).
+    #[serde(default = "default_http_addr")]
+    pub http_addr: String,
+    /// ⭐ H1: CORS Access-Control-Allow-Origin (`*` 或具体 origin; 空 = 不发 CORS 头).
+    #[serde(default)]
+    pub http_cors_origin: String,
+    /// ⭐ H1: REST Bearer token (空 = 免鉴权; /metrics 与 /v1/status 恒免).
+    #[serde(default)]
+    pub http_token: String,
+    /// ⭐ F83: SQL 门面 TLS 证书 PEM 路径 (空 = 不启用 TLS, 明文). 两门面共用.
+    #[serde(default)]
+    pub tls_cert: String,
+    /// ⭐ F83: SQL 门面 TLS 私钥 PEM 路径 (PKCS8/PKCS1/SEC1; 空 = 不启用).
+    #[serde(default)]
+    pub tls_key: String,
     /// key 长度上限 (字节). 超限请求在协议层拦截.
     pub max_key_bytes: usize,
     /// value 长度上限 (字节). ⭐ 大 value: 超过 inline 阈值 (~4000B) 的
@@ -44,6 +88,15 @@ impl Default for ServerConfig {
             worker_count: 2,
             redis_addr: "0.0.0.0:6379".to_string(),
             redis_password: String::new(),
+            sql_addr: "0.0.0.0:5434".to_string(),
+            pg_addr: default_pg_addr(),
+            sql_password: String::new(),
+            sql_worker_count: 1,
+            http_addr: default_http_addr(),
+            http_cors_origin: String::new(),
+            http_token: String::new(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
             max_key_bytes: 1024,
             max_value_bytes: 1024 * 1024,
         }
@@ -68,6 +121,18 @@ pub struct StorageConfig {
     pub default_db: String,
     /// 启动时确保存在的默认 table.
     pub default_table: String,
+    /// ⭐ D3 (分库): 启动时预建 `db1..dbN` (id 1..N), 供 RESP `SELECT n` 直用.
+    /// 0 = 不预建 (只有 default db, id 0). 建库走 2PC, 仅启动时一次.
+    pub precreate_dbs: usize,
+    /// ⭐ WAL (F60): 预写日志档位 — "off" | "periodic" (默认, 每秒 fsync,
+    /// 丢失窗口 ~1s) | "strict" (回复前 fsync + 组提交, crash 零丢失).
+    #[serde(default = "default_wal_mode")]
+    pub wal_mode: String,
+}
+
+/// ⭐ WAL (F60): 档位缺省.
+fn default_wal_mode() -> String {
+    "periodic".to_string()
 }
 
 impl Default for StorageConfig {
@@ -80,6 +145,8 @@ impl Default for StorageConfig {
             create_if_missing: true,
             default_db: "default".to_string(),
             default_table: "default".to_string(),
+            wal_mode: default_wal_mode(),
+            precreate_dbs: 0,
         }
     }
 }
@@ -134,6 +201,9 @@ impl NexusConfig {
             "error" | "warn" | "info" | "debug" | "trace" => {}
             other => return Err(format!("log.level invalid: {other:?} (expect error|warn|info|debug|trace)")),
         }
+        if !matches!(self.storage.wal_mode.to_ascii_lowercase().as_str(), "off" | "periodic" | "strict" | "") {
+            return Err(format!("storage.wal_mode invalid: {} (off|periodic|strict)", self.storage.wal_mode));
+        }
         if self.storage.num_shards == 0 {
             return Err("storage.num_shards must be >= 1".to_string());
         }
@@ -149,6 +219,24 @@ impl NexusConfig {
                 .redis_addr
                 .parse::<std::net::SocketAddr>()
                 .map_err(|e| format!("server.redis_addr invalid: {e}"))?;
+        }
+        if !self.server.sql_addr.is_empty() {
+            self.server
+                .sql_addr
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("server.sql_addr invalid: {e}"))?;
+        }
+        if !self.server.pg_addr.is_empty() {
+            self.server
+                .pg_addr
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("server.pg_addr invalid: {e}"))?;
+        }
+        if !self.server.http_addr.is_empty() {
+            self.server
+                .http_addr
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("server.http_addr invalid: {e}"))?;
         }
         if self.server.max_key_bytes == 0 || self.server.max_value_bytes == 0 {
             return Err("server.max_key_bytes / max_value_bytes must be >= 1".to_string());

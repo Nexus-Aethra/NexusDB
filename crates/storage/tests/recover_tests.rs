@@ -426,6 +426,7 @@ fn pid_state_fast_path_roundtrip() {
             chunk_cache_size: 4,
             io_backend: storage::IoBackend::StdFs,
             io_config: storage::IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
         {
             let mut e = StorageEngine::open(opts.clone()).await.unwrap();

@@ -63,6 +63,7 @@ fn main() {
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 16,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
 
     println!("[setup] opening ShardManager with {NUM_SHARDS} shards...");
@@ -202,11 +203,17 @@ fn main() {
                                     | BatchResult::DeleteExisted(_)
                                     | BatchResult::Values(_)
                                     | BatchResult::Integer(_)
+                                    | BatchResult::TxnApplied(_)
+                                    | BatchResult::ReserveOk
+                                    | BatchResult::ReserveConflict { .. }
+                                    | BatchResult::Catalog(_)
+                                    | BatchResult::ProjRows(_)
                                     | BatchResult::Double(_)
                                     | BatchResult::Pairs(_)
                                     | BatchResult::Members(_)
                                     | BatchResult::OptMember(_)
                                     | BatchResult::IntList(_)
+                                    | BatchResult::Rows(_)
                                     | BatchResult::MultiPutOk => {
                                         match op_type {
                                             0 => { total_put.fetch_add(1, Ordering::Relaxed); }

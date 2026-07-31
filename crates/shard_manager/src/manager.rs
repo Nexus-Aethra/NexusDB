@@ -43,6 +43,8 @@ pub struct ShardManagerOptions {
     /// reply bus 数量 (None = num_shards). 多协议 server 并存时
     /// 需要 >= 所有 server 的 worker 总数 (worker_id 空间不重叠).
     pub reply_bus_count: Option<usize>,
+    /// ⭐ WAL (F60): 预写日志档位 (Off / Periodic 默认 / Strict).
+    pub wal_mode: storage::wal::WalMode,
 }
 
 impl ShardManagerOptions {
@@ -56,6 +58,7 @@ impl ShardManagerOptions {
             io_config: storage::IoBackendConfig::default(),
             chunk_cache_size: 4,
             reply_bus_count: None,
+            wal_mode: storage::wal::WalMode::default(),
         }
     }
 }
@@ -103,6 +106,62 @@ pub struct ShardManager {
     reply_sink: Arc<StdMutex<Option<Arc<dyn ReplySink>>>>,
     /// ⭐ 独立服务架构: 所有 worker 的 reply bus 集合.
     pub reply_bus_set: Arc<crate::task_reply_bus::ReplyBusSet>,
+    /// ⭐ D2 (分库): KV 数字 id ↔ db name 双向翻译视图 (resolver 内存镜像).
+    db_view: Arc<DbDirView>,
+}
+
+/// ⭐ D2 (分库): KV 数字 id ↔ db name 双向翻译视图.
+/// `DbNameResolver` (MetaPage 持久化, 各 shard 2PC 同序副本) 的内存镜像;
+/// open 时从 shard 0 拉取, create_db 成功后全量刷新 (建库低频).
+/// 协议层翻译用: RESP `SELECT n` 查 id→name, SQL 门面未来查 name→id.
+#[derive(Default)]
+pub struct DbDirView {
+    inner: std::sync::RwLock<DbDirInner>,
+}
+
+#[derive(Default)]
+struct DbDirInner {
+    by_id: std::collections::HashMap<u32, Arc<str>>,
+    by_name: std::collections::HashMap<Arc<str>, u32>,
+}
+
+impl DbDirView {
+    /// id → name (RESP SELECT n 翻译). Arc 克隆, 零拷贝.
+    pub fn name_of(&self, id: u32) -> Option<Arc<str>> {
+        self.inner.read().expect("db_view lock").by_id.get(&id).cloned()
+    }
+
+    /// name → id (SQL 门面 / 管理面用).
+    pub fn id_of(&self, name: &str) -> Option<u32> {
+        self.inner.read().expect("db_view lock").by_name.get(name).copied()
+    }
+
+    /// ⭐ F66: 全部 db 名 (information_schema.schemata / pg_namespace 合成).
+    pub fn all_names(&self) -> Vec<Arc<str>> {
+        self.inner.read().expect("db_view lock").by_id.values().cloned().collect()
+    }
+
+    /// 当前库数 (测试/诊断).
+    pub fn len(&self) -> usize {
+        self.inner.read().expect("db_view lock").by_id.len()
+    }
+
+    /// 是否空 (clippy 配套).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 全量替换 (open 初始化 / create_db 后刷新).
+    fn replace(&self, list: Vec<(u32, String)>) {
+        let mut inner = self.inner.write().expect("db_view lock");
+        inner.by_id.clear();
+        inner.by_name.clear();
+        for (id, name) in list {
+            let name: Arc<str> = Arc::from(name.as_str());
+            inner.by_id.insert(id, name.clone());
+            inner.by_name.insert(name, id);
+        }
+    }
 }
 
 /// ReplySink: shard 完成 KV op 后, 网络层用来接收路由回包的 sink.
@@ -145,6 +204,7 @@ impl ShardManager {
                 chunk_cache_size: opts.chunk_cache_size,
                 io_backend: opts.io_backend,
                 io_config: opts.io_config,
+                wal_mode: opts.wal_mode,
             };
 
             // ⭐ T20: ShardInbox 替代 mpsc channel
@@ -168,7 +228,7 @@ impl ShardManager {
             threads.push(join);
         }
 
-        Ok(Self {
+        let mgr = Self {
             shards,
             threads,
             router,
@@ -176,7 +236,27 @@ impl ShardManager {
             coordinator: std::sync::Mutex::new(TwoPhaseCoordinator::new()),
             reply_sink: reply_sink_arc,
             reply_bus_set,
-        })
+            db_view: Arc::new(DbDirView::default()),
+        };
+        // ⭐ D2 (分库): 从 shard 0 (resolver SoT 副本) 初始化 id↔name 视图
+        mgr.refresh_db_view();
+        Ok(mgr)
+    }
+
+    /// ⭐ D2 (分库): 从 shard 0 拉 (id, name) 全表刷新翻译视图.
+    fn refresh_db_view(&self) {
+        let (tx, fut) = PendingReply::new();
+        self.shards[0]
+            .inbox
+            .push_spin(ShardRequest::ListDbsWithIds { reply: tx });
+        if let Ok(ShardReply::DbList(list)) = block_on_v2(fut) {
+            self.db_view.replace(list);
+        }
+    }
+
+    /// ⭐ D2 (分库): 协议层翻译视图 (Arc 共享, worker 只读).
+    pub fn db_view(&self) -> Arc<DbDirView> {
+        self.db_view.clone()
     }
 
     /// num_shards.
@@ -363,6 +443,83 @@ impl ShardManager {
         self.batch_ops_inner(ops)
     }
 
+    /// ⭐ Q5 (SQL 索引): 设置表 schema — 顺序广播全 shard (控制面低频,
+    /// 幂等可重试; 本轮不走 2PC, 失败即返错由 caller 重试).
+    pub fn set_table_schema(
+        &self,
+        db: &str,
+        table: &str,
+        schema: &storage::schema::TableSchema,
+    ) -> ShardResult<()> {
+        let bytes = schema.encode();
+        for shard in &self.shards {
+            let (tx, fut) = PendingReply::new();
+            shard.inbox.push_spin(ShardRequest::SetSchema {
+                db: db.to_string(),
+                table: table.to_string(),
+                bytes: bytes.clone(),
+                reply: tx,
+            });
+            block_on_v2(fut).map_err(ShardError::from_kind)?;
+        }
+        Ok(())
+    }
+
+    /// ⭐ Q5 (SQL 索引): 索引扫描 — 广播全 shard (本地索引 + shard 内回表,
+    /// 禁止两跳), 聚合后按 (索引值, pk) 归并为全局序, `limit` 截断 (0 = 不限).
+    /// 返回 `(索引原值, pk, row_bytes)`; 任一 shard 报错即整体报错.
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_scan(
+        &self,
+        db: &str,
+        table: &str,
+        iid: u32,
+        lo: Option<storage::row::ColValue>,
+        hi: Option<storage::row::ColValue>,
+        limit: u32,
+        with_rows: bool,
+    ) -> Result<Vec<storage::sql_rows::IndexEntry>, String> {
+        // 每 shard 一份 IndexScan (limit 下推: 每 shard 本地 limit 条已足够全局 top-limit)
+        let mut futures = Vec::with_capacity(self.num_shards);
+        for shard in &self.shards {
+            let (tx, fut) = PendingReply::new();
+            let op = BatchOp::IndexScan {
+                db: std::sync::Arc::from(db),
+                table: std::sync::Arc::from(table),
+                iid,
+                lo: lo.clone(),
+                hi: hi.clone(),
+                limit,
+                with_rows,
+            };
+            shard.inbox.push_spin(ShardRequest::Batch {
+                ops: vec![op],
+                req_id: 0,
+                reply: tx,
+            });
+            futures.push(fut);
+        }
+        // 聚合: 各 shard 已按 (val, pk) 升序, k 路合并简化为 concat + 排序
+        // (shard 数小, N log N 足够; 大结果集时可换真 k 路归并)
+        let mut merged: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        for fut in futures {
+            match block_on_v2(fut) {
+                Ok(ShardReply::BatchResults(mut rs)) => match rs.pop() {
+                    Some(BatchResult::Rows(rows)) => merged.extend(rows),
+                    Some(BatchResult::Error(e)) => return Err(e),
+                    _ => return Err("unexpected index scan result".to_string()),
+                },
+                Ok(_) => return Err("unexpected reply".to_string()),
+                Err(kind) => return Err(format!("{kind:?}")),
+            }
+        }
+        merged.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        if limit > 0 {
+            merged.truncate(limit as usize);
+        }
+        Ok(merged)
+    }
+
     /// 内部实现: 按 shard 分组 → 每 shard 一次 push + block_on → 重组结果.
     fn batch_ops_inner(&self, ops: &[BatchOp]) -> Vec<BatchResult> {
         if ops.is_empty() {
@@ -372,77 +529,8 @@ impl ShardManager {
         // 1. 按 shard 分组, 记录原始索引
         let mut shard_groups: Vec<Vec<(usize, BatchOp)>> = vec![Vec::new(); self.num_shards];
         for (i, op) in ops.iter().enumerate() {
-            let (db, table, key) = match op {
-                BatchOp::Put { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::Get { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::Delete { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                // ⭐ Multi op: 直连 API 按第一个 key 路由 (caller 应保证
-                // 批内 key 同 shard; 网络门面由 worker 预分组, 不经此路径)
-                BatchOp::MultiGet { db, table, keys } => (
-                    db.as_ref(),
-                    table.as_ref(),
-                    keys.first().map(|k| k.as_slice()).unwrap_or(&[]),
-                ),
-                BatchOp::MultiPut { db, table, pairs } => (
-                    db.as_ref(),
-                    table.as_ref(),
-                    pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
-                ),
-                BatchOp::MultiPutNx { db, table, pairs } => (
-                    db.as_ref(),
-                    table.as_ref(),
-                    pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
-                ),
-                BatchOp::Incr { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::IncrFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::Append { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::GetDel { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::GetSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SetRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HSetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HMGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HDel { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HGetAll { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HIncrByFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SIsMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SMembers { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SPop { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SRandMember { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LPush { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LIndex { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZRangeByScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZRank { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZMScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SMisMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SPopN { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SRandCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HRandField { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LTrim { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LPos { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LInsert { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SetBit { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-            };
+            // ⭐ T1: 单源提取 (Multi op 按第一个 key; worker 已预分组)
+            let (db, table, key) = op.locator();
             let shard_id = self.route_db_table_key(db, table, key);
             shard_groups[shard_id].push((i, op.clone()));
         }
@@ -509,77 +597,8 @@ impl ShardManager {
         // 1. 按 shard 分组 push
         let mut expected_count = 0usize;
         for (i, op) in ops.iter().enumerate() {
-            let (db, table, key) = match op {
-                BatchOp::Put { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::Get { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::Delete { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                // ⭐ Multi op: 直连 API 按第一个 key 路由 (caller 应保证
-                // 批内 key 同 shard; 网络门面由 worker 预分组, 不经此路径)
-                BatchOp::MultiGet { db, table, keys } => (
-                    db.as_ref(),
-                    table.as_ref(),
-                    keys.first().map(|k| k.as_slice()).unwrap_or(&[]),
-                ),
-                BatchOp::MultiPut { db, table, pairs } => (
-                    db.as_ref(),
-                    table.as_ref(),
-                    pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
-                ),
-                BatchOp::MultiPutNx { db, table, pairs } => (
-                    db.as_ref(),
-                    table.as_ref(),
-                    pairs.first().map(|p| p.0.as_slice()).unwrap_or(&[]),
-                ),
-                BatchOp::Incr { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::IncrFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::Append { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::GetDel { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::GetSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SetRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HSetNx { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HMGet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HDel { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HGetAll { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HIncrByFloat { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SIsMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SMembers { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SPop { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SRandMember { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LPush { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LLen { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LIndex { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LSet { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZAdd { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZCard { db, table, key } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZIncrBy { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZRange { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZRangeByScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZRank { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZMScore { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::ZPop { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SMisMember { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SPopN { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SRandCount { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::HRandField { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LRem { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LTrim { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LPos { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::LInsert { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-                BatchOp::SetBit { db, table, key, .. } => (db.as_ref(), table.as_ref(), key.as_slice()),
-            };
+            // ⭐ T1: 单源提取 (Multi op 按第一个 key; worker 已预分组)
+            let (db, table, key) = op.locator();
             let shard_id = self.route_db_table_key(db, table, key);
             self.shards[shard_id].task_inbox.push_spin(ShardTask {
                 conn_id,
@@ -781,6 +800,8 @@ impl ShardManager {
                     self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
                 }
             }
+            // ⭐ D2 (分库): 建库成功 → 刷新 id↔name 翻译视图
+            self.refresh_db_view();
             Ok(())
         } else {
             let (err_shard, err_reason) = first_error.unwrap_or((0, "unknown".into()));
@@ -1383,6 +1404,583 @@ fn exec_setbit(
     }
 }
 
+/// ⭐ X2: 数据面 schema 分发 — decode 校验后落 `[$]` 行 + 常驻镜像 (幂等).
+/// 表由 exec 前置的惰性建表保证存在.
+fn exec_set_schema(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    bytes: &[u8],
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    match storage::schema::TableSchema::decode(bytes) {
+        Ok(schema) => match block_on_io(e.set_schema(db, table, &schema)) {
+            Ok(()) => BatchResult::PutOk,
+            Err(err) => BatchResult::Error(err.to_string()),
+        },
+        Err(err) => BatchResult::Error(format!("bad schema bytes: {err}")),
+    }
+}
+
+/// ⭐ X2: 读表 schema 字节 (worker 缓存 miss 拉取; None = 纯 KV 表).
+fn exec_get_schema(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    match block_on_io(e.get_schema(db, table)) {
+        Ok(s) => BatchResult::GetValue(s.map(|s| s.encode())),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ Q5: RowPut — shard 端引擎内部维护 row 行 + 索引行 (同 shard 原子).
+fn exec_row_put(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    pk: &[u8],
+    values: &[storage::row::ColValue],
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    match block_on_io(e.row_put(db, table, pk, values)) {
+        Ok(()) => BatchResult::PutOk,
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ Q5: IndexScan — shard 内闭环 "本地索引扫 → 本地回表" (禁止两跳).
+#[allow(clippy::too_many_arguments)]
+fn exec_index_scan(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    iid: u32,
+    lo: Option<&storage::row::ColValue>,
+    hi: Option<&storage::row::ColValue>,
+    limit: u32,
+    with_rows: bool,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    match block_on_io(e.index_scan_entries_local(db, table, iid, lo, hi, limit as usize, with_rows))
+    {
+        Ok(rows) => BatchResult::Rows(rows),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ 事务 v1 (F61): COMMIT 原子批 — 先验后写.
+///
+/// 预检 (零部分应用红线):
+/// 1. 全部 op 的表 ensure_table (惰性建表)
+/// 2. RowPut 逐个 row_put_check (schema/编码/类型/UNIQUE)
+/// 3. 批内自冲突: 不同 pk 写同一 unique 值 (互相看不见盘上探测) → 拒
+///
+/// 应用: 逐 op 执行 (shard 单线程 = 批内零并发穿插); 预检后仅剩 IO 级
+/// 失败 (灾难态, 回复标注 partially applied). 完成后无条件 wal_barrier
+/// (事务语义: 回复到达 ⇒ 已持久; wal_mode=off 时退化, 文档化).
+fn exec_txn_apply(
+    e: &mut StorageEngine,
+    ops: Vec<crate::request::BatchOp>,
+    read_set: Vec<crate::request::ReadCheck>,
+) -> crate::request::BatchResult {
+    use crate::request::{BatchOp, BatchResult};
+    // --- ⭐ v2 (F62): OCC 读集验证 (SERIALIZABLE) — 重读比对指纹,
+    // 变了整批拒 (shard 单线程: 验证+应用之间零并发窗口) ---
+    for rc in &read_set {
+        // 表已删/不存在 → 当作行不存在 (读时若存在则必冲突)
+        let cur = block_on_io(e.row_get(&rc.db, &rc.table, &rc.pk)).unwrap_or_default();
+        let cur_fp = cur.as_deref().map(storage::wal::crc32);
+        if cur_fp != rc.fp {
+            return BatchResult::Error(
+                "serialization failure: concurrent update detected (retry transaction)".into(),
+            );
+        }
+    }
+    // --- 预检 ---
+    let mut batch_uniques: std::collections::HashMap<(String, u32, Vec<u8>), Vec<u8>> =
+        std::collections::HashMap::new();
+    for op in &ops {
+        let (db, table, _) = op.locator();
+        if let Err(err) = block_on_io(e.ensure_table(db, table)) {
+            return BatchResult::Error(err.to_string());
+        }
+        if let BatchOp::RowPut { db, table, pk, values } = op {
+            if let Err(err) = block_on_io(e.row_put_check(db, table, pk, values)) {
+                return BatchResult::Error(err.to_string());
+            }
+            // 批内自冲突 (盘上探测看不见未应用的同批写)
+            if let Ok(Some(schema)) = block_on_io(e.get_schema(db, table)) {
+                for idx in schema.indexes.iter().filter(|i| i.unique) {
+                    let ty = schema.columns[idx.col as usize].ty;
+                    if let Some(nv) =
+                        storage::sql_rows::index_val_bytes(ty, &values[idx.col as usize])
+                    {
+                        let key = (format!("{db}\u{0}{table}"), idx.iid, nv);
+                        if let Some(prev) = batch_uniques.insert(key, pk.clone())
+                            && &prev != pk
+                        {
+                            return BatchResult::Error(format!(
+                                "duplicate key on unique column '{}' (within transaction)",
+                                schema.columns[idx.col as usize].name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // --- 应用 ---
+    let n = ops.len() as u64;
+    for op in ops {
+        if let BatchResult::Error(err) = exec_task_op(e, op) {
+            return BatchResult::Error(format!("txn partially applied (IO-level): {err}"));
+        }
+    }
+    // --- 事务持久化屏障 (独立于 wal_mode strict/periodic) ---
+    if let Err(err) = block_on_io(e.wal_barrier()) {
+        return BatchResult::Error(format!("txn applied but WAL sync failed: {err}"));
+    }
+    BatchResult::TxnApplied(n)
+}
+
+/// ⭐ 事务 v1 (F61): 单 op 执行 — ShardTask 热路径与 TxnApply 原子批共用.
+/// 从 shard_thread_main 的 ShardTask 臂原样提取, 行为零变化.
+fn exec_task_op(
+    e: &mut StorageEngine,
+    op: crate::request::BatchOp,
+) -> crate::request::BatchResult {
+    match op {
+        crate::request::BatchOp::Put { ref db, ref table, ref key, ref val } => {
+            match block_on_io(e.table_put(db, table, key, val)) {
+                Ok(_) => crate::request::BatchResult::PutOk,
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::Get { ref db, ref table, ref key } => {
+            // ⭐ Phase H: 类型感知 (hash key → WRONGTYPE)
+            match block_on_io(e.table_get_typed(db, table, key)) {
+                Ok(v) => crate::request::BatchResult::GetValue(v),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::Delete { ref db, ref table, ref key } => {
+            // ⭐ Phase H: 类型感知 (顺带清 hash 全部行/孤儿行)
+            match block_on_io(e.key_delete_any(db, table, key)) {
+                Ok(b) => crate::request::BatchResult::DeleteExisted(b),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        // ⭐ MGET/MSET 分片: shard 内 LeafGuide 区间复用批量执行
+        crate::request::BatchOp::MultiGet { ref db, ref table, ref keys } => {
+            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+            match block_on_io(e.table_get_many(db, table, &refs)) {
+                Ok(vs) => crate::request::BatchResult::Values(vs),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::MultiPut { ref db, ref table, ref pairs } => {
+            match block_on_io(e.table_put_many(db, table, pairs)) {
+                Ok(_) => crate::request::BatchResult::MultiPutOk,
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::MultiPutNx { ref db, ref table, ref pairs } => {
+            exec_multiputnx(e, db, table, pairs)
+        }
+        // ⭐ String RMW (shard 单线程内天然原子)
+        crate::request::BatchOp::Incr { ref db, ref table, ref key, delta } => {
+            exec_incr(e, db, table, key, delta)
+        }
+        crate::request::BatchOp::IncrFloat { ref db, ref table, ref key, delta } => {
+            exec_incr_float(e, db, table, key, delta)
+        }
+        crate::request::BatchOp::Append { ref db, ref table, ref key, ref suffix } => {
+            exec_append(e, db, table, key, suffix)
+        }
+        crate::request::BatchOp::SetNx { ref db, ref table, ref key, ref val } => {
+            exec_setnx(e, db, table, key, val)
+        }
+        crate::request::BatchOp::GetDel { ref db, ref table, ref key } => {
+            exec_getdel(e, db, table, key)
+        }
+        crate::request::BatchOp::GetSet { ref db, ref table, ref key, ref val } => {
+            exec_getset(e, db, table, key, val)
+        }
+        crate::request::BatchOp::SetRange { ref db, ref table, ref key, offset, ref data } => {
+            exec_setrange(e, db, table, key, offset, data)
+        }
+        // ⭐ Phase H: Hash ops (单 key 单 shard, 无需聚合)
+        crate::request::BatchOp::HSet { ref db, ref table, ref key, ref pairs } => {
+            match block_on_io(e.hash_set(db, table, key, pairs)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::HSetNx { ref db, ref table, ref key, ref field, ref val } => {
+            match block_on_io(e.hash_set_nx(db, table, key, field, val)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::HGet { ref db, ref table, ref key, ref field } => {
+            match block_on_io(e.hash_get(db, table, key, field)) {
+                Ok(v) => crate::request::BatchResult::GetValue(v),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::HMGet { ref db, ref table, ref key, ref fields } => {
+            match block_on_io(e.hash_get_many(db, table, key, fields)) {
+                Ok(vs) => crate::request::BatchResult::Values(vs),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::HDel { ref db, ref table, ref key, ref fields } => {
+            match block_on_io(e.hash_del(db, table, key, fields)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::HLen { ref db, ref table, ref key } => {
+            match block_on_io(e.hash_len(db, table, key)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::HGetAll { ref db, ref table, ref key } => {
+            match block_on_io(e.hash_get_all(db, table, key)) {
+                Ok(ps) => crate::request::BatchResult::Pairs(ps),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::HIncrBy { ref db, ref table, ref key, ref field, delta } => {
+            exec_hincrby(e, db, table, key, field, delta)
+        }
+        crate::request::BatchOp::HIncrByFloat { ref db, ref table, ref key, ref field, delta } => {
+            exec_hincrbyfloat(e, db, table, key, field, delta)
+        }
+        // ⭐ Phase Set: Set ops
+        crate::request::BatchOp::SAdd { ref db, ref table, ref key, ref members } => {
+            match block_on_io(e.set_add(db, table, key, members)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::SRem { ref db, ref table, ref key, ref members } => {
+            match block_on_io(e.set_rem(db, table, key, members)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::SIsMember { ref db, ref table, ref key, ref member } => {
+            match block_on_io(e.set_is_member(db, table, key, member)) {
+                Ok(b) => crate::request::BatchResult::Integer(i64::from(b)),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::SCard { ref db, ref table, ref key } => {
+            match block_on_io(e.set_card(db, table, key)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::SMembers { ref db, ref table, ref key } => {
+            match block_on_io(e.set_members(db, table, key)) {
+                Ok(ms) => crate::request::BatchResult::Members(ms),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::SPop { ref db, ref table, ref key } => {
+            exec_spop(e, db, table, key)
+        }
+        crate::request::BatchOp::SRandMember { ref db, ref table, ref key } => {
+            match block_on_io(e.set_pick_one(db, table, key)) {
+                Ok(m) => crate::request::BatchResult::Members(m.into_iter().collect()),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        // ⭐ Phase L: List ops
+        crate::request::BatchOp::LPush { ref db, ref table, ref key, ref values, left } => {
+            match block_on_io(e.list_push(db, table, key, values, left)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::LPop { ref db, ref table, ref key, left, count } => {
+            exec_lpop(e, db, table, key, left, count as usize)
+        }
+        crate::request::BatchOp::LLen { ref db, ref table, ref key } => {
+            match block_on_io(e.list_len(db, table, key)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::LRange { ref db, ref table, ref key, start, end } => {
+            exec_lrange(e, db, table, key, start, end)
+        }
+        crate::request::BatchOp::LIndex { ref db, ref table, ref key, idx } => {
+            match block_on_io(e.list_index(db, table, key, idx)) {
+                Ok(v) => crate::request::BatchResult::GetValue(v),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::LSet { ref db, ref table, ref key, idx, ref val } => {
+            exec_lset(e, db, table, key, idx, val)
+        }
+        // ⭐ Phase Z: ZSet ops
+        crate::request::BatchOp::ZAdd { ref db, ref table, ref key, ref pairs } => {
+            match block_on_io(e.zset_add(db, table, key, pairs)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZRem { ref db, ref table, ref key, ref members } => {
+            match block_on_io(e.zset_rem(db, table, key, members)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZScore { ref db, ref table, ref key, ref member } => {
+            match block_on_io(e.zset_score(db, table, key, member)) {
+                Ok(s) => crate::request::BatchResult::OptMember(s.map(fmt_score)),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZCard { ref db, ref table, ref key } => {
+            match block_on_io(e.zset_card(db, table, key)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZIncrBy { ref db, ref table, ref key, delta, ref member } => {
+            match block_on_io(e.zset_incr(db, table, key, delta, member)) {
+                Ok(s) => crate::request::BatchResult::Double(s),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZRange { ref db, ref table, ref key, start, end, rev, withscores } => {
+            match block_on_io(e.zset_range(db, table, key, start, end, rev)) {
+                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZRangeByScore { ref db, ref table, ref key, min, max, withscores } => {
+            match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
+                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZRank { ref db, ref table, ref key, ref member, rev } => {
+            match block_on_io(e.zset_rank(db, table, key, member, rev)) {
+                Ok(Some(r)) => crate::request::BatchResult::Integer(r),
+                Ok(None) => crate::request::BatchResult::OptMember(None),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZCount { ref db, ref table, ref key, min, max } => {
+            match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
+                Ok(rows) => crate::request::BatchResult::Integer(rows.len() as i64),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZMScore { ref db, ref table, ref key, ref members } => {
+            match block_on_io(e.zset_mscore(db, table, key, members)) {
+                Ok(scores) => crate::request::BatchResult::Values(
+                    scores.into_iter().map(|s| s.map(fmt_score)).collect(),
+                ),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ZPop { ref db, ref table, ref key, rev, count } => {
+            match block_on_io(e.zset_pop(db, table, key, rev, count as usize)) {
+                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, true)),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::SMisMember { ref db, ref table, ref key, ref members } => {
+            match block_on_io(e.set_mismember(db, table, key, members)) {
+                Ok(bs) => crate::request::BatchResult::IntList(
+                    bs.into_iter().map(i64::from).collect(),
+                ),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::SPopN { ref db, ref table, ref key, count } => {
+            match block_on_io(e.set_pop_n(db, table, key, count as usize)) {
+                Ok(ms) => crate::request::BatchResult::Members(ms),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::SRandCount { ref db, ref table, ref key, count } => {
+            match block_on_io(e.set_rand_n(db, table, key, count as usize)) {
+                Ok(ms) => crate::request::BatchResult::Members(ms),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::HRandField { ref db, ref table, ref key, count, .. } => {
+            match block_on_io(e.hash_rand(db, table, key, count as usize)) {
+                Ok(ps) => crate::request::BatchResult::Pairs(ps),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::LRem { ref db, ref table, ref key, count, ref val } => {
+            match block_on_io(e.list_rem(db, table, key, count, val)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::LTrim { ref db, ref table, ref key, start, stop } => {
+            match block_on_io(e.list_trim(db, table, key, start, stop)) {
+                Ok(()) => crate::request::BatchResult::Integer(1),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::LPos { ref db, ref table, ref key, ref val, rank, count } => {
+            exec_lpos(e, db, table, key, val, rank, count)
+        }
+        crate::request::BatchOp::LInsert { ref db, ref table, ref key, before, ref pivot, ref val } => {
+            match block_on_io(e.list_insert(db, table, key, before, pivot, val)) {
+                Ok(n) => crate::request::BatchResult::Integer(n),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::SetBit { ref db, ref table, ref key, offset, bit } => {
+            exec_setbit(e, db, table, key, offset, bit)
+        }
+        // ---- ⭐ Q5: SQL row 表 ----
+        crate::request::BatchOp::RowPut { ref db, ref table, ref pk, ref values } => {
+            exec_row_put(e, db, table, pk, values)
+        }
+        crate::request::BatchOp::RowGet { ref db, ref table, ref pk } => {
+            match block_on_io(e.row_get(db, table, pk)) {
+                Ok(v) => crate::request::BatchResult::GetValue(v),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::RowDelete { ref db, ref table, ref pk } => {
+            match block_on_io(e.row_delete(db, table, pk)) {
+                Ok(existed) => crate::request::BatchResult::DeleteExisted(existed),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::RowUpdate { ref db, ref table, ref pk, ref sets } => {
+            match block_on_io(e.row_update(db, table, pk, sets)) {
+                Ok(updated) => crate::request::BatchResult::DeleteExisted(updated),
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::DropTableOp { ref db, ref table } => {
+            match block_on_io(e.drop_table_sql(db, table)) {
+                Ok(_) => crate::request::BatchResult::PutOk,
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::TableScan { ref db, ref table, limit } => {
+            exec_table_scan(e, db, table, limit)
+        }
+        crate::request::BatchOp::ScanFiltered { ref db, ref table, ref preds, ref proj, ref index_hint, ref key_set_hint, limit } => {
+            exec_scan_filtered(e, db, table, preds, proj, index_hint.as_ref(), key_set_hint.as_ref(), limit)
+        }
+        crate::request::BatchOp::IndexScan {
+            ref db, ref table, iid, ref lo, ref hi, limit, with_rows,
+        } => exec_index_scan(
+            e, db, table, iid, lo.as_ref(), hi.as_ref(), limit, with_rows,
+        ),
+        crate::request::BatchOp::SetSchemaOp { ref db, ref table, ref bytes } => {
+            exec_set_schema(e, db, table, bytes)
+        }
+        crate::request::BatchOp::GetSchemaOp { ref db, ref table } => {
+            exec_get_schema(e, db, table)
+        }
+        // ⭐ 事务 v1 (F61): COMMIT 原子批 — 先验后写 + 逐 op 应用.
+        // shard 单线程 = 批内零并发穿插; 预检失败整批拒绝 (零部分应用);
+        // wal_barrier 由 caller (ShardTask 臂) 在回复前统一执行.
+        crate::request::BatchOp::TxnApply { ops, read_set } => exec_txn_apply(e, ops, read_set),
+        // ⭐ F65: 全局 UNIQUE 占坑原语 (email-shard 单线程原子)
+        crate::request::BatchOp::ReserveUnique { db, table, iid, enc_val, pk, txn_id } => {
+            match block_on_io(e.unique_reserve(&db, &table, iid, &enc_val, &pk, txn_id)) {
+                Ok(None) => crate::request::BatchResult::ReserveOk,
+                Ok(Some((state, holder_txn, holder_pk))) => {
+                    crate::request::BatchResult::ReserveConflict { state, holder_txn, holder_pk }
+                }
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::StealUnique { db, table, iid, enc_val, pk, txn_id } => {
+            match block_on_io(e.unique_steal(&db, &table, iid, &enc_val, &pk, txn_id)) {
+                Ok(()) => crate::request::BatchResult::ReserveOk,
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ConfirmUnique { db, table, iid, enc_val, pk, txn_id } => {
+            match block_on_io(e.unique_confirm(&db, &table, iid, &enc_val, &pk, txn_id)) {
+                Ok(()) => crate::request::BatchResult::PutOk,
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        crate::request::BatchOp::ReleaseUnique { db, table, iid, enc_val, txn_id } => {
+            match block_on_io(e.unique_release(&db, &table, iid, &enc_val, txn_id)) {
+                Ok(()) => crate::request::BatchResult::PutOk,
+                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+            }
+        }
+        // ⭐ F66: catalog 快照 — 列当前 db 全表 + schema (任意单 shard).
+        crate::request::BatchOp::CatalogDump { db } => {
+            let tables = match e.list_tables(&db) {
+                Ok(t) => t,
+                Err(err) => return crate::request::BatchResult::Error(err.to_string()),
+            };
+            let mut out = Vec::with_capacity(tables.len());
+            for t in tables {
+                match block_on_io(e.get_schema(&db, &t)) {
+                    Ok(Some(sc)) => out.push((t, sc.encode())),
+                    Ok(None) => {} // 无 schema 的纯 KV 表不入 catalog
+                    Err(err) => return crate::request::BatchResult::Error(err.to_string()),
+                }
+            }
+            crate::request::BatchResult::Catalog(out)
+        }
+    }
+}
+
+/// ⭐ S2: 全表扫 (广播 op; `[S]` 前缀收 TAG_ROW 行).
+fn exec_table_scan(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    limit: u32,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    let mut out = Vec::new();
+    match block_on_io(e.table_scan_rows_local(db, table, limit as usize, &mut out)) {
+        Ok(()) => BatchResult::Rows(out),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ F67 (JOIN): 带谓词+投影下推的全表扫 → ProjRows.
+#[allow(clippy::too_many_arguments)]
+fn exec_scan_filtered(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    preds: &[crate::request::ScanPred],
+    proj: &[u16],
+    index_hint: Option<&storage::sql_rows::IndexHint>,
+    key_set_hint: Option<&storage::sql_rows::KeySetHint>,
+    limit: u32,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    let mut out = Vec::new();
+    match block_on_io(e.table_scan_filtered_local(
+        db, table, preds, proj, index_hint, key_set_hint, limit as usize, &mut out,
+    )) {
+        Ok(()) => BatchResult::ProjRows(out),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
 /// ⭐ SETRANGE: 从 offset 覆盖写 data (零扩展), 结果归一为 TAG_RAW,
 /// 返回新长度. data 空 → 不写, 返回当前长度 (Redis 语义).
 fn exec_setrange(
@@ -1706,6 +2304,8 @@ fn drive_async_flush(
                             nlog::error!("shard", "meta window {window_idx} flush failed (will retry): {err}");
                         }
                         e.pager_mut().complete_meta_flush(window_idx, result);
+                        // ⭐ WAL (F60): meta 全部持久化 → sealed 段可删
+                        e.wal_drop_sealed_if_meta_flushed();
                     }
                     // ⭐ G2 阶段 2 (同步): meta 判活 → 组装写作业 → 低优先级协程写盘
                     FlushDone::CompactRead(dst, src, dst_fresh, read_result) => {
@@ -1848,7 +2448,16 @@ fn drive_async_flush(
             }
             // c. 周期/计数刷盘 (内部守卫: 有 in-flight/pending 时自动推迟)
             let pf_start = std::time::Instant::now();
-            let _ = block_on_io(e.pager_mut().maybe_periodic_flush());
+            let pf = block_on_io(e.pager_mut().maybe_periodic_flush());
+            // ⭐ WAL (F60): 刷盘快照已入队 → 同轮内 seal 当前段 (无并发写间隙;
+            // 段覆盖记录 ⊆ 快照内容, meta 全部落盘后删)
+            if matches!(pf, Ok(true)) {
+                e.wal_seal();
+            }
+            // ⭐ WAL (F60): periodic 档每 1s 落盘+fsync (丢失窗口 10s → ~1s)
+            if let Err(err) = block_on_io(e.wal_periodic_tick()) {
+                nlog::error!("shard", "WAL periodic sync failed: {err}");
+            }
             if crate::PROBE.is_enabled() {
                 crate::PROBE
                     .block_on_io_ns
@@ -1940,7 +2549,8 @@ fn shard_thread_main(
         rt.clone().drive_until_idle(1000);
     }
     if init_result.borrow().as_ref().unwrap().is_err() {
-        nlog::error!("shard", "shard-{shard_id} engine init failed, exiting");
+        let err = init_result.borrow().as_ref().unwrap().as_ref().err().map(|e| format!("{e:?}"));
+        nlog::error!("shard", "shard-{shard_id} engine init failed: {err:?}, exiting");
         return;
     }
     drop(init_result);
@@ -2053,7 +2663,23 @@ fn shard_thread_main(
                     if let Some(e) = e_borrow.as_mut() {
                         let mut results = Vec::with_capacity(ops.len());
                         for op in ops {
+                            // ⭐ T1: 惰性建表 (已存在 = registry 纯内存查表)
+                            {
+                                let (db, table, _) = op.locator();
+                                if let Err(err) = block_on_io(e.ensure_table(db, table)) {
+                                    results.push(BatchResult::Error(err.to_string()));
+                                    continue;
+                                }
+                            }
                             let r = match op {
+                                // ⭐ 事务批 (管理面 Batch 兼容臂; 热路径走 ShardTask)
+                                BatchOp::TxnApply { ops, read_set } => exec_txn_apply(e, ops, read_set),
+                                // ⭐ F65: 占坑 op (管理面兼容; 热路径走 ShardTask → exec_task_op)
+                                op @ (BatchOp::ReserveUnique { .. }
+                                | BatchOp::StealUnique { .. }
+                                | BatchOp::ConfirmUnique { .. }
+                                | BatchOp::ReleaseUnique { .. }
+                                | BatchOp::CatalogDump { .. }) => exec_task_op(e, op),
                                 BatchOp::Put { db, table, key, val } => {
                                     match block_on_io(e.table_put(&db, &table, &key, &val)) {
                                         Ok(_) => BatchResult::PutOk,
@@ -2343,8 +2969,62 @@ fn shard_thread_main(
                                 BatchOp::SetBit { db, table, key, offset, bit } => {
                                     exec_setbit(e, &db, &table, &key, offset, bit)
                                 }
+                                // ---- ⭐ Q5: SQL row 表 ----
+                                BatchOp::RowPut { db, table, pk, values } => {
+                                    exec_row_put(e, &db, &table, &pk, &values)
+                                }
+                                BatchOp::RowGet { db, table, pk } => {
+                                    match block_on_io(e.row_get(&db, &table, &pk)) {
+                                        Ok(v) => BatchResult::GetValue(v),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::RowDelete { db, table, pk } => {
+                                    match block_on_io(e.row_delete(&db, &table, &pk)) {
+                                        Ok(existed) => BatchResult::DeleteExisted(existed),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::RowUpdate { db, table, pk, sets } => {
+                                    match block_on_io(e.row_update(&db, &table, &pk, &sets)) {
+                                        Ok(updated) => BatchResult::DeleteExisted(updated),
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::DropTableOp { db, table } => {
+                                    match block_on_io(e.drop_table_sql(&db, &table)) {
+                                        Ok(_) => BatchResult::PutOk,
+                                        Err(err) => BatchResult::Error(err.to_string()),
+                                    }
+                                }
+                                BatchOp::TableScan { db, table, limit } => {
+                                    exec_table_scan(e, &db, &table, limit)
+                                }
+                                BatchOp::ScanFiltered { db, table, preds, proj, index_hint, key_set_hint, limit } => {
+                                    exec_scan_filtered(e, &db, &table, &preds, &proj, index_hint.as_ref(), key_set_hint.as_ref(), limit)
+                                }
+                                BatchOp::IndexScan { db, table, iid, lo, hi, limit, with_rows } => {
+                                    exec_index_scan(
+                                        e, &db, &table, iid, lo.as_ref(), hi.as_ref(), limit,
+                                        with_rows,
+                                    )
+                                }
+                                BatchOp::SetSchemaOp { db, table, bytes } => {
+                                    exec_set_schema(e, &db, &table, &bytes)
+                                }
+                                BatchOp::GetSchemaOp { db, table } => {
+                                    exec_get_schema(e, &db, &table)
+                                }
                             };
                             results.push(r);
+                        }
+                        // ⭐ WAL (F60) strict: 回复前持久化屏障 (一个 Batch 多 op
+                        // 天然共享一次 fsync); reply 到达 ⇒ 已落盘
+                        if e.wal_mode() == storage::wal::WalMode::Strict
+                            && e.wal_needs_sync()
+                            && let Err(err) = block_on_io(e.wal_barrier())
+                        {
+                            nlog::error!("shard", "WAL barrier failed: {err}");
                         }
                         let _ = reply.send(Ok(ShardReply::BatchResults(results)));
                         // reply_bus 支持
@@ -2372,311 +3052,49 @@ fn shard_thread_main(
         if !tasks.is_empty() {
             let mut e_borrow = engine.borrow_mut();
             if let Some(e) = e_borrow.as_mut() {
+                // ⭐ WAL (F60) strict 组提交: 本轮有未 sync 写时回复押后,
+                // 轮末一次 fsync 后统一 push (N 个写共享一次 fsync)
+                let strict = e.wal_mode() == storage::wal::WalMode::Strict;
+                let mut held: Vec<(u32, crate::request::TaskResult)> = Vec::new();
                 for task in tasks {
-                    let result = match task.op {
-                        crate::request::BatchOp::Put { ref db, ref table, ref key, ref val } => {
-                            match block_on_io(e.table_put(db, table, key, val)) {
-                                Ok(_) => crate::request::BatchResult::PutOk,
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
+                    // ⭐ T1: 惰性建表 (已存在 = registry 纯内存查表);
+                    // ⭐ F66: CatalogDump 等无表名的元 op 跳过 (table 空)
+                    {
+                        let (db, table, _) = task.op.locator();
+                        if !table.is_empty()
+                            && let Err(err) = block_on_io(e.ensure_table(db, table))
+                        {
+                            reply_bus_set.get(task.worker_id).push(crate::request::TaskResult {
+                                conn_id: task.conn_id,
+                                req_id: task.req_id,
+                                group: task.group,
+                                result: crate::request::BatchResult::Error(err.to_string()),
+                            });
+                            continue;
                         }
-                        crate::request::BatchOp::Get { ref db, ref table, ref key } => {
-                            // ⭐ Phase H: 类型感知 (hash key → WRONGTYPE)
-                            match block_on_io(e.table_get_typed(db, table, key)) {
-                                Ok(v) => crate::request::BatchResult::GetValue(v),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::Delete { ref db, ref table, ref key } => {
-                            // ⭐ Phase H: 类型感知 (顺带清 hash 全部行/孤儿行)
-                            match block_on_io(e.key_delete_any(db, table, key)) {
-                                Ok(b) => crate::request::BatchResult::DeleteExisted(b),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        // ⭐ MGET/MSET 分片: shard 内 LeafGuide 区间复用批量执行
-                        crate::request::BatchOp::MultiGet { ref db, ref table, ref keys } => {
-                            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-                            match block_on_io(e.table_get_many(db, table, &refs)) {
-                                Ok(vs) => crate::request::BatchResult::Values(vs),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::MultiPut { ref db, ref table, ref pairs } => {
-                            match block_on_io(e.table_put_many(db, table, pairs)) {
-                                Ok(_) => crate::request::BatchResult::MultiPutOk,
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::MultiPutNx { ref db, ref table, ref pairs } => {
-                            exec_multiputnx(e, db, table, pairs)
-                        }
-                        // ⭐ String RMW (shard 单线程内天然原子)
-                        crate::request::BatchOp::Incr { ref db, ref table, ref key, delta } => {
-                            exec_incr(e, db, table, key, delta)
-                        }
-                        crate::request::BatchOp::IncrFloat { ref db, ref table, ref key, delta } => {
-                            exec_incr_float(e, db, table, key, delta)
-                        }
-                        crate::request::BatchOp::Append { ref db, ref table, ref key, ref suffix } => {
-                            exec_append(e, db, table, key, suffix)
-                        }
-                        crate::request::BatchOp::SetNx { ref db, ref table, ref key, ref val } => {
-                            exec_setnx(e, db, table, key, val)
-                        }
-                        crate::request::BatchOp::GetDel { ref db, ref table, ref key } => {
-                            exec_getdel(e, db, table, key)
-                        }
-                        crate::request::BatchOp::GetSet { ref db, ref table, ref key, ref val } => {
-                            exec_getset(e, db, table, key, val)
-                        }
-                        crate::request::BatchOp::SetRange { ref db, ref table, ref key, offset, ref data } => {
-                            exec_setrange(e, db, table, key, offset, data)
-                        }
-                        // ⭐ Phase H: Hash ops (单 key 单 shard, 无需聚合)
-                        crate::request::BatchOp::HSet { ref db, ref table, ref key, ref pairs } => {
-                            match block_on_io(e.hash_set(db, table, key, pairs)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::HSetNx { ref db, ref table, ref key, ref field, ref val } => {
-                            match block_on_io(e.hash_set_nx(db, table, key, field, val)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::HGet { ref db, ref table, ref key, ref field } => {
-                            match block_on_io(e.hash_get(db, table, key, field)) {
-                                Ok(v) => crate::request::BatchResult::GetValue(v),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::HMGet { ref db, ref table, ref key, ref fields } => {
-                            match block_on_io(e.hash_get_many(db, table, key, fields)) {
-                                Ok(vs) => crate::request::BatchResult::Values(vs),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::HDel { ref db, ref table, ref key, ref fields } => {
-                            match block_on_io(e.hash_del(db, table, key, fields)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::HLen { ref db, ref table, ref key } => {
-                            match block_on_io(e.hash_len(db, table, key)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::HGetAll { ref db, ref table, ref key } => {
-                            match block_on_io(e.hash_get_all(db, table, key)) {
-                                Ok(ps) => crate::request::BatchResult::Pairs(ps),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::HIncrBy { ref db, ref table, ref key, ref field, delta } => {
-                            exec_hincrby(e, db, table, key, field, delta)
-                        }
-                        crate::request::BatchOp::HIncrByFloat { ref db, ref table, ref key, ref field, delta } => {
-                            exec_hincrbyfloat(e, db, table, key, field, delta)
-                        }
-                        // ⭐ Phase Set: Set ops
-                        crate::request::BatchOp::SAdd { ref db, ref table, ref key, ref members } => {
-                            match block_on_io(e.set_add(db, table, key, members)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::SRem { ref db, ref table, ref key, ref members } => {
-                            match block_on_io(e.set_rem(db, table, key, members)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::SIsMember { ref db, ref table, ref key, ref member } => {
-                            match block_on_io(e.set_is_member(db, table, key, member)) {
-                                Ok(b) => crate::request::BatchResult::Integer(i64::from(b)),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::SCard { ref db, ref table, ref key } => {
-                            match block_on_io(e.set_card(db, table, key)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::SMembers { ref db, ref table, ref key } => {
-                            match block_on_io(e.set_members(db, table, key)) {
-                                Ok(ms) => crate::request::BatchResult::Members(ms),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::SPop { ref db, ref table, ref key } => {
-                            exec_spop(e, db, table, key)
-                        }
-                        crate::request::BatchOp::SRandMember { ref db, ref table, ref key } => {
-                            match block_on_io(e.set_pick_one(db, table, key)) {
-                                Ok(m) => crate::request::BatchResult::Members(m.into_iter().collect()),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        // ⭐ Phase L: List ops
-                        crate::request::BatchOp::LPush { ref db, ref table, ref key, ref values, left } => {
-                            match block_on_io(e.list_push(db, table, key, values, left)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::LPop { ref db, ref table, ref key, left, count } => {
-                            exec_lpop(e, db, table, key, left, count as usize)
-                        }
-                        crate::request::BatchOp::LLen { ref db, ref table, ref key } => {
-                            match block_on_io(e.list_len(db, table, key)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::LRange { ref db, ref table, ref key, start, end } => {
-                            exec_lrange(e, db, table, key, start, end)
-                        }
-                        crate::request::BatchOp::LIndex { ref db, ref table, ref key, idx } => {
-                            match block_on_io(e.list_index(db, table, key, idx)) {
-                                Ok(v) => crate::request::BatchResult::GetValue(v),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::LSet { ref db, ref table, ref key, idx, ref val } => {
-                            exec_lset(e, db, table, key, idx, val)
-                        }
-                        // ⭐ Phase Z: ZSet ops
-                        crate::request::BatchOp::ZAdd { ref db, ref table, ref key, ref pairs } => {
-                            match block_on_io(e.zset_add(db, table, key, pairs)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZRem { ref db, ref table, ref key, ref members } => {
-                            match block_on_io(e.zset_rem(db, table, key, members)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZScore { ref db, ref table, ref key, ref member } => {
-                            match block_on_io(e.zset_score(db, table, key, member)) {
-                                Ok(s) => crate::request::BatchResult::OptMember(s.map(fmt_score)),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZCard { ref db, ref table, ref key } => {
-                            match block_on_io(e.zset_card(db, table, key)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZIncrBy { ref db, ref table, ref key, delta, ref member } => {
-                            match block_on_io(e.zset_incr(db, table, key, delta, member)) {
-                                Ok(s) => crate::request::BatchResult::Double(s),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZRange { ref db, ref table, ref key, start, end, rev, withscores } => {
-                            match block_on_io(e.zset_range(db, table, key, start, end, rev)) {
-                                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZRangeByScore { ref db, ref table, ref key, min, max, withscores } => {
-                            match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
-                                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZRank { ref db, ref table, ref key, ref member, rev } => {
-                            match block_on_io(e.zset_rank(db, table, key, member, rev)) {
-                                Ok(Some(r)) => crate::request::BatchResult::Integer(r),
-                                Ok(None) => crate::request::BatchResult::OptMember(None),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZCount { ref db, ref table, ref key, min, max } => {
-                            match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
-                                Ok(rows) => crate::request::BatchResult::Integer(rows.len() as i64),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZMScore { ref db, ref table, ref key, ref members } => {
-                            match block_on_io(e.zset_mscore(db, table, key, members)) {
-                                Ok(scores) => crate::request::BatchResult::Values(
-                                    scores.into_iter().map(|s| s.map(fmt_score)).collect(),
-                                ),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::ZPop { ref db, ref table, ref key, rev, count } => {
-                            match block_on_io(e.zset_pop(db, table, key, rev, count as usize)) {
-                                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, true)),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::SMisMember { ref db, ref table, ref key, ref members } => {
-                            match block_on_io(e.set_mismember(db, table, key, members)) {
-                                Ok(bs) => crate::request::BatchResult::IntList(
-                                    bs.into_iter().map(i64::from).collect(),
-                                ),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::SPopN { ref db, ref table, ref key, count } => {
-                            match block_on_io(e.set_pop_n(db, table, key, count as usize)) {
-                                Ok(ms) => crate::request::BatchResult::Members(ms),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::SRandCount { ref db, ref table, ref key, count } => {
-                            match block_on_io(e.set_rand_n(db, table, key, count as usize)) {
-                                Ok(ms) => crate::request::BatchResult::Members(ms),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::HRandField { ref db, ref table, ref key, count, .. } => {
-                            match block_on_io(e.hash_rand(db, table, key, count as usize)) {
-                                Ok(ps) => crate::request::BatchResult::Pairs(ps),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::LRem { ref db, ref table, ref key, count, ref val } => {
-                            match block_on_io(e.list_rem(db, table, key, count, val)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::LTrim { ref db, ref table, ref key, start, stop } => {
-                            match block_on_io(e.list_trim(db, table, key, start, stop)) {
-                                Ok(()) => crate::request::BatchResult::Integer(1),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::LPos { ref db, ref table, ref key, ref val, rank, count } => {
-                            exec_lpos(e, db, table, key, val, rank, count)
-                        }
-                        crate::request::BatchOp::LInsert { ref db, ref table, ref key, before, ref pivot, ref val } => {
-                            match block_on_io(e.list_insert(db, table, key, before, pivot, val)) {
-                                Ok(n) => crate::request::BatchResult::Integer(n),
-                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-                            }
-                        }
-                        crate::request::BatchOp::SetBit { ref db, ref table, ref key, offset, bit } => {
-                            exec_setbit(e, db, table, key, offset, bit)
-                        }
-                    };
-                    reply_bus_set.get(task.worker_id).push(crate::request::TaskResult {
+                    }
+                    let result = exec_task_op(e, task.op);
+                    // ⭐ WAL (F60) strict: 本轮已有未持久化写 → 回复押到轮末
+                    // barrier 后 (读 op 在无待 sync 内容时仍直发)
+                    let tr = crate::request::TaskResult {
                         conn_id: task.conn_id,
                         req_id: task.req_id,
                         group: task.group,
                         result,
-                    });
+                    };
+                    if strict && e.wal_needs_sync() {
+                        held.push((task.worker_id, tr));
+                    } else {
+                        reply_bus_set.get(task.worker_id).push(tr);
+                    }
+                }
+                if !held.is_empty() {
+                    if let Err(err) = block_on_io(e.wal_barrier()) {
+                        nlog::error!("shard", "WAL group-commit barrier failed: {err}");
+                    }
+                    for (wid, tr) in held {
+                        reply_bus_set.get(wid).push(tr);
+                    }
                 }
             }
         }
@@ -2727,6 +3145,8 @@ fn handle_request_blocking(
         | ShardRequest::Delete { reply, .. }
         | ShardRequest::CreateTable { reply, .. }
         | ShardRequest::CreateDb { reply, .. }
+        | ShardRequest::ListDbsWithIds { reply }
+        | ShardRequest::SetSchema { reply, .. }
         | ShardRequest::PrepareCreateDb { reply, .. }
         | ShardRequest::CommitCreateDb { reply, .. }
         | ShardRequest::AbortCreateDb { reply, .. }
@@ -2776,6 +3196,10 @@ fn handle_request_blocking(
             ..
         } => {
             let r = block_on_io(e.table_put(&db, &table, &key, &val));
+            // ⭐ WAL (F60) strict: 同步慢路径也保证回复前持久化
+            if e.wal_mode() == storage::wal::WalMode::Strict && e.wal_needs_sync() {
+                let _ = block_on_io(e.wal_barrier());
+            }
             send_reply(
                 match r {
                     Ok(_) => Ok(ShardReply::PutOk),
@@ -2808,6 +3232,9 @@ fn handle_request_blocking(
             ..
         } => {
             let r = block_on_io(e.table_delete(&db, &table, &key));
+            if e.wal_mode() == storage::wal::WalMode::Strict && e.wal_needs_sync() {
+                let _ = block_on_io(e.wal_barrier());
+            }
             send_reply(
                 match r {
                     Ok(b) => Ok(ShardReply::DeleteExisted(b)),
@@ -2818,6 +3245,11 @@ fn handle_request_blocking(
         }
         ShardRequest::CreateTable { db, table, .. } => {
             let r = block_on_io(e.create_table(&db, &table));
+            // ⭐ WAL (F60): DDL 不进 WAL (catalog 页写), 立即全量落盘保持久
+            // (低频; 重放时表必存在)
+            if r.is_ok() && e.wal_mode() != storage::wal::WalMode::Off {
+                let _ = block_on_io(e.flush());
+            }
             let _ = reply.send(match r {
                 Ok(vpid) => Ok(ShardReply::CreateTableOk(vpid)),
                 Err(err) => Err(ShardErrorKind::from_storage_display(&err)),
@@ -2825,13 +3257,37 @@ fn handle_request_blocking(
         }
         ShardRequest::CreateDb { db, .. } => {
             let r = block_on_io(e.create_db(&db));
+            if r.is_ok() && e.wal_mode() != storage::wal::WalMode::Off {
+                let _ = block_on_io(e.flush());
+            }
             let _ = reply.send(match r {
                 Ok(_) => Ok(ShardReply::CreateDbOk),
                 Err(err) => Err(ShardErrorKind::from_storage_display(&err)),
             });
         }
+        ShardRequest::ListDbsWithIds { .. } => {
+            // ⭐ D2 (分库): resolver (id, name) 全表 — DbDirView 初始化/刷新
+            let _ = reply.send(Ok(ShardReply::DbList(e.list_dbs_with_ids())));
+        }
+        ShardRequest::SetSchema { db, table, bytes, .. } => {
+            // ⭐ Q5: 反序列化校验后落 [$] 行 + 常驻镜像 (幂等)
+            let r = storage::schema::TableSchema::decode(&bytes)
+                .map_err(|err| ShardErrorKind::StorageError(err.to_string()))
+                .and_then(|schema| {
+                    block_on_io(e.set_schema(&db, &table, &schema))
+                        .map_err(|err| ShardErrorKind::from_storage_display(&err))
+                });
+            let _ = reply.send(match r {
+                Ok(()) => Ok(ShardReply::PutOk),
+                Err(kind) => Err(kind),
+            });
+        }
         ShardRequest::PrepareCreateDb { db, .. } => {
             let r = block_on_io(e.create_db(&db));
+            // ⭐ WAL (F60): DDL 不进 WAL → 立即落盘 (2PC 生产建库路径)
+            if r.is_ok() && e.wal_mode() != storage::wal::WalMode::Off {
+                let _ = block_on_io(e.flush());
+            }
             let _ = reply.send(match r {
                 Ok(_) => Ok(ShardReply::PrepareOk),
                 Err(err) => Err(ShardErrorKind::from_storage_display(&err)),
@@ -2846,6 +3302,10 @@ fn handle_request_blocking(
         }
         ShardRequest::PrepareCreateTable { db, table, .. } => {
             let r = block_on_io(e.create_table(&db, &table));
+            // ⭐ WAL (F60): DDL 不进 WAL → 立即落盘 (2PC 生产建表路径)
+            if r.is_ok() && e.wal_mode() != storage::wal::WalMode::Off {
+                let _ = block_on_io(e.flush());
+            }
             let _ = reply.send(match r {
                 Ok(_) => Ok(ShardReply::PrepareOk),
                 Err(err) => Err(ShardErrorKind::from_storage_display(&err)),

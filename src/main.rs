@@ -87,10 +87,16 @@ fn main() {
 
     // 4. 启动 ShardManager
     let io_backend = cfg.storage.io_backend().expect("validated backend");
-    // 双协议 server 并存时 worker_id 空间不重叠, reply_bus 总数 = 两者 worker 之和
+    // 三协议 server 并存时 worker_id 空间不重叠, reply_bus 总数 = 三者 worker 之和
     let resp_enabled = !cfg.server.redis_addr.is_empty();
     let binary_workers = cfg.server.worker_count;
     let resp_workers = if resp_enabled { cfg.server.worker_count } else { 0 };
+    // ⭐ ORM-B3: SQL/PG 门面 worker 数可配 (路由缓存进程级共享后正确性成立)
+    let sqlwc = cfg.server.sql_worker_count.max(1);
+    let sql_workers = if cfg.server.sql_addr.is_empty() { 0 } else { sqlwc };
+    let pg_workers = if cfg.server.pg_addr.is_empty() { 0 } else { sqlwc };
+    // ⭐ H1: HTTP REST 门面 1 worker
+    let http_workers = if cfg.server.http_addr.is_empty() { 0 } else { 1 };
     let opts = ShardManagerOptions {
         num_shards: cfg.storage.num_shards,
         block_root: cfg.storage.block_root.clone(),
@@ -102,8 +108,12 @@ fn main() {
         },
         chunk_cache_size: cfg.storage.chunk_cache_size,
         reply_bus_count: Some(
-            (binary_workers + resp_workers).max(cfg.storage.num_shards),
+            (binary_workers + resp_workers + sql_workers + pg_workers + http_workers)
+                .max(cfg.storage.num_shards),
         ),
+        // ⭐ WAL (F60): off | periodic (默认) | strict (validate 已挡非法值)
+        wal_mode: storage::wal::WalMode::parse(&cfg.storage.wal_mode)
+            .unwrap_or_default(),
     };
     let mgr = match ShardManager::open(opts) {
         Ok(m) => Arc::new(m),
@@ -116,11 +126,34 @@ fn main() {
 
     // 5. 幂等确保默认 db/table 存在 (已存在的错误容忍)
     ensure_catalog(&mgr, &cfg.storage.default_db, &cfg.storage.default_table);
+    // ⭐ D3 (分库): 预建 db1..dbN (id 1..N) + 各自的 default_table,
+    // 供 RESP `SELECT n` 直接使用 (幂等; 建库 2PC 仅启动时一次)
+    for n in 1..=cfg.storage.precreate_dbs {
+        ensure_catalog(&mgr, &format!("db{n}"), &cfg.storage.default_table);
+    }
 
     // 6. 启动网络层 (Binary + 可选 RESP)
     let limits = KvLimits {
         max_key_bytes: cfg.server.max_key_bytes,
         max_value_bytes: cfg.server.max_value_bytes,
+    };
+    // ⭐ ORM-B2: 进程级共享 SQL 路由缓存 (五门面同集群共用一个)
+    let sql_shared = network::new_sql_shared();
+    // ⭐ F83: TLS 配置 (SQL/PG 门面共用; 两路径均非空才启用, 否则明文)
+    let tls_config = if !cfg.server.tls_cert.is_empty() && !cfg.server.tls_key.is_empty() {
+        match network::tls::load_server_config(&cfg.server.tls_cert, &cfg.server.tls_key) {
+            Ok(c) => {
+                nlog::info!("main", "TLS enabled for SQL/PG facades");
+                Some(c)
+            }
+            Err(e) => {
+                nlog::error!("main", "TLS config load failed: {e}");
+                nlog::shutdown();
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
     };
     let listen_addr = cfg.server.listen_addr.parse().expect("validated addr");
     let server = match NetworkServer::start(NetworkServerConfig {
@@ -134,6 +167,8 @@ fn main() {
         limits,
         auth_password: None,
         worker_id_base: 0,
+            sql_shared: sql_shared.clone(),
+            tls_config: None,
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -162,6 +197,8 @@ fn main() {
             limits,
             auth_password,
             worker_id_base: binary_workers as u32,
+            sql_shared: sql_shared.clone(),
+            tls_config: None,
         }) {
             Ok(s) => {
                 nlog::info!("main", "RESP (Redis) listening on {}", s.local_addr());
@@ -169,6 +206,120 @@ fn main() {
             }
             Err(e) => {
                 nlog::error!("main", "RESP server start failed: {e}");
+                nlog::shutdown();
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // 6c. ⭐ Z2: SQL 门面 (MySQL wire protocol, mysql cli 直连)
+    let sql_enabled = !cfg.server.sql_addr.is_empty();
+    let sql_server = if sql_enabled {
+        let sql_addr = cfg.server.sql_addr.parse().expect("validated sql addr");
+        // 空密码 = 免密登录
+        let sql_password = if cfg.server.sql_password.is_empty() {
+            None
+        } else {
+            Some(cfg.server.sql_password.clone())
+        };
+        match NetworkServer::start(NetworkServerConfig {
+            listen_addr: sql_addr,
+            shard_manager: mgr.clone(),
+            worker_count: sqlwc,
+            default_db: cfg.storage.default_db.clone(),
+            default_table: cfg.storage.default_table.clone(),
+            inbox_capacity: 1024,
+            protocol: ProtocolKind::Sql,
+            limits,
+            auth_password: sql_password,
+            worker_id_base: (binary_workers + resp_workers) as u32,
+            sql_shared: sql_shared.clone(),
+            tls_config: tls_config.clone(),
+        }) {
+            Ok(s) => {
+                nlog::info!("main", "SQL (MySQL wire) listening on {}", s.local_addr());
+                Some(s)
+            }
+            Err(e) => {
+                nlog::error!("main", "SQL server start failed: {e}");
+                nlog::shutdown();
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // 6d. ⭐ S4: PostgreSQL wire 门面 (psql 直连; 密码复用 sql_password)
+    let pg_enabled = !cfg.server.pg_addr.is_empty();
+    let pg_server = if pg_enabled {
+        let pg_addr = cfg.server.pg_addr.parse().expect("validated pg addr");
+        let pg_password = if cfg.server.sql_password.is_empty() {
+            None
+        } else {
+            Some(cfg.server.sql_password.clone())
+        };
+        match NetworkServer::start(NetworkServerConfig {
+            listen_addr: pg_addr,
+            shard_manager: mgr.clone(),
+            worker_count: sqlwc,
+            default_db: cfg.storage.default_db.clone(),
+            default_table: cfg.storage.default_table.clone(),
+            inbox_capacity: 1024,
+            protocol: ProtocolKind::Pg,
+            limits,
+            auth_password: pg_password,
+            worker_id_base: (binary_workers + resp_workers + sql_workers) as u32,
+            sql_shared: sql_shared.clone(),
+            tls_config: tls_config.clone(),
+        }) {
+            Ok(s) => {
+                nlog::info!("main", "SQL (PostgreSQL wire) listening on {}", s.local_addr());
+                Some(s)
+            }
+            Err(e) => {
+                nlog::error!("main", "PG server start failed: {e}");
+                nlog::shutdown();
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // 6e. ⭐ H1: HTTP REST 门面 (JSON + CORS + /metrics)
+    network::metrics::init_start_time();
+    let http_enabled = !cfg.server.http_addr.is_empty();
+    let http_server = if http_enabled {
+        let http_addr = cfg.server.http_addr.parse().expect("validated http addr");
+        network::http_config::set_cors_origin(Some(cfg.server.http_cors_origin.clone()));
+        let http_token = if cfg.server.http_token.is_empty() {
+            None
+        } else {
+            Some(cfg.server.http_token.clone())
+        };
+        match NetworkServer::start(NetworkServerConfig {
+            listen_addr: http_addr,
+            shard_manager: mgr.clone(),
+            worker_count: 1,
+            default_db: cfg.storage.default_db.clone(),
+            default_table: cfg.storage.default_table.clone(),
+            inbox_capacity: 1024,
+            protocol: ProtocolKind::Http,
+            limits,
+            auth_password: http_token, // = Bearer token
+            worker_id_base: (binary_workers + resp_workers + sql_workers + pg_workers) as u32,
+            sql_shared: sql_shared.clone(),
+            tls_config: None,
+        }) {
+            Ok(s) => {
+                nlog::info!("main", "REST (HTTP) listening on {}", s.local_addr());
+                Some(s)
+            }
+            Err(e) => {
+                nlog::error!("main", "HTTP server start failed: {e}");
                 nlog::shutdown();
                 std::process::exit(1);
             }
@@ -193,7 +344,22 @@ fn main() {
     }
     nlog::info!("main", "shutdown signal received, stopping...");
 
-    // 8. 优雅退出: network (双协议) → shards → log
+    // 8. 优雅退出: network (五协议) → shards → log
+    if let Some(hs) = http_server
+        && let Err(e) = hs.shutdown()
+    {
+        nlog::warn!("main", "HTTP server shutdown error: {e}");
+    }
+    if let Some(ps) = pg_server
+        && let Err(e) = ps.shutdown()
+    {
+        nlog::warn!("main", "PG server shutdown error: {e}");
+    }
+    if let Some(ss) = sql_server
+        && let Err(e) = ss.shutdown()
+    {
+        nlog::warn!("main", "SQL server shutdown error: {e}");
+    }
     if let Some(rs) = resp_server
         && let Err(e) = rs.shutdown()
     {

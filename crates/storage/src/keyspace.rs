@@ -64,6 +64,16 @@ pub fn encode_string(key: &[u8]) -> Vec<u8> {
     out
 }
 
+/// ⭐ S2: `[S][varint klen][key]` 物理 key → 逻辑 key (全表扫提取 pk 用).
+pub fn split_string(pkey: &[u8]) -> Option<&[u8]> {
+    if pkey.first() != Some(&KIND_STRING) {
+        return None;
+    }
+    let (klen, n) = read_varint(&pkey[1..])?;
+    let start = 1 + n;
+    pkey.get(start..start + klen as usize)
+}
+
 // =====================================================================
 // 复合结构通用: meta 行 / data 行 / data 前缀
 // =====================================================================
@@ -101,6 +111,15 @@ pub fn split_type_meta(encoded: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(&body[..klen])
+}
+
+/// ⭐ Q1 (SQL 索引): 表级 schema 保留行首字节 (与 S/H/L/T/Z/#/I 均不冲突).
+/// 每表至多一行, 无 user key 段 — 整个物理 key 就是 `[$]` 单字节.
+pub const SCHEMA_ROW: u8 = b'$';
+
+/// schema 行物理 key: `[$]` (表级单行).
+pub fn encode_schema_row() -> Vec<u8> {
+    vec![SCHEMA_ROW]
 }
 
 /// 复合结构 data 行前缀: `[kind][1][klen][key]` (范围扫描的精确前缀).
@@ -214,6 +233,169 @@ pub fn decode_idx(b: [u8; 8]) -> i64 {
     (u64::from_be_bytes(b) ^ 0x8000_0000_0000_0000) as i64
 }
 
+/// ⭐ F81: i128 → 16B 符号翻转 BE 保序编码 (Decimal 定标整数; memcmp 保序).
+pub fn encode_i128_ordered(i: i128) -> [u8; 16] {
+    ((i as u128) ^ (1u128 << 127)).to_be_bytes()
+}
+
+/// 逆变换: 16B → i128.
+pub fn decode_i128_ordered(b: [u8; 16]) -> i128 {
+    (u128::from_be_bytes(b) ^ (1u128 << 127)) as i128
+}
+
+// =====================================================================
+// ⭐ Q3 (SQL 索引): 本地二级索引行 [I][iid u32 BE][memcmp 保序值][PK] → 空值
+// =====================================================================
+//
+// 值段必须 memcmp 保序 (支持范围扫), 因此**不用长度前缀**:
+// - 数值列: 1B 型别字节 + 8B 保序编码 (encode_idx / encode_f64_ordered)
+// - 字符串/字节列: 1B 型别字节 + 转义编码 (0x00 → 0x00 0xFF) + 终结符 0x00 0x00
+//   转义保证任何内嵌 0x00 都排在终结符之后不歧义, 且保持原字节字典序.
+// 型别字节保证异型值不混序 (同一 iid 实际只会有单一类型, 防御性设计).
+
+/// 索引行首字节 (与 S/H/L/T/Z/#/$ 均不冲突).
+pub const KIND_INDEX: u8 = b'I';
+
+/// ⭐ F65: 全局 UNIQUE 占坑行首字节 (与 S/H/L/T/Z/#/$/I 均不冲突).
+/// 行在 email-shard 上 (按 unique 值路由), key = `[U][iid u32 BE][enc_val]`,
+/// value = `[state 1B][txn_id u64 LE][pk...]` (state: 1=PENDING / 2=COMMITTED).
+pub const KIND_UNIQUE: u8 = b'U';
+
+/// 占坑行 key: `[U][iid u32 BE][enc_val]` (enc_val 同索引值编码).
+pub fn unique_slot_key(iid: u32, enc_val: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + enc_val.len());
+    out.push(KIND_UNIQUE);
+    out.extend_from_slice(&iid.to_be_bytes());
+    out.extend_from_slice(enc_val);
+    out
+}
+
+/// 索引值段的型别字节 (参与排序: 数值 < 字节串).
+pub const IVAL_NUM: u8 = 0x01;
+pub const IVAL_BYTES: u8 = 0x02;
+/// ⭐ F81: Decimal 索引值型别字节 (17B: 型别 + 16B i128 符号翻转 BE 保序).
+pub const IVAL_DECIMAL: u8 = 0x03;
+
+/// 整个 iid 的扫描前缀: `[I][iid u32 BE]`.
+pub fn index_prefix(iid: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5);
+    out.push(KIND_INDEX);
+    out.extend_from_slice(&iid.to_be_bytes());
+    out
+}
+
+/// 等值扫描前缀: `[I][iid][enc_val]` (enc_val 来自 encode_index_num/bytes).
+pub fn index_value_prefix(iid: u32, enc_val: &[u8]) -> Vec<u8> {
+    let mut out = index_prefix(iid);
+    out.extend_from_slice(enc_val);
+    out
+}
+
+/// 完整索引行: `[I][iid][enc_val][pk]` (value 为空; 一对多 = 相邻多行).
+pub fn encode_index_entry(iid: u32, enc_val: &[u8], pk: &[u8]) -> Vec<u8> {
+    let mut out = index_value_prefix(iid, enc_val);
+    out.extend_from_slice(pk);
+    out
+}
+
+/// 数值列索引值: `[IVAL_NUM][8B 保序]` (i64 用 encode_idx, f64 用 encode_f64_ordered).
+pub fn encode_index_num(ordered8: [u8; 8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    out.push(IVAL_NUM);
+    out.extend_from_slice(&ordered8);
+    out
+}
+
+/// ⭐ F81: Decimal 列索引值: `[IVAL_DECIMAL][16B i128 保序]` (17B 定长).
+pub fn encode_index_decimal(ordered16: [u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    out.push(IVAL_DECIMAL);
+    out.extend_from_slice(&ordered16);
+    out
+}
+
+/// 字节串列索引值: `[IVAL_BYTES][转义体][0x00 0x00]`.
+/// 转义 `0x00 → 0x00 0xFF` 保持字典序且与终结符 `0x00 0x00` 无歧义.
+pub fn encode_index_bytes(val: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + val.len());
+    out.push(IVAL_BYTES);
+    for &b in val {
+        out.push(b);
+        if b == 0x00 {
+            out.push(0xFF);
+        }
+    }
+    out.extend_from_slice(&[0x00, 0x00]);
+    out
+}
+
+/// 解析索引行 `[I][iid][enc_val][pk]` → (iid, val_bytes 原值, pk).
+/// 值段自定界: 数值定长 9B; 字节串扫描终结符 (转义还原).
+pub fn split_index_entry(encoded: &[u8]) -> Option<(u32, Vec<u8>, &[u8])> {
+    if encoded.len() < 6 || encoded[0] != KIND_INDEX {
+        return None;
+    }
+    let iid = u32::from_be_bytes(encoded[1..5].try_into().ok()?);
+    let (enc_val, pk) = split_index_val(&encoded[5..])?;
+    let val = decode_index_val(enc_val)?;
+    Some((iid, val, pk))
+}
+
+/// 切分值段: `[enc_val 原样(含型别字节)][pk]` → (enc_val, pk).
+/// 用于范围扫描时直接以编码形态与界比较 (memcmp 保序, 免解码).
+pub fn split_index_val(rest: &[u8]) -> Option<(&[u8], &[u8])> {
+    match *rest.first()? {
+        IVAL_NUM => {
+            if rest.len() < 9 {
+                return None;
+            }
+            Some((&rest[..9], &rest[9..]))
+        }
+        IVAL_DECIMAL => {
+            if rest.len() < 17 {
+                return None;
+            }
+            Some((&rest[..17], &rest[17..]))
+        }
+        IVAL_BYTES => {
+            let body = &rest[1..];
+            let mut i = 0usize;
+            loop {
+                if *body.get(i)? != 0x00 {
+                    i += 1;
+                    continue;
+                }
+                match *body.get(i + 1)? {
+                    0xFF => i += 2,
+                    0x00 => return Some((&rest[..1 + i + 2], &body[i + 2..])),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 解码值段 (enc_val 含型别字节) → 原值字节 (数值 = 8B 保序编码, 字节串 = 还原体).
+pub fn decode_index_val(enc_val: &[u8]) -> Option<Vec<u8>> {
+    match *enc_val.first()? {
+        IVAL_NUM => (enc_val.len() == 9).then(|| enc_val[1..9].to_vec()),
+        IVAL_DECIMAL => (enc_val.len() == 17).then(|| enc_val[1..17].to_vec()),
+        IVAL_BYTES => {
+            let body = enc_val.get(1..enc_val.len().checked_sub(2)?)?;
+            let mut val = Vec::with_capacity(body.len());
+            let mut i = 0usize;
+            while i < body.len() {
+                let b = body[i];
+                val.push(b);
+                i += if b == 0x00 { 2 } else { 1 }; // 跳过转义 0xFF
+            }
+            Some(val)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +476,62 @@ mod tests {
         let e = encode_zscore(b"z", score, b"m1");
         assert_eq!(split_zscore(&e), Some((&b"z"[..], score, &b"m1"[..])));
         assert!(e.starts_with(&zscore_prefix(b"z")));
+    }
+
+    // =============== ⭐ Q3: 索引行编码 ===============
+
+    #[test]
+    fn index_entry_roundtrip() {
+        // 数值
+        let ev = encode_index_num(encode_idx(-7));
+        let e = encode_index_entry(3, &ev, b"pk1");
+        let (iid, val, pk) = split_index_entry(&e).unwrap();
+        assert_eq!(iid, 3);
+        assert_eq!(decode_idx(val.try_into().unwrap()), -7);
+        assert_eq!(pk, b"pk1");
+        assert!(e.starts_with(&index_value_prefix(3, &ev)));
+        assert!(e.starts_with(&index_prefix(3)));
+        // 字节串 (含内嵌 0x00, pk 也含 0x00)
+        let ev = encode_index_bytes(b"a\x00b");
+        let e = encode_index_entry(9, &ev, b"p\x00k");
+        let (iid, val, pk) = split_index_entry(&e).unwrap();
+        assert_eq!((iid, val.as_slice(), pk), (9, &b"a\x00b"[..], &b"p\x00k"[..]));
+    }
+
+    #[test]
+    fn index_bytes_memcmp_order_matches_value_order() {
+        // 编码后 memcmp 序 == 原值字典序 (含 0x00 边界情形)
+        let vals: Vec<&[u8]> = vec![
+            b"", b"\x00", b"\x00\x00", b"\x00\x01", b"a", b"a\x00", b"a\x00x", b"a\x01",
+            b"ab", b"b",
+        ];
+        for w in vals.windows(2) {
+            let (lo, hi) = (encode_index_bytes(w[0]), encode_index_bytes(w[1]));
+            assert!(lo < hi, "编码破坏序: {:?} vs {:?}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn index_value_prefix_no_cross_value_match() {
+        // 等值前缀不误圈其它值的行 ("a" 的前缀不匹配 "a\x00"/"ab" 的行)
+        let pa = index_value_prefix(1, &encode_index_bytes(b"a"));
+        for other in [&b"a\x00"[..], b"ab", b"a\x01"] {
+            let row = encode_index_entry(1, &encode_index_bytes(other), b"pk");
+            assert!(!row.starts_with(&pa), "值 {other:?} 被 a 的等值前缀误圈");
+        }
+        let row_a = encode_index_entry(1, &encode_index_bytes(b"a"), b"pk");
+        assert!(row_a.starts_with(&pa));
+        // 不同 iid 隔离
+        assert!(!row_a.starts_with(&index_prefix(2)));
+    }
+
+    #[test]
+    fn schema_row_key_isolated() {
+        let k = encode_schema_row();
+        assert_eq!(k, vec![SCHEMA_ROW]);
+        // 与其它 kind 首字节全不冲突
+        for b in [KIND_STRING, KIND_HASH, KIND_LIST, KIND_SET, KIND_ZSET, TYPE_META, KIND_INDEX] {
+            assert_ne!(k[0], b);
+        }
     }
 }

@@ -20,8 +20,58 @@ pub mod kv_to_shard;
 pub mod protocol;
 pub mod reply_bus;
 pub mod server;
+pub mod tls;
 pub mod value_codec;
 pub mod worker;
+pub use worker::{SqlSharedRoutes, new_sql_shared};
+
+/// ⭐ H4: 进程级指标 (relaxed 原子, 热路径零锁; /metrics 导出).
+pub mod metrics {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU64;
+
+    pub static HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+    pub static HTTP_ERRORS: AtomicU64 = AtomicU64::new(0);
+    /// SQL 语句计数 (三门面共入口: sql_dispatch_stmt).
+    pub static SQL_QUERIES: AtomicU64 = AtomicU64::new(0);
+    /// RESP 命令计数.
+    pub static KV_OPS: AtomicU64 = AtomicU64::new(0);
+    /// 进程启动 unix 秒 (uptime 计算).
+    pub static START_UNIX: OnceLock<u64> = OnceLock::new();
+
+    pub fn init_start_time() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = START_UNIX.set(now);
+    }
+
+    pub fn uptime_seconds() -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.saturating_sub(*START_UNIX.get().unwrap_or(&now))
+    }
+}
+
+/// ⭐ H1: HTTP 门面 CORS origin 全局配置 (进程单 HTTP server; 启动时 set 一次).
+/// 空/未设 = 不发 CORS 头.
+pub mod http_config {
+    use std::sync::OnceLock;
+
+    static CORS_ORIGIN: OnceLock<Option<String>> = OnceLock::new();
+
+    /// main/测试 在启动 HTTP server 前调用 (幂等, 首次生效).
+    pub fn set_cors_origin(origin: Option<String>) {
+        let _ = CORS_ORIGIN.set(origin.filter(|s| !s.is_empty()));
+    }
+
+    pub fn cors_origin() -> Option<&'static str> {
+        CORS_ORIGIN.get().and_then(|o| o.as_deref())
+    }
+}
 
 /// ⭐ Phase G: geohash 纯函数桥 (协议层编/解码 + worker 渲染用).
 pub mod geo_bridge {

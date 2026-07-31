@@ -20,9 +20,220 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
   - `crates/network` — 网络层: acceptor + epoll worker + **双协议门面 (Binary + RESP2/Redis 兼容含 AUTH)** + KvLimits 校验 + value type tag (✅)
   - `crates/shard_manager` — 多 shard 控制器 + hash 路由 + 2PC + **TaskInbox/TaskReplyBus 直连架构** (✅)
   - `crates/config` (TOML) / `crates/logging` (nlog, io_uring 协程融合 logger) (✅)
-  - 根 binary `src/main.rs` — 服务器入口: `nexusdb --config nexusdb.toml`, Binary(5433) + RESP(6379) 双监听, 信号优雅退出
+  - 根 binary `src/main.rs` — 服务器入口: `nexusdb --config nexusdb.toml`, Binary(5433, 内部) + RESP(6379) + MySQL wire(5434) + PostgreSQL wire(5435) + REST HTTP(6778) 五监听, 信号优雅退出
 
 ## 当前进度
+
+### 2026-08-01 会话十九-D 总览 (F83 TLS 传输加密 — rustls STARTTLS, 安全 P0 收官, 细节见 CHANGELOG)
+
+- **SQL 双门面 TLS** (opt-in)。唯一新增外部 crate: `rustls 0.23` + **ring 后端** (避 aws-lc cmake); 手写 PEM 解析 (tls.rs, 复用 crypto::base64_decode)。
+- 传输层最小侵入: `ConnState.tls: Option<Box<ServerConnection>>` + start_tls; recv (read_tls→process→冲刷→读明文) / send_bytes (writer→write_tls 泵) TLS 分支; 沿用 spin-flush **不引 EPOLLOUT** (v1); 协议解析层无感知。
+- STARTTLS: PG SSLRequest→'S'+升级 (未配→'N' 回退); MySQL `build_handshake_v10_caps` 宣告 CLIENT_SSL + 短包检测 SSLRequest→升级 (未配→1043)。config tls_cert/tls_key + main.rs 注入 SQL/PG (RESP/HTTP/Binary None)。
+- 实机: psycopg3 sslmode=require **ssl_in_use=True** SCRAM-over-TLS OK / sslmode=disable 明文回退; mysql-connector ssl_disabled=False OK / True 明文。全量 **862/862** (明文零回归) clippy 0。
+- **P0 (数据类型 F80/F81 + 安全 F82/F83) 全部完成**。边界: opt-in 不配证书=纯明文零成本; 无客户端证书认证/无 channel binding/spin-flush 无写缓冲。
+
+### 2026-08-01 会话十九-C 总览 (F82 认证升级 — PG SCRAM-SHA-256 + MySQL caching_sha2, 细节见 CHANGELOG)
+
+- **安全 P0 认证** (不含 TLS=F83)。零依赖手写密码学 `protocol/crypto.rs`: SHA-256/HMAC-SHA256/PBKDF2/base64 (RFC 向量过) + CSPRNG (`/dev/urandom`)。不引 rustls/sha2 (留 F83 才需 rustls)。
+- **PG SCRAM-SHA-256** (RFC 5802): 消除明文口令。pg.rs SASL 帧 (code 10/11/12) + ScramState + scram_server_first/verify_final (从明文 sql_password 现场派生, proof 验证); worker pg_phase SASL 两步交换 + ConnState.pg_scram。破坏性: PG 认证 cleartext→SCRAM。
+- **MySQL caching_sha2 fast-auth** (additive 非破坏): caching_sha2_password_ok (服务端知明文直接验证, 免 RSA/TLS) + fast_auth_success(0x01 0x03); 失败/其他保留 AuthSwitch→native 兜底; mysql_gen_salt 改 CSPRNG。
+- 实机 (sql_password=s3cret): psycopg3 SCRAM 登录+查询 OK/错口令拒; mysql-connector 默认+显式 caching_sha2 均 OK/错口令 1045。全量 **862/862** clippy 0。
+- 边界: 单一 sql_password (无 per-user); 无 channel binding; **传输加密 TLS 仍缺 → F83** (最后阶段)。
+
+### 2026-08-01 会话十九-B 总览 (F81 DECIMAL 定点小数 — P0 数据类型第二阶段, 细节见 CHANGELOG)
+
+- **金额精确类型 DECIMAL** (唯一动 row/keyspace 结构的类型)。承载双源: **`ColType::Decimal{precision,scale}`** (scale 入类型→转换/渲染/DDL 零签名改动, 避免 Column 加字段) + **`ColValue::Decimal(i128,u8)`** (值自带 scale, 变长区 16B i128 承载, 不动 row 8B 定长假设)。schema FMT_VER 3→4 (兼容 v1-3)。
+- keyspace: IVAL_DECIMAL(0x03) + encode_i128_ordered(符号翻转BE 16B) + 17B 索引值; worker: parse_decimal/render_decimal + sql_to_col/sql_cmp/cmp_colvalue/sql_order_cmp/Accum::SumDec/pk/index/json 全加 Decimal 臂 + Accum::new 传真实 out_ty; sql.rs parse DECIMAL(p,s); 协议 NEWDECIMAL(246)/NUMERIC(1700) 定点文本 (mysql 文本+二进制均 lenenc)。
+- 实机: psycopg3 + mysql-connector (文本+预处理) 均返回原生 `Decimal`, 精度不丢, SUM 精确; 全量 **858/858** clippy 0。
+- 边界: i128 精度<=38; AVG→f64 回退; SUM 溢出报错; SQL 字面量经 f64 最短文本(常见精确), ORM 字符串参数完全精确; 超位截断不四舍五入。
+
+### 2026-08-01 会话十九总览 (F80 数据类型扩展 P0-1 — BOOL/DATE/TIME/TIMESTAMP/JSON/UUID, 细节见 CHANGELOG)
+
+- **生产可用性 P0** (数据类型与安全 4 阶段计划: F80 类型-整数/字节系 → F81 DECIMAL → F82 认证 → F83 TLS)。本轮 F80:
+  - `ColType` 加 6 变体; **BOOL/DATE/TIME/TIMESTAMP 以 i64 承载** (复用 8B 定长槽 + encode_idx; 时间统一 i64 微秒 UTC 裸值); **JSON/UUID 以 Bytes 承载**; ColValue 不新增变体 (语义由列 ColType 决定)。
+  - 解析: 抽 `parse_col_type` (create/alter 共用); `value()` 认 TRUE/FALSE + `DATE|TIMESTAMP '...'` 前缀; WHERE RHS ColRef 守卫排除字面量关键字。
+  - worker: 自包含日期数学 (days_from_civil/civil_from_days) + parse/render_{date,time,timestamp}/uuid; `coerce_cmp_lit` 在 eval_cond_leaf 按列类型强转 WHERE 时间/布尔字面量。
+  - 渲染**按 (ColType,ColValue)**: pg text_cell(ty,v) + type_oid; mysql 文本 + **二进制协议 encode_bin_date/datetime/time** (预处理结果集); mysql_type / coltype_sql_name / SHOW CREATE 加类型名。
+- 实机: e2e mysql_types + storage 单元 f80_new_types_roundtrip; **psycopg3** 原生 True/date/datetime/dict/UUID, **mysql-connector** 文本+预处理均原生 datetime; 全量 **856/856** clippy 0。
+- 边界: 时间无时区 (UTC v1); JSON 文本存储不建路径索引/单行 <64KB; 破坏性: DESCRIBE BOOLEAN 列 bigint→boolean。
+
+### 2026-07-31 会话十八总览 (F78 表达式聚合 / F79 ALTER — ORM P2 完结, 细节见 CHANGELOG)
+
+- **ORM P2** (15/17→17/17, P0/P1/P2 全完成):
+  - **F78 表达式聚合** SUM(a+b)/COUNT(v-1)/AVG(x/2): tokenizer +−*/; ScalarExpr AST + 递归下降; SelectItem::Agg.col→arg:Option<ScalarExpr>; worker BoundExpr + eval_bound_expr 逐行求值嗂 Accum (除零/非数/溢出→NULL)
+  - **F79 ALTER TABLE ADD COLUMN**: storage 多版本行解码 (TableSchema.version_ncols + FMT_VER3 + read_col 按行首版本字节取列数, 超出列补 NULL, 零数据重写); parse_alter; dispatch 基于旧 schema 合成新 schema 广播 SetSchemaOp + ddl_epoch递增
+- 实机: e2e + ORM 17/17 + mysql/pg 一致; 全量 854/854 (45s) clippy 0
+- 边界: F78 仅 +−*/无函数嵌套; F79 仅 ADD 可空列 (DROP/MODIFY/NOT NULL 拒, version u8 上限 255)
+- **ORM 对接 P0/P1/P2 全部完成** (列别名/限定列/db.table/LIMIT n,m/DISTINCT/COUNT(DISTINCT)/表达式聚合/ALTER ADD COLUMN + create_all)
+
+### 2026-07-31 会话十七总览 (F77: DISTINCT 补全 ORM P1, 细节见 CHANGELOG)
+
+- **ORM P1** (13/17→15/17): `SELECT DISTINCT` (解析期 desugar→GROUP BY, 零新字段零 worker 新逻辑) + `COUNT(DISTINCT col)` (SelectItem::Agg/AggItemKind 加 distinct + 新 Accum::CountDistinct 去重集)
+- 两项均在聚合完成点 gather 后全局去重 (encode_col_key 与 GROUP BY 组键同源), 无跨 shard 改动
+- 拒绝: DISTINCT * / DISTINCT+聚合/GROUP BY/JOIN/派生表/系统表; SUM/AVG/MIN/MAX(DISTINCT)
+- 剩余 P2: SUM(表达式) / ALTER TABLE
+- 实机: e2e mysql_distinct + ORM 15/17 + mysql/pg 一致; 全量 851/851 (52s) clippy 0
+- **❗lld 链接器使所有 cargo 命令 (含 build) 都需 `TMPDIR=$PWD/target/nxtmp`** (只读 /tmp 下 lld 建临时文件会 SIGABRT)
+
+### 2026-07-31 会话十六总览 (F76: ORM 对接 P0 + 回归提速, 细节见 CHANGELOG)
+
+- **ORM 对接 P0** (以 SQLAlchemy 实机探测驱动, 0/17→13/17): 列别名 AS / 单表限定列 `表.列` / `db.table` (含反引号) / `LIMIT offset,count`; 额外解 create_all 阻断 (DESCRIBE不存在表→MySQL 1146; 表级 PRIMARY KEY/UNIQUE/KEY/FOREIGN KEY/CONSTRAINT + 吃 AUTO_INCREMENT/DEFAULT)
+- 均在 protocol/sql.rs 解析层 + worker.rs 投影渲染 (out_names 三路: alias>label>列名); 零存储/调度改动
+- 剩余缺口 (P1/P2): DISTINCT / COUNT(DISTINCT) / SUM(表达式) / ALTER TABLE
+- **回归提速 (已配置)**: rust-lld 链接器 (.cargo/config.toml + .linker/ld.lld, 零安装) 使重链接 ~1s; cargo-nextest (并行+进度+超时, .config/nextest.toml) 全量 850 测试 57s
+- **❗跑测试必加 `TMPDIR=$PWD/target/nxtmp`**: 沙箱 /tmp 只读不稳定, e2e 写临时库到 /tmp 会导致并发下引擎初始化失败/页损坏→hang (非 io_uring/非代码 bug)
+
+### 2026-07-31 会话十五总览 (F73/F74/F75, 细节见 CHANGELOG)
+
+- **子查询后续三件套** (Phase 3 已知遗留收尾):
+  - **F73 大 IN**: 阈值提升 65536 (按叶子类型: EXISTS 无限/scalar >1 报/IN 65536); IN 集合 sort_in_set 排序去重 + eval_cond_leaf 同型 >64 binary_search
+  - **F74 关联 EXISTS 去相关**: `SqlValue::ColRef` 解析期收, decorrelate 改写单等值 EXISTS/NOT EXISTS → 非关联 IN/NOT IN, 执行层零新机制; 不可去相关形态报错
+  - **F75 派生表参与 JOIN**: SelectJoin 加 from_inner; 内层物化预填 tables[0] (prefilled, proj 全列), JOIN 状态机跳过其 gather; JOIN 右侧派生表 v1 拒
+- 实机: **mysql-connector + psycopg3 跨协议对拍 19×2 全 PASS**; 回归全绿 + clippy 0
+- gotcha: is_join_ahead 遇 RParen 即停 (防内层误视外层 JOIN); F73 二分依赖集合已排序; F75 prefilled 表 proj 强制全列 identity
+- **子查询能力基本完备**: 非关联 WHERE (F71) + FROM 派生表 (F72) + 大 IN (F73) + 单等值关联 EXISTS (F74) + 派生表 JOIN (F75); 剩余 = 关联 IN/标量、多重相关、JOIN 右侧派生表
+
+### 2026-07-31 会话十四总览 (F72, 细节见 CHANGELOG)
+
+- **FROM 派生表** (Phase 3 收尾): `SELECT ... FROM (SELECT ...) t [WHERE/ORDER/LIMIT/OFFSET]`。方案 = 零 TableSource ripple — 独立 `SqlStmt::SelectDerived` 变体 (学 F67 隔离先例), 单表 Select 路径零改动
+- 执行: 内层复用 F71 完成点拦截 (SqlSelectAgg → Fire::DerivedDone(MatResult); SqlRowCtx → derived_capture_rowctx 自合成列定义); 外层 finish_derived/derived_render 在 worker 内存过滤/投影/排序/截断 (保留内层真实列类型)
+- 内层 = 任意单表 SELECT (含聚合/GROUP BY, 输出列名 = label 如 `SUM(v)`); 外层支持 `t.x`/裸列 + OR/NOT + 孤 COUNT(*)
+- 实机: **mysql-connector + psycopg3 跨协议对拍 30/30** (含 F71 全部用例 pg 欠账补验); 回归全绿 + clippy 0
+- **Phase 3 完结**: 非关联 WHERE 子查询 (F71) + FROM 派生表 (F72) 均交付; 已知后续 = 关联子查询 / 大 IN 半连接 (复用 F70 键集合点查) / 派生表参与 JOIN
+- 边界: 派生表不参与 JOIN; 外层无 GROUP BY/HAVING/聚合投影 (孤 COUNT(*) 除外); 物化内存上限 JOIN_MAX_ROWS
+
+### 2026-07-31 会话十三总览 (F71, 细节见 CHANGELOG)
+
+- **非关联 WHERE 子查询** (Phase 3 第一部分): IN/NOT IN + 标量 + EXISTS/NOT EXISTS。方案 = 内层先跑完→折叠成字面量/恒真恒假→外层走完全现有路径
+- 载体: `SqlValue::Subquery(Box<SqlStmt>)` (与 Param 同构“执行前必解”占位) — 保 `Pred<Cond>` 类型不变, 下游 plan/eval/shard 零改动
+- 编排: SubqCtx 顺序状态机 (仿 SqlUniqueIns/PendingSql); materialize 拆分 render_select_agg/render_agg_groups; 拦截 SqlSelectAgg 与 SqlRowCtx 两完成路径 materialize 而非渲染; 折叠后重跑外层
+- 实机: mysql 驱动 IN/NOT IN/标量(含 MAX/pk-point)/EXISTS/空集/多行报错/关联拒 全正确; 回归全绿 + clippy 0
+- **已知限制**: 仅非关联; 大 IN >1024 阈值拦截引导改 JOIN; 内层限单表; **FROM 派生表未含** (需 TableSource enum 波及, 独立后续)
+- gotcha: 内层可走 SqlSelectAgg 或 SqlRowCtx, 两处都需拦截; EXISTS 恒真=And([]) 恒假=Not(And([])); collect/fold 同 DFS 序
+
+### 2026-07-31 会话十二总览 (F70, 细节见 CHANGELOG)
+
+- **JOIN gather 索引点查优化** (纯性能): probe 侧表 gather 时用前序表 ON 等值键值集合下推为索引点查, shard 只回匹配行而非全表扫。实机: 有索引 JOIN 16ms→2.5ms (~6.3x)
+- K1 KeySetHint + index_multi_point_local (逐键等值点查+bloom短路+去重+table_get_many 批量回表); table_scan_filtered_local 行来源优先级 key_set>index_hint>全扫
+- K3 sql_join_keyset_hint 决策 (worker.rs); sql_join_broadcast 命中时优先键集合不再用 index_hint
+- **启用条件**: 单列等值 ON + INNER/LEFT(右表) + 新表 join 列有索引 + 键集合<=1024; RIGHT/FULL/CROSS/多列/无索引退回全扫 (无劣化)
+- **不改语义**: 现有 JOIN e2e 全过; tables[idx].rows 变子集对 INNER/LEFT 是精确子集, finish 零改动。回归全绿+clippy 0
+- 剩余开销: JOIN 固有两轮串行 gather + 6 shard fan-out 往返 (非全扫问题)
+
+### 2026-07-31 会话十一总览 (F69, 细节见 CHANGELOG)
+
+- **OR/NOT/括号 谓词表达式树**: WHERE 从 AND-only `Vec<Cond>` 升为泛型 `Pred<C>`(Leaf/And/Or/Not), 覆盖单表 SELECT/DELETE/UPDATE/HAVING 与 JOIN 全路径
+- 解析: parse_where 改递归下降 (OR<AND<NOT<primary, 括号复用 LParen); Cond 原样作 Pred::Leaf; BETWEEN/LIKE desugar → And(leaves)
+- 求值: eval_pred 递归 (5 调用点), JOIN eval_join_pred, HAVING eval_having_pred, 系统表 eval_pred_sysq
+- **核心机制 as_conjuncts()**: 纯 leaf 合取 → 平铺列表, 索引界推导/下推/bloom 原 AND 优化不变; 含 OR/NOT → None → sql_plan_select FullScan 回退 + 空下推, 完成点递归残余保正确 (列名校验用 leaves())
+- 实机: mysql/pg 双驱动 OR/NOT/嵌套/DELETE·UPDATE·JOIN·HAVING OR 全正确跨协议一致; 回归全绿 + clippy 0
+- **已知限制**: 含 OR/NOT 不走索引 (全扫+残余); OR 不下推 shard; NOT 二值简化 (NULL 比较 false)
+- **分阶段路线**: Phase 3 = 子查询 (FROM 派生表/IN·EXISTS/标量, 另计划)
+
+### 2026-07-31 会话十总览 (F68, 细节见 CHANGELOG)
+
+- **JOIN 族完备化 Phase 1**: F67 两表 → **N 表左深 + 多条件 ON + RIGHT/FULL/CROSS/USING + 索引驱动 gather**. 仍 worker 完成点、零新增跨线程
+- AST: `SelectJoin{from, joins: Vec<JoinClause>}` + OnPred(Eq/Cmp) + JoinKind(+Right/Full/Cross); 执行: SqlJoinCtx 逐表 gather → 左深迭代 hash join (宽行折叠, col_offset 定位, 外连接 null 扩展)
+- 索引驱动: ScanFiltered 加 index_hint (storage IndexHint); WHERE 命中索引列 Eq/范围 → 索引范围扫缩候选 (过度近似 + 残余 preds 精确)
+- 实机: mysql/pg 双驱动 3 表/RIGHT/FULL/CROSS/USING/多 ON/索引 全正确; 回归全绿 + clippy 0
+- **分阶段路线**: Phase 2 = OR (WHERE 升级谓词表达式树, 全查询路径通用); Phase 3 = 子查询 (FROM 派生表/IN·EXISTS/标量)
+- **已知限制**: WHERE 仍 AND-only; ON 需至少一等值; 不走索引嵌套循环; JOIN_MAX_ROWS 262144 上限; USING 列在 `*` 不合并
+- gotcha: USING/未限定 ON 操作数用 sql_join_resolve_on 按 join 位置限作用域; JOIN 结果同键多行顺序非确定, e2e 断言需完整 ORDER BY
+
+### 2026-07-31 会话九总览 (F67, 细节见 CHANGELOG)
+
+- **两表 hash JOIN** (worker 完成点): `A [INNER|LEFT] JOIN B ON a.x=b.y` — JOIN 逻辑全在 worker, shard 只本地单表扫+谓词/投影下推, fan-in 后 build/probe (右建表、左探测). **零新增跨线程** (无 shard↔shard, 不碰 Scheduler 契约); gather 复用 SqlSelectAgg fan-in 模板
+- 下推: 左表谓词恒下推, 右表 INNER 下推/LEFT 留 worker 残余; finish 总重应用全 WHERE (下推仅优化不影响正确性); 投影只回引用列 (ProjRows)
+- 新协议: `BatchOp::ScanFiltered` + `BatchResult::ProjRows` + `ScanPred/PredOp` (定于 storage::sql_rows 避分层, request.rs re-export); 解析用独立 `SqlStmt::SelectJoin` 隔离单表路径
+- 实机: mysql-connector + psycopg3 INNER/LEFT/下推/重名列/`*` 全正确跨协议一致; 回归全绿 + clippy 0
+- **已知限制**: v1 仅两表单 equi ON; 多表/多 ON/RIGHT/FULL/CROSS/USING/子查询/OR 不支持; JOIN 输入全扫不走索引; 单侧 gather 256K 行上限
+- gotcha: LEFT 的右表谓词绝不能下推 (null 扩展前误删); 固定右建表左探测保 LEFT 驱动順序
+
+### 2026-07-31 会话八总览 (F66, 细节见 CHANGELOG)
+
+- **系统表虚拟化** (GUI/ORM 反射): worker 层拦截 `information_schema.*` / `pg_catalog.*` / `SHOW` → 从活元数据合成虚拟表, 复用 SELECT 完成点 (过滤/投影/排序/三门面渲染). 数据源: DbDirView 列 db + CatalogDump BatchOp (任意单 shard 列当前 db 全表+schema, schema 每 shard 全副本)
+- 支持: information_schema (tables/columns/key_column_usage/schemata); pg_catalog flat 单表 (pg_namespace/pg_class/pg_attribute); SHOW [FULL] TABLES/COLUMNS + SHOW CREATE TABLE (重建 MySQL DDL) + SHOW DATABASES; 反引号标识符; `SELECT @@var` stub (parse_prepared tokenize 前拦, '@' 不过 tokenizer)
+- 实机: SQLAlchemy 2.x + PyMySQL `inspect()` 全链路通 (get_table_names 走 SHOW FULL TABLES, get_columns 走 SHOW CREATE TABLE; pk/unique 反射正确). 回归全绿 + clippy 0
+- **已知限制**: psql `\d`/`\dt` (pg_catalog 多表 JOIN) 不完整 (无 JOIN, 留后); v1 仅反射 current_db; 系统表只读
+- gotcha: CatalogDump locator table 为空 → ensure_table 报 btree 空键; 无表名元 op 跳过 ensure_table
+
+### 2026-07-31 会话七总览 (F65, 细节见 CHANGELOG)
+
+- **全局跨 shard UNIQUE**: opt-in `GLOBAL UNIQUE` 列 — 唯一值按 hash 路由到 email-shard 占坑 (持久化物理行 `[U][iid][enc_val]`→`[state][txn_id][pk]`, 行本身即 prepare 记录自带 WAL); worker 顺序状态机 Reserve→Verify→Write→Confirm; pk-shard 行为真相源, 冲突时回查行懒校对 (删后重插自愈); 不复用 DDL 2PC 协调器
+- 边界: 事务内写/UPDATE 全局唯一列/多行 INSERT → v1 拒绝; 普通 UNIQUE 仍本 shard best-effort
+- 验收: 旗舰"不同 pk 同 email 必拒 1062"; 实机 mysql-connector IntegrityError + psycopg3 UniqueViolation 跨协议一致; 顺手修 SQLSTATE 映射 (ORM 异常分类); 回归全绿 + clippy 0
+
+### 2026-07-31 会话六总览 (F64, 细节见 CHANGELOG)
+
+- **首次端到端正确性检验**: 真实驱动 (mysql-connector + psycopg3) 订单系统工作流组合压全功能 + 跨协议一致性, 20 项全过. 发现并修复: (a) 事务内 UPDATE 的 RYOW (resolve_ryow 重放同 pk 缓冲 op, NeedBase 读盘+overlay); (b) duplicate key errno 1105→1062 (ER_DUP_ENTRY)
+- 新增回归 mysql_txn_ryow_update; 确认 UNIQUE 跨 shard 漏检为文档化 gap (单 shard 正常)
+- 回归 net 全绿 + storage+sm+cfg 537/0 + clippy 0
+
+### 2026-07-31 会话五总览 (F63, 细节见 CHANGELOG)
+
+- **GROUP BY 聚合族**: SELECT 投影扩展为列/聚合函数 (COUNT/SUM/AVG/MIN/MAX) + GROUP BY 多列 + HAVING + 裸聚合 (全表单桶); worker 完成点纯内存分桶 (Accum 累加器, NULL 忽略, 空集 SUM/AVG→NULL, 分桶上限 64K), shard/存储/协议零改动; 合成结果集复用 sql_rows_bytes 三门面统一
+- 边界: 不做表达式聚合/DISTINCT/GROUP_CONCAT/别名 AS/窗口函数; shard 端部分聚合下推留 v2 (当前全量收行)
+- 验收: 实机 mysql-connector + psycopg3 GROUP BY/HAVING/AVG/ORDER BY 聚合列全通; 回归 829/0 + clippy 0
+
+### 2026-07-31 会话四总览 (F62, 细节见 CHANGELOG)
+
+- **事务 v2 多隔离级别**: SET [SESSION] TRANSACTION / BEGIN 尾缀四级语法 (RU→RC, RR→Serializable 归并); SERIALIZABLE = OCC backward validation (pk 点查记 read_set crc32 指纹, TxnApply 预检重读比对, 冲突 40001/1213); READ ONLY (25006/1792); SAVEPOINT/ROLLBACK TO/RELEASE (ops 水位截断, E 态 ROLLBACK TO 恢复 — SQLAlchemy 标准路径); 仍零锁零 MVCC 零调度器改造
+- 边界: 不防幻读 (行级 OCC, 扫描读不进 read-set); RR=SER 等价; 真快照读留后
+- 验收: 实机 psycopg3 SerializationFailure 类型化捕获+重试 + SQLAlchemy savepoint 序列全通; 回归 827/0 + clippy 0
+
+### 2026-07-31 会话三总览 (F61, 细节见 CHANGELOG)
+
+- **事务 v1**: BEGIN/COMMIT/ROLLBACK 双协议 (MySQL+PG+HTTP SQL) — conn 层 write_set 缓冲 (shard/调度器零事务状态), COMMIT 按 shard 分组 TxnApply 原子批 (先验后写 + 无条件 wal_barrier — 回复到达即持久); RC 隔离 + pk 点查 RYOW; PG I/T/E 状态字节 + 25P02, MySQL IN_TRANS 位 (resp_complete 单点注入)
+- 边界: 跨 shard commit best-effort (单 shard 严格); RYOW 仅 pk 点查; DDL 事务中拒; Serializable (read-set 验证)/快照读 (COW 视图) 留 v2
+- 验收: 实机 psycopg3 默认事务模式 + mysql-connector commit/rollback 全通; COMMIT 后立即 kill -9 → 20/20; 回归 824/0 + clippy 0; String 316K 无回退
+
+### 2026-07-31 会话二总览 (F60, 细节见 CHANGELOG)
+
+- **WAL 预写日志**: `storage.wal_mode = off | periodic (默认, 每秒 fsync, 窗口 ~1s) | strict (回复前 fsync + 组提交, crash 零丢失)`; per-shard 段文件 `{block_root}/shard_N.wal.{seq}`, 插在 put/delete_physical 收敛点记结果态 (重放幂等), 刷盘快照时 seal / meta 全落盘后删段; DDL 不进 WAL → 成功后强制 flush
+- 验收: strict 写完立即 kill -9 → 50/50 全恢复; 性能 off 234K / periodic 231K (-1.6%) / strict 63K@8.1ms; 回归 821/0 + clippy 0
+- **gotcha 作废更新**: crash 测试不再需等 10s 刷盘 (strict 立即可杀 / periodic 等 >1s); wal_mode=off 时旧 gotcha 仍适用
+
+### 2026-07-31 会话总览 (F59, 细节见 CHANGELOG)
+
+- **ORM 性能专项 — SQL 门面多 worker 化**: `sql_worker_count` 配置 (MySQL+PG 门面, 默认 1); **单 SQL worker 前提正式解除** — schema 缓存 per-worker 零锁 + 进程级 DDL epoch 失效 (DROP +1, 每语句一次 load); routes bloom/created_here 进程级 `SqlSharedRoutes` (IndexBloom 原子位图化 fetch_or 无锁; per-worker 会假阴性漏行). 热路径零锁 (1 epoch load + bloom 原子读)
+- **归因**: prepared 服务端净差仅 0.90x (上轮 0.62x 是 Python 客户端开销); 单 worker 饱和 ~135K → **4 worker 16 连接 254K qps (2.5x)**
+- **gotcha**: NetworkServerConfig.sql_shared 必填 — 同集群全部 SQL 门面必须同一实例 (跨门面一致性), e2e 各测试独立实例 (全局 OnceLock 会串台致假阴性)
+- 回归 632/0 + clippy 0; 实机 4 worker 双驱动全通; String 234K 无回退
+
+### 2026-07-30 会话四总览 (F58, 细节见 CHANGELOG)
+
+- **预处理语句 (ORM 接轨)**: SQL 层 `?`/`$n` → `SqlValue::Param` + `bind_params` AST 绑定 (拒文本代入, 零注入面); MySQL COM_STMT_PREPARE/EXECUTE/CLOSE (二进制参数 + **二进制结果集**, prepare 报 num_columns=0); PG 扩展查询协议 (Parse/Bind/Describe/Execute/Sync 批次 = 单 seq, 前缀在 resp_complete 单点拼接)
+- **gotcha**: 弱类型文本参数要同时放宽 sql_to_col **和 sql_cmp** (漏一边 = 残余过滤静默滤光); mysql-connector 握手后必发 `SET @@session...` ('@' 需在 tokenize 前吞); prepared 吞吐低于文本 (0.62x, 客户端编码开销) — 价值在安全与生态
+- 实测: **mysql-connector (prepared=True) + psycopg3 (扩展协议) 双驱动全通**; 回归 164/0 + clippy 0; asyncpg (Flush 依赖) 不保证
+
+### 2026-07-30 会话三总览 (F57, 细节见 CHANGELOG)
+
+- **REST 门面 (6778)**: 零依赖手写 HTTP/1.1 (`protocol/http.rs`; 增量解析/keep-alive/chunked 拒 501) + CORS (进程级 OnceLock 配置 + OPTIONS preflight) + Bearer 鉴权 (复用 auth_password 通道, /metrics /v1/status 白名单); KV `GET/PUT/DELETE /v1/kv/{table}/{key}` (tag 感知 JSON, 与 RESP 数值互通) + SQL `POST /v1/sql` (共内核第四门面, sql_*_bytes 加 Http 分支); serde_json 为唯一新依赖
+- **可观测性**: `/metrics` Prometheus + `/v1/status` + `/v1/debug/sql-cache`; 进程级 AtomicU64 relaxed 打点 (RESP dispatch 一次 fetch_add, String 基线无回退)
+- **Binary 5433 降级为内部协议** (README; 代码零改动, 测试/压测工具仍用)
+- 测试快照: net+sm+cfg 161/0 (新增 http_e2e 3), clippy 0; curl 实机 + 四协议互联 (redis↔REST↔mysql) 全通; REST 基线 KV ~10.4K / SQL pk ~11.3K rps
+
+### 2026-07-30 会话二总览 (F56, 细节见 CHANGELOG)
+
+- **SQL 补全 + PG 门面**: DELETE/UPDATE SET/多行 INSERT/DROP TABLE (pk 单 shard 原子, 索引条件两阶段收 pk 非原子); 全表扫 (无索引 fallback)/ORDER BY/OFFSET/COUNT(\*)/IN/BETWEEN/!=/LIKE 前缀 (BETWEEN·LIKE 解析期 desugar 成范围); 方言别名 + USE/DESCRIBE; **PostgreSQL wire 门面 5435** (psql 直连, cleartext auth, 与 MySQL 门面共内核 — 渲染收敛 `sql_{err,ok,rows}_bytes(proto,..)`)
+- **gotcha (真客户端 stub 债)**: mysql cli 的 USE 走 COM_INIT_DB 不走 COM_QUERY; USE 后自动发 `SELECT DATABASE()`; 登录 database 字段要在 AuthSwitch 二段后应用; psql dbname 缺省 = user 名, default 隐式库需特判
+- 测试快照: **800 passed / 0 failed** (新增 pg_e2e 3 + sql_e2e 扩至 7), clippy 0; psql 16 + mysql 8.4 交叉读写实机全通
+
+### 2026-07-30 会话总览 (F50-F55, 细节见 CHANGELOG)
+
+- **F50 SQL 索引基建**: schema (`[$]` 行 + 常驻镜像) + row 编码 (`TAG_ROW` null bitmap + 变长偏移) + 索引行 `[I][iid][保序值][PK]` (字符串转义终结符, **不用长度前缀**); **本地二级索引** — 索引行与 row 同 shard (按 PK 路由), **禁止两跳** (IndexScan 广播 → shard 内扫+回表闭环)
+- **F51 SQL INSERT/SELECT**: 零依赖解析器 + worker 查询规划 (pk 点查单发 / 索引广播 + 界下推 + 全条件残余过滤 / limit 条件下推)
+- **F52 MySQL wire 门面**: 5434 端口 mysql cli 直连, `mysql_native_password` + AuthSwitch 兜底 (手写 SHA1), COM_QUERY/结果集; config `sql_addr`/`sql_password`
+- **F53 双层布隆剪枝**: shard 本地 bloom (开库重建, 免 BTree travel) + worker 路由缓存 (`created_here` 表零任务短路). **gotcha: 两层都必须只增不减 — 精确 map+LRU 驱逐重积 = 假阴性漏行**
+- **F54/F55 性能**: 回表批量化 (LeafGuide 复用) + 投影/覆盖索引 (免回表 3.3x) + 复合写批量化 (SADD 3x) + UNIQUE 索引 (约束先行 + 等值早停 60µs)
+- **gotcha: crash 测试 kill 前必须等 >10s 刷盘窗口**; repro_verify_storage 间歇 hang (杀掉重跑即可); **UNIQUE 跨 shard 漏检** (探测仅本 shard, 记录 gap)
+- 测试快照: **79 suites / 784 passed / 0 failed**, clippy 0; SQL: 覆盖 eq 5.7K / unique 点查 36.7K / pk 43K qps
+
+### 2026-07-29 会话总览 (F48, 细节见 CHANGELOG)
+
+- **F48 RESP 分库分表**: 分表 = key 冒号前缀 `table:key` (协议无状态, `push_task` 单点重写 + `BatchOp::table_key_mut()`; 表名限 `[A-Za-z0-9_.-]{1,64}`, 非法前缀整 key 落 default 表); 分库 = `SELECT n` 经 `DbDirView` (resolver name↔DbId 内存镜像, 只含真实已建库) 翻译成 db name, `ConnState.current_db` per-connection; **惰性建表** = shard 数据面 op 前 `ensure_table` (本地建, 免 2PC). **gotcha: 建库仍是重资源不自动建 (`precreate_dbs` 配置预建); list_tables 各 shard 视图可能不一致 (惰性建表固有)**
+- 顺手重构: `BatchOp::locator()` 单源提取, 净删 ~200 行三份重复路由 match
+- 测试快照: **75 suites / 739 passed / 0 failed**, clippy 0; memtier 189K (无回退)
 
 ### 2026-07-28 会话总览 (F45-F47, 细节见 CHANGELOG)
 
@@ -84,15 +295,17 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 - **持久化**: 多 db 物理隔离 (`{block_root}/{db_name}/shard_{N}/`); reopen recover; **自动持久化** (chunk 满 swap + 周期 10s/256 写); **异步 chunk 落盘** (FlushJob 协程 + 有界背压 MAX_INFLIGHT=8); data→meta 刷盘顺序不变量
 - **异步**: 全 async; 自实现协程调度器 + io_uring 后端 (服务器默认 io_uring)
 - **多 shard**: hash 路由 + TaskInbox/TaskReplyBus 直连 (worker→shard→worker, 零 client 线程); 跨 key 命令 worker 端分组聚合
-- **协议层**: RESP2 命令面覆盖五大结构 + Geo/Bitmap (清单见 README); 自家二进制协议; KvLimits (key≤1024/value≤1MB); value type tag (数值原生二进制)
-- **测试**: workspace 75 suites / 736 passed / 0 failed; clippy 0 警告
+- **分库分表 (RESP)**: `SELECT n` 选库 (DbNameResolver id↔name 翻译, per-connection; `precreate_dbs` 预建) + key 冒号前缀 `table:key` 选表 (无状态, 非法前缀落 default 表) + shard 数据面惰性建表
+- **协议层**: RESP2 命令面覆盖五大结构 + Geo/Bitmap (清单见 README); 自家二进制协议; **SQL 双门面 (MySQL wire 5434 + PostgreSQL wire 5435, 共内核)** — CREATE/INSERT 多行/SELECT (投影·ORDER BY·COUNT·IN·BETWEEN·LIKE·全表扫)/UPDATE/DELETE/DROP/USE/DESCRIBE; KvLimits (key≤1024/value≤1MB); value type tag (数值原生二进制)
+- **SQL 索引**: schema/row 编码 + 本地二级索引 (与 row 同 shard, 禁两跳) + 双层布隆剪枝 (shard 本地 + worker 路由) + 覆盖索引/UNIQUE 早停; 查询规划在 worker (pk 单发/索引广播/全表扫 fallback/残余过滤)
+- **测试**: workspace 800 passed / 0 failed; clippy 0 警告
 
 **还没支持** (下一步 gap):
 - **TTL/过期** (EXPIRE/TTL/PERSIST + SET 的 EX/PX/NX/XX) — 明确后置的生命周期机制
 - **跨 key 原子命令**: BITOP/SMOVE/LMOVE/RPOPLPUSH/阻塞类 BLPOP·BRPOP; MSETNX/Set 代数/*STORE 跨 shard 非原子 (已记 gap)
-- **Transaction** (begin/commit/rollback) — 跨多 page ACID
+- **Transaction** — ✅ F61 v1 + F62 v2 已交付 (conn 层缓冲 + commit 原子批; RC/SERIALIZABLE 双档 + OCC 验证 + SAVEPOINT + READ ONLY; 跨 shard best-effort, 幻读防护/快照读留后)
 - **Snapshot** — 事务内一致性读 (COW + meta_cache 天然支持, 实现成本低; **不需要 MVCC** 见 §3.3.2 设计决策)
-- **WAL** — 消每写 16KB 页 COW 写放大 (写重负载与 Redis 差距的主因)
+- ~~WAL~~ — ✅ F60 已交付 (三档可配; 注: "消 16KB 页写放大"的 WAL-as-主存储变体未做, 当前 WAL 是附加日志非替代写路径)
 - **Stream / HyperLogLog** — 最后两个 Redis 类型 (前者工程量大, 后者小众)
 - **PG/MySQL/Mongo 门面** — 前置: 统一记录编码 (保序 key 编码已有 + 表级 schema)
 - **shard 自包含网络** (ScyllaDB 模式) — 消 worker↔shard 两跳 handoff 的终局方案

@@ -837,6 +837,12 @@ impl Pager {
         })
     }
 
+    /// ⭐ WAL (F60): meta 无未刷窗口 (= 上轮刷盘已全部持久化,
+    /// sealed WAL 段可安全删除).
+    pub fn meta_all_flushed(&self) -> bool {
+        !self.meta.has_unflushed()
+    }
+
     /// ⭐ Phase M3: 收割 meta window 写盘结果.
     ///
     /// 全部 window 确认后才 persist_pid_state (data→meta→pid.state 顺序闭环);

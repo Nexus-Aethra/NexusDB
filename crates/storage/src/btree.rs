@@ -346,8 +346,21 @@ pub async fn btree_scan<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()>>(
     prefix: &[u8],
     f: &mut F,
 ) -> Result<(), BTreeError> {
+    btree_scan_from(pager, root_vpid, prefix, prefix, f).await
+}
+
+/// ⭐ Q4 (SQL 索引): 从 `start` (>= prefix) 开始的前缀扫描 — 范围查询
+/// (`WHERE idx >= lo`) 跳过下界之前的行, 不必从前缀头扫起.
+/// `btree_scan` = `btree_scan_from(start = prefix)`. 上界由回调 Break 实现.
+pub async fn btree_scan_from<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()>>(
+    pager: &mut Pager,
+    root_vpid: Vpid,
+    start: &[u8],
+    prefix: &[u8],
+    f: &mut F,
+) -> Result<(), BTreeError> {
     use core::ops::ControlFlow;
-    let mut start: Vec<u8> = prefix.to_vec();
+    let mut start: Vec<u8> = start.to_vec();
     loop {
         let (guide, leaf_bytes) = travel_to_leaf_guided(pager, root_vpid, &start).await?;
         // 本 leaf 扫 key >= start; 首遇不带 prefix 的 key → Break (全局下界)

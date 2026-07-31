@@ -36,6 +36,7 @@ fn meta_page_flush_then_load_via_storage_engine() {
             chunk_cache_size: 8,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
         
         // 第一次: open, put data, flush, close
@@ -76,6 +77,7 @@ fn meta_page_persists_in_disk_after_recovery() {
             chunk_cache_size: 8,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
         
         {
@@ -202,6 +204,7 @@ fn meta_page_empty_dbs_after_recovery() {
             chunk_cache_size: 8,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
         
         {
@@ -271,6 +274,7 @@ fn meta_page_pager_integration_with_simulated_catalog() {
             chunk_cache_size: 8,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
         
         // 1. 构造 MetaPage (3 个 db)

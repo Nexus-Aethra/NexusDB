@@ -76,6 +76,9 @@ pub struct OpenOptions {
     /// ⭐ T18a: 进阶 IO 后端配置 (FD 池 / 注册缓冲区 / SQPOLL / O_DIRECT).
     /// 默认 `IoBackendConfig::default()` (use_fixed_file=true, 其余关闭).
     pub io_config: IoBackendConfig,
+    /// ⭐ WAL (F60): 预写日志档位 (Off / Periodic 默认 / Strict).
+    /// 段文件在 `{block_root}/shard_{N}.wal.{seq}` (compat 模式在 block_dir).
+    pub wal_mode: crate::wal::WalMode,
 }
 
 impl Default for OpenOptions {
@@ -89,6 +92,7 @@ impl Default for OpenOptions {
             chunk_cache_size: 8,
             io_backend: IoBackend::default(),
             io_config: IoBackendConfig::default(),
+            wal_mode: crate::wal::WalMode::default(),
         }
     }
 }
@@ -130,6 +134,58 @@ pub struct StorageEngine {
     /// ⭐ T12.16 当前 db 的 `DbId`. 默认 `DEFAULT_DB_ID` (= 0, "default" db).
     /// 用 `use_db(name)` 切换; ShardManager 创建多 engine 时显式 set.
     current_db: DbId,
+    /// ⭐ PERF (F49): "表内出现过复合类型" 单调提示 (db → table 集合).
+    /// 只增不减 — 用于纯 String 表跳过热路径类型探测 (SET purge / GET-miss
+    /// WRONGTYPE); false positive 无害 (仅多一次点查), 开库时由
+    /// `rebuild_composite_counts` 从 `[#]` meta 行重建.
+    composite_tables: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// ⭐ Q1 (SQL 索引): table schema 常驻镜像 ((db, table) → schema).
+    /// write-through: set_schema 先落 `[$]` 行再更新; lazy load (首次 get miss
+    /// 时读 `[$]` 行); 无 schema 行 = 纯 KV 表 (缓存 None 免重复探盘).
+    schemas: std::collections::HashMap<(String, String), SchemaSlot>,
+    /// ⭐ Y1 (布隆剪枝): 每 (db, table, iid) 一个本地索引 bloom.
+    /// 等值 IndexScan 快速拒绝; set_schema 建空 bloom, row_put 喂值,
+    /// 开库随 rebuild_composite_counts 扫 [I] 前缀重建 (永不假阴性).
+    index_blooms: std::collections::HashMap<(String, String, u32), crate::index_bloom::IndexBloom>,
+    /// ⭐ Y1: 剪枝命中计数 (等值扫被 bloom 短路的次数; 测试/观测用).
+    pub bloom_skip_count: u64,
+    /// ⭐ WAL (F60): per-shard 预写日志 (None = Off 档 / 重放期间).
+    wal: Option<crate::wal::WalWriter>,
+}
+
+/// ⭐ Q1: schema 镜像槽别名 (None = 已确认无 schema 的纯 KV 表).
+pub(crate) type SchemaSlot = Option<std::sync::Arc<crate::schema::TableSchema>>;
+
+impl StorageEngine {
+    /// ⭐ Q1: schema 镜像读 (外层 None = 未加载过, 内层 None = 确认无 schema).
+    pub(crate) fn schema_cache_get(&self, db: &str, table: &str) -> Option<&SchemaSlot> {
+        self.schemas.get(&(db.to_string(), table.to_string()))
+    }
+
+    /// ⭐ Q1: schema 镜像写 (write-through 的内存侧; caller 先保证 `[$]` 行已落).
+    pub(crate) fn schema_cache_put(&mut self, db: &str, table: &str, slot: SchemaSlot) {
+        self.schemas.insert((db.to_string(), table.to_string()), slot);
+    }
+    
+    /// ⭐ Y1: 确保 (db, table, iid) 的 bloom 存在并返回可变引用.
+    pub(crate) fn bloom_entry(
+        &mut self,
+        db: &str,
+        table: &str,
+        iid: u32,
+    ) -> &mut crate::index_bloom::IndexBloom {
+        self.index_blooms
+            .entry((db.to_string(), table.to_string(), iid))
+            .or_default()
+    }
+    
+    /// ⭐ Y1: 等值剪枝判定 — Some(false) = bloom 断言不存在 (可短路);
+    /// 无条目 → true (不剪枝, 正常扫).
+    pub(crate) fn bloom_may_contain(&self, db: &str, table: &str, iid: u32, val: &[u8]) -> bool {
+        self.index_blooms
+            .get(&(db.to_string(), table.to_string(), iid))
+            .is_none_or(|b| b.may_contain(val))
+    }
 }
 
 impl StorageEngine {
@@ -254,7 +310,7 @@ impl StorageEngine {
             )
         } else {
             Pager::new_for_shard_with_io(
-                block_root,
+                block_root.clone(),
                 db_name,
                 shard_id,
                 recovered.meta,
@@ -281,12 +337,73 @@ impl StorageEngine {
             pager: pager_for_registry,
             registry,
             current_db: DEFAULT_DB_ID,
+            composite_tables: std::collections::HashMap::new(),
+            schemas: std::collections::HashMap::new(),
+            index_blooms: std::collections::HashMap::new(),
+            bloom_skip_count: 0,
+            wal: None, // 重放期间保持 None (append 自动跳过)
         };
         // ⭐ U3: 从 data 行重建复合结构计数 (修复 crash 中 meta count 漂移).
         engine.rebuild_composite_counts().await.map_err(|e| {
             StorageError::Io(std::io::Error::other(format!("rebuild_composite_counts: {e}")))
         })?;
+        // ⭐ WAL (F60): 重放现存段 (填补上次 crash 的刷盘窗口), 完成后删段并
+        // 启用新 WalWriter. 段目录: compat 模式用 block_dir, 否则 block_root 根.
+        if opts.wal_mode != crate::wal::WalMode::Off {
+            let wal_dir =
+                if let Some(bd) = &opts.block_dir { bd.clone() } else { block_root.clone() };
+            let segs = crate::wal::WalWriter::existing_segments(&wal_dir, shard_id);
+            if !segs.is_empty() {
+                engine.replay_wal_segments(&segs).await;
+                // 重放产物立即全量落盘 (数据+meta), 之后段可安全删除
+                engine.pager.flush().await?;
+                crate::wal::WalWriter::purge_replayed(&segs);
+            }
+            engine.wal = Some(
+                crate::wal::WalWriter::open(
+                    &wal_dir,
+                    shard_id,
+                    opts.wal_mode,
+                    matches!(opts.io_backend, IoBackend::IoUring),
+                )
+                .map_err(StorageError::Io)?,
+            );
+        }
         Ok(engine)
+    }
+
+    /// ⭐ WAL (F60): 按段序逐条重放 (幂等: 结果态 put / delete).
+    /// db/table 已不存在 (drop 后残留记录) → warn 跳过不 panic.
+    async fn replay_wal_segments(&mut self, segs: &[std::path::PathBuf]) {
+        let mut applied = 0u64;
+        let mut skipped = 0u64;
+        for seg in segs {
+            let Ok(data) = std::fs::read(seg) else { continue };
+            for rec in crate::wal::decode_records(&data) {
+                let r = match &rec.value {
+                    Some(v) => {
+                        // 惰性建表窗口: 表未持久化时重建 (db 必须存在 —
+                        // create_db 路径已强制落盘; 不存在 = 已 drop, 跳过)
+                        if self.ensure_table(&rec.db, &rec.table).await.is_err() {
+                            skipped += 1;
+                            continue;
+                        }
+                        self.put_physical(&rec.db, &rec.table, &rec.pkey, v).await.map(|_| ())
+                    }
+                    None => self
+                        .delete_physical(&rec.db, &rec.table, &rec.pkey)
+                        .await
+                        .map(|_| ()),
+                };
+                match r {
+                    Ok(()) => applied += 1,
+                    Err(_) => skipped += 1, // db/table 已删等陈旧记录, 跳过
+                }
+            }
+        }
+        if applied + skipped > 0 {
+            eprintln!("[storage] WAL replay: {applied} applied, {skipped} skipped (stale db/table)");
+        }
     }
 
     /// 写一个 page. 分配新 vpid, 走 nowchunks.
@@ -311,12 +428,71 @@ impl StorageEngine {
         // drive_write_queue 再写剩余 pending (nowchunks 中无新版本的 chunk).
         // 两步内部都保证 "chunk data 全部写完才刷 meta".
         self.pager.flush().await?;
-        self.pager.drive_write_queue().await
+        self.pager.drive_write_queue().await?;
+        // ⭐ WAL (F60): 正常关闭 = 全量已落盘, 全部段可删 (重启免重放)
+        if let Some(mut w) = self.wal.take() {
+            w.purge_all();
+        }
+        Ok(())
     }
 
     /// 暴露 meta cache (高级用法: 调试, 直接读写映射).
     pub fn meta(&mut self) -> &mut MetaCache {
         self.pager.meta()
+    }
+
+    // =================================================================
+    // ⭐ WAL (F60): shard 主循环接线面
+    // =================================================================
+
+    /// 当前 WAL 档位 (Off = 未启用).
+    pub fn wal_mode(&self) -> crate::wal::WalMode {
+        self.wal.as_ref().map_or(crate::wal::WalMode::Off, |w| w.mode())
+    }
+
+    /// 有未持久化的 WAL 内容 (strict 档回复前判断是否需 barrier).
+    pub fn wal_needs_sync(&self) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.needs_sync())
+    }
+
+    /// WAL 持久化屏障: buf 落盘 + fsync (strict 档回复前 / 显式 flush 前).
+    pub async fn wal_barrier(&mut self) -> io::Result<()> {
+        match self.wal.as_mut() {
+            Some(w) => w.flush_and_sync().await,
+            None => Ok(()),
+        }
+    }
+
+    /// Periodic 档心跳: 距上次 sync ≥ 1s 且有内容 → 落盘+fsync.
+    pub async fn wal_periodic_tick(&mut self) -> io::Result<()> {
+        const WAL_SYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+        match self.wal.as_mut() {
+            Some(w)
+                if w.mode() == crate::wal::WalMode::Periodic
+                    && w.periodic_due(WAL_SYNC_PERIOD) =>
+            {
+                w.flush_and_sync().await
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// 刷盘快照触发时调用 (同轮内无并发写): seal 当前段.
+    pub fn wal_seal(&mut self) {
+        if let Some(w) = self.wal.as_mut()
+            && let Err(e) = w.seal()
+        {
+            eprintln!("[storage] WAL seal failed (segment kept): {e}");
+        }
+    }
+
+    /// meta 全部持久化后调用: 删除 sealed 段 (其记录已由 chunk+meta 覆盖).
+    pub fn wal_drop_sealed_if_meta_flushed(&mut self) {
+        if self.pager.meta_all_flushed()
+            && let Some(w) = self.wal.as_mut()
+        {
+            w.drop_sealed();
+        }
     }
 
     /// chunk_list 缓存大小 (测试 helper).
@@ -405,6 +581,11 @@ impl StorageEngine {
         self.registry.list_dbs()
     }
 
+    /// ⭐ D1 (分库): 列出所有 db 的 (id, name) — resolver 持久化事实源.
+    pub fn list_dbs_with_ids(&self) -> Vec<(u32, String)> {
+        self.registry.list_dbs_with_ids()
+    }
+
     /// db 总数.
     pub fn db_count(&self) -> usize {
         self.registry.db_count()
@@ -432,6 +613,48 @@ impl StorageEngine {
         db_handle.open_table(&mut self.pager, table).await
     }
 
+    /// ⭐ PERF (F49): 表内是否出现过复合类型 (单调提示; 见字段注释).
+    pub(crate) fn has_composite(&self, db: &str, table: &str) -> bool {
+        self.composite_tables
+            .get(db)
+            .is_some_and(|s| s.contains(table))
+    }
+
+    /// ⭐ PERF (F49): 标记表出现过复合类型 (复合 meta 写入口 + 开库重建时调).
+    pub(crate) fn mark_composite(&mut self, db: &str, table: &str) {
+        let set = self.composite_tables.entry(db.to_string()).or_default();
+        if !set.contains(table) {
+            set.insert(table.to_string());
+        }
+    }
+
+    /// ⭐ S1 (DROP TABLE): 清除表的全部 engine 侧派生状态 —
+    /// schema 镜像 + 全部 index bloom + 复合提示位.
+    /// (物理数据由 drop_table 负责; 此处只清内存缓存, 防已删表幽灵命中)
+    pub(crate) fn purge_table_state(&mut self, db: &str, table: &str) {
+        self.schemas.remove(&(db.to_string(), table.to_string()));
+        self.index_blooms
+            .retain(|(d, t, _), _| !(d == db && t == table));
+        if let Some(set) = self.composite_tables.get_mut(db) {
+            set.remove(table);
+        }
+    }
+
+    /// ⭐ T1 (分表): 惰性建表 — 表已存在 (registry 缓存命中) 零 IO 返回;
+    /// 不存在则本 shard 本地创建 (幂等; shard 间物理隔离, 无需 2PC 协调).
+    /// RESP 冒号前缀路由的自动建表入口, 由 shard 数据面在 op 执行前调用.
+    pub async fn ensure_table(&mut self, db: &str, table: &str) -> Result<(), RegistryError> {
+        if self.open_table(db, table).await?.is_some() {
+            return Ok(());
+        }
+        match self.create_table(db, table).await {
+            Ok(_) => Ok(()),
+            // shard 单线程无并发窗口, 但保持幂等语义 (重复建表视为成功)
+            Err(RegistryError::TableOp(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// 列出指定 db 中所有表名 (按 name 升序).
     ///
     /// **注意**: 需要 `&mut self` 因为内部要查 DbHandle (拿 vpid 缓存).
@@ -457,7 +680,10 @@ impl StorageEngine {
     ) -> Result<(), RegistryError> {
         // ⭐ Phase K: user key 统一编码为 [S][klen][key]
         // ⭐ U2: SET 覆盖异类旧值 — 若 key 当前是复合类型先 purge (Redis 语义).
-        self.purge_composite_if_any(db, table, key).await?;
+        // ⭐ PERF (F49): 表内从未写过复合类型 → 不可能有旧复合行, 跳过探测.
+        if self.has_composite(db, table) {
+            self.purge_composite_if_any(db, table, key).await?;
+        }
         let ek = crate::keyspace::encode_string(key);
         self.put_physical(db, table, &ek, value).await
     }
@@ -483,6 +709,11 @@ impl StorageEngine {
 
         let new_root =
             crate::registry::table_put(&mut self.pager, table_vpid, pkey, value).await?;
+
+        // ⭐ WAL (F60): 成功路径记录结果态 (重放幂等)
+        if let Some(w) = self.wal.as_mut() {
+            w.append_put(db, table, pkey, value);
+        }
 
         // ⭐ T15: root split 时同步 TableDirectory BTree + 缓存
         if let Some(new_root) = new_root {
@@ -513,6 +744,59 @@ impl StorageEngine {
         crate::registry::table_get(&mut self.pager, table_vpid, pkey).await
     }
 
+    /// ⭐ O2: 物理 key 批量读 (LeafGuide 区间复用, 结果按输入序, 溢出展开).
+    /// 复合 op 多 field/member 探在从逐条 travel 摊薄为区间复用.
+    pub(crate) async fn get_physical_many(
+        &mut self,
+        db: &str,
+        table: &str,
+        pkeys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, RegistryError> {
+        let db_handle = self.registry.open_db(db)?;
+        let table_vpid = db_handle
+            .open_table(&mut self.pager, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+        crate::registry::table_get_many(&mut self.pager, table_vpid, pkeys).await
+    }
+
+    /// ⭐ O2: 物理 key 批量写 (排序 + 同 leaf 一次 batch 提交;
+    /// root split 同步 TableDirectory, 与 put_physical 同逻辑).
+    pub(crate) async fn put_physical_many(
+        &mut self,
+        db: &str,
+        table: &str,
+        pairs: &[(Vec<u8>, &[u8])],
+    ) -> Result<(), RegistryError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let db_handle = self.registry.open_db(db)?;
+        let table_vpid = db_handle
+            .open_table(&mut self.pager, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+        let new_root =
+            crate::registry::table_put_many(&mut self.pager, table_vpid, pairs).await?;
+        // ⭐ WAL (F60): 批量记录 (一次遍历, flush 时共享后续 fsync)
+        if let Some(w) = self.wal.as_mut() {
+            for (pkey, value) in pairs {
+                w.append_put(db, table, pkey, value);
+            }
+        }
+        if let Some(new_root) = new_root {
+            let db_handle = self.registry.open_db(db)?;
+            db_handle
+                .table_dir_mut()
+                .update_table(&mut self.pager, table, new_root)
+                .await
+                .map_err(RegistryError::from)?;
+            let db_handle = self.registry.open_db(db)?;
+            db_handle.update_table_root(table, new_root);
+        }
+        Ok(())
+    }
+
     /// 按物理 key 删 (溢出链自动释放). 返回是否存在.
     pub(crate) async fn delete_physical(
         &mut self,
@@ -525,7 +809,12 @@ impl StorageEngine {
             .open_table(&mut self.pager, table)
             .await?
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        crate::registry::table_delete(&mut self.pager, table_vpid, pkey).await
+        let existed = crate::registry::table_delete(&mut self.pager, table_vpid, pkey).await?;
+        // ⭐ WAL (F60): 存在才记 (不存在的 delete 重放无意义)
+        if existed && let Some(w) = self.wal.as_mut() {
+            w.append_del(db, table, pkey);
+        }
+        Ok(existed)
     }
 
     /// 读 key 对应 value. 返回 None 表示 key 不存在.
@@ -766,6 +1055,7 @@ mod tests {
             chunk_cache_size: 0,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: crate::wal::WalMode::Off,
         };
         let result = StorageEngine::open(opts);
         // 用 pollster 等结果
@@ -791,6 +1081,7 @@ mod tests {
             chunk_cache_size: 16,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: crate::wal::WalMode::Off,
         };
         let cloned = opts.clone();
         assert_eq!(cloned.block_root, opts.block_root);
@@ -820,6 +1111,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let mut engine = StorageEngine::open(opts)
                 .await
@@ -875,6 +1167,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let mut engine = StorageEngine::open(opts).await.expect("open compat ok");
 
@@ -912,6 +1205,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let _e0 = StorageEngine::open(opts0).await.expect("shard 0 ok");
 
@@ -924,6 +1218,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let _e1 = StorageEngine::open(opts1).await.expect("shard 1 ok");
 
@@ -955,6 +1250,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let engine = StorageEngine::open(opts).await.expect("open ok");
             assert_eq!(engine.current_db(), DEFAULT_DB_ID);
@@ -979,6 +1275,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let mut engine = StorageEngine::open(opts).await.expect("open ok");
 
@@ -1010,6 +1307,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let mut engine = StorageEngine::open(opts).await.expect("open ok");
             let before = engine.current_db();
@@ -1033,6 +1331,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let mut engine = StorageEngine::open(opts).await.expect("open ok");
             engine.create_db("logs").await.expect("create logs");
@@ -1071,6 +1370,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let mut engine1 = StorageEngine::open(opts1).await.expect("open1 ok");
             engine1
@@ -1093,6 +1393,7 @@ mod tests {
                 chunk_cache_size: 4,
                 io_backend: IoBackend::StdFs,
                 io_config: IoBackendConfig::default(),
+                wal_mode: crate::wal::WalMode::Off,
             };
             let engine2 = StorageEngine::open(opts2).await.expect("open2 ok");
             // current_db 重置为 DEFAULT_DB_ID

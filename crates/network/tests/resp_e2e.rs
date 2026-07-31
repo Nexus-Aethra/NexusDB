@@ -24,6 +24,7 @@ fn start_server(auth_password: Option<&str>) -> (NetworkServer, Arc<ShardManager
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 4,
         reply_bus_count: None,
+        wal_mode: Default::default(),
     };
     let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
     mgr.create_db("app").expect("create db");
@@ -42,6 +43,8 @@ fn start_server(auth_password: Option<&str>) -> (NetworkServer, Arc<ShardManager
         limits: KvLimits::default(),
         auth_password: auth_password.map(|s| s.to_string()),
         worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     (server, mgr)
@@ -299,8 +302,12 @@ fn resp_misc_commands() {
     s.write_all(&cmd(&[b"ECHO", b"hi"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\nhi\r\n");
 
-    s.write_all(&cmd(&[b"SELECT", b"0"])).unwrap();
+    // ⭐ D (分库): SELECT 不再忽略 — e2e 环境 "app" 是 resolver id 1
+    // ("default" 占 0 但未创建 → out of range)
+    s.write_all(&cmd(&[b"SELECT", b"1"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"SELECT", b"0"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR DB index is out of range"));
 
     s.write_all(&cmd(&[b"COMMAND"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*0\r\n");
@@ -1207,6 +1214,175 @@ fn resp_b_bitmap_commands() {
     // 越界 offset 拒绝 (max_value_bytes 默认 1MB)
     s.write_all(&cmd(&[b"SETBIT", b"bm", b"99999999999", b"1"])).unwrap();
     assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ T2 (分表): key 冒号前缀选表 e2e — "table:key" 路由 + shard 惰性建表.
+#[test]
+fn resp_t_table_routing() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // 三个表 (user / order / default) 同名 stripped key 互不干扰
+    s.write_all(&cmd(&[b"SET", b"user:1", b"a"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"SET", b"order:1", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"SET", b"1", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", b"user:1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\na\r\n");
+    s.write_all(&cmd(&[b"GET", b"order:1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nb\r\n");
+    s.write_all(&cmd(&[b"GET", b"1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nc\r\n");
+
+    // DEL 只删所在表
+    s.write_all(&cmd(&[b"DEL", b"user:1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"GET", b"order:1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nb\r\n");
+
+    // 只拆第一个冒号: user:1000:profile → 表 user, key "1000:profile"
+    s.write_all(&cmd(&[b"SET", b"user:1000:profile", b"p"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", b"user:1000:profile"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\np\r\n");
+
+    // 复合结构带前缀
+    s.write_all(&cmd(&[b"HSET", b"user:1000", b"f", b"v"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"HGETALL", b"user:1000"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\nf\r\n$1\r\nv\r\n");
+    s.write_all(&cmd(&[b"LPUSH", b"q:jobs", b"j1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"LLEN", b"q:jobs"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+
+    // 跨表 MGET (混合前缀 + 无前缀, 按输入序回填)
+    s.write_all(&cmd(&[b"MGET", b"order:1", b"1", b"user:1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$-1\r\n");
+    // 跨表 MSET
+    s.write_all(&cmd(&[b"MSET", b"m1:k", b"x", b"m2:k", b"y", b"k", b"z"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"MGET", b"m1:k", b"m2:k", b"k"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n$1\r\nx\r\n$1\r\ny\r\n$1\r\nz\r\n");
+
+    // *STORE 带前缀 dst + 跨表源
+    s.write_all(&cmd(&[b"SADD", b"sa:s", b"a", b"b"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"SADD", b"sb:s", b"b", b"c"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"SINTERSTORE", b"out:r", b"sa:s", b"sb:s"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"SMEMBERS", b"out:r"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"*1\r\n$1\r\nb\r\n");
+
+    // 边界: 非法前缀 → 整 key 落 default 表 (与写入自洽)
+    s.write_all(&cmd(&[b"SET", b":x", b"e1"])).unwrap(); // 空前缀
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", b":x"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\ne1\r\n");
+    s.write_all(&cmd(&[b"GET", b"x"])).unwrap(); // 不是 "x" (未剥前缀)
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    s.write_all(&cmd(&[b"SET", b"\xff\x01:bin", b"e2"])).unwrap(); // 二进制前缀
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", b"\xff\x01:bin"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\ne2\r\n");
+    let long = [b"t".repeat(65), b":k".to_vec()].concat(); // 65B 前缀超长
+    s.write_all(&cmd(&[b"SET", &long, b"e3"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", &long])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\ne3\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ D (分库): SELECT n 经 DbNameResolver id 翻译切库 e2e.
+#[test]
+fn resp_d_select_db() {
+    let (server, mgr) = start_server(None);
+    // harness 已建 "app" (resolver id 1; "default" 占 0 但未创建被视图过滤).
+    // 再建 "app2" → id 2 (create_db 后 DbDirView 自动刷新); 表靠惰性建表.
+    mgr.create_db("app2").expect("create app2");
+    let mut s = connect(&server);
+
+    // 默认连接在 "app": 写 k
+    s.write_all(&cmd(&[b"SET", b"k", b"in-app"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+
+    // SELECT 2 → app2: k 不可见 (库隔离); 写入走惰性建表
+    s.write_all(&cmd(&[b"SELECT", b"2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", b"k"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    s.write_all(&cmd(&[b"SET", b"k", b"in-app2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    // SELECT 与表前缀正交
+    s.write_all(&cmd(&[b"SET", b"user:k", b"u2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+
+    // 切回 app (id 1): 各自数据独立
+    s.write_all(&cmd(&[b"SELECT", b"1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", b"k"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$6\r\nin-app\r\n");
+    s.write_all(&cmd(&[b"GET", b"user:k"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    s.write_all(&cmd(&[b"SELECT", b"2"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"GET", b"k"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$7\r\nin-app2\r\n");
+    s.write_all(&cmd(&[b"GET", b"user:k"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\nu2\r\n");
+
+    // 越界 / 非整数
+    s.write_all(&cmd(&[b"SELECT", b"99"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR DB index is out of range"));
+    s.write_all(&cmd(&[b"SELECT", b"abc"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
+    // "default" 未真实创建 → id 0 不可选
+    s.write_all(&cmd(&[b"SELECT", b"0"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR DB index is out of range"));
+
+    // 断连重置: 新连接回默认 db (app)
+    drop(s);
+    let mut s2 = connect(&server);
+    s2.write_all(&cmd(&[b"GET", b"k"])).unwrap();
+    assert_eq!(read_replies(&mut s2, 1)[0], b"$6\r\nin-app\r\n");
+
+    drop(s2);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+// ===== ⭐ Y2: SQL 已迁独立端口 — RESP 回归纯 Redis 语义断言 =====
+
+/// SQL 剥离后 RESP 行为回归: CREATE/INSERT 是未知命令, SELECT 严格选库.
+#[test]
+fn resp_sql_removed_pure_redis_semantics() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    // CREATE / INSERT → unknown command
+    s.write_all(&cmd(&[b"CREATE", b"TABLE", b"t", b"(a", b"INT", b"PRIMARY", b"KEY)"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR unknown command 'create'"));
+    s.write_all(&cmd(&[b"INSERT", b"INTO", b"t", b"VALUES", b"(1)"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR unknown command 'insert'"));
+
+    // SELECT 恢复严格 arity=2 整数
+    s.write_all(&cmd(&[b"SELECT", b"*", b"FROM", b"t"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR wrong number of arguments"));
+    s.write_all(&cmd(&[b"SELECT", b"abc"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
+    // 选库语义不变 (e2e 环境 "app" 是 resolver id 1)
+    s.write_all(&cmd(&[b"SELECT", b"1"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
 
     drop(s);
     server.shutdown().unwrap();

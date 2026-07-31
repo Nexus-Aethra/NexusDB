@@ -3,7 +3,12 @@
 //! 纯字节 ↔ KV 转换, 不接触 shard / scheduler / IO.
 
 pub mod binary;
+pub mod crypto;
+pub mod http;
+pub mod mysql;
+pub mod pg;
 pub mod resp;
+pub mod sql;
 
 use thiserror::Error;
 
