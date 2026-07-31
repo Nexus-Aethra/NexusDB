@@ -1,0 +1,31 @@
+# NexusDB docker-compose — 一键起库 + 持久化卷
+# 用法:  docker compose up -d   /   docker compose logs -f   /   docker compose down
+services:
+  nexusdb:
+    build: .
+    image: nexusdb:latest
+    container_name: nexusdb
+    restart: unless-stopped
+    ports:
+      - "6379:6379"   # RESP (Redis 兼容)
+      - "5434:5434"   # MySQL wire
+      - "5435:5435"   # PostgreSQL wire
+      - "6778:6778"   # HTTP REST + /metrics
+    volumes:
+      - nexusdb-data:/data
+      # 覆盖默认配置 (可选): 取消注释并提供自己的 toml
+      # - ./deploy/nexusdb.docker.toml:/etc/nexusdb/nexusdb.toml:ro
+      # 启用 TLS (可选): 挂证书目录, 并在配置里指向 /etc/nexusdb/certs/*.pem
+      # - ./certs:/etc/nexusdb/certs:ro
+    # io_uring 若被宿主 seccomp 拦截, 放开(或改配置 io_backend=stdfs):
+    # security_opt:
+    #   - seccomp=unconfined
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6778/v1/status || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  nexusdb-data:

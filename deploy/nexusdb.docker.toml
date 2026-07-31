@@ -1,0 +1,41 @@
+# NexusDB 容器默认配置 (镜像内置于 /etc/nexusdb/nexusdb.toml)
+# 覆盖方式: docker run -v /path/to/your.toml:/etc/nexusdb/nexusdb.toml ...
+
+[server]
+# 监听 0.0.0.0 以便容器外访问 (端口映射见 docker run -p)
+listen_addr = "0.0.0.0:5433"     # Binary 内部协议 (压测/工具)
+redis_addr  = "0.0.0.0:6379"     # RESP (Redis 兼容); 空 = 禁用
+sql_addr    = "0.0.0.0:5434"     # MySQL wire
+pg_addr     = "0.0.0.0:5435"     # PostgreSQL wire
+http_addr   = "0.0.0.0:6778"     # HTTP REST + /metrics
+
+# 认证 (为空 = 免密; 生产务必设置, 或通过挂载配置覆盖)
+sql_password   = ""              # SQL 双门面登录密码 (非空时 PG 走 SCRAM-SHA-256)
+redis_password = ""              # RESP AUTH 密码
+http_token     = ""              # REST Bearer token
+http_cors_origin = ""
+
+# TLS 传输加密 (opt-in; 两项均非空才启用)。把证书挂进容器再指向:
+#   -v /host/certs:/etc/nexusdb/certs
+# tls_cert = "/etc/nexusdb/certs/cert.pem"
+# tls_key  = "/etc/nexusdb/certs/key.pem"
+tls_cert = ""
+tls_key  = ""
+
+sql_worker_count = 2
+max_key_bytes = 1024
+max_value_bytes = 1048576
+
+[storage]
+block_root = "/data"             # 持久化目录 (对应 VOLUME /data)
+num_shards = 6
+# io 后端: "io_uring" (默认, 高性能, 需较新内核 + seccomp 允许) 或 "stdfs" (最大兼容)。
+# 若容器 io_uring 报错, 改成 "stdfs":
+io_backend = "io_uring"
+default_db = "default"
+default_table = "default"
+
+[log]
+level = "info"
+stderr = true                    # 容器内日志输出到 stderr (docker logs 可见)
+dir = ""                         # 空 = 不写文件, 只 stderr

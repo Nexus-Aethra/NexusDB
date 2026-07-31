@@ -67,6 +67,25 @@ RUST_MIN_STACK=67108864 ./target/release/NexusDB --config nexusdb.toml
 ```
 启动后日志会打印各门面监听地址。任一门面 `addr` 留空即禁用该门面。
 
+### Docker 部署
+镜像随仓库提供 [`Dockerfile`](../Dockerfile)(多阶段:Rust builder → debian-slim)+ [`docker-compose.yml`](../docker-compose.yml)+ 容器默认配置 [`deploy/nexusdb.docker.toml`](../deploy/nexusdb.docker.toml)。
+```bash
+# 构建镜像
+docker build -t nexusdb:latest .
+
+# 直接运行 (持久化到命名卷 nexusdb-data)
+docker run -d --name nexusdb \
+  -p 6379:6379 -p 5434:5434 -p 5435:5435 -p 6778:6778 \
+  -v nexusdb-data:/data nexusdb:latest
+
+# 或 compose 一键起
+docker compose up -d
+```
+- 数据持久化在容器 `/data`(`VOLUME`);内置 `HEALTHCHECK` 探测 HTTP `/v1/status`。
+- 覆盖配置:`-v /path/your.toml:/etc/nexusdb/nexusdb.toml`。
+- **io_uring 注意**:默认 `io_backend=io_uring`,需较新内核;若被宿主 seccomp 拦截而报 I/O 错,改配置为 `io_backend="stdfs"`(挂自定义配置),或 `docker run --security-opt seccomp=unconfined`。
+- 启用 TLS:挂证书目录并在配置里设置 `tls_cert`/`tls_key`。
+
 ---
 
 ## 3. 多协议门面接入
