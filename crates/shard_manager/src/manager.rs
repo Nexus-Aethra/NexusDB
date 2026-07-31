@@ -2549,7 +2549,8 @@ fn shard_thread_main(
         rt.clone().drive_until_idle(1000);
     }
     if init_result.borrow().as_ref().unwrap().is_err() {
-        nlog::error!("shard", "shard-{shard_id} engine init failed, exiting");
+        let err = init_result.borrow().as_ref().unwrap().as_ref().err().map(|e| format!("{e:?}"));
+        nlog::error!("shard", "shard-{shard_id} engine init failed: {err:?}, exiting");
         return;
     }
     drop(init_result);

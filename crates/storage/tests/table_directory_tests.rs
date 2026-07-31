@@ -38,6 +38,7 @@ fn setup() -> (tempfile::TempDir, OpenOptions) {
         chunk_cache_size: 8,
         io_backend: IoBackend::StdFs,
         io_config: IoBackendConfig::default(),
+        wal_mode: Default::default(),
     };
     (tmp, opts)
 }

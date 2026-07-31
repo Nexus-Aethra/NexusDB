@@ -40,6 +40,7 @@ fn setup() -> (tempfile::TempDir, OpenOptions) {
         chunk_cache_size: 4,
         io_backend: IoBackend::StdFs,
         io_config: IoBackendConfig::default(),
+        wal_mode: Default::default(),
     };
     (tmp, opts)
 }
@@ -114,6 +115,7 @@ fn engine_open_creates_block_dir_and_files() {
             chunk_cache_size: 4,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
 
         let block_dir = opts.block_dir.as_ref().expect("compat mode");
@@ -145,6 +147,7 @@ fn engine_open_without_create_if_missing_errors_on_missing_dir() {
             chunk_cache_size: 4,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
 
         let result = StorageEngine::open(opts);
@@ -360,7 +363,8 @@ fn open_options_clone_works() {
         chunk_cache_size: 8,
         io_backend: IoBackend::StdFs,
         io_config: IoBackendConfig::default(),
-        };
+        wal_mode: Default::default(),
+    };
     let opts2 = opts.clone();
     assert_eq!(opts.block_dir, opts2.block_dir);
     assert_eq!(opts.create_if_missing, opts2.create_if_missing);
@@ -493,6 +497,7 @@ fn engine_two_engines_in_separate_dirs_isolated() {
             chunk_cache_size: 4,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
         let opts2 = OpenOptions {
             block_root: tmp2.path().to_path_buf().clone(),
@@ -503,6 +508,7 @@ fn engine_two_engines_in_separate_dirs_isolated() {
             chunk_cache_size: 4,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
 
         // 写 1 page 到 opts1
@@ -615,5 +621,39 @@ fn engine_drop_without_close_does_not_panic() {
         }
         // 上面 drop 应不 panic
         // 注意: 数据可能丢失 (未 fsync), 但不应 panic
+    });
+}
+
+/// ⭐ T1 (分表): ensure_table 幂等 — 不存在则本地建, 已存在零副作用.
+/// ⭐ D1 (分库): list_dbs_with_ids 只含真实已创建的库, id 单调.
+#[test]
+fn ensure_table_and_db_id_view() {
+    run_async(async move {
+        let (_tmp, opts) = setup();
+        let mut e = StorageEngine::open(opts).await.unwrap();
+        e.create_db("default").await.unwrap();
+
+        // 不存在 → 自动建
+        assert!(e.open_table("default", "auto").await.unwrap().is_none());
+        e.ensure_table("default", "auto").await.unwrap();
+        assert!(e.open_table("default", "auto").await.unwrap().is_some());
+        // 再次 ensure 零副作用 (root 不变)
+        let root1 = e.open_table("default", "auto").await.unwrap();
+        e.ensure_table("default", "auto").await.unwrap();
+        assert_eq!(e.open_table("default", "auto").await.unwrap(), root1);
+        // 建后可读写
+        e.table_put("default", "auto", b"k", &[1, 2]).await.unwrap();
+        assert_eq!(
+            e.table_get("default", "auto", b"k").await.unwrap(),
+            Some(vec![1, 2])
+        );
+
+        // id 视图: default 已真实创建 → (0, "default"); 新建库 id 递增
+        assert_eq!(e.list_dbs_with_ids(), vec![(0, "default".to_string())]);
+        e.create_db("db1").await.unwrap();
+        assert_eq!(
+            e.list_dbs_with_ids(),
+            vec![(0, "default".to_string()), (1, "db1".to_string())]
+        );
     });
 }

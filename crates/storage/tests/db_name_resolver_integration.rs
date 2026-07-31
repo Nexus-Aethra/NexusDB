@@ -71,6 +71,7 @@ fn meta_page_resolver_segment_survives_reopen() {
             chunk_cache_size: 8,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
 
         {
@@ -136,6 +137,7 @@ fn meta_page_resolver_name_id_round_trip_via_storage_engine() {
             chunk_cache_size: 8,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
 
         let names = vec!["default", "analytics", "users", "inventory", "orders"];
@@ -278,6 +280,7 @@ fn resolver_persists_across_multiple_open_close_cycles() {
             chunk_cache_size: 8,
             io_backend: IoBackend::StdFs,
             io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
         };
 
         // 第一次: 创建 3 个 db

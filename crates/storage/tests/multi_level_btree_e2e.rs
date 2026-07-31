@@ -32,6 +32,7 @@ fn setup() -> (tempfile::TempDir, OpenOptions) {
         io_backend: IoBackend::StdFs,
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 8, // 大一些, 减少 flush 干扰
+        wal_mode: Default::default(),
     };
     (tmp, opts)
 }
