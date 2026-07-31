@@ -18,6 +18,7 @@
 - **五协议监听**: RESP2 6379 + **REST (HTTP/1.1 JSON + CORS + Bearer) 6778** + SQL 双门面 (MySQL wire 5434 / PostgreSQL wire 5435, 共内核) + Binary 5433 (内部), 均含 `KvLimits` 协议层长度拦截, TCP_NODELAY
 - **可观测性**: `/metrics` (Prometheus) + `/v1/status` + `/v1/debug/*` (进程级原子计数, 热路径零锁)
 - **SQL 能力**: CREATE/INSERT 多行/SELECT (投影·ORDER BY·聚合 COUNT/SUM/AVG/MIN/MAX·GROUP BY·HAVING·IN·BETWEEN·LIKE·WHERE 支持 OR/NOT/括号嵌套·全表扫)/UPDATE/DELETE/DROP/USE/DESCRIBE; 本地二级索引 + 双层布隆剪枝 + 覆盖索引/UNIQUE 早停 + GLOBAL UNIQUE (跨 shard 全局唯一)
+- **子查询 (非关联 WHERE + FROM 派生表 + 单等值关联 EXISTS)**: `IN/NOT IN (SELECT..)` / `标量 x op (SELECT..)` / `[NOT] EXISTS (SELECT..)` — 内层先跑→折叠字面量/恒真恒假→外层走现有索引路径 (大 IN 上限 65536 + 同型集合二分求值), DELETE/UPDATE 同支持; `SELECT .. FROM (SELECT ..) t [WHERE/ORDER/LIMIT]` 且可参与 JOIN (内层物化预填, 含聚合/GROUP BY, 孤 COUNT(*)); 单等值关联 `EXISTS/NOT EXISTS` 自动去相关为 IN; mysql+pg 驱动实机一致 (关联 IN/标量ヽJOIN 右侧派生表后续)
 - **JOIN (多表等值)**: N 表左深 `INNER|LEFT|RIGHT|FULL|CROSS JOIN ... ON/USING` — worker 完成点 hash join (shard 只本地扫描, 零跨线程), 多条件 ON + 非等值残余, 谓词/投影下推 + 索引驱动 gather + probe 侧键集合索引点查 (前序表 join 键下推, ~6x 提速), 表别名/限定列/ORDER/LIMIT; mysql+pg 驱动实机一致 (子查询后续)
 - **系统表 / 内省 (GUI/ORM 反射)**: information_schema (tables/columns/key_column_usage/schemata) + pg_catalog flat 单表 + SHOW [FULL] TABLES/COLUMNS/CREATE TABLE/DATABASES + 反引号标识符 + `SELECT @@var` stub; SQLAlchemy `inspect()` 实机反射通 (psql `\d` 的 pg_catalog JOIN 留后)
 - **统一记录编码 + value type tag**: 网络门面写入统一附加 tag, storage 层不感知, 新协议接入零存储改动
@@ -363,7 +364,7 @@ DROP TABLE users;  USE db1;  DESCRIBE users;               -- 工具命令
 | DELETE / INSERT (pk) | ~11K qps | 0.11ms |
 | 全表扫 5K 行 (+过滤/COUNT) | ~70 qps | 55ms |
 
-> SQL gap (记录在案): 无 JOIN / OR / 子查询 / ALTER / TLS / SCRAM (PG 仅 cleartext); 聚合不支持表达式 SUM(a+b)/COUNT(DISTINCT)/GROUP_CONCAT/别名 AS/窗口函数 (GROUP BY 当前全量收行, shard 端部分聚合下推留后); LIKE 仅前缀模式; 普通 **UNIQUE 跨 shard best-effort** (探测仅本 shard) — 需全局唯一用 `GLOBAL UNIQUE` (email-shard 占坑, 事务内写/UPDATE 该列为 v1 边界); 非事务的 DELETE/UPDATE 两阶段与多行 INSERT 非原子 (事务内单 shard 原子); 事务跨 shard best-effort; ORDER BY 无 top-k (全量排序); schema 广播非原子 (幂等重试)。
+> SQL gap (记录在案): JOIN/OR/子查询已交付 (F67-F75, 见上方能力表; 剩余缺口 = 关联 IN/标量、多重相关 EXISTS、JOIN 右侧派生表); 无 ALTER / TLS / SCRAM (PG 仅 cleartext); 聚合不支持表达式 SUM(a+b)/COUNT(DISTINCT)/GROUP_CONCAT/别名 AS/窗口函数 (GROUP BY 当前全量收行, shard 端部分聚合下推留后); LIKE 仅前缀模式; 普通 **UNIQUE 跨 shard best-effort** (探测仅本 shard) — 需全局唯一用 `GLOBAL UNIQUE` (email-shard 占坑, 事务内写/UPDATE 该列为 v1 边界); 非事务的 DELETE/UPDATE 两阶段与多行 INSERT 非原子 (事务内单 shard 原子); 事务跨 shard best-effort; ORDER BY 无 top-k (全量排序); schema 广播非原子 (幂等重试)。
 
 ### REST 门面 (HTTP/1.1, 6778, 2026-07-30)
 

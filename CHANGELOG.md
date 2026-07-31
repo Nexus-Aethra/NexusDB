@@ -10,6 +10,116 @@
 
 ---
 
+## 2026-07-31 会话十五 (F73 大 IN / F74 关联 EXISTS 去相关 / F75 派生表参与 JOIN)
+
+子查询后续三件套, 收尾 Phase 3 已知遗留。三项独立交付, 统一跨协议对拍。
+
+### F73: 大 IN 上限提升 (>1024 不再报错)
+
+- 阈值区分叶子类型: EXISTS 无上限 (仅存在性); scalar 保持 >1 行报错; IN 去重后上限 `SUBQ_IN_MAX=65536` (捕获阶段 OOM 护栏同值)
+- IN 集合排序去重 (`sql::sort_in_set`, 同型: 全 Int 按值 / 全 Str 按字节): 解析期字面量 IN + fold_one_subq 折叠集合均排序
+- `eval_cond_leaf` IN 分支: 集合 >64 且同型匹配列型 (I64+全 Int / Bytes+全 Str) → `binary_search`; 混型/跨型 coercion 回退线性
+- 实机: 2000 行内层 IN (旧报错语句) 现出正确结果; 边界抽查 + NOT IN 补集正确
+
+### F74: 关联 EXISTS/NOT EXISTS 单等值去相关
+
+- `EXISTS (SELECT 1 FROM o WHERE o.uid=u.id [AND 非相关])` ≡ `u.id IN (SELECT uid FROM o WHERE 非相关)` — 解析期收 `SqlValue::ColRef`, 编排前 AST 改写为非关联 IN, 执行层零新机制
+- `decorrelate_stmt/pred/leaf/exists` (worker): EXISTS 叶内层含 ColRef → 去相关 (内层 AND-only, 恰一条相关等值 Eq, 两侧一外一内, 其余无 ColRef); NOT EXISTS 在 Pred::Not 内自然成 NOT IN
+- 不可去相关 (关联 IN/标量、多重相关、非等值、OR 内) → 清晰报错 "correlated subquery not supported (v1, only single-equality EXISTS)"
+- 实机: 关联 EXISTS/NOT EXISTS (附加内层条件/两侧顺序/裸列与限定列) 结果对拍手工 JOIN; 各不可去相关形态报错
+
+### F75: FROM 派生表参与 JOIN
+
+- `SqlStmt::SelectJoin` 加 `from_inner: Option<Box<SqlStmt>>` (Some=首表派生表, from.table=别名); parse_join 拆 wrapper + `parse_join_from` (接受已解析 from + from_inner)
+- worker `DerivedCtx` → enum {Standalone, JoinFrom{db, join_stmt}}; 内层复用完成点拦截物化, `finish_derived_join` 合成 schema (真实列型) + 预填 `SqlJoinCtx.tables[0]` (proj=全列 identity, prefilled=true), 转 sql_join_kickoff
+- `JoinTable.prefilled`: kickoff 跳过其 FetchSchema/Gather, 不清空其 rows, 从首个非预填表开始 gather; 左深 hash join/外连接逻辑零感知
+- 实机: 派生表 INNER/LEFT JOIN、混合投影+WHERE 限定列、内层聚合 GROUP BY 作首表 (group 列作 ON 键); JOIN 右侧派生表报错 (v1)
+
+### gotcha
+
+- **is_join_ahead 跨 RParen 误判**: `(SELECT .. FROM u) t LEFT JOIN` 中内层 `SELECT .. FROM u` 的 is_join_ahead 会在 3-token 窗口内看到 `)` 后的 LEFT 而误判为内层 JOIN → 内层 parse_join 提前 done() 撞剩余 token. 修复: is_join_ahead 遇 RParen 即停 (子查询边界不跨)
+- F73 二分求值前提是集合已排序去重, 故 sort_in_set 必须在解析期字面量 IN 与折叠集合两处都调; 混型集合不排序 → eval 保守回退线性
+- F74 ColRef 与 Param/Subquery 同 "执行前必解" 家族: sql_to_col 防御报 "unresolved column reference"; 列-列比较 (非关联) 也走此拒绝路径
+- F75 prefilled 表 proj 必须强制全列 identity (物化行定宽), 否则 plan 算的子集 proj 与实际行宽错位
+
+---
+
+## 2026-07-31 会话十四 (F72: FROM 派生表 + Phase 3 收尾)
+
+Phase 3 收尾: FROM 派生表 `SELECT ... FROM (SELECT ...) t` + F71 补 pg 驱动跨协议验收。
+方案 = **零 TableSource ripple**: 不动 `Select.table: String`, 学 F67 SelectJoin 隔离先例用
+独立 `SqlStmt::SelectDerived` 变体; 内层复用 F71 完成点拦截物化 (列定义+行集),
+外层在 worker 内存过滤/投影/排序/截断 (sysq_finish 同款管线, 但保留内层真实列类型)。
+
+### 交付总览
+
+| # | 交付 | 文件 |
+|---|---|---|
+| D1 | `SqlStmt::SelectDerived{inner,alias,items,conds,order,limit,offset}` + parse_derived (FROM 处 peek_paren_select 接入; 必带别名; 孤 COUNT(*) 特例外拒聚合投影; 外层 WHERE 拒子查询) + bind_params 臂 | protocol/sql.rs |
+| D2 | `DerivedCtx` + `sql_derived: HashMap<seq,ctx>` + dispatch 臂 (内层验证后同 seq 重入 sql_dispatch_stmt) + 两完成点拦截 (SqlSelectAgg → `Fire::DerivedDone(MatResult)`; SqlRowCtx → `derived_capture_rowctx`) + `finish_derived`/`derived_render` 内存管线 | worker.rs |
+| D3 | e2e mysql_derived_tables (13 断言) + **mysql-connector + psycopg3 跨协议对拍 30/30** (F71 全部用例 pg 欠账补上) + 回归全绿 + clippy 0 | tests/sql_e2e.rs |
+
+### 支持能力 (实机验收)
+
+- 内层 = 任意单表 SELECT (含聚合/GROUP BY/ORDER/LIMIT); 输出列名 = 投影列名或聚合 label (`g`/`SUM(v)`)
+- 外层: WHERE (`t.x`/裸 `x`, 含 OR/NOT 谓词树) + 投影 + ORDER (多键/DESC) + LIMIT/OFFSET + 孤 `COUNT(*)`
+- 内层 pk 点查形态 (SqlRowCtx 路径) / 索引路径 / 全扫 / 聚合路径均可作内层
+- 错误面: 无别名 / 未知列 / 错 qualifier / 内层 JOIN / 内层嵌套子查询 / 非孤 COUNT(*) 聚合投影 → 清晰报错
+
+### 边界 / 已知限制 (v1 文档化)
+
+- 派生表仅作唯一数据源 (不参与 JOIN); 外层无 GROUP BY/HAVING/聚合投影 (孤 COUNT(*) 特判除外); 外层 WHERE 无嵌套子查询
+- 物化在 worker 内存 (JOIN_MAX_ROWS=262144 上限, 无流式); 外层谓词不下推 shard (数据已在内存)
+- 外层 ORDER BY 聚合 label 需裸写 (`ORDER BY g` 可; `ORDER BY SUM(v)` 语法层不收, 同单表限制)
+- 事务内 RYOW 直渲染路径不经拦截 (与 F71 同源已知边界, 低频组合)
+
+### gotcha
+
+- **拦截优先级**: SqlSelectAgg 完成点 `None if is_derived => Fire::DerivedDone(materialize_select_agg(agg))` 携带 MatResult 整体 (含 Err) — 错误在 fire 处统一清理 sql_derived ctx, 避免借用冲突与 ctx 泄漏
+- **SqlRowCtx 拦截需自合成列定义** (COUNT → 单列 I64; 否则 proj 列 name+ty) — 该路径无 materialize 可用
+- **parse_join 内层自然拒绝**: `(SELECT .. JOIN ..)` 在 parse_join 末尾 `p.done()` 撞 `)` 报 trailing tokens, 无需额外拦截
+- pkill 自身包装进程: 沙箱 bwrap 命令行含模式串, `pkill -f` 会自杀; 用 `pkill -x NexusDB`
+
+---
+
+## 2026-07-31 会话十三 (F71: 非关联 WHERE 子查询)
+
+Phase 3 第一部分: 非关联 WHERE 子查询 (IN/NOT IN + 标量 + EXISTS/NOT EXISTS)。
+方案 = **内层先跑完 → 折叠成字面量/恒真恒假 → 外层走完全现有 WHERE/plan/eval/shard 路径**。
+
+### 交付总览
+
+| # | 交付 | 文件 |
+|---|---|---|
+| S1 | `SqlValue::Subquery(Box<SqlStmt>)` (与 Param 同构的“执行前必解”占位) + parse (IN/NOT IN/scalar/EXISTS, parse_select top 参 + parse_paren_subselect) | protocol/sql.rs |
+| S2 | bind_params 子查询递归绑定 + sql_to_col 防御拒未折叠 | protocol/sql.rs, worker.rs |
+| S3 | SubqCtx 顺序编排状态机 + materialize 拆分 (render_select_agg/render_agg_groups) + 折叠重跑; 拦截 SqlSelectAgg 与 SqlRowCtx 两完成路径 | worker.rs |
+| S5 | e2e mysql_where_subqueries + mysql 驱动实机 + 回归 | tests/sql_e2e.rs |
+
+### 支持能力 (实机验收)
+
+- **IN / NOT IN** `x [NOT] IN (SELECT col FROM..)` — 内层列集 → IN 字面量集 (享 [min,max] 索引剪枝); 空集 → 恒假; NOT 包 Pred::Not
+- **标量** `x op (SELECT ..)` — 0 行→NULL(恒假), 1 行→常量, >1 行→报错; 支持聚合内层 (SELECT MAX/MIN) 与 pk-point 内层
+- **EXISTS / NOT EXISTS** `[NOT] EXISTS (SELECT 1 FROM..)` — 非空→恒真/空→恒假; 子查询中字面量投影 (SELECT 1) 视为全列
+- DELETE/UPDATE ... WHERE 带子查询; 多个子查询顺序串行 (仿 SqlUniqueIns)
+
+### 边界 / 已知限制
+
+- **仅非关联** (内层不引用外层列); 关联子查询报错 (内层 `o.uid=u.id` 的外层列非字面量→解析/执行拒)
+- **大结果集 IN 阈值拦截** (去重 >1024=SUBQ_MAX_ROWS 报错引导改写 JOIN; 半连接优化留后)
+- 内层 v1 限单表 SELECT (JOIN 内层/嵌套子查询 拒, 避免绕过 SqlSelectAgg 拦截)
+- NOT IN 遇 NULL 三值逻辑 v1 简化 (与现有 NULL 恒 false 一致)
+- **FROM 派生表未含** (需 TableSource enum 波及 + 内存外层执行, 独立后续)
+
+### gotcha
+
+- **SqlValue::Subquery 与 Param 同模式**: 执行前必解占位, sql_to_col 防御报 "unresolved subquery"; 折叠保持 `Pred<Cond>` 类型不变 → 下游 plan/eval/shard 零改动
+- **完成点两路径都要拦**: 内层可能走 SqlSelectAgg (Index/FullScan/agg) 或 SqlRowCtx (pk-point), 两处都需 is_subq 拦截 materialize 而非渲染
+- EXISTS 恒真 = `And(vec![])`, 恒假 = `Not(Box::new(And(vec![])))` — 无需新 Cond 变体
+- 折叠与 collect 必须同 DFS 序 (Leaf-first, And/Or 左右, Not 入内) 才能正确配对
+
+---
+
 ## 2026-07-31 会话十二 (F70: JOIN gather 索引点查优化)
 
 纯性能优化。probe 侧表 gather 时, 用前序已 gather 表的 ON 等值键值集合下推为

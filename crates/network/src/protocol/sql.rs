@@ -21,6 +21,35 @@ pub enum SqlValue {
     /// ⭐ P1: 预处理占位符 (`?` 按序 / `$n` 显式, 0-based); 执行前必经
     /// bind_params 替换, 泄漏到执行层是 bug (sql_to_col 防御报错).
     Param(u16),
+    /// ⭐ F71 (子查询): 非关联子查询占位 (scalar / IN / EXISTS 内层 SELECT).
+    /// worker dispatch 前必经子查询折叠替换为字面量, 泄漏到执行层是 bug
+    /// (sql_to_col 防御报错). 与 Param 同构的“执行前必解”占位.
+    Subquery(Box<SqlStmt>),
+    /// ⭐ F74 (关联子查询): 列引用 `[表/别名.]列` — 仅出现在内层
+    /// WHERE 比较 RHS (相关条件). decorrelate_pred 改写为非关联 IN 后消失;
+    /// 泄漏到执行层是 bug (sql_to_col 防御报错). 同 “执行前必解”占位家族.
+    ColRef(String),
+}
+
+/// ⭐ F73: IN 集合原地排序去重 (同型集合: 全 Int 按值 / 全 Str 按字节序).
+/// 大集合求值走二分依赖有序; 混型 (含 Float / 跨型) 保持原序不动 (求值回退线性).
+/// 成员语义不变 (集合无序), 仅重排 + 去重.
+pub fn sort_in_set(set: &mut Vec<SqlValue>) {
+    let all_int = set.iter().all(|v| matches!(v, SqlValue::Int(_)));
+    let all_str = set.iter().all(|v| matches!(v, SqlValue::Str(_)));
+    if all_int {
+        set.sort_by_key(|v| match v {
+            SqlValue::Int(i) => *i,
+            _ => unreachable!(),
+        });
+        set.dedup();
+    } else if all_str {
+        set.sort_by(|a, b| match (a, b) {
+            (SqlValue::Str(x), SqlValue::Str(y)) => x.cmp(y),
+            _ => unreachable!(),
+        });
+        set.dedup();
+    }
 }
 
 /// 比较算子 (WHERE 条件).
@@ -78,6 +107,10 @@ pub struct Cond {
     /// ⭐ S2: 仅 In 使用 (非空); 其它算子恒空.
     pub set: Vec<SqlValue>,
 }
+
+/// ⭐ F71 (子查询): EXISTS 哨兵列名 — 真实列名不可为空, 以此区分 EXISTS(无列)
+/// 与 scalar/IN(有列) 子查询叶子. 折叠前临时存在, 折叠后消失.
+pub const EXISTS_SENTINEL_COL: &str = "";
 
 /// ⭐ F69: 谓词表达式树 (AND/OR/NOT/括号) — 泛型于叶子类型 C.
 /// WHERE 用 `Pred<Cond>`, JOIN WHERE 用 `Pred<JoinCond>`, HAVING 用下标域叶子.
@@ -258,10 +291,25 @@ pub enum SqlStmt {
     /// ⭐ F66: `SELECT @@var [, @@var2]` 系统变量 (SQLAlchemy/驱动初始化探测).
     /// vars = 去 @@ 的变量名列表; worker 回合理值单行.
     SystemVarStub { vars: Vec<String> },
+    /// ⭐ F72 (子查询): FROM 派生表 `(SELECT ...) alias`. inner 先物化成
+    /// 虚拟表 (worker 内存), 外层在其上过滤/投影/排序/截断.
+    /// v1: 派生表为唯一数据源 (不参与 JOIN); 外层无 GROUP BY/HAVING/聚合
+    /// 投影 (COUNT(*) worker 特判除外); 外层 WHERE 不含子查询.
+    SelectDerived {
+        inner: Box<SqlStmt>,
+        alias: String,
+        items: Vec<SelectItem>,
+        conds: Pred<Cond>,
+        order: Vec<(String, bool)>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    },
     /// ⭐ F67/F68 (JOIN): N 表左深 hash join — worker 侧执行.
     /// 别名无时 = 表名; items 空 = `*` 展开各表全列; joins 为左深链.
+    /// ⭐ F75: from_inner=Some 时 from 为派生表 (from.table=别名), 内层先物化预填 tables[0].
     SelectJoin {
         from: TableRef,
+        from_inner: Option<Box<SqlStmt>>,
         joins: Vec<JoinClause>,
         items: Vec<JoinItem>,
         conds: Pred<JoinCond>,
@@ -579,6 +627,17 @@ impl P {
             Err(format!("trailing tokens after statement: {:?}", &self.toks[self.i..]))
         }
     }
+
+    /// ⭐ F71: 仅顶层语句校验尾部无残余 token; 子查询 (top=false) 不校验.
+    fn done_if(&self, top: bool) -> Result<(), String> {
+        if top { self.done() } else { Ok(()) }
+    }
+
+    /// ⭐ F71: 当前是 `( SELECT` (子查询开头), 区分于 `(` 分组/字面量列表.
+    fn peek_paren_select(&self) -> bool {
+        self.peek() == Some(&Tok::LParen)
+            && matches!(self.toks.get(self.i + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("SELECT"))
+    }
 }
 
 /// 入口: RESP 参数 join 后的完整语句 → AST.
@@ -704,7 +763,7 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
     let stmt = match p.peek() {
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("CREATE") => parse_create(&mut p),
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("INSERT") => parse_insert(&mut p),
-        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("SELECT") => parse_select(&mut p),
+        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("SELECT") => parse_select(&mut p, true),
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("SHOW") => parse_show(&mut p),
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("DELETE") => parse_delete(&mut p),
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("UPDATE") => parse_update(&mut p),
@@ -792,6 +851,12 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
                 .get(*i as usize)
                 .cloned()
                 .ok_or_else(|| format!("missing parameter {}", i + 1)),
+            // ⭐ F71: 子查询内层递归绑定 (占位符编号全局连续, 同一 params)
+            SqlValue::Subquery(s) => {
+                Ok(SqlValue::Subquery(Box::new(bind_params(s, params)?)))
+            }
+            // ⭐ F74: 列引用原样 (decorrelate 前不参与绑定)
+            SqlValue::ColRef(_) => Ok(v.clone()),
             other => Ok(other.clone()),
         }
     };
@@ -838,9 +903,14 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
             conds: bind_conds(conds)?,
         },
         // ⭐ F67/F68 (JOIN): 替换 WHERE 限定条件里的占位符 (ON/from/joins 无字面量)
-        SqlStmt::SelectJoin { from, joins, items, conds, order, limit, offset } => {
+        SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset } => {
             SqlStmt::SelectJoin {
                 from: from.clone(),
+                // ⭐ F75: 派生表内层递归绑定
+                from_inner: match from_inner {
+                    Some(s) => Some(Box::new(bind_params(s, params)?)),
+                    None => None,
+                },
                 joins: joins.clone(),
                 items: items.clone(),
                 conds: conds.try_map(&|c: &JoinCond| {
@@ -851,6 +921,18 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
                         set: c.set.iter().map(&subst).collect::<Result<_, _>>()?,
                     })
                 })?,
+                order: order.clone(),
+                limit: *limit,
+                offset: *offset,
+            }
+        }
+        // ⭐ F72: 派生表 — 内层递归绑定 + 外层 WHERE 绑定
+        SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset } => {
+            SqlStmt::SelectDerived {
+                inner: Box::new(bind_params(inner, params)?),
+                alias: alias.clone(),
+                items: items.clone(),
+                conds: bind_conds(conds)?,
                 order: order.clone(),
                 limit: *limit,
                 offset: *offset,
@@ -1017,6 +1099,54 @@ fn parse_insert(p: &mut P) -> Result<SqlStmt, String> {
     Ok(SqlStmt::Insert { table, cols, rows })
 }
 
+/// ⭐ F71: 解 `( SELECT ... )` 子查询 (LParen 未消费), 返回内层 stmt.
+fn parse_paren_subselect(p: &mut P) -> Result<Box<SqlStmt>, String> {
+    p.expect(&Tok::LParen, "(")?;
+    let inner = parse_select(p, false)?;
+    p.expect(&Tok::RParen, ")")?;
+    Ok(Box::new(inner))
+}
+
+/// ⭐ F72: 派生表叶子含子查询判定 (外层 WHERE 不允许嵌套子查询).
+fn cond_has_subquery(c: &Cond) -> bool {
+    matches!(c.val, SqlValue::Subquery(_))
+        || c.set.iter().any(|v| matches!(v, SqlValue::Subquery(_)))
+        || c.col == EXISTS_SENTINEL_COL
+}
+
+fn pred_has_subquery(pred: &Pred<Cond>) -> bool {
+    pred.leaves().iter().any(|c| cond_has_subquery(c))
+}
+
+/// ⭐ F72: FROM 派生表 `(SELECT ...) [AS] alias [WHERE ...] [ORDER/LIMIT/OFFSET]`.
+/// 外层投影 items 已在 FROM 前解完 (传入). v1: 无聚合投影; 无别名报错;
+/// 外层 WHERE 不得含子查询 (双层编排留后).
+fn parse_derived(p: &mut P, items: Vec<SelectItem>, top: bool) -> Result<SqlStmt, String> {
+    let inner = parse_paren_subselect(p)?;
+    let alias =
+        parse_opt_alias(p).ok_or_else(|| "every derived table must have its own alias".to_string())?;
+    // ⭐ F75: 派生表参与 JOIN — 别名后接 JOIN 子句 → 走 JOIN 主体 (from=派生表)
+    if is_join_ahead(p) {
+        let from = TableRef { table: alias.clone(), alias };
+        return parse_join_from(p, items, from, Some(inner));
+    }
+    if items.iter().any(|i| matches!(i, SelectItem::Agg { .. })) {
+        // v1 特判: 唯一投影项为 COUNT(*) 允许 (行数统计); 其余聚合拒
+        let lone_count = items.len() == 1
+            && matches!(&items[0], SelectItem::Agg { func: AggFn::Count, col: None });
+        if !lone_count {
+            return Err("aggregate on derived table is not supported (v1, except lone COUNT(*))".into());
+        }
+    }
+    let conds = parse_where(p)?;
+    if pred_has_subquery(&conds) {
+        return Err("subquery in derived-table outer WHERE is not supported (v1)".into());
+    }
+    let (order, limit, offset) = parse_select_tail(p)?;
+    p.done_if(top)?;
+    Ok(SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset })
+}
+
 /// WHERE 子句 (AND 平铺; caller 决定是否必带).
 /// ⭐ S2: BETWEEN → Ge+Le, LIKE 'p%' → 前缀范围 (解析期 desugar);
 /// IN → CmpOp::In (set); `!=`/`<>` → Ne.
@@ -1055,8 +1185,19 @@ fn parse_not_expr(p: &mut P) -> Result<Pred<Cond>, String> {
     }
 }
 
-/// ⭐ F69: primary = `( <or_expr> )` | 单个比较叶子.
+/// ⭐ F69: primary = `( <or_expr> )` | EXISTS 子查询 | 单个比较叶子.
 fn parse_primary(p: &mut P) -> Result<Pred<Cond>, String> {
+    // ⭐ F71: EXISTS (SELECT ...) — 哨兵列名区分; NOT EXISTS 由 parse_not_expr 包 Pred::Not
+    if matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("EXISTS")) {
+        p.next()?;
+        let stmt = parse_paren_subselect(p)?;
+        return Ok(Pred::Leaf(Cond {
+            col: EXISTS_SENTINEL_COL.to_string(),
+            op: CmpOp::Eq,
+            val: SqlValue::Subquery(stmt),
+            set: vec![],
+        }));
+    }
     if p.peek() == Some(&Tok::LParen) {
         p.next()?;
         let inner = parse_or_expr(p)?;
@@ -1072,8 +1213,21 @@ fn parse_primary(p: &mut P) -> Result<Pred<Cond>, String> {
 fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
     let mut conds: Vec<Cond> = Vec::new();
     let col = p.ident()?;
-    // IN (v, ...)
+    // ⭐ F71: col [NOT] IN (...) — NOT IN 包 Pred::Not; 子查询与字面量列表两路
+    let negated_in = p.try_kw("NOT");
     if p.try_kw("IN") {
+        // ⭐ F71: IN (SELECT ...) → Subquery 占位 (dispatch 前折叠为 set)
+        if p.peek_paren_select() {
+            let stmt = parse_paren_subselect(p)?;
+            let leaf = Pred::Leaf(Cond {
+                col,
+                op: CmpOp::In,
+                val: SqlValue::Subquery(stmt),
+                set: vec![],
+            });
+            return Ok(if negated_in { Pred::Not(Box::new(leaf)) } else { leaf });
+        }
+        // 字面量列表
         p.expect(&Tok::LParen, "(")?;
         let mut set = Vec::new();
         loop {
@@ -1091,8 +1245,13 @@ fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
         if set.is_empty() {
             return Err("empty IN list".into());
         }
-        conds.push(Cond { col, op: CmpOp::In, val: SqlValue::Null, set });
-    } else if p.try_kw("BETWEEN") {
+        sort_in_set(&mut set); // ⭐ F73: 大集合求值二分化
+        let leaf = Pred::Leaf(Cond { col, op: CmpOp::In, val: SqlValue::Null, set });
+        return Ok(if negated_in { Pred::Not(Box::new(leaf)) } else { leaf });
+    } else if negated_in {
+        return Err("expected IN after NOT".into());
+    }
+    if p.try_kw("BETWEEN") {
         // BETWEEN a AND b → col >= a AND col <= b (内部 AND 在此消费)
         let a = p.value()?;
         p.kw("AND")?;
@@ -1147,6 +1306,18 @@ fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             Tok::Ne => CmpOp::Ne,
             other => return Err(format!("expected comparison operator, got {other:?}")),
         };
+        // ⭐ F71: col op (SELECT ...) — 标量子查询 (dispatch 前折叠为常量)
+        if p.peek_paren_select() {
+            let stmt = parse_paren_subselect(p)?;
+            return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::Subquery(stmt), set: vec![] }));
+        }
+        // ⭐ F74: col op ident (非 NULL) → ColRef (关联子查询相关列; decorrelate 前收集)
+        if let Some(Tok::Ident(s)) = p.peek()
+            && !s.eq_ignore_ascii_case("NULL")
+        {
+            let rhs = p.ident()?;
+            return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::ColRef(rhs), set: vec![] }));
+        }
         let val = p.value()?;
         if val == SqlValue::Null {
             return Err("NULL is not a valid comparison bound".into());
@@ -1327,9 +1498,16 @@ fn is_join_kw(t: Option<&Tok>) -> bool {
 }
 
 fn is_join_ahead(p: &P) -> bool {
-    is_join_kw(p.toks.get(p.i))
-        || is_join_kw(p.toks.get(p.i + 1))
-        || is_join_kw(p.toks.get(p.i + 2))
+    // ⭐ F75: 扫描未来 3 token, 但遇 RParen (子查询边界) 即停 —
+    // 防止内层 `(SELECT .. FROM u)` 误视外层 `) t JOIN` 为自身 JOIN.
+    for off in 0..3 {
+        match p.toks.get(p.i + off) {
+            Some(Tok::RParen) => return false,
+            t if is_join_kw(t) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// ⭐ F67 (JOIN): 可选表别名 — `[AS] alias`; alias 不能是保留子句关键字.
@@ -1409,8 +1587,22 @@ fn parse_join(
 ) -> Result<SqlStmt, String> {
     let first_alias = parse_opt_alias(p).unwrap_or_else(|| first_table.clone());
     let from = TableRef { table: first_table, alias: first_alias };
+    parse_join_from(p, sel_items, from, None)
+}
+
+/// ⭐ F75: JOIN 主体 (from 已解析). from_inner=Some 时 from 为派生表.
+fn parse_join_from(
+    p: &mut P,
+    sel_items: Vec<SelectItem>,
+    from: TableRef,
+    from_inner: Option<Box<SqlStmt>>,
+) -> Result<SqlStmt, String> {
     let mut joins: Vec<JoinClause> = Vec::new();
     while let Some(kind) = parse_join_kind(p) {
+        // ⭐ F75: JOIN 右侧派生表 v1 拒 (仅 FROM 位支持)
+        if p.peek_paren_select() {
+            return Err("derived table on JOIN right side is not supported (v1)".into());
+        }
         let table = p.ident()?;
         let alias = parse_opt_alias(p).unwrap_or_else(|| table.clone());
         let on = if kind == JoinKind::Cross {
@@ -1462,7 +1654,7 @@ fn parse_join(
         set: c.set.clone(),
     });
     let order = order_raw.into_iter().map(|(s, d)| (QualCol::parse(&s), d)).collect();
-    Ok(SqlStmt::SelectJoin { from, joins, items, conds, order, limit, offset })
+    Ok(SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset })
 }
 
 /// ⭐ F69: HAVING 谓词树 (OR<AND<NOT<primary; 叶子 = 输出列 label op val).
@@ -1513,21 +1705,24 @@ fn parse_having_not(p: &mut P) -> Result<Pred<Cond>, String> {
 }
 
 /// `SELECT * | COUNT(*) | c1, c2, ... FROM t [WHERE ...] [ORDER BY c [DESC], ...]
-/// [LIMIT n] [OFFSET m]`
-fn parse_select(p: &mut P) -> Result<SqlStmt, String> {
+/// [LIMIT n] [OFFSET m]`. ⭐ F71: top=false 为子查询上下文 (不调 done, 不走 stub).
+fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     p.kw("SELECT")?;
     // ⭐ O1: 投影列表 (Star = 全列); ⭐ G1 (F63): 列/聚合函数混合项
     let mut items: Vec<SelectItem> = Vec::new();
     if p.peek() == Some(&Tok::Star) {
         p.next()?;
-    } else if matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("VERSION")) {
+    } else if !top && matches!(p.peek(), Some(Tok::Num(_))) {
+        // ⭐ F71: 子查询中的字面量投影 (如 EXISTS 的 `SELECT 1`) — 值无关, 视为全列
+        p.next()?;
+    } else if top && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("VERSION")) {
         // ⭐ S3: SELECT version() — psql/驱动探测 stub
         p.next()?;
         p.expect(&Tok::LParen, "(")?;
         p.expect(&Tok::RParen, ")")?;
         p.done()?;
         return Ok(SqlStmt::VersionStub);
-    } else if matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("DATABASE")) {
+    } else if top && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("DATABASE")) {
         // ⭐ S5: SELECT DATABASE() — mysql cli USE 后探测
         p.next()?;
         p.expect(&Tok::LParen, "(")?;
@@ -1570,13 +1765,19 @@ fn parse_select(p: &mut P) -> Result<SqlStmt, String> {
         }
     }
     p.kw("FROM")?;
+    // ⭐ F72: FROM 派生表 `(SELECT ...) alias` — items (外层投影) 已解完, 传入.
+    if p.peek_paren_select() {
+        return parse_derived(p, items, top);
+    }
     let table = p.ident()?;
     // ⭐ F66: 系统表拦截 — `information_schema.X` / `pg_catalog.X` (大小写不敏)
     // 走虚拟表合成路径; 尾部只解 WHERE/ORDER/LIMIT/OFFSET (不支持 GROUP/HAVING)
     if let Some((cat, tbl)) = split_system_table(&table) {
         let conds = parse_where(p)?;
         let (order, limit, offset) = parse_select_tail(p)?;
-        p.done()?;
+        if top {
+            p.done()?;
+        }
         let cols: Vec<String> = items
             .iter()
             .filter_map(|i| match i {
@@ -1694,7 +1895,7 @@ fn parse_select(p: &mut P) -> Result<SqlStmt, String> {
             other => return Err(format!("expected OFFSET count, got {other:?}")),
         }
     }
-    p.done()?;
+    p.done_if(top)?;
     Ok(SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having })
 }
 

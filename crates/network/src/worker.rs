@@ -306,6 +306,8 @@ struct JoinTable {
     /// 下推投影列号 (升序; 与 rows 每行位置一一对应).
     proj: Vec<u16>,
     rows: Vec<Vec<ColValue>>,
+    /// ⭐ F75: 派生表预填 (rows 已物化, schema 合成) — kickoff/gather 跳过其 fetch/scan.
+    prefilled: bool,
 }
 
 /// ⭐ F67/F68 (JOIN): N 表左深 hash join 上下文 (worker 完成点执行).
@@ -435,6 +437,42 @@ struct PendingSql {
     db: std::sync::Arc<str>,
     table: String,
 }
+
+/// ⭐ F71 (子查询): 非关联 WHERE 子查询编排 — 顺序跑内层→折叠→重跑外层.
+/// inners 按 DFS 左右序; 每个内层跑完 materialize 行集存 results; 全部完→fold→重跑.
+struct SubqCtx {
+    outer: SqlStmt,
+    db: std::sync::Arc<str>,
+    inners: Vec<SqlStmt>,
+    results: Vec<Vec<Vec<ColValue>>>, // 每内层的行集 (投影后)
+    cur: usize,
+}
+
+/// ⭐ F71: 子查询内层捕获行上限 (防 OOM; 超限报错). EXISTS 只需存在性 /
+/// IN 去重后的精确上限在 fold_one_subq 按叶子类型判定; 此值仅作捕获阶段 OOM 护栏.
+const SUBQ_IN_MAX: usize = 65_536;
+
+/// ⭐ F72 (派生表): FROM `(SELECT ...) alias` 编排 — 内层物化完成后的去向.
+/// ⭐ F75: Standalone = 单独派生表 (worker 内存执行外层);
+/// JoinFrom = 派生表作 JOIN 首表 (物化行预填 tables[0] 后转 JOIN 状态机).
+enum DerivedCtx {
+    Standalone {
+        alias: String,
+        items: Vec<sql::SelectItem>,
+        conds: Pred<Cond>,
+        order: Vec<(String, bool)>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    },
+    JoinFrom {
+        db: std::sync::Arc<str>,
+        /// 去掉 from_inner 的 SelectJoin (from.table = 别名).
+        join_stmt: SqlStmt,
+    },
+}
+
+/// ⭐ F71: materialize 返回 — (输出列定义, 行集).
+type MatResult = Result<(Vec<(String, ColType)>, Vec<Vec<ColValue>>), String>;
 
 /// SELECT 访问路径 (worker 过滤器选择).
 enum SqlPlan {
@@ -580,6 +618,10 @@ struct ConnState {
     sql_sysq: HashMap<u64, SysQuerySpec>,
     /// ⭐ F67 (JOIN): 两表 hash join 顺序状态机 (seq → ctx).
     sql_join: HashMap<u64, SqlJoinCtx>,
+    /// ⭐ F71 (子查询): WHERE 子查询编排 (seq → ctx).
+    sql_subq: HashMap<u64, SubqCtx>,
+    /// ⭐ F72 (派生表): FROM 派生表编排 (seq → ctx).
+    sql_derived: HashMap<u64, DerivedCtx>,
     /// ⭐ v2 (F62): 连接级默认隔离级别/读写属性 (SET SESSION TRANSACTION).
     default_iso: sql::TxnIso,
     default_ro: bool,
@@ -711,6 +753,8 @@ impl ConnState {
             sql_unique_ins: HashMap::new(),
             sql_sysq: HashMap::new(),
             sql_join: HashMap::new(),
+            sql_subq: HashMap::new(),
+            sql_derived: HashMap::new(),
             default_iso: sql::TxnIso::default(),
             default_ro: false,
             sql_select_agg: HashMap::new(),
@@ -983,6 +1027,8 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                                     r.group,
                                     &r.result,
                                     worker_id,
+                                    &db,
+                                    &db_view,
                                     &shard_inboxes,
                                     num_shards,
                                 );
@@ -2432,6 +2478,8 @@ fn handle_resp_shard_result(
     group: u32,
     result: &BatchResult,
     worker_id: u32,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
 ) {
@@ -2576,7 +2624,32 @@ fn handle_resp_shard_result(
                                 *slot = cv.clone();
                             }
                         }
-                        if eval_pred(&ctx.schema, &values, &ctx.conds) {
+                        let hit = eval_pred(&ctx.schema, &values, &ctx.conds);
+                        // ⭐ F71: 内层子查询 → 捕获 0/1 行 (投影/计数) 而非渲染
+                        if conn.sql_subq.contains_key(&seq) {
+                            let captured: Vec<Vec<ColValue>> = if !hit {
+                                vec![]
+                            } else if ctx.count {
+                                vec![vec![ColValue::I64(1)]]
+                            } else {
+                                vec![ctx.proj.iter().map(|&i| values[i as usize].clone()).collect()]
+                            };
+                            sql_subq_advance(
+                                conn, conn_id, seq, worker_id, default_db, db_view,
+                                shard_inboxes, num_shards, captured,
+                            );
+                            return;
+                        }
+                        // ⭐ F72: 派生表内层 (pk 点查形态) → 物化后 worker 内存执行外层
+                        if conn.sql_derived.contains_key(&seq) {
+                            let (cols, captured) = derived_capture_rowctx(&ctx, hit, &values);
+                            finish_derived(
+                                conn, conn_id, seq, worker_id, bin, shard_inboxes, num_shards,
+                                cols, captured,
+                            );
+                            return;
+                        }
+                        if hit {
                             if ctx.count {
                                 render_sql_count(conn.proto, bin, 1)
                             } else {
@@ -2591,6 +2664,24 @@ fn handle_resp_shard_result(
                     Err(e) => sql_err_bytes(conn.proto, &e.to_string()),
                 }
             }
+            BatchResult::GetValue(None) if conn.sql_subq.contains_key(&seq) => {
+                // ⭐ F71: 内层子查询空结果
+                let captured: Vec<Vec<ColValue>> =
+                    if ctx.count { vec![vec![ColValue::I64(0)]] } else { vec![] };
+                sql_subq_advance(
+                    conn, conn_id, seq, worker_id, default_db, db_view, shard_inboxes,
+                    num_shards, captured,
+                );
+                return;
+            }
+            BatchResult::GetValue(None) if conn.sql_derived.contains_key(&seq) => {
+                // ⭐ F72: 派生表内层空结果
+                let (cols, captured) = derived_capture_rowctx(&ctx, false, &[]);
+                finish_derived(
+                    conn, conn_id, seq, worker_id, bin, shard_inboxes, num_shards, cols, captured,
+                );
+                return;
+            }
             BatchResult::GetValue(None) if ctx.count => render_sql_count(conn.proto, bin, 0),
             BatchResult::GetValue(None) => render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[]),
             BatchResult::Error(e) => sql_err_bytes(conn.proto, e),
@@ -2603,10 +2694,16 @@ fn handle_resp_shard_result(
     if conn.sql_select_agg.contains_key(&seq) {
         let proto = conn.proto;
         let bin = conn.mysql_binary.contains(&seq); // ⭐ P2 (借用前 peek)
+        // ⭐ F71: 此 agg 属内层子查询 → 完成时 materialize 行集而非渲染
+        let is_subq_inner = conn.sql_subq.contains_key(&seq);
+        // ⭐ F72: 此 agg 属派生表内层 → 完成时物化 (列定义+行集) 交 finish_derived
+        let is_derived = conn.sql_derived.contains_key(&seq);
         enum Fire {
             No,
             Reply(Vec<u8>),
             Dml { pks: Vec<Vec<u8>>, action: SqlDmlAction, target: (std::sync::Arc<str>, String) },
+            SubqInner(Vec<Vec<ColValue>>),
+            DerivedDone(MatResult),
         }
         let (fire, drained) = {
             let agg = conn.sql_select_agg.get_mut(&seq).expect("just checked");
@@ -2638,6 +2735,13 @@ fn handle_resp_shard_result(
                         proto,
                         agg.error.as_deref().unwrap_or("error"),
                     )),
+                    // ⭐ F71: 内层子查询 → materialize 行集捕获; 否则正常渲染
+                    None if is_subq_inner => match materialize_select_agg(agg) {
+                        Ok((_cols, rows)) => Fire::SubqInner(rows),
+                        Err(e) => Fire::Reply(sql_err_bytes(proto, &e)),
+                    },
+                    // ⭐ F72: 派生表内层 → 物化 (含错误; 清理在 fire 处)
+                    None if is_derived => Fire::DerivedDone(materialize_select_agg(agg)),
                     None => Fire::Reply(render_select_agg(proto, bin, agg)),
                 }
             } else {
@@ -2653,6 +2757,36 @@ fn handle_resp_shard_result(
         match fire {
             Fire::No => {}
             Fire::Reply(bytes) => conn.resp_complete(seq, bytes),
+            // ⭐ F71: 内层子查询完成 → 存行集并推进编排 (行数上限护栏)
+            Fire::SubqInner(rows) => {
+                // ⭐ F73: 捕获阶段 OOM 护栏 (精确语义在 fold_one_subq 按叶子类型);
+                // IN >SUBQ_IN_MAX / scalar >1 由 fold 报错, EXISTS 无上限但捕获封顶
+                if rows.len() > SUBQ_IN_MAX {
+                    conn.sql_subq.remove(&seq);
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(
+                            proto,
+                            "subquery result too large; rewrite as JOIN",
+                        ),
+                    );
+                    return;
+                }
+                sql_subq_advance(
+                    conn, conn_id, seq, worker_id, default_db, db_view, shard_inboxes,
+                    num_shards, rows,
+                );
+            }
+            // ⭐ F72: 派生表内层完成 → worker 内存执行外层 (错误时清理 ctx)
+            Fire::DerivedDone(res) => match res {
+                Ok((cols, rows)) => finish_derived(
+                    conn, conn_id, seq, worker_id, bin, shard_inboxes, num_shards, cols, rows,
+                ),
+                Err(e) => {
+                    conn.sql_derived.remove(&seq);
+                    conn.resp_complete(seq, sql_err_bytes(proto, &e));
+                }
+            },
             Fire::Dml { pks, action, target } => {
                 // ⭐ 事务 v1 (F61): 两阶段 DML 的 phase2 在事务中截流
                 // (phase1 读的是已提交态 — v1 文档化语义)
@@ -3695,6 +3829,603 @@ fn txn_buffer_op(conn: &mut ConnState, op: BatchOp) -> Result<(), String> {
     Ok(())
 }
 
+// =====================================================================
+// ⭐ F71 (子查询): 非关联 WHERE 子查询编排
+// =====================================================================
+
+/// ColValue → SqlValue (子查询结果折叠回字面量).
+fn colval_to_sqlval(cv: &ColValue) -> SqlValue {
+    match cv {
+        ColValue::Null => SqlValue::Null,
+        ColValue::I64(i) => SqlValue::Int(*i),
+        ColValue::F64(f) => SqlValue::Float(*f),
+        ColValue::Bytes(b) => SqlValue::Str(b.clone()),
+    }
+}
+
+/// stmt 的 WHERE conds (Select/Delete/Update) 只读引用.
+fn stmt_where_conds(stmt: &SqlStmt) -> Option<&Pred<Cond>> {
+    match stmt {
+        SqlStmt::Select { conds, .. }
+        | SqlStmt::Delete { conds, .. }
+        | SqlStmt::Update { conds, .. } => Some(conds),
+        _ => None,
+    }
+}
+
+/// 重建 stmt 替换 conds (折叠后重跑外层用).
+fn stmt_replace_conds(stmt: SqlStmt, new: Pred<Cond>) -> SqlStmt {
+    match stmt {
+        SqlStmt::Select { table, items, limit, order, offset, group_by, having, .. } => {
+            SqlStmt::Select { table, items, conds: new, limit, order, offset, group_by, having }
+        }
+        SqlStmt::Delete { table, .. } => SqlStmt::Delete { table, conds: new },
+        SqlStmt::Update { table, sets, .. } => SqlStmt::Update { table, sets, conds: new },
+        other => other,
+    }
+}
+
+/// DFS 左右序收集 WHERE 中的子查询内层 stmt (与 fold 同序).
+fn collect_pred_subq(pred: &Pred<Cond>, out: &mut Vec<SqlStmt>) {
+    match pred {
+        Pred::Leaf(c) => {
+            if let SqlValue::Subquery(s) = &c.val {
+                out.push((**s).clone());
+            }
+        }
+        Pred::And(v) | Pred::Or(v) => v.iter().for_each(|p| collect_pred_subq(p, out)),
+        Pred::Not(b) => collect_pred_subq(b, out),
+    }
+}
+
+fn true_pred() -> Pred<Cond> {
+    Pred::And(vec![])
+}
+fn false_pred() -> Pred<Cond> {
+    Pred::Not(Box::new(Pred::And(vec![])))
+}
+
+/// ⭐ F74: 该子查询 stmt 的 WHERE 是否含相关列 (ColRef) — 判定关联性.
+fn subquery_has_colref(inner: &SqlStmt) -> bool {
+    stmt_where_conds(inner).is_some_and(|p| p.leaves().iter().any(|c| matches!(c.val, SqlValue::ColRef(_))))
+}
+
+/// ⭐ F74: 相关等值两侧分类 → (外层列名, 内层列名). 一侧外层一侧内层, 否则 Err.
+fn classify_corr(
+    outer_table: &str,
+    inner_table: &str,
+    a: &QualCol,
+    b: &QualCol,
+) -> Result<(String, String), String> {
+    let is_outer = |q: &QualCol| {
+        q.qualifier.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(outer_table))
+    };
+    let is_inner = |q: &QualCol| match &q.qualifier {
+        Some(x) => x.eq_ignore_ascii_case(inner_table),
+        None => true, // 无限定 → 默认内层
+    };
+    if is_outer(a) && !is_outer(b) && is_inner(b) {
+        Ok((a.col.clone(), b.col.clone()))
+    } else if is_outer(b) && !is_outer(a) && is_inner(a) {
+        Ok((b.col.clone(), a.col.clone()))
+    } else {
+        Err("correlated equality must reference one outer and one inner column (v1)".into())
+    }
+}
+
+/// ⭐ F74: 单个关联 EXISTS 内层 → 非关联 IN 叶 (`外层列 IN (SELECT 内层列 FROM .. WHERE 剩余)`).
+fn decorrelate_exists(outer_table: &str, inner: &SqlStmt) -> Result<Pred<Cond>, String> {
+    let SqlStmt::Select { table: inner_table, conds, .. } = inner else {
+        return Err("correlated EXISTS inner must be a simple SELECT (v1)".into());
+    };
+    let Some(conjuncts) = conds.as_conjuncts() else {
+        return Err("correlated EXISTS supports only AND conditions (v1)".into());
+    };
+    let mut corr: Option<(String, String)> = None;
+    let mut remaining: Vec<Cond> = Vec::new();
+    for c in conjuncts {
+        if let SqlValue::ColRef(rhs) = &c.val {
+            if c.op != CmpOp::Eq {
+                return Err("correlated condition must be equality (v1)".into());
+            }
+            if corr.is_some() {
+                return Err("correlated EXISTS supports only a single equality (v1)".into());
+            }
+            let pair = classify_corr(
+                outer_table,
+                inner_table,
+                &QualCol::parse(&c.col),
+                &QualCol::parse(rhs),
+            )?;
+            corr = Some(pair);
+        } else {
+            remaining.push(c.clone());
+        }
+    }
+    let Some((outer_col, inner_col)) = corr else {
+        return Err("correlated EXISTS: no correlation equality found (v1)".into());
+    };
+    let new_conds = if remaining.is_empty() {
+        Pred::And(vec![])
+    } else {
+        Pred::And(remaining.into_iter().map(Pred::Leaf).collect())
+    };
+    let new_inner = SqlStmt::Select {
+        table: inner_table.clone(),
+        items: vec![sql::SelectItem::Col(inner_col)],
+        conds: new_conds,
+        limit: None,
+        order: vec![],
+        offset: None,
+        group_by: vec![],
+        having: Pred::And(vec![]),
+    };
+    Ok(Pred::Leaf(Cond {
+        col: outer_col,
+        op: CmpOp::In,
+        val: SqlValue::Subquery(Box::new(new_inner)),
+        set: vec![],
+    }))
+}
+
+/// ⭐ F74: 单叶去相关. 关联 EXISTS → IN; 非关联原样; 其余含相关形态 → 拒.
+fn decorrelate_leaf(outer_table: &str, c: &Cond) -> Result<Pred<Cond>, String> {
+    if c.col == sql::EXISTS_SENTINEL_COL
+        && let SqlValue::Subquery(inner) = &c.val
+    {
+        if subquery_has_colref(inner) {
+            return decorrelate_exists(outer_table, inner);
+        }
+        return Ok(Pred::Leaf(c.clone())); // 非关联 EXISTS (F71 处理)
+    }
+    if matches!(c.val, SqlValue::ColRef(_)) {
+        return Err("correlated subquery not supported (v1, only single-equality EXISTS)".into());
+    }
+    if let SqlValue::Subquery(inner) = &c.val
+        && subquery_has_colref(inner)
+    {
+        return Err("correlated subquery not supported (v1, only single-equality EXISTS)".into());
+    }
+    Ok(Pred::Leaf(c.clone()))
+}
+
+/// ⭐ F74: 递归去相关整个谓词树 (NOT EXISTS 包在 Pred::Not 内, 改写叶后自然成 NOT IN).
+fn decorrelate_pred(outer_table: &str, pred: &Pred<Cond>) -> Result<Pred<Cond>, String> {
+    match pred {
+        Pred::Leaf(c) => decorrelate_leaf(outer_table, c),
+        Pred::And(v) => Ok(Pred::And(
+            v.iter().map(|p| decorrelate_pred(outer_table, p)).collect::<Result<_, _>>()?,
+        )),
+        Pred::Or(v) => Ok(Pred::Or(
+            v.iter().map(|p| decorrelate_pred(outer_table, p)).collect::<Result<_, _>>()?,
+        )),
+        Pred::Not(b) => Ok(Pred::Not(Box::new(decorrelate_pred(outer_table, b)?))),
+    }
+}
+
+/// ⭐ F74: 去相关整个 stmt 的 WHERE (仅 Select/Delete/Update). 无相关时返回原 stmt.
+fn decorrelate_stmt(stmt: &SqlStmt) -> Result<SqlStmt, String> {
+    let table = match stmt {
+        SqlStmt::Select { table, .. }
+        | SqlStmt::Delete { table, .. }
+        | SqlStmt::Update { table, .. } => table.clone(),
+        _ => return Ok(stmt.clone()),
+    };
+    let conds = stmt_where_conds(stmt).expect("has where");
+    let new = decorrelate_pred(&table, conds)?;
+    Ok(stmt_replace_conds(stmt.clone(), new))
+}
+
+/// 单个子查询叶子折叠. rows = 内层投影行集.
+fn fold_one_subq(c: &Cond, rows: &[Vec<ColValue>]) -> Result<Pred<Cond>, String> {
+    // EXISTS: 哨兵空列名 → 非空真/空假
+    if c.col == sql::EXISTS_SENTINEL_COL {
+        return Ok(if rows.is_empty() { false_pred() } else { true_pred() });
+    }
+    // IN 子查询: 各行首列 → set (跳 NULL); 空集 → 恒假
+    if c.op == CmpOp::In {
+        let mut set: Vec<SqlValue> = rows
+            .iter()
+            .filter_map(|r| r.first())
+            .map(colval_to_sqlval)
+            .filter(|v| *v != SqlValue::Null)
+            .collect();
+        if set.is_empty() {
+            return Ok(false_pred());
+        }
+        // ⭐ F73: 排序去重 → 大集合求值二分化; 去重后 > SUBQ_IN_MAX 才报错
+        sql::sort_in_set(&mut set);
+        if set.len() > SUBQ_IN_MAX {
+            return Err(format!(
+                "IN subquery returns too many rows ({} > {SUBQ_IN_MAX})",
+                set.len()
+            ));
+        }
+        return Ok(Pred::Leaf(Cond { col: c.col.clone(), op: CmpOp::In, val: SqlValue::Null, set }));
+    }
+    // 标量子查询: 0 行→假, 1 行→常量, >1→错
+    match rows.len() {
+        0 => Ok(false_pred()),
+        1 => {
+            let sv = rows[0].first().map(colval_to_sqlval).unwrap_or(SqlValue::Null);
+            if sv == SqlValue::Null {
+                return Ok(false_pred());
+            }
+            Ok(Pred::Leaf(Cond { col: c.col.clone(), op: c.op, val: sv, set: vec![] }))
+        }
+        _ => Err("subquery returns more than one row".into()),
+    }
+}
+
+/// 按 DFS 序消费 results, 子查询叶子 → Cond/恒真恒假子树.
+fn fold_pred_subq(
+    pred: &Pred<Cond>,
+    it: &mut std::slice::Iter<Vec<Vec<ColValue>>>,
+) -> Result<Pred<Cond>, String> {
+    match pred {
+        Pred::Leaf(c) => {
+            if matches!(c.val, SqlValue::Subquery(_)) {
+                let rows = it.next().ok_or("subquery result missing")?;
+                fold_one_subq(c, rows)
+            } else {
+                Ok(Pred::Leaf(c.clone()))
+            }
+        }
+        Pred::And(v) => {
+            Ok(Pred::And(v.iter().map(|p| fold_pred_subq(p, it)).collect::<Result<_, _>>()?))
+        }
+        Pred::Or(v) => {
+            Ok(Pred::Or(v.iter().map(|p| fold_pred_subq(p, it)).collect::<Result<_, _>>()?))
+        }
+        Pred::Not(b) => Ok(Pred::Not(Box::new(fold_pred_subq(b, it)?))),
+    }
+}
+
+/// ⭐ F71: 启动子查询编排. 无子查询返回 false (caller 走常规); 否则跑首个内层返回 true.
+#[allow(clippy::too_many_arguments)]
+fn sql_subq_start(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    db: &std::sync::Arc<str>,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    stmt: &SqlStmt,
+) -> bool {
+    // ⭐ F74: 先去相关 (单等值关联 EXISTS/NOT EXISTS → 非关联 IN/NOT IN);
+    // 不可去相关形态 → 报错 (已消费, 返回 true)
+    let decorr;
+    let stmt: &SqlStmt = match decorrelate_stmt(stmt) {
+        Ok(s) => {
+            decorr = s;
+            &decorr
+        }
+        Err(e) => {
+            conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+            return true;
+        }
+    };
+    let mut inners: Vec<SqlStmt> = Vec::new();
+    if let Some(p) = stmt_where_conds(stmt) {
+        collect_pred_subq(p, &mut inners);
+    }
+    if inners.is_empty() {
+        return false;
+    }
+    // v1: 内层仅单表 SELECT (非 JOIN, 非嵌套) — 否则会绕过 SqlSelectAgg 拦截
+    for inn in &inners {
+        if !matches!(inn, SqlStmt::Select { .. }) {
+            conn.resp_complete(
+                seq,
+                sql_err_bytes(conn.proto, "subquery inner must be a simple SELECT (v1)"),
+            );
+            return true;
+        }
+        if let Some(p) = stmt_where_conds(inn) {
+            let mut nested = Vec::new();
+            collect_pred_subq(p, &mut nested);
+            if !nested.is_empty() {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, "nested subquery not supported (v1)"),
+                );
+                return true;
+            }
+        }
+    }
+    let first = inners[0].clone();
+    conn.sql_subq.insert(
+        seq,
+        SubqCtx { outer: stmt.clone(), db: db.clone(), inners, results: Vec::new(), cur: 0 },
+    );
+    sql_dispatch_stmt(
+        conn, conn_id, seq, worker_id, db, default_db, db_view, shard_inboxes, num_shards, first,
+    );
+    true
+}
+
+/// ⭐ F71: 内层完成→存行集→跑下一内层或折叠重跑外层.
+#[allow(clippy::too_many_arguments)]
+fn sql_subq_advance(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    captured: Vec<Vec<ColValue>>,
+) {
+    let (next, db) = {
+        let ctx = conn.sql_subq.get_mut(&seq).expect("subq ctx");
+        ctx.results.push(captured);
+        ctx.cur += 1;
+        let next = ctx.inners.get(ctx.cur).cloned();
+        (next, ctx.db.clone())
+    };
+    if let Some(inner) = next {
+        sql_dispatch_stmt(
+            conn, conn_id, seq, worker_id, &db, default_db, db_view, shard_inboxes, num_shards, inner,
+        );
+        return;
+    }
+    // 全部内层完 → 折叠 → 重跑外层
+    let ctx = conn.sql_subq.remove(&seq).expect("subq ctx");
+    let folded = {
+        let conds = stmt_where_conds(&ctx.outer).expect("outer has where");
+        let mut it = ctx.results.iter();
+        fold_pred_subq(conds, &mut it)
+    };
+    match folded {
+        Ok(fp) => {
+            let outer = stmt_replace_conds(ctx.outer, fp);
+            sql_dispatch_stmt(
+                conn, conn_id, seq, worker_id, &db, default_db, db_view, shard_inboxes, num_shards,
+                outer,
+            );
+        }
+        Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
+    }
+}
+
+/// ⭐ F72: 派生表内层走 pk 点查 (SqlRowCtx) 完成时的物化 —
+/// 从 ctx 合成列定义 (COUNT → 单列; 否则投影列) + 0/1 行行集.
+fn derived_capture_rowctx(
+    ctx: &SqlRowCtx,
+    hit: bool,
+    values: &[ColValue],
+) -> (Vec<(String, ColType)>, Vec<Vec<ColValue>>) {
+    if ctx.count {
+        let n = i64::from(hit);
+        return (
+            vec![("COUNT(*)".to_string(), ColType::I64)],
+            vec![vec![ColValue::I64(n)]],
+        );
+    }
+    let cols: Vec<(String, ColType)> = ctx
+        .proj
+        .iter()
+        .map(|&i| {
+            let c = &ctx.schema.columns[i as usize];
+            (c.name.clone(), c.ty)
+        })
+        .collect();
+    let rows = if hit {
+        vec![ctx.proj.iter().map(|&i| values[i as usize].clone()).collect()]
+    } else {
+        vec![]
+    };
+    (cols, rows)
+}
+
+/// ⭐ F72: 派生表内层物化完成 → 外层在 worker 内存执行并回包.
+#[allow(clippy::too_many_arguments)]
+fn finish_derived(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    binary: bool,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    cols: Vec<(String, ColType)>,
+    rows: Vec<Vec<ColValue>>,
+) {
+    let ctx = conn.sql_derived.remove(&seq).expect("derived ctx");
+    match ctx {
+        // ⭐ F72: 单独派生表 → worker 内存执行外层并回包
+        DerivedCtx::Standalone { alias, items, conds, order, limit, offset } => {
+            let bytes = derived_render(
+                conn.proto, binary, &alias, &items, &conds, &order, limit, offset, &cols, rows,
+            );
+            conn.resp_complete(seq, bytes);
+        }
+        // ⭐ F75: 派生表作 JOIN 首表 → 预填 tables[0] 后转 JOIN 状态机
+        DerivedCtx::JoinFrom { db, join_stmt } => {
+            finish_derived_join(
+                conn, conn_id, seq, worker_id, shard_inboxes, num_shards, db, join_stmt, cols, rows,
+            );
+        }
+    }
+}
+
+/// ⭐ F75: 派生表物化完成 → 建 SqlJoinCtx (tables[0] 预填) → sql_join_kickoff.
+#[allow(clippy::too_many_arguments)]
+fn finish_derived_join(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    db: std::sync::Arc<str>,
+    join_stmt: SqlStmt,
+    cols: Vec<(String, ColType)>,
+    rows: Vec<Vec<ColValue>>,
+) {
+    if rows.len() > JOIN_MAX_ROWS {
+        conn.resp_complete(seq, sql_err_bytes(conn.proto, "derived table too large (limit 262144 rows)"));
+        return;
+    }
+    let SqlStmt::SelectJoin { from, joins, items, conds, order, limit, offset, .. } = join_stmt else {
+        conn.resp_complete(seq, sql_err_bytes(conn.proto, "internal: derived join expects SelectJoin"));
+        return;
+    };
+    // 合成派生表 schema (内层真实列类型); proj = 全列 identity (行已定宽)
+    let synth = std::sync::Arc::new(TableSchema {
+        version: 1,
+        columns: cols
+            .iter()
+            .map(|(n, t)| storage::schema::Column { name: n.clone(), ty: *t, nullable: true })
+            .collect(),
+        pk_col: 0,
+        indexes: Vec::new(),
+        next_iid: 0,
+    });
+    let ncols = cols.len() as u16;
+    let mut tables: Vec<JoinTable> = Vec::with_capacity(joins.len() + 1);
+    tables.push(JoinTable {
+        table: std::sync::Arc::from(from.table.as_str()),
+        alias: from.alias.clone(),
+        schema: Some(synth),
+        proj: (0..ncols).collect(),
+        rows,
+        prefilled: true,
+    });
+    for j in &joins {
+        let schema = conn
+            .sql_cache
+            .borrow()
+            .schemas
+            .get(&(db.to_string(), j.table.table.clone()))
+            .cloned();
+        tables.push(JoinTable {
+            table: std::sync::Arc::from(j.table.table.as_str()),
+            alias: j.table.alias.clone(),
+            schema,
+            proj: Vec::new(),
+            rows: Vec::new(),
+            prefilled: false,
+        });
+    }
+    let ctx = SqlJoinCtx {
+        db,
+        tables,
+        joins,
+        items,
+        conds,
+        order,
+        limit,
+        offset,
+        phase: JoinPhase::Gather(0),
+        remaining: 0,
+    };
+    conn.sql_join.insert(seq, ctx);
+    sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
+}
+
+/// ⭐ F72: 外层内存管线 — 列名解析 (剥 alias 前缀) → eval_pred 过滤 →
+/// ORDER → OFFSET/LIMIT → 投影 (COUNT(*) 特判) → 渲染 (sysq_finish 同款先例,
+/// 但保留内层真实列类型).
+#[allow(clippy::too_many_arguments)]
+fn derived_render(
+    proto: ProtocolKind,
+    binary: bool,
+    alias: &str,
+    items: &[sql::SelectItem],
+    conds_in: &Pred<Cond>,
+    order: &[(String, bool)],
+    limit: Option<u32>,
+    offset: Option<u32>,
+    cols: &[(String, ColType)],
+    mut rows: Vec<Vec<ColValue>>,
+) -> Vec<u8> {
+    if rows.len() > JOIN_MAX_ROWS {
+        return sql_err_bytes(proto, "derived table too large (limit 262144 rows)");
+    }
+    // 列名解析: `t.x` / 裸 `x` — qualifier 仅接受 alias
+    let resolve = |name: &str| -> Result<usize, String> {
+        let qc = QualCol::parse(name);
+        if let Some(q) = &qc.qualifier
+            && !q.eq_ignore_ascii_case(alias)
+        {
+            return Err(format!("unknown table '{q}'"));
+        }
+        cols.iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(&qc.col))
+            .ok_or_else(|| format!("unknown column '{}'", qc.col))
+    };
+    // 合成 schema (内层真实列类型) 供 eval_pred; 叶子列名先剥前缀重写
+    let schema = TableSchema {
+        version: 1,
+        columns: cols
+            .iter()
+            .map(|(n, t)| storage::schema::Column { name: n.clone(), ty: *t, nullable: true })
+            .collect(),
+        pk_col: 0,
+        indexes: Vec::new(),
+        next_iid: 0,
+    };
+    let conds = match conds_in.try_map(&|c: &Cond| {
+        let idx = resolve(&c.col)?;
+        Ok::<_, String>(Cond {
+            col: schema.columns[idx].name.clone(),
+            op: c.op,
+            val: c.val.clone(),
+            set: c.set.clone(),
+        })
+    }) {
+        Ok(p) => p,
+        Err(e) => return sql_err_bytes(proto, &e),
+    };
+    rows.retain(|r| eval_pred(&schema, r, &conds));
+    // ORDER BY (逆序叠加稳定排序 = 多键优先级)
+    for (name, desc) in order.iter().rev() {
+        match resolve(name) {
+            Ok(ci) => rows.sort_by(|a, b| {
+                let o = cmp_colvalue(&a[ci], &b[ci]);
+                if *desc { o.reverse() } else { o }
+            }),
+            Err(e) => return sql_err_bytes(proto, &e),
+        }
+    }
+    // OFFSET / LIMIT
+    let start = (offset.unwrap_or(0) as usize).min(rows.len());
+    let end = match limit {
+        Some(l) => (start + l as usize).min(rows.len()),
+        None => rows.len(),
+    };
+    let rows = &rows[start..end];
+    // COUNT(*) 特判 (parse 已保证含 Agg 时必为孤 COUNT(*))
+    if items.iter().any(|i| matches!(i, sql::SelectItem::Agg { .. })) {
+        let cref = [("COUNT(*)", ColType::I64)];
+        return sql_rows_bytes(proto, binary, &cref, &[vec![ColValue::I64(rows.len() as i64)]]);
+    }
+    // 投影: items 空 = 全列
+    if items.is_empty() {
+        let cref: Vec<(&str, ColType)> = cols.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+        return sql_rows_bytes(proto, binary, &cref, rows);
+    }
+    let mut idxs: Vec<usize> = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            sql::SelectItem::Col(c) => match resolve(c) {
+                Ok(i) => idxs.push(i),
+                Err(e) => return sql_err_bytes(proto, &e),
+            },
+            sql::SelectItem::Agg { .. } => unreachable!("孤 COUNT(*) 已在上方特判"),
+        }
+    }
+    let cref: Vec<(&str, ColType)> = idxs.iter().map(|&i| (cols[i].0.as_str(), cols[i].1)).collect();
+    let proj: Vec<Vec<ColValue>> =
+        rows.iter().map(|r| idxs.iter().map(|&i| r[i].clone()).collect()).collect();
+    sql_rows_bytes(proto, binary, &cref, &proj)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sql_dispatch_stmt(
     conn: &mut ConnState,
@@ -4027,6 +4758,16 @@ fn sql_dispatch_stmt(
         | SqlStmt::Delete { ref table, .. }
         | SqlStmt::Update { ref table, .. }
         | SqlStmt::Describe { ref table } => {
+            // ⭐ F71: WHERE 子查询 — 先顺序跑内层折叠, 完后重跑外层 (仅 Select/Delete/Update)
+            if matches!(
+                stmt,
+                SqlStmt::Select { .. } | SqlStmt::Delete { .. } | SqlStmt::Update { .. }
+            ) && sql_subq_start(
+                conn, conn_id, seq, worker_id, db, default_db, db_view, shard_inboxes,
+                num_shards, &stmt,
+            ) {
+                return;
+            }
             let key = (db.to_string(), table.clone());
             // ⭐ W1: worker 级共享缓存 (borrow 局部化: 取 Arc 即还)
             let cached = conn.sql_cache.borrow().schemas.get(&key).cloned();
@@ -4042,7 +4783,37 @@ fn sql_dispatch_stmt(
             }
         }
         // ⭐ F67 (JOIN): 两表 hash join — 建 ctx → 补 schema/gather 顺序启动
-        SqlStmt::SelectJoin { from, joins, items, conds, order, limit, offset } => {
+        SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset } => {
+            // ⭐ F75: 首表为派生表 → 先物化内层 (同 seq 完成点拦截), 完后 finish_derived 建 JOIN
+            if let Some(inner) = from_inner {
+                if !matches!(*inner, SqlStmt::Select { .. }) {
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(conn.proto, "derived-table inner must be a simple SELECT (v1)"),
+                    );
+                    return;
+                }
+                if let Some(p) = stmt_where_conds(&inner) {
+                    let mut nested = Vec::new();
+                    collect_pred_subq(p, &mut nested);
+                    if !nested.is_empty() {
+                        conn.resp_complete(
+                            seq,
+                            sql_err_bytes(conn.proto, "subquery inside derived table not supported (v1)"),
+                        );
+                        return;
+                    }
+                }
+                let join_stmt = SqlStmt::SelectJoin {
+                    from, from_inner: None, joins, items, conds, order, limit, offset,
+                };
+                conn.sql_derived.insert(seq, DerivedCtx::JoinFrom { db: db.clone(), join_stmt });
+                sql_dispatch_stmt(
+                    conn, conn_id, seq, worker_id, db, default_db, db_view, shard_inboxes,
+                    num_shards, *inner,
+                );
+                return;
+            }
             // 构建 tables 列表 (from + 各 join.table); schema 命中缓存则填
             let mut tables: Vec<JoinTable> = Vec::with_capacity(joins.len() + 1);
             for tr in std::iter::once(&from).chain(joins.iter().map(|j| &j.table)) {
@@ -4058,6 +4829,7 @@ fn sql_dispatch_stmt(
                     schema,
                     proj: Vec::new(),
                     rows: Vec::new(),
+                    prefilled: false,
                 });
             }
             let ctx = SqlJoinCtx {
@@ -4074,6 +4846,35 @@ fn sql_dispatch_stmt(
             };
             conn.sql_join.insert(seq, ctx);
             sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
+        }
+        // ⭐ F72: FROM 派生表 — 内层先物化 (同 seq 完成点拦截), 完后 finish_derived
+        // 在 worker 内存执行外层 (过滤/投影/排序/截断; 不下推 shard)
+        SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset } => {
+            // v1: 内层仅单表 SELECT (非 JOIN/系统表) — 否则绕过完成点拦截
+            if !matches!(*inner, SqlStmt::Select { .. }) {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, "derived-table inner must be a simple SELECT (v1)"),
+                );
+                return;
+            }
+            // v1: 内层不得再带 WHERE 子查询 (双层编排留后)
+            if let Some(p) = stmt_where_conds(&inner) {
+                let mut nested = Vec::new();
+                collect_pred_subq(p, &mut nested);
+                if !nested.is_empty() {
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(conn.proto, "subquery inside derived table not supported (v1)"),
+                    );
+                    return;
+                }
+            }
+            conn.sql_derived.insert(seq, DerivedCtx::Standalone { alias, items, conds, order, limit, offset });
+            sql_dispatch_stmt(
+                conn, conn_id, seq, worker_id, db, default_db, db_view, shard_inboxes,
+                num_shards, *inner,
+            );
         }
         // ⭐ S1: DROP TABLE — 无需 schema, 数据面广播删表
         SqlStmt::DropTable { table } => {
@@ -4237,16 +5038,33 @@ fn sql_join_kickoff(
             conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
         }
         Ok(projs) => {
-            {
+            let start = {
                 let c = conn.sql_join.get_mut(&seq).unwrap();
                 for (t, p) in c.tables.iter_mut().zip(projs) {
-                    t.proj = p;
+                    if t.prefilled {
+                        // ⭐ F75: 预填表行已定宽 (全列) → proj 强制 identity, 不清空 rows
+                        let ncols = t.schema.as_ref().unwrap().columns.len() as u16;
+                        t.proj = (0..ncols).collect();
+                    } else {
+                        t.proj = p;
+                    }
                 }
-                c.phase = JoinPhase::Gather(0);
-                c.remaining = num_shards;
-                c.tables[0].rows.clear();
+                // ⭐ F75: 从第一个非预填表开始 gather (预填表 0 跳过)
+                c.tables.iter().position(|t| !t.prefilled)
+            };
+            match start {
+                Some(idx) => {
+                    {
+                        let c = conn.sql_join.get_mut(&seq).unwrap();
+                        c.phase = JoinPhase::Gather(idx);
+                        c.remaining = num_shards;
+                        c.tables[idx].rows.clear();
+                    }
+                    sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, idx);
+                }
+                // 全部预填 (理论不可达: joins 非空) → 直接 finish
+                None => sql_join_finish(conn, seq),
             }
-            sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, 0);
         }
     }
 }
@@ -6003,6 +6821,7 @@ fn sql_run_dml(
         }
         SqlStmt::CreateTable { .. } => unreachable!("CREATE 在 sql_dispatch_stmt 处理"),
         SqlStmt::DropTable { .. } => unreachable!("DROP 在 sql_dispatch_stmt 处理"),
+        SqlStmt::SelectDerived { .. } => unreachable!("派生表在 sql_dispatch_stmt 处理"),
         SqlStmt::Begin { .. }
         | SqlStmt::Commit
         | SqlStmt::Rollback
@@ -6189,6 +7008,10 @@ fn sql_to_col(ty: ColType, v: &SqlValue) -> Result<ColValue, String> {
     Ok(match (ty, v) {
         (_, SqlValue::Null) => ColValue::Null,
         (_, SqlValue::Param(_)) => return Err("unbound parameter".into()),
+        // ⭐ F71: 子查询未折叠就流到执行层 = bug (防御)
+        (_, SqlValue::Subquery(_)) => return Err("unresolved subquery".into()),
+        // ⭐ F74: 列引用未去相关就流到执行层 = bug (防御)
+        (_, SqlValue::ColRef(_)) => return Err("unresolved column reference".into()),
         (ColType::I64, SqlValue::Int(i)) => ColValue::I64(*i),
         (ColType::F64, SqlValue::Int(i)) => ColValue::F64(*i as f64),
         (ColType::F64, SqlValue::Float(f)) => ColValue::F64(*f),
@@ -6228,6 +7051,31 @@ fn eval_cond_leaf(schema: &TableSchema, values: &[ColValue], c: &Cond) -> bool {
     let cv = &values[i as usize];
     // ⭐ S2: IN — 集合任一相等 (NULL 列恒 false)
     if c.op == CmpOp::In {
+        // ⭐ F73: 大同型集合 → 二分 (解析/折叠期已 sort_in_set 排序去重);
+        // 混型/跨型 coercion 保守回退线性
+        if c.set.len() > 64 {
+            match cv {
+                ColValue::I64(x) if c.set.iter().all(|v| matches!(v, SqlValue::Int(_))) => {
+                    return c
+                        .set
+                        .binary_search_by(|v| match v {
+                            SqlValue::Int(b) => b.cmp(x),
+                            _ => std::cmp::Ordering::Less,
+                        })
+                        .is_ok();
+                }
+                ColValue::Bytes(x) if c.set.iter().all(|v| matches!(v, SqlValue::Str(_))) => {
+                    return c
+                        .set
+                        .binary_search_by(|v| match v {
+                            SqlValue::Str(b) => b.as_slice().cmp(x.as_slice()),
+                            _ => std::cmp::Ordering::Less,
+                        })
+                        .is_ok();
+                }
+                _ => {}
+            }
+        }
         return c.set.iter().any(|v| sql_cmp(cv, v) == Some(Ordering::Equal));
     }
     match sql_cmp(cv, &c.val) {
@@ -6846,14 +7694,12 @@ fn eval_having_pred(
     }
 }
 
-fn render_agg_groups(
-    proto: ProtocolKind,
-    binary: bool,
+fn materialize_agg_groups(
     spec: &AggSpec,
     rows: Vec<Vec<ColValue>>,
     offset: u32,
     limit: Option<u32>,
-) -> Vec<u8> {
+) -> MatResult {
     // 分桶: 组键 = 各列保序编码级联 (NULL 归一组, 0x00 标记); BTreeMap =
     // 无 ORDER BY 时输出按组键序 (确定性)
     let mut buckets: std::collections::BTreeMap<Vec<u8>, (Vec<ColValue>, Vec<Accum>)> =
@@ -6900,7 +7746,7 @@ fn render_agg_groups(
             }
         }
         if !buckets.contains_key(&key) && buckets.len() >= AGG_MAX_GROUPS {
-            return sql_err_bytes(proto, "too many groups (limit 65536)");
+            return Err("too many groups (limit 65536)".into());
         }
         let entry = buckets
             .entry(key)
@@ -6911,13 +7757,11 @@ fn render_agg_groups(
                     Some(ci) => &values[*ci as usize],
                     None => &ColValue::I64(1), // COUNT(*) 任意非 Null
                 };
-                if let Err(e) = acc.feed(v) {
-                    return sql_err_bytes(proto, &e);
-                }
+                acc.feed(v)?;
             }
         }
     }
-    // 桶 → 输出行
+    // 桶 → 输出行 (materialize)
     let mut out: Vec<Vec<ColValue>> = Vec::with_capacity(buckets.len());
     for (_, (rep, accums)) in buckets {
         let mut row = Vec::with_capacity(spec.items.len());
@@ -6956,22 +7800,35 @@ fn render_agg_groups(
         None => out.len(),
     };
     // 合成结果集 (render_sql_count 同源路径, 三门面统一)
-    let cols: Vec<(&str, ColType)> =
-        spec.items.iter().map(|it| (it.label.as_str(), it.out_ty)).collect();
-    sql_rows_bytes(proto, binary, &cols, &out[start..end])
+    let cols: Vec<(String, ColType)> =
+        spec.items.iter().map(|it| (it.label.clone(), it.out_ty)).collect();
+    Ok((cols, out[start..end].to_vec()))
 }
 
 /// SELECT 聚合完成渲染: (val, pk) 排序 → 覆盖重建或 decode → 残余过滤
 /// → ⭐ S2: ORDER BY → OFFSET → LIMIT → 投影/COUNT 结果集.
 /// (⭐ O3: 早停时提前调用, agg.rows 取走清空)
 fn render_select_agg(proto: ProtocolKind, binary: bool, agg: &mut SqlSelectAgg) -> Vec<u8> {
+    match materialize_select_agg(agg) {
+        Ok((cols, rows)) => {
+            let cref: Vec<(&str, ColType)> = cols.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+            sql_rows_bytes(proto, binary, &cref, &rows)
+        }
+        Err(e) => sql_err_bytes(proto, &e),
+    }
+}
+
+/// ⭐ F71: SELECT 完成点物化 (不渲染) — 返回最终投影列定义 + 行集.
+/// 供子查询捕获 (materialize) 与正常渲染 (render_select_agg) 共用.
+fn materialize_select_agg(
+    agg: &mut SqlSelectAgg,
+) -> MatResult {
     if let Some(e) = agg.error.take() {
-        return sql_err_bytes(proto, &e);
+        return Err(e);
     }
     // 全局序: (索引值, pk); 残余过滤全条件 (下推界是超集, 过滤幂等)
     let mut rows = std::mem::take(&mut agg.rows);
     rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    // 提前截断仅当: 非 COUNT/聚合 且无 ORDER BY (排序/聚合需全量)
     let early_cut: Option<usize> = if agg.count || !agg.order.is_empty() || agg.agg_spec.is_some()
     {
         None
@@ -6979,10 +7836,7 @@ fn render_select_agg(proto: ProtocolKind, binary: bool, agg: &mut SqlSelectAgg) 
         agg.limit.map(|l| (l + agg.offset) as usize)
     };
     let mut out_rows: Vec<Vec<ColValue>> = Vec::new();
-    let mut err: Option<String> = None;
     for (val, pk, rb) in &rows {
-        // ⭐ O1: 覆盖索引 — 免回表, 行值从 (val, pk) 重建
-        // (覆盖判定保证过滤/投影/排序只引用这两列, 其余列置 Null 不会被读)
         let decoded = if let Some((idx_col, pk_col)) = agg.cover {
             let n = agg.schema.columns.len();
             let iv = col_from_ordered_bytes(agg.schema.columns[idx_col as usize].ty, val);
@@ -6999,33 +7853,26 @@ fn render_select_agg(proto: ProtocolKind, binary: bool, agg: &mut SqlSelectAgg) 
         } else {
             storage::row::decode_row(&agg.schema, rb).map_err(|e| e.to_string())
         };
-        match decoded {
-            Ok(values) => {
-                if eval_pred(&agg.schema, &values, &agg.conds) {
-                    out_rows.push(values);
-                    if let Some(cut) = early_cut
-                        && out_rows.len() >= cut
-                    {
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                err = Some(e);
+        let values = decoded?;
+        if eval_pred(&agg.schema, &values, &agg.conds) {
+            out_rows.push(values);
+            if let Some(cut) = early_cut
+                && out_rows.len() >= cut
+            {
                 break;
             }
         }
     }
-    if let Some(e) = err {
-        return sql_err_bytes(proto, &e);
-    }
-    // ⭐ G2 (F63): 广义聚合 — 已过滤行交给分桶聚合完成点
+    // ⭐ G2: 广义聚合
     if let Some(spec) = agg.agg_spec.take() {
-        return render_agg_groups(proto, binary, &spec, out_rows, agg.offset, agg.limit);
+        return materialize_agg_groups(&spec, out_rows, agg.offset, agg.limit);
     }
-    // ⭐ S2: COUNT(*) — 计数不受 ORDER/OFFSET/LIMIT 影响
+    // ⭐ S2: COUNT(*)
     if agg.count {
-        return render_sql_count(proto, binary, out_rows.len() as u64);
+        return Ok((
+            vec![("COUNT(*)".to_string(), ColType::I64)],
+            vec![vec![ColValue::I64(out_rows.len() as i64)]],
+        ));
     }
     if !agg.order.is_empty() {
         out_rows.sort_by(|a, b| sql_order_cmp(a, b, &agg.order));
@@ -7035,7 +7882,20 @@ fn render_select_agg(proto: ProtocolKind, binary: bool, agg: &mut SqlSelectAgg) 
         Some(l) => (start + l as usize).min(out_rows.len()),
         None => out_rows.len(),
     };
-    render_sql_rows(proto, binary, &agg.schema, &agg.proj, &out_rows[start..end])
+    // 投影到输出列 (与 render_sql_rows 同义)
+    let cols: Vec<(String, ColType)> = agg
+        .proj
+        .iter()
+        .map(|&i| {
+            let c = &agg.schema.columns[i as usize];
+            (c.name.clone(), c.ty)
+        })
+        .collect();
+    let proj_rows: Vec<Vec<ColValue>> = out_rows[start..end]
+        .iter()
+        .map(|r| agg.proj.iter().map(|&i| r[i as usize].clone()).collect())
+        .collect();
+    Ok((cols, proj_rows))
 }
 
 // =====================================================================

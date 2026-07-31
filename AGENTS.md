@@ -24,6 +24,34 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 
 ## 当前进度
 
+### 2026-07-31 会话十五总览 (F73/F74/F75, 细节见 CHANGELOG)
+
+- **子查询后续三件套** (Phase 3 已知遗留收尾):
+  - **F73 大 IN**: 阈值提升 65536 (按叶子类型: EXISTS 无限/scalar >1 报/IN 65536); IN 集合 sort_in_set 排序去重 + eval_cond_leaf 同型 >64 binary_search
+  - **F74 关联 EXISTS 去相关**: `SqlValue::ColRef` 解析期收, decorrelate 改写单等值 EXISTS/NOT EXISTS → 非关联 IN/NOT IN, 执行层零新机制; 不可去相关形态报错
+  - **F75 派生表参与 JOIN**: SelectJoin 加 from_inner; 内层物化预填 tables[0] (prefilled, proj 全列), JOIN 状态机跳过其 gather; JOIN 右侧派生表 v1 拒
+- 实机: **mysql-connector + psycopg3 跨协议对拍 19×2 全 PASS**; 回归全绿 + clippy 0
+- gotcha: is_join_ahead 遇 RParen 即停 (防内层误视外层 JOIN); F73 二分依赖集合已排序; F75 prefilled 表 proj 强制全列 identity
+- **子查询能力基本完备**: 非关联 WHERE (F71) + FROM 派生表 (F72) + 大 IN (F73) + 单等值关联 EXISTS (F74) + 派生表 JOIN (F75); 剩余 = 关联 IN/标量、多重相关、JOIN 右侧派生表
+
+### 2026-07-31 会话十四总览 (F72, 细节见 CHANGELOG)
+
+- **FROM 派生表** (Phase 3 收尾): `SELECT ... FROM (SELECT ...) t [WHERE/ORDER/LIMIT/OFFSET]`。方案 = 零 TableSource ripple — 独立 `SqlStmt::SelectDerived` 变体 (学 F67 隔离先例), 单表 Select 路径零改动
+- 执行: 内层复用 F71 完成点拦截 (SqlSelectAgg → Fire::DerivedDone(MatResult); SqlRowCtx → derived_capture_rowctx 自合成列定义); 外层 finish_derived/derived_render 在 worker 内存过滤/投影/排序/截断 (保留内层真实列类型)
+- 内层 = 任意单表 SELECT (含聚合/GROUP BY, 输出列名 = label 如 `SUM(v)`); 外层支持 `t.x`/裸列 + OR/NOT + 孤 COUNT(*)
+- 实机: **mysql-connector + psycopg3 跨协议对拍 30/30** (含 F71 全部用例 pg 欠账补验); 回归全绿 + clippy 0
+- **Phase 3 完结**: 非关联 WHERE 子查询 (F71) + FROM 派生表 (F72) 均交付; 已知后续 = 关联子查询 / 大 IN 半连接 (复用 F70 键集合点查) / 派生表参与 JOIN
+- 边界: 派生表不参与 JOIN; 外层无 GROUP BY/HAVING/聚合投影 (孤 COUNT(*) 除外); 物化内存上限 JOIN_MAX_ROWS
+
+### 2026-07-31 会话十三总览 (F71, 细节见 CHANGELOG)
+
+- **非关联 WHERE 子查询** (Phase 3 第一部分): IN/NOT IN + 标量 + EXISTS/NOT EXISTS。方案 = 内层先跑完→折叠成字面量/恒真恒假→外层走完全现有路径
+- 载体: `SqlValue::Subquery(Box<SqlStmt>)` (与 Param 同构“执行前必解”占位) — 保 `Pred<Cond>` 类型不变, 下游 plan/eval/shard 零改动
+- 编排: SubqCtx 顺序状态机 (仿 SqlUniqueIns/PendingSql); materialize 拆分 render_select_agg/render_agg_groups; 拦截 SqlSelectAgg 与 SqlRowCtx 两完成路径 materialize 而非渲染; 折叠后重跑外层
+- 实机: mysql 驱动 IN/NOT IN/标量(含 MAX/pk-point)/EXISTS/空集/多行报错/关联拒 全正确; 回归全绿 + clippy 0
+- **已知限制**: 仅非关联; 大 IN >1024 阈值拦截引导改 JOIN; 内层限单表; **FROM 派生表未含** (需 TableSource enum 波及, 独立后续)
+- gotcha: 内层可走 SqlSelectAgg 或 SqlRowCtx, 两处都需拦截; EXISTS 恒真=And([]) 恒假=Not(And([])); collect/fold 同 DFS 序
+
 ### 2026-07-31 会话十二总览 (F70, 细节见 CHANGELOG)
 
 - **JOIN gather 索引点查优化** (纯性能): probe 侧表 gather 时用前序表 ON 等值键值集合下推为索引点查, shard 只回匹配行而非全表扫。实机: 有索引 JOIN 16ms→2.5ms (~6.3x)

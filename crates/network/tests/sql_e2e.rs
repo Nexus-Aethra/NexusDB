@@ -2016,3 +2016,317 @@ fn mysql_or_join_having() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+// ===== ⭐ 非关联 WHERE 子查询 (F71): IN/NOT IN/scalar/EXISTS =====
+
+/// IN/NOT IN + 标量 + EXISTS/NOT EXISTS 子查询 + 空集 + 多行报错 + 关联拒绝.
+#[test]
+fn mysql_where_subqueries() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT, age INT, INDEX(age))");
+    c.query("CREATE TABLE o (id INT PRIMARY KEY, uid INT, amt INT)");
+    for i in 1..=5 {
+        c.query(&format!("INSERT INTO u VALUES ({i}, 'u{i}', {})", 20 + i));
+    }
+    c.query("INSERT INTO o VALUES (1, 1, 100)");
+    c.query("INSERT INTO o VALUES (2, 3, 50)");
+
+    // IN 子查询: uid ∈ {1,3}
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE id IN (SELECT uid FROM o) ORDER BY id"),
+        vec!["1", "3"]
+    );
+    // NOT IN: 补集
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE id NOT IN (SELECT uid FROM o) ORDER BY id"),
+        vec!["2", "4", "5"]
+    );
+    // 标量子查询 = MAX(age)=25 → id5
+    assert_eq!(c.ids("SELECT id FROM u WHERE age = (SELECT MAX(age) FROM u)"), vec!["5"]);
+    // 标量比较 > MIN(age)=21
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE age > (SELECT MIN(age) FROM u) ORDER BY id"),
+        vec!["2", "3", "4", "5"]
+    );
+    // 标量 pk-point 内层
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE age = (SELECT age FROM u WHERE id = 3)"),
+        vec!["3"]
+    );
+    // EXISTS 真 → 全部行
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE amt > 40) ORDER BY id"),
+        vec!["1", "2", "3", "4", "5"]
+    );
+    // NOT EXISTS (o 有 amt>40) → 假 → 空
+    assert_eq!(
+        c.query("SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE amt > 40)"),
+        QueryResult::Rows(vec![])
+    );
+    // EXISTS 假 (无 amt>999) → 空
+    assert_eq!(
+        c.query("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE amt > 999)"),
+        QueryResult::Rows(vec![])
+    );
+    // IN 空集 → 恒假 → 空
+    assert_eq!(
+        c.query("SELECT id FROM u WHERE id IN (SELECT uid FROM o WHERE amt > 999)"),
+        QueryResult::Rows(vec![])
+    );
+    // DELETE 带 IN 子查询
+    c.query("DELETE FROM u WHERE id IN (SELECT uid FROM o)");
+    assert_eq!(c.ids("SELECT id FROM u ORDER BY id"), vec!["2", "4", "5"]);
+
+    // 多行标量子查询 → 报错
+    assert!(matches!(
+        c.query("SELECT id FROM u WHERE age = (SELECT age FROM u)"),
+        QueryResult::Err { .. }
+    ));
+    // 关联子查询 → 报错 (内层引用外层列)
+    assert!(matches!(
+        c.query("SELECT id FROM u WHERE id IN (SELECT uid FROM o WHERE o.uid = u.id)"),
+        QueryResult::Err { .. }
+    ));
+    // 无子查询零回归
+    assert_eq!(c.ids("SELECT id FROM u WHERE age = 22"), vec!["2"]);
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F75: FROM 派生表参与 JOIN (内层物化预填 tables[0]).
+#[test]
+fn mysql_derived_join() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT, age INT)");
+    c.query("CREATE TABLE o (id INT PRIMARY KEY, uid INT, amt INT)");
+    for i in 1..=5 {
+        c.query(&format!("INSERT INTO u VALUES ({i}, 'u{i}', {})", 20 + i));
+    }
+    c.query("INSERT INTO o VALUES (1, 1, 100)");
+    c.query("INSERT INTO o VALUES (2, 3, 50)");
+    c.query("INSERT INTO o VALUES (3, 3, 70)");
+
+    // 派生表 INNER JOIN: (age>22 的 u) ⱈ o on t.id=o.uid → id3 × {o2,o3}
+    assert_eq!(
+        c.ids("SELECT t.id FROM (SELECT id FROM u WHERE age > 22) t JOIN o ON t.id = o.uid ORDER BY o.id"),
+        vec!["3", "3"]
+    );
+    // 派生表 LEFT JOIN: 全 u 左驱动, 无匹配补 NULL → 5 行 (id1,3,3 匹配; 2,4,5 无)
+    assert_eq!(
+        c.ids("SELECT t.id FROM (SELECT id FROM u) t LEFT JOIN o ON t.id = o.uid ORDER BY t.id, o.id"),
+        vec!["1", "2", "3", "3", "4", "5"]
+    );
+    // 派生表列 + 真表列混合投影 + WHERE 限定列 (t.id∈{3,4,5}; 仅 o3 uid=3 amt=70 匹配且 >60)
+    let r = c.query("SELECT t.id, o.amt FROM (SELECT id FROM u WHERE age > 22) t JOIN o ON t.id = o.uid WHERE o.amt > 60 ORDER BY o.amt");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![vec![Some("3".into()), Some("70".into())]])
+    );
+    // 内层聚合派生表作首表 (group 列 uid 作 ON 键): (uid,SUM(amt)) ⱈ u on t.uid=u.id
+    // uid ∈ {1,3} → 与 u.id 1/3 匹配 → {1,3}
+    assert_eq!(
+        c.ids("SELECT t.uid FROM (SELECT uid, SUM(amt) FROM o GROUP BY uid) t JOIN u ON t.uid = u.id ORDER BY t.uid"),
+        vec!["1", "3"]
+    );
+
+    // JOIN 右侧派生表 → 报错 (v1)
+    assert!(matches!(
+        c.query("SELECT u.id FROM u JOIN (SELECT id FROM o) t ON u.id = t.id"),
+        QueryResult::Err { .. }
+    ));
+    // 普通 JOIN 零回归
+    assert_eq!(
+        c.ids("SELECT u.id FROM u JOIN o ON u.id = o.uid ORDER BY o.id"),
+        vec!["1", "3", "3"]
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F73: 大 IN 子查询 (>1024 不再报错, 排序集合二分求值).
+#[test]
+fn mysql_large_in_subquery() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, age INT)");
+    c.query("CREATE TABLE o (id INT PRIMARY KEY, uid INT)");
+    // u: 1..=3000; o.uid = 1..=2000 (远超旧 1024 阀)
+    for i in 1..=3000 {
+        c.query(&format!("INSERT INTO u VALUES ({i}, {})", i % 100));
+    }
+    for i in 1..=2000 {
+        c.query(&format!("INSERT INTO o VALUES ({i}, {i})"));
+    }
+    // 旧版报错语句 → 现出正确结果 (2000 行)
+    let n = c.ids("SELECT id FROM u WHERE id IN (SELECT uid FROM o)").len();
+    assert_eq!(n, 2000);
+    // 边界抽查: 1500 ∈, 2500 ∉
+    assert_eq!(c.ids("SELECT id FROM u WHERE id IN (SELECT uid FROM o) ORDER BY id LIMIT 1"), vec!["1"]);
+    assert_eq!(c.ids("SELECT id FROM u WHERE id = 1500 AND id IN (SELECT uid FROM o)"), vec!["1500"]);
+    assert_eq!(c.query("SELECT id FROM u WHERE id = 2500 AND id IN (SELECT uid FROM o)"), QueryResult::Rows(vec![]));
+    // NOT IN 补集大小 = 3000 - 2000 = 1000
+    assert_eq!(c.ids("SELECT id FROM u WHERE id NOT IN (SELECT uid FROM o)").len(), 1000);
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F74: 关联 EXISTS/NOT EXISTS 单等值去相关 (改写为非关联 IN/NOT IN).
+#[test]
+fn mysql_correlated_exists() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, age INT)");
+    c.query("CREATE TABLE o (id INT PRIMARY KEY, uid INT, amt INT)");
+    for i in 1..=5 {
+        c.query(&format!("INSERT INTO u VALUES ({i}, {})", 20 + i));
+    }
+    // o: uid 1/3 有单; amt 高低混
+    c.query("INSERT INTO o VALUES (1, 1, 100)");
+    c.query("INSERT INTO o VALUES (2, 3, 30)");
+    c.query("INSERT INTO o VALUES (3, 3, 200)");
+
+    // 关联 EXISTS: u.id 存在对应 o.uid → {1,3}
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) ORDER BY id"),
+        vec!["1", "3"]
+    );
+    // 两侧顺序互换 (u.id = o.uid) 同结果
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE u.id = o.uid) ORDER BY id"),
+        vec!["1", "3"]
+    );
+    // 带附加内层非相关条件: 仅 amt>150 → o.uid=3 → {3}
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND amt > 150) ORDER BY id"),
+        vec!["3"]
+    );
+    // NOT EXISTS → 补集 {2,4,5}
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) ORDER BY id"),
+        vec!["2", "4", "5"]
+    );
+    // 裸内层列 (无限定) 与外层限定相关
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE uid = u.id) ORDER BY id"),
+        vec!["1", "3"]
+    );
+    // 不可去相关: 多重相关 → 报错
+    assert!(matches!(
+        c.query("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND o.amt = u.age)"),
+        QueryResult::Err { .. }
+    ));
+    // 不可去相关: 非等值相关 → 报错
+    assert!(matches!(
+        c.query("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid > u.id)"),
+        QueryResult::Err { .. }
+    ));
+    // 不可去相关: 关联 IN (非 EXISTS) → 报错
+    assert!(matches!(
+        c.query("SELECT id FROM u WHERE id IN (SELECT uid FROM o WHERE o.uid = u.id)"),
+        QueryResult::Err { .. }
+    ));
+    // 零回归: 非关联 EXISTS 仍工作
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE amt > 50) ORDER BY id"),
+        vec!["1", "2", "3", "4", "5"]
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F72: FROM 派生表 — 内层物化 + 外层 worker 内存过滤/投影/排序/截断.
+#[test]
+fn mysql_derived_tables() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT, age INT, INDEX(age))");
+    c.query("CREATE TABLE s (id INT PRIMARY KEY, g INT, v INT)");
+    for i in 1..=5 {
+        c.query(&format!("INSERT INTO u VALUES ({i}, 'u{i}', {})", 20 + i));
+    }
+    // s: g=1 → v {10,20}; g=2 → v {30}
+    c.query("INSERT INTO s VALUES (1, 1, 10)");
+    c.query("INSERT INTO s VALUES (2, 1, 20)");
+    c.query("INSERT INTO s VALUES (3, 2, 30)");
+
+    // 基础: 内层过滤 + 外层再过滤 (带 alias 前缀) + ORDER
+    assert_eq!(
+        c.ids("SELECT id FROM (SELECT id FROM u WHERE age > 22) t WHERE t.id < 5 ORDER BY id"),
+        vec!["3", "4"]
+    );
+    // 全列 * + 裸列名 WHERE + DESC + LIMIT/OFFSET
+    assert_eq!(
+        c.ids("SELECT * FROM (SELECT id FROM u) t WHERE id > 1 ORDER BY id DESC LIMIT 2 OFFSET 1"),
+        vec!["4", "3"]
+    );
+    // 内层聚合 GROUP BY: 输出列 label 即列名 (g / SUM(v))
+    let r = c.query("SELECT * FROM (SELECT g, SUM(v) FROM s GROUP BY g) t ORDER BY g");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![Some("1".into()), Some("30".into())],
+            vec![Some("2".into()), Some("30".into())],
+        ])
+    );
+    // COUNT(*) on 派生表 (外层过滤后计数)
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM (SELECT id FROM u WHERE age > 21) t WHERE t.id < 5"),
+        QueryResult::Rows(vec![vec![Some("3".into())]])
+    );
+    // 内层 pk 点查形态 (SqlRowCtx 拦截路径)
+    assert_eq!(
+        c.ids("SELECT id FROM (SELECT id FROM u WHERE id = 3) t"),
+        vec!["3"]
+    );
+    // 内层空结果
+    assert_eq!(
+        c.query("SELECT * FROM (SELECT id FROM u WHERE age > 999) t"),
+        QueryResult::Rows(vec![])
+    );
+    // 无别名 → 报错
+    assert!(matches!(
+        c.query("SELECT id FROM (SELECT id FROM u)"),
+        QueryResult::Err { .. }
+    ));
+    // 未知列 → 报错
+    assert!(matches!(
+        c.query("SELECT nope FROM (SELECT id FROM u) t"),
+        QueryResult::Err { .. }
+    ));
+    // 错 qualifier → 报错
+    assert!(matches!(
+        c.query("SELECT id FROM (SELECT id FROM u) t WHERE x.id > 1"),
+        QueryResult::Err { .. }
+    ));
+    // 内层带 JOIN → 报错 (v1)
+    assert!(matches!(
+        c.query("SELECT * FROM (SELECT u.id FROM u JOIN s ON u.id = s.id) t"),
+        QueryResult::Err { .. }
+    ));
+    // 内层带子查询 → 报错 (v1)
+    assert!(matches!(
+        c.query("SELECT * FROM (SELECT id FROM u WHERE id IN (SELECT g FROM s)) t"),
+        QueryResult::Err { .. }
+    ));
+    // 非孤 COUNT(*) 聚合投影 → 报错 (v1)
+    assert!(matches!(
+        c.query("SELECT SUM(id) FROM (SELECT id FROM u) t"),
+        QueryResult::Err { .. }
+    ));
+    // 零回归: 普通单表不受影响
+    assert_eq!(c.ids("SELECT id FROM u WHERE age = 22"), vec!["2"]);
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
