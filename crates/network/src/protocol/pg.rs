@@ -25,6 +25,14 @@ pub const OID_INT8: u32 = 20;
 pub const OID_FLOAT8: u32 = 701;
 pub const OID_TEXT: u32 = 25;
 pub const OID_BYTEA: u32 = 17;
+// ⭐ F80
+pub const OID_BOOL: u32 = 16;
+pub const OID_DATE: u32 = 1082;
+pub const OID_TIME: u32 = 1083;
+pub const OID_TIMESTAMP: u32 = 1114;
+pub const OID_JSON: u32 = 114;
+pub const OID_UUID: u32 = 2950;
+pub const OID_NUMERIC: u32 = 1700;
 
 /// startup 阶段帧: `[len u32 BE 含自身][payload]` (无 type 字节).
 /// 返回 (消耗字节, payload).
@@ -97,6 +105,130 @@ pub fn build_auth_cleartext() -> Vec<u8> {
     frame(b'R', &3u32.to_be_bytes())
 }
 
+// ===== ⭐ F82: SCRAM-SHA-256 (RFC 5802 / 7677) =====
+
+/// AuthenticationSASL (code 10): 宣告支持的机制列表 (仅 SCRAM-SHA-256).
+pub fn build_auth_sasl() -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&10u32.to_be_bytes());
+    p.extend_from_slice(b"SCRAM-SHA-256");
+    p.push(0); // 机制名以 NUL 分隔
+    p.push(0); // 列表终止空串
+    frame(b'R', &p)
+}
+
+/// AuthenticationSASLContinue (code 11): server-first-message.
+pub fn build_auth_sasl_continue(server_first: &[u8]) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&11u32.to_be_bytes());
+    p.extend_from_slice(server_first);
+    frame(b'R', &p)
+}
+
+/// AuthenticationSASLFinal (code 12): "v=base64(ServerSignature)".
+pub fn build_auth_sasl_final(server_final: &[u8]) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&12u32.to_be_bytes());
+    p.extend_from_slice(server_final);
+    frame(b'R', &p)
+}
+
+/// 解析 SASLInitialResponse payload (客户端 'p' 帧首条):
+/// `[mechanism NUL][client-first len u32 BE][client-first-message]` → (mechanism, client_first).
+pub fn parse_sasl_initial(payload: &[u8]) -> Option<(String, Vec<u8>)> {
+    let nul = payload.iter().position(|&b| b == 0)?;
+    let mech = String::from_utf8_lossy(&payload[..nul]).into_owned();
+    let rest = &payload[nul + 1..];
+    if rest.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let body = rest.get(4..4 + len)?;
+    Some((mech, body.to_vec()))
+}
+
+/// SCRAM 服务端会话状态 (跨两条客户端消息).
+#[derive(Debug, Clone)]
+pub struct ScramState {
+    pub client_first_bare: Vec<u8>, // "n=user,r=cnonce"
+    pub server_first: Vec<u8>,      // "r=nonce,s=salt,i=iter"
+    pub salt: Vec<u8>,
+    pub iterations: u32,
+    pub nonce: Vec<u8>, // 完整 r= (client+server)
+}
+
+/// SCRAM 步骤 1: 处理 client-first-message → (state, server-first-message).
+/// client_first 形如 `n,,n=user,r=cnonce` (gs2 头 `n,,` = 无 channel binding).
+pub fn scram_server_first(client_first: &[u8]) -> Option<(ScramState, Vec<u8>)> {
+    let s = std::str::from_utf8(client_first).ok()?;
+    // 剥 gs2 头: 支持 "n,,"/"y,," (无 CB); "p=" (要求 CB) v1 不支持
+    let bare = s
+        .strip_prefix("n,,")
+        .or_else(|| s.strip_prefix("y,,"))?;
+    // 取 client nonce (r=...)
+    let cnonce = bare.split(',').find_map(|kv| kv.strip_prefix("r="))?;
+    let snonce = String::from_utf8(crate::protocol::crypto::rand_printable(18)).ok()?;
+    let full_nonce = format!("{cnonce}{snonce}");
+    let salt = crate::protocol::crypto::rand_bytes(16);
+    let iterations = 4096u32;
+    let server_first = format!(
+        "r={full_nonce},s={},i={iterations}",
+        crate::protocol::crypto::base64_encode(&salt)
+    );
+    let state = ScramState {
+        client_first_bare: bare.as_bytes().to_vec(),
+        server_first: server_first.clone().into_bytes(),
+        salt,
+        iterations,
+        nonce: full_nonce.into_bytes(),
+    };
+    Some((state, server_first.into_bytes()))
+}
+
+/// SCRAM 步骤 2: 验证 client-final-message, 返回 server-final ("v=...") 或 None (认证失败).
+/// client_final 形如 `c=biws,r=fullnonce,p=base64(proof)`.
+pub fn scram_verify_final(state: &ScramState, client_final: &[u8], password: &str) -> Option<Vec<u8>> {
+    use crate::protocol::crypto::{base64_decode, base64_encode, hmac_sha256, pbkdf2_sha256_32, sha256};
+    let s = std::str::from_utf8(client_final).ok()?;
+    // 校验 nonce 一致
+    let recv_nonce = s.split(',').find_map(|kv| kv.strip_prefix("r="))?;
+    if recv_nonce.as_bytes() != state.nonce.as_slice() {
+        return None;
+    }
+    let proof_b64 = s.split(',').find_map(|kv| kv.strip_prefix("p="))?;
+    let proof = base64_decode(proof_b64.as_bytes())?;
+    if proof.len() != 32 {
+        return None;
+    }
+    // client-final-without-proof = "c=biws,r=nonce"
+    let cfwp = {
+        let end = s.rfind(",p=")?;
+        &s[..end]
+    };
+    // AuthMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
+    let mut auth_msg = state.client_first_bare.clone();
+    auth_msg.push(b',');
+    auth_msg.extend_from_slice(&state.server_first);
+    auth_msg.push(b',');
+    auth_msg.extend_from_slice(cfwp.as_bytes());
+
+    let salted = pbkdf2_sha256_32(password.as_bytes(), &state.salt, state.iterations);
+    let client_key = hmac_sha256(&salted, b"Client Key");
+    let stored_key = sha256(&client_key);
+    let client_sig = hmac_sha256(&stored_key, &auth_msg);
+    // 恢复 ClientKey = proof XOR ClientSignature, 校验 SHA256 == StoredKey
+    let mut recovered = [0u8; 32];
+    for i in 0..32 {
+        recovered[i] = proof[i] ^ client_sig[i];
+    }
+    if sha256(&recovered) != stored_key {
+        return None; // 密码错误
+    }
+    let server_key = hmac_sha256(&salted, b"Server Key");
+    let server_sig = hmac_sha256(&server_key, &auth_msg);
+    Some(format!("v={}", base64_encode(&server_sig)).into_bytes())
+}
+
 /// AuthenticationOk + ParameterStatus × n + BackendKeyData + ReadyForQuery.
 pub fn build_auth_ok_bundle(backend_pid: u32) -> Vec<u8> {
     let mut out = frame(b'R', &0u32.to_be_bytes());
@@ -154,17 +286,38 @@ fn type_oid(ty: ColType) -> u32 {
         ColType::F64 => OID_FLOAT8,
         ColType::Str => OID_TEXT,
         ColType::Bytes => OID_BYTEA,
+        ColType::Bool => OID_BOOL,
+        ColType::Date => OID_DATE,
+        ColType::Time => OID_TIME,
+        ColType::Timestamp => OID_TIMESTAMP,
+        ColType::Json => OID_JSON,
+        ColType::Uuid => OID_UUID,
+        ColType::Decimal { .. } => OID_NUMERIC,
     }
 }
 
-/// 值 → 文本格式单元 (None = SQL NULL).
-/// Bytes 按 UTF-8 直出 (与 MySQL 门面一致; 二进制安全性同级 gap).
-fn text_cell(v: &ColValue) -> Option<Vec<u8>> {
+/// 值 → 文本格式单元 (None = SQL NULL). ⭐ F80: 按列 ColType 渲染
+/// (Bool→'t'/'f', Date/Time/Timestamp→格式化文本, Uuid→36 字符 hex).
+fn text_cell(ty: ColType, v: &ColValue) -> Option<Vec<u8>> {
     match v {
         ColValue::Null => None,
-        ColValue::I64(x) => Some(x.to_string().into_bytes()),
+        ColValue::I64(x) => Some(
+            match ty {
+                ColType::Bool => (if *x != 0 { "t" } else { "f" }).to_string(),
+                ColType::Date => crate::worker::render_date(*x),
+                ColType::Time => crate::worker::render_time(*x),
+                ColType::Timestamp => crate::worker::render_timestamp(*x),
+                _ => x.to_string(),
+            }
+            .into_bytes(),
+        ),
         ColValue::F64(x) => Some(format_f64(*x).into_bytes()),
-        ColValue::Bytes(b) => Some(b.clone()),
+        ColValue::Bytes(b) => Some(match ty {
+            ColType::Uuid => crate::worker::render_uuid(b).into_bytes(),
+            _ => b.clone(),
+        }),
+        // ⭐ F81: Decimal → 定点文本 "123.45"
+        ColValue::Decimal(x, scale) => Some(crate::worker::render_decimal(*x, *scale).into_bytes()),
     }
 }
 
@@ -198,8 +351,9 @@ pub fn build_result_set(cols: &[(&str, ColType)], rows: &[Vec<ColValue>]) -> Vec
     for r in rows {
         let mut p = Vec::new();
         p.extend_from_slice(&(r.len() as u16).to_be_bytes());
-        for v in r {
-            match text_cell(v) {
+        for (ci, v) in r.iter().enumerate() {
+            let ty = cols.get(ci).map(|(_, t)| *t).unwrap_or(ColType::Str);
+            match text_cell(ty, v) {
                 None => p.extend_from_slice(&(-1i32).to_be_bytes()),
                 Some(cell) => {
                     p.extend_from_slice(&(cell.len() as u32).to_be_bytes());

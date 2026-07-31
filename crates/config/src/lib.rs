@@ -68,6 +68,12 @@ pub struct ServerConfig {
     /// ⭐ H1: REST Bearer token (空 = 免鉴权; /metrics 与 /v1/status 恒免).
     #[serde(default)]
     pub http_token: String,
+    /// ⭐ F83: SQL 门面 TLS 证书 PEM 路径 (空 = 不启用 TLS, 明文). 两门面共用.
+    #[serde(default)]
+    pub tls_cert: String,
+    /// ⭐ F83: SQL 门面 TLS 私钥 PEM 路径 (PKCS8/PKCS1/SEC1; 空 = 不启用).
+    #[serde(default)]
+    pub tls_key: String,
     /// key 长度上限 (字节). 超限请求在协议层拦截.
     pub max_key_bytes: usize,
     /// value 长度上限 (字节). ⭐ 大 value: 超过 inline 阈值 (~4000B) 的
@@ -89,6 +95,8 @@ impl Default for ServerConfig {
             http_addr: default_http_addr(),
             http_cors_origin: String::new(),
             http_token: String::new(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
             max_key_bytes: 1024,
             max_value_bytes: 1024 * 1024,
         }

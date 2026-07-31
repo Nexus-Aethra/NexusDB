@@ -13,6 +13,8 @@ crossbeam-channel = "0.5"
 libc = "0.2"
 thiserror = "2"
 serde_json = "1"
+# ⭐ F83: TLS (SQL 门面传输加密). ring 后端 (纯 Rust + 少量汇编, 免 aws-lc 的 cmake C 构建).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 [dev-dependencies]
 tempfile = "3"

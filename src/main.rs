@@ -139,6 +139,22 @@ fn main() {
     };
     // ⭐ ORM-B2: 进程级共享 SQL 路由缓存 (五门面同集群共用一个)
     let sql_shared = network::new_sql_shared();
+    // ⭐ F83: TLS 配置 (SQL/PG 门面共用; 两路径均非空才启用, 否则明文)
+    let tls_config = if !cfg.server.tls_cert.is_empty() && !cfg.server.tls_key.is_empty() {
+        match network::tls::load_server_config(&cfg.server.tls_cert, &cfg.server.tls_key) {
+            Ok(c) => {
+                nlog::info!("main", "TLS enabled for SQL/PG facades");
+                Some(c)
+            }
+            Err(e) => {
+                nlog::error!("main", "TLS config load failed: {e}");
+                nlog::shutdown();
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     let listen_addr = cfg.server.listen_addr.parse().expect("validated addr");
     let server = match NetworkServer::start(NetworkServerConfig {
         listen_addr,
@@ -152,6 +168,7 @@ fn main() {
         auth_password: None,
         worker_id_base: 0,
             sql_shared: sql_shared.clone(),
+            tls_config: None,
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -181,6 +198,7 @@ fn main() {
             auth_password,
             worker_id_base: binary_workers as u32,
             sql_shared: sql_shared.clone(),
+            tls_config: None,
         }) {
             Ok(s) => {
                 nlog::info!("main", "RESP (Redis) listening on {}", s.local_addr());
@@ -218,6 +236,7 @@ fn main() {
             auth_password: sql_password,
             worker_id_base: (binary_workers + resp_workers) as u32,
             sql_shared: sql_shared.clone(),
+            tls_config: tls_config.clone(),
         }) {
             Ok(s) => {
                 nlog::info!("main", "SQL (MySQL wire) listening on {}", s.local_addr());
@@ -254,6 +273,7 @@ fn main() {
             auth_password: pg_password,
             worker_id_base: (binary_workers + resp_workers + sql_workers) as u32,
             sql_shared: sql_shared.clone(),
+            tls_config: tls_config.clone(),
         }) {
             Ok(s) => {
                 nlog::info!("main", "SQL (PostgreSQL wire) listening on {}", s.local_addr());
@@ -292,6 +312,7 @@ fn main() {
             auth_password: http_token, // = Bearer token
             worker_id_base: (binary_workers + resp_workers + sql_workers + pg_workers) as u32,
             sql_shared: sql_shared.clone(),
+            tls_config: None,
         }) {
             Ok(s) => {
                 nlog::info!("main", "REST (HTTP) listening on {}", s.local_addr());

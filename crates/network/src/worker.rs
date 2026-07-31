@@ -71,6 +71,8 @@ pub struct WorkerConfig {
     pub db_view: std::sync::Arc<shard_manager::DbDirView>,
     /// ⭐ ORM-B2: 进程级共享路由缓存 (同数据集群的全部 SQL 门面共用一个).
     pub sql_shared: std::sync::Arc<SqlSharedRoutes>,
+    /// ⭐ F83: TLS 配置 (None = 明文; Some = SQL 门面 STARTTLS 可升级).
+    pub tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
 }
 
 pub struct WorkerPool {
@@ -247,6 +249,8 @@ struct SqlDdlAgg {
     /// 成功后填 worker schema 缓存的 key/值.
     key: (String, String),
     schema: std::sync::Arc<TableSchema>,
+    /// ⭐ F79: ALTER (非 CREATE) — 完成时递增 ddl_epoch 使其他 worker 旧 schema 缓存失效.
+    alter: bool,
 }
 
 /// SELECT 索引路径: IndexScan 广播聚合.
@@ -280,6 +284,8 @@ struct SqlSelectAgg {
     offset: u32,
     /// ⭐ S2: COUNT(*) — 输出单行计数 (免投影; limit/offset 不影响计数).
     count: bool,
+    /// ⭐ F76: 投影输出列名 (与 proj 同序; None = 用 schema 列名, 空 vec = 全 None).
+    out_names: Vec<Option<String>>,
 }
 
 /// ⭐ S1: 两阶段 DML 的动作 (phase2 每 pk 一发).
@@ -429,6 +435,8 @@ struct SqlRowCtx {
     read_key: Option<(String, String, Vec<u8>)>,
     /// ⭐ RYOW (F63): 事务内 UPDATE 基于已提交盘行时, 读盘后叠加的 sets.
     ryow_overlay: Vec<(u16, ColValue)>,
+    /// ⭐ F76: 投影输出列名 (与 proj 同序; None = 用 schema 列名, 空 vec = 全 None).
+    out_names: Vec<Option<String>>,
 }
 
 /// schema 缓存 miss 时挂起的语句 (GetSchemaOp 结果到达后续跑).
@@ -551,6 +559,8 @@ pub fn new_sql_shared() -> std::sync::Arc<SqlSharedRoutes> {
 struct ConnState {
     fd: RawFd,
     stream: TcpStream,
+    /// ⭐ F83: TLS 会话 (None = 明文; Some = 已 STARTTLS 升级, recv/send 走 rustls).
+    tls: Option<Box<rustls::ServerConnection>>,
     read_buf: Vec<u8>,
     proto: ProtocolKind,
     /// RESP: 是否已通过 AUTH (无密码配置时恒 true).
@@ -633,8 +643,10 @@ struct ConnState {
     sql_pending: HashMap<u64, PendingSql>,
     /// ⭐ Z2 (MySQL wire): Sql conn 的握手/登录状态 (非 Sql conn 为 None).
     mysql: Option<MysqlState>,
-    /// ⭐ S4: PG wire 状态 (0 = 等 startup, 1 = 等 password, 2 = 已认证).
+    /// ⭐ S4: PG wire 状态 (0 = 等 startup, 1 = 等 password/SASL, 2 = 已认证).
     pg_phase: u8,
+    /// ⭐ F82: PG SCRAM-SHA-256 会话状态 (仅 SCRAM 认证期非 None).
+    pg_scram: Option<crate::protocol::pg::ScramState>,
     /// ⭐ H2: HTTP KV 请求渲染簿记 (seq → 请求上下文).
     http_ctx: HashMap<u64, HttpReqCtx>,
     /// ⭐ P2: MySQL 预处理语句注册表 (stmt_id → 模板).
@@ -719,6 +731,7 @@ impl ConnState {
         Self {
             fd,
             stream,
+            tls: None,
             read_buf: Vec::with_capacity(4096),
             proto,
             authenticated: !auth_required,
@@ -762,6 +775,7 @@ impl ConnState {
             sql_pending: HashMap::new(),
             mysql: None,
             pg_phase: 0,
+            pg_scram: None,
             http_ctx: HashMap::new(),
             mysql_stmts: HashMap::new(),
             next_stmt_id: 1,
@@ -776,6 +790,52 @@ impl ConnState {
     /// 从连接 recv 数据, 追加到 read_buf.
     /// 返回 Ok(true) = 有数据, Ok(false) = 连接关闭, Err = 错误.
     fn recv(&mut self) -> std::io::Result<bool> {
+        // ⭐ F83: TLS 路径 — 读密文喂 rustls → 冲刷握手待写 → 读明文入 read_buf.
+        if let Some(tls) = self.tls.as_mut() {
+            let mut eof = false;
+            loop {
+                match tls.read_tls(&mut self.stream) {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        if let Err(e) = tls.process_new_packets() {
+                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            // 冲刷握手/告警等待写字节 (spin, 同明文 send 语义)
+            while tls.wants_write() {
+                match tls.write_tls(&mut self.stream) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            // 读明文
+            let before = self.read_buf.len();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match tls.reader().read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => self.read_buf.extend_from_slice(&tmp[..n]),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            let got_plain = self.read_buf.len() > before;
+            // EOF 且本轮无新明文 → 连接关闭
+            return Ok(!(eof && !got_plain));
+        }
         let mut tmp = [0u8; 4096];
         loop {
             match self.stream.read(&mut tmp) {
@@ -794,9 +854,38 @@ impl ConnState {
         }
     }
 
+    /// ⭐ F83: 就地把明文连接升级为 TLS (STARTTLS). 握手在后续 recv 泵中完成.
+    fn start_tls(&mut self, config: std::sync::Arc<rustls::ServerConfig>) -> bool {
+        match rustls::ServerConnection::new(config) {
+            Ok(c) => {
+                self.tls = Some(Box::new(c));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// 发送原始字节. non-blocking socket 遇 WouldBlock 时 spin retry
     /// (回复帧小, 正常情况下 send buffer 不会满太久).
     fn send_bytes(&mut self, bytes: &[u8]) {
+        // ⭐ F83: TLS 路径 — 明文写入 rustls writer, 再泵密文到 socket.
+        if let Some(tls) = self.tls.as_mut() {
+            if tls.writer().write_all(bytes).is_err() {
+                return;
+            }
+            while tls.wants_write() {
+                match tls.write_tls(&mut self.stream) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            return;
+        }
         let mut written = 0usize;
         while written < bytes.len() {
             match self.stream.write(&bytes[written..]) {
@@ -946,6 +1035,7 @@ fn worker_main_epoll(cfg: WorkerConfig) {
     let limits = cfg.limits;
     let auth_password = cfg.auth_password;
     let auth_required = auth_password.is_some();
+    let tls_config = cfg.tls_config; // ⭐ F83: None = 明文门面
     let num_shards = shard_inboxes.len();
 
     let mut events = vec![
@@ -966,8 +1056,8 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                     // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
                     if proto_kind == ProtocolKind::Sql {
                         let salt = mysql_gen_salt(id, worker_id);
-                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10(
-                            &salt, id as u32,
+                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
+                            &salt, id as u32, tls_config.is_some(),
                         ));
                         state.mysql = Some(MysqlState { salt, phase: 0, pending_db: None });
                     }
@@ -1053,8 +1143,8 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                     // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
                     if proto_kind == ProtocolKind::Sql {
                         let salt = mysql_gen_salt(id, worker_id);
-                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10(
-                            &salt, id as u32,
+                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
+                            &salt, id as u32, tls_config.is_some(),
                         ));
                         state.mysql = Some(MysqlState { salt, phase: 0, pending_db: None });
                     }
@@ -1086,7 +1176,7 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                                 // ⭐ Z2: MySQL wire 帧循环
                                 process_sql_input(
                                     conn, conn_id, worker_id, &auth_password, &db, &db_view,
-                                    &shard_inboxes, num_shards,
+                                    &shard_inboxes, num_shards, &tls_config,
                                 );
                                 should_remove = conn.resp_should_close();
                             }
@@ -1094,7 +1184,7 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                                 // ⭐ S4: PostgreSQL wire 帧循环
                                 process_pg_input(
                                     conn, conn_id, worker_id, &auth_password, &db, &db_view,
-                                    &shard_inboxes, num_shards,
+                                    &shard_inboxes, num_shards, &tls_config,
                                 );
                                 should_remove = conn.resp_should_close();
                             }
@@ -2653,12 +2743,12 @@ fn handle_resp_shard_result(
                             if ctx.count {
                                 render_sql_count(conn.proto, bin, 1)
                             } else {
-                                render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[values])
+                                render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &ctx.out_names, &[values])
                             }
                         } else if ctx.count {
                             render_sql_count(conn.proto, bin, 0)
                         } else {
-                            render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[])
+                            render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &ctx.out_names, &[])
                         }
                     }
                     Err(e) => sql_err_bytes(conn.proto, &e.to_string()),
@@ -2683,7 +2773,7 @@ fn handle_resp_shard_result(
                 return;
             }
             BatchResult::GetValue(None) if ctx.count => render_sql_count(conn.proto, bin, 0),
-            BatchResult::GetValue(None) => render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &[]),
+            BatchResult::GetValue(None) => render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &ctx.out_names, &[]),
             BatchResult::Error(e) => sql_err_bytes(conn.proto, e),
             _ => sql_err_bytes(conn.proto, "unexpected reply"),
         };
@@ -2923,6 +3013,13 @@ fn handle_resp_shard_result(
                         sh.created_here.write().unwrap().insert(agg.key.clone());
                     }
                     conn.sql_cache.borrow_mut().schemas.insert(agg.key, agg.schema);
+                    // ⭐ F79: ALTER 递增 ddl_epoch — 其他 worker 下次 dispatch 重拉新 schema,
+                    // 避免用旧列数解码新写的行 (同 DROP 先例)
+                    if agg.alter {
+                        conn.sql_shared
+                            .ddl_epoch
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     sql_ok_bytes(conn.proto, 0)
                 }
             };
@@ -3840,6 +3937,8 @@ fn colval_to_sqlval(cv: &ColValue) -> SqlValue {
         ColValue::I64(i) => SqlValue::Int(*i),
         ColValue::F64(f) => SqlValue::Float(*f),
         ColValue::Bytes(b) => SqlValue::Str(b.clone()),
+        // ⭐ F81: Decimal 折叠回字面量用定点文本 (保精度; 目标列再按 scale 解析)
+        ColValue::Decimal(x, scale) => SqlValue::Str(render_decimal(*x, *scale).into_bytes()),
     }
 }
 
@@ -3952,7 +4051,7 @@ fn decorrelate_exists(outer_table: &str, inner: &SqlStmt) -> Result<Pred<Cond>, 
     };
     let new_inner = SqlStmt::Select {
         table: inner_table.clone(),
-        items: vec![sql::SelectItem::Col(inner_col)],
+        items: vec![sql::SelectItem::Col { name: inner_col, alias: None }],
         conds: new_conds,
         limit: None,
         order: vec![],
@@ -4285,6 +4384,7 @@ fn finish_derived_join(
         pk_col: 0,
         indexes: Vec::new(),
         next_iid: 0,
+        version_ncols: Vec::new(),
     });
     let ncols = cols.len() as u16;
     let mut tables: Vec<JoinTable> = Vec::with_capacity(joins.len() + 1);
@@ -4369,6 +4469,7 @@ fn derived_render(
         pk_col: 0,
         indexes: Vec::new(),
         next_iid: 0,
+        version_ncols: Vec::new(),
     };
     let conds = match conds_in.try_map(&|c: &Cond| {
         let idx = resolve(&c.col)?;
@@ -4413,7 +4514,7 @@ fn derived_render(
     let mut idxs: Vec<usize> = Vec::with_capacity(items.len());
     for it in items {
         match it {
-            sql::SelectItem::Col(c) => match resolve(c) {
+            sql::SelectItem::Col { name: c, .. } => match resolve(c) {
                 Ok(i) => idxs.push(i),
                 Err(e) => return sql_err_bytes(proto, &e),
             },
@@ -4628,7 +4729,9 @@ fn sql_dispatch_stmt(
             );
         }
         // ⭐ 事务 v1 (F61): DDL 在事务中拒绝 (避免与 2PC 交叉)
-        SqlStmt::CreateTable { .. } | SqlStmt::DropTable { .. } if conn.txn.is_some() => {
+        SqlStmt::CreateTable { .. } | SqlStmt::DropTable { .. } | SqlStmt::AlterTable { .. }
+            if conn.txn.is_some() =>
+        {
             conn.resp_complete(
                 seq,
                 sql_err_bytes(conn.proto, "DDL is not allowed inside a transaction"),
@@ -4741,6 +4844,7 @@ fn sql_dispatch_stmt(
                     error: None,
                     key: (db.to_string(), table),
                     schema: std::sync::Arc::new(schema),
+                    alter: false,
                 },
             );
             // 数据面广播 (worker 不持控制面); shard 端惰性建表 + set_schema 幂等
@@ -4757,6 +4861,7 @@ fn sql_dispatch_stmt(
         | SqlStmt::Select { ref table, .. }
         | SqlStmt::Delete { ref table, .. }
         | SqlStmt::Update { ref table, .. }
+        | SqlStmt::AlterTable { ref table, .. }
         | SqlStmt::Describe { ref table } => {
             // ⭐ F71: WHERE 子查询 — 先顺序跑内层折叠, 完后重跑外层 (仅 Select/Delete/Update)
             if matches!(
@@ -5547,6 +5652,13 @@ fn join_key(cv: &ColValue) -> Option<Vec<u8>> {
             k.extend_from_slice(b);
             Some(k)
         }
+        // ⭐ F81: Decimal join key (tag 3 + 16B i128 LE)
+        ColValue::Decimal(x, _) => {
+            let mut k = Vec::with_capacity(17);
+            k.push(3);
+            k.extend_from_slice(&x.to_le_bytes());
+            Some(k)
+        }
     }
 }
 
@@ -5931,6 +6043,13 @@ fn coltype_sql_name(ty: ColType) -> &'static str {
         ColType::F64 => "double",
         ColType::Str => "text",
         ColType::Bytes => "blob",
+        ColType::Bool => "boolean",
+        ColType::Date => "date",
+        ColType::Time => "time",
+        ColType::Timestamp => "timestamp",
+        ColType::Json => "json",
+        ColType::Uuid => "uuid",
+        ColType::Decimal { .. } => "decimal",
     }
 }
 
@@ -5957,6 +6076,7 @@ fn sysq_finish(
         pk_col: 0,
         indexes: Vec::new(),
         next_iid: 0,
+        version_ncols: Vec::new(),
     };
     // WHERE 残余过滤 (递归 eval; `__` 前缀的内部标记叶子如 __table__ 视为真,
     // 已在生成器里处理; 未知真实列的条件 → 不匹配则滤掉)
@@ -6145,11 +6265,20 @@ fn sysq_render_catalog(
             if let Some((t, sc)) = entries.iter().find(|(t, _)| t.eq_ignore_ascii_case(&target)) {
                 let mut lines: Vec<String> = Vec::new();
                 for (i, c) in sc.columns.iter().enumerate() {
-                    let ty = match c.ty {
-                        ColType::I64 => "int",
-                        ColType::F64 => "double",
-                        ColType::Str => "text",
-                        ColType::Bytes => "blob",
+                    let ty: std::borrow::Cow<str> = match c.ty {
+                        ColType::I64 => "int".into(),
+                        ColType::F64 => "double".into(),
+                        ColType::Str => "text".into(),
+                        ColType::Bytes => "blob".into(),
+                        ColType::Bool => "tinyint(1)".into(),
+                        ColType::Date => "date".into(),
+                        ColType::Time => "time".into(),
+                        ColType::Timestamp => "timestamp".into(),
+                        ColType::Json => "json".into(),
+                        ColType::Uuid => "char(36)".into(),
+                        ColType::Decimal { precision, scale } => {
+                            format!("decimal({precision},{scale})").into()
+                        }
                     };
                     let nullness = if i as u16 == sc.pk_col || !c.nullable {
                         " NOT NULL".to_string()
@@ -6278,6 +6407,62 @@ fn sysq_render_catalog(
     sysq_finish(proto, binary, spec, &all_cols, rows)
 }
 
+/// ⭐ F76: 剥列名的表名限定前缀 (`表.列`/`别名.列` → `列`); 仅当前缀匹配时.
+fn strip_col_qual(col: &mut String, table: &str) {
+    if let Some((q, c)) = col.split_once('.')
+        && q.eq_ignore_ascii_case(table)
+    {
+        *col = c.to_string();
+    }
+}
+
+fn strip_pred_qual(pred: &mut Pred<Cond>, table: &str) {
+    match pred {
+        Pred::Leaf(c) => strip_col_qual(&mut c.col, table),
+        Pred::And(v) | Pred::Or(v) => v.iter_mut().for_each(|p| strip_pred_qual(p, table)),
+        Pred::Not(b) => strip_pred_qual(b, table),
+    }
+}
+
+/// ⭐ F76: 单表 Select/Delete/Update 内所有列引用剥表名限定符 (JOIN 走 QualCol 不经此).
+fn strip_qual_in_stmt(stmt: &mut SqlStmt) {
+    match stmt {
+        SqlStmt::Select { table, items, conds, order, group_by, having, .. } => {
+            let t = table.clone();
+            for it in items.iter_mut() {
+                match it {
+                    sql::SelectItem::Col { name, .. } => strip_col_qual(name, &t),
+                    // ⭐ F78: 聚合参可为表达式 — 递归剥内部列引用的表限定前缀
+                    sql::SelectItem::Agg { arg: Some(e), .. } => {
+                        e.for_each_col_mut(&mut |c| strip_col_qual(c, &t));
+                    }
+                    sql::SelectItem::Agg { .. } => {}
+                }
+            }
+            strip_pred_qual(conds, &t);
+            strip_pred_qual(having, &t);
+            for (n, _) in order.iter_mut() {
+                strip_col_qual(n, &t);
+            }
+            for g in group_by.iter_mut() {
+                strip_col_qual(g, &t);
+            }
+        }
+        SqlStmt::Delete { table, conds } => {
+            let t = table.clone();
+            strip_pred_qual(conds, &t);
+        }
+        SqlStmt::Update { table, sets, conds } => {
+            let t = table.clone();
+            for (c, _) in sets.iter_mut() {
+                strip_col_qual(c, &t);
+            }
+            strip_pred_qual(conds, &t);
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sql_run_dml(
     conn: &mut ConnState,
@@ -6290,6 +6475,9 @@ fn sql_run_dml(
     schema: std::sync::Arc<TableSchema>,
     stmt: SqlStmt,
 ) {
+    // ⭐ F76: 单表限定列 `表.列` → 剥为 `列` (ORM 单表查询也带表名限定符)
+    let mut stmt = stmt;
+    strip_qual_in_stmt(&mut stmt);
     match stmt {
         SqlStmt::Insert { table, cols, rows } => {
             // ⭐ S1: 多行 VALUES — 逐行 RowPut, DmlAgg 计数 (批内非原子, 文档记录)
@@ -6493,6 +6681,7 @@ fn sql_run_dml(
                             offset: 0,
                             count: false,
                             agg_spec: None,
+                            out_names: Vec::new(),
                         },
                     );
                     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -6532,6 +6721,7 @@ fn sql_run_dml(
                             offset: 0,
                             count: false,
                             agg_spec: None,
+                            out_names: Vec::new(),
                         },
                     );
                     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -6559,7 +6749,7 @@ fn sql_run_dml(
                 && order.is_empty()
                 && matches!(
                     items[0],
-                    sql::SelectItem::Agg { func: sql::AggFn::Count, col: None }
+                    sql::SelectItem::Agg { func: sql::AggFn::Count, arg: None, .. }
                 );
             if (has_agg || !group_by.is_empty()) && !count {
                 sql_run_agg_select(
@@ -6571,8 +6761,16 @@ fn sql_run_dml(
             let cols: Vec<String> = items
                 .iter()
                 .filter_map(|i| match i {
-                    sql::SelectItem::Col(c) => Some(c.clone()),
+                    sql::SelectItem::Col { name, .. } => Some(name.clone()),
                     sql::SelectItem::Agg { .. } => None, // 仅 COUNT(*) 特例可达
+                })
+                .collect();
+            // ⭐ F76: 输出列名 (alias 优先) — 与 proj 同序; 空 items (SELECT *) → 全 None
+            let out_names: Vec<Option<String>> = items
+                .iter()
+                .filter_map(|i| match i {
+                    sql::SelectItem::Col { alias, .. } => Some(alias.clone()),
+                    sql::SelectItem::Agg { .. } => None,
                 })
                 .collect();
             // ⭐ O1: 投影列名 → 列号 (空/COUNT = 全列)
@@ -6630,12 +6828,13 @@ fn sql_run_dml(
                                             bin,
                                             &schema,
                                             &proj,
+                                            &out_names,
                                             std::slice::from_ref(&values),
                                         )
                                     }
                                 }
                                 _ if count => render_sql_count(conn.proto, bin, 0),
-                                _ => render_sql_rows(conn.proto, bin, &schema, &proj, &[]),
+                                _ => render_sql_rows(conn.proto, bin, &schema, &proj, &out_names, &[]),
                             };
                             conn.resp_complete(seq, bytes);
                             return;
@@ -6651,6 +6850,7 @@ fn sql_run_dml(
                                     count,
                                     read_key,
                                     ryow_overlay: overlay,
+                                    out_names: out_names.clone(),
                                 },
                             );
                             let op = BatchOp::RowGet {
@@ -6667,7 +6867,7 @@ fn sql_run_dml(
                 let read_key = sql_read_key(conn, db, &table, &pk);
                 conn.sql_row_ctx.insert(
                     seq,
-                    SqlRowCtx { schema, conds, proj, count, read_key, ryow_overlay: Vec::new() },
+                    SqlRowCtx { schema, conds, proj, count, read_key, ryow_overlay: Vec::new(), out_names },
                 );
                 let op = BatchOp::RowGet {
                     db: db.clone(),
@@ -6703,6 +6903,7 @@ fn sql_run_dml(
                         offset,
                         count,
                         agg_spec: None,
+                        out_names,
                     },
                 );
                 let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -6771,7 +6972,7 @@ fn sql_run_dml(
                     let bytes = if count {
                         render_sql_count(conn.proto, bin, 0)
                     } else {
-                        render_sql_rows(conn.proto, bin, &schema, &proj, &[])
+                        render_sql_rows(conn.proto, bin, &schema, &proj, &out_names, &[])
                     };
                     conn.resp_complete(seq, bytes);
                     return;
@@ -6801,6 +7002,7 @@ fn sql_run_dml(
                         offset,
                         count,
                         agg_spec: None,
+                        out_names,
                     },
                 );
                 let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -6821,6 +7023,46 @@ fn sql_run_dml(
         }
         SqlStmt::CreateTable { .. } => unreachable!("CREATE 在 sql_dispatch_stmt 处理"),
         SqlStmt::DropTable { .. } => unreachable!("DROP 在 sql_dispatch_stmt 处理"),
+        // ⭐ F79: ALTER TABLE ADD COLUMN — 基于旧 schema (参数) 合成新 schema 并广播 SetSchemaOp
+        SqlStmt::AlterTable { table, add } => {
+            if schema.col_by_name(&add.name).is_some() {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, &format!("duplicate column name '{}'", add.name)),
+                );
+                return;
+            }
+            let new_schema = match schema.with_added_column(add) {
+                Ok(s) => s,
+                Err(_) => {
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(conn.proto, "too many ALTER TABLE versions (v1 limit)"),
+                    );
+                    return;
+                }
+            };
+            let bytes = new_schema.encode();
+            let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+            conn.sql_ddl_agg.insert(
+                seq,
+                SqlDdlAgg {
+                    remaining: num_shards,
+                    error: None,
+                    key: (db.to_string(), table),
+                    schema: std::sync::Arc::new(new_schema),
+                    alter: true,
+                },
+            );
+            for sid in 0..num_shards {
+                let op = BatchOp::SetSchemaOp {
+                    db: db.clone(),
+                    table: table_arc.clone(),
+                    bytes: bytes.clone(),
+                };
+                push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+            }
+        }
         SqlStmt::SelectDerived { .. } => unreachable!("派生表在 sql_dispatch_stmt 处理"),
         SqlStmt::Begin { .. }
         | SqlStmt::Commit
@@ -6844,12 +7086,7 @@ fn sql_run_dml(
         SqlStmt::Describe { .. } => {
             let mut rows: Vec<Vec<ColValue>> = Vec::new();
             for (i, col) in schema.columns.iter().enumerate() {
-                let ty = match col.ty {
-                    ColType::I64 => "bigint",
-                    ColType::F64 => "double",
-                    ColType::Str => "text",
-                    ColType::Bytes => "blob",
-                };
+                let ty = coltype_sql_name(col.ty);
                 let key = if i as u16 == schema.pk_col {
                     "PRI"
                 } else if let Some(idx) = schema.indexes.iter().find(|x| x.col == i as u16) {
@@ -7002,6 +7239,192 @@ fn sql_build_row(
     Ok(out)
 }
 
+/// ⭐ F80: 民用日期 (y,m,d) → 距 1970-01-01 的天数 (Howard Hinnant days_from_civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// ⭐ F80: 逆变换 天数 → (y,m,d).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// ⭐ F80: 解析 'YYYY-MM-DD' → 距 epoch 微秒 (00:00:00).
+fn parse_date_micros(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let mut it = s.splitn(3, '-');
+    let y = it.next()?.parse::<i64>().ok()?;
+    let m = it.next()?.parse::<i64>().ok()?;
+    let d = it.next()?.parse::<i64>().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d) * MICROS_PER_DAY)
+}
+
+/// ⭐ F80: 解析 'HH:MM:SS[.ffffff]' → 距零点微秒.
+fn parse_time_micros(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (hms, frac) = match s.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (s, ""),
+    };
+    let mut it = hms.splitn(3, ':');
+    let h = it.next()?.parse::<i64>().ok()?;
+    let mi = it.next()?.parse::<i64>().ok()?;
+    let se = it.next().unwrap_or("0").parse::<i64>().ok()?;
+    let mut micros = ((h * 60 + mi) * 60 + se) * 1_000_000;
+    if !frac.is_empty() {
+        let mut f = frac.to_string();
+        f.truncate(6);
+        while f.len() < 6 {
+            f.push('0');
+        }
+        micros += f.parse::<i64>().ok()?;
+    }
+    Some(micros)
+}
+
+/// ⭐ F80: 解析 'YYYY-MM-DD[ T]HH:MM:SS[.ffffff]' → 距 epoch 微秒.
+fn parse_timestamp_micros(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, time) = if let Some((d, t)) = s.split_once('T') {
+        (d, Some(t))
+    } else if let Some((d, t)) = s.split_once(' ') {
+        (d, Some(t))
+    } else {
+        (s, None)
+    };
+    let base = parse_date_micros(date)?;
+    match time {
+        Some(t) if !t.trim().is_empty() => Some(base + parse_time_micros(t)?),
+        _ => Some(base),
+    }
+}
+
+/// ⭐ F80: 渲染 (供三门面): 微秒 → 'YYYY-MM-DD'.
+pub(crate) fn render_date(micros: i64) -> String {
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// ⭐ F80: 微秒 → 'HH:MM:SS' (截去小数; 距零点).
+pub(crate) fn render_time(micros: i64) -> String {
+    let mut secs = micros.rem_euclid(MICROS_PER_DAY) / 1_000_000;
+    let h = secs / 3600;
+    secs %= 3600;
+    format!("{:02}:{:02}:{:02}", h, secs / 60, secs % 60)
+}
+
+/// ⭐ F80: 微秒 → 'YYYY-MM-DD HH:MM:SS'.
+pub(crate) fn render_timestamp(micros: i64) -> String {
+    format!("{} {}", render_date(micros), render_time(micros))
+}
+
+/// ⭐ F80: 微秒 → (年, 月, 日, 时, 分, 秒, 微秒) — MySQL 二进制协议 DATE/DATETIME 编码用.
+pub(crate) fn datetime_parts(micros: i64) -> (u16, u8, u8, u8, u8, u8, u32) {
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let (y, m, d) = civil_from_days(days);
+    let tod = micros.rem_euclid(MICROS_PER_DAY);
+    let micro = (tod % 1_000_000) as u32;
+    let secs = tod / 1_000_000;
+    let hh = (secs / 3600) as u8;
+    let mm = ((secs % 3600) / 60) as u8;
+    let ss = (secs % 60) as u8;
+    (y as u16, m as u8, d as u8, hh, mm, ss, micro)
+}
+
+/// ⭐ F80: 距零点微秒 → (时, 分, 秒, 微秒) — MySQL 二进制 TIME 编码用.
+pub(crate) fn time_parts(micros: i64) -> (u8, u8, u8, u32) {
+    let tod = micros.rem_euclid(MICROS_PER_DAY);
+    let micro = (tod % 1_000_000) as u32;
+    let secs = tod / 1_000_000;
+    ((secs / 3600) as u8, ((secs % 3600) / 60) as u8, (secs % 60) as u8, micro)
+}
+
+/// ⭐ F80: 16B → 36 字符带连字符 UUID.
+pub(crate) fn render_uuid(b: &[u8]) -> String {
+    if b.len() != 16 {
+        return String::from_utf8_lossy(b).into_owned();
+    }
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+/// ⭐ F80: 解析 UUID 文本 (带/不带连字符) → 16B; 失败返回 None.
+fn parse_uuid(s: &str) -> Option<Vec<u8>> {
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..16).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect()
+}
+
+/// ⭐ F81: 10^scale (i128; scale<=38 → <i128::MAX). None=溢出.
+fn pow10_i128(scale: u8) -> Option<i128> {
+    10i128.checked_pow(scale as u32)
+}
+
+/// ⭐ F81: 十进制文本 → 定标 i128 (按 scale; 超出小数位截断, 不四舍五入). 非法/溢出→None.
+fn parse_decimal(s: &str, scale: u8) -> Option<i128> {
+    let s = s.trim();
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (s, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|c| c.is_ascii_digit()) || !frac_part.bytes().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let sc = scale as usize;
+    let mut frac = frac_part.to_string();
+    if frac.len() > sc {
+        frac.truncate(sc);
+    }
+    while frac.len() < sc {
+        frac.push('0');
+    }
+    let int_val: i128 = if int_part.is_empty() { 0 } else { int_part.parse().ok()? };
+    let frac_val: i128 = if sc == 0 || frac.is_empty() { 0 } else { frac.parse().ok()? };
+    let scaled = int_val.checked_mul(pow10_i128(scale)?)?.checked_add(frac_val)?;
+    Some(if neg { -scaled } else { scaled })
+}
+
+/// ⭐ F81: 定标 i128 + scale → 十进制文本 "123.45".
+pub(crate) fn render_decimal(v: i128, scale: u8) -> String {
+    if scale == 0 {
+        return v.to_string();
+    }
+    let neg = v < 0;
+    let av = v.unsigned_abs();
+    let p = 10u128.pow(scale as u32);
+    format!("{}{}.{:0width$}", if neg { "-" } else { "" }, av / p, av % p, width = scale as usize)
+}
+
 /// SQL 字面量 → 列值 (Int 可升 F64; 类型不符报错).
 /// ⭐ P1: 数值列收到 Str → 尝试文本解析 (PG 文本参数按目标类型转换语义).
 fn sql_to_col(ty: ColType, v: &SqlValue) -> Result<ColValue, String> {
@@ -7016,6 +7439,50 @@ fn sql_to_col(ty: ColType, v: &SqlValue) -> Result<ColValue, String> {
         (ColType::F64, SqlValue::Int(i)) => ColValue::F64(*i as f64),
         (ColType::F64, SqlValue::Float(f)) => ColValue::F64(*f),
         (ColType::Str | ColType::Bytes, SqlValue::Str(s)) => ColValue::Bytes(s.clone()),
+        // ⭐ F80: BOOL — TRUE/FALSE(Int 1/0) 或文本 true/false/t/f/1/0 → I64(0/1)
+        (ColType::Bool, SqlValue::Int(i)) => ColValue::I64(i64::from(*i != 0)),
+        (ColType::Bool, SqlValue::Str(s)) => {
+            let t = std::str::from_utf8(s).unwrap_or("").trim().to_ascii_lowercase();
+            match t.as_str() {
+                "1" | "true" | "t" | "yes" | "y" => ColValue::I64(1),
+                "0" | "false" | "f" | "no" | "n" | "" => ColValue::I64(0),
+                _ => return Err("invalid boolean text".into()),
+            }
+        }
+        // ⭐ F80: DATE/TIME/TIMESTAMP — 文本解析成 i64 微秒; Int 视为已是微秒
+        (ColType::Date, SqlValue::Str(s)) => parse_date_micros(std::str::from_utf8(s).unwrap_or(""))
+            .map(ColValue::I64)
+            .ok_or("invalid DATE literal (expect 'YYYY-MM-DD')")?,
+        (ColType::Time, SqlValue::Str(s)) => parse_time_micros(std::str::from_utf8(s).unwrap_or(""))
+            .map(ColValue::I64)
+            .ok_or("invalid TIME literal (expect 'HH:MM:SS')")?,
+        (ColType::Timestamp, SqlValue::Str(s)) => {
+            parse_timestamp_micros(std::str::from_utf8(s).unwrap_or(""))
+                .map(ColValue::I64)
+                .ok_or("invalid TIMESTAMP literal")?
+        }
+        (ColType::Date | ColType::Time | ColType::Timestamp, SqlValue::Int(i)) => ColValue::I64(*i),
+        // ⭐ F81: DECIMAL — 文本(精确)/整数(精确)/浮点(经最短文本, 保常见精度) → 定标 i128
+        (ColType::Decimal { scale, .. }, SqlValue::Str(s)) => {
+            parse_decimal(std::str::from_utf8(s).unwrap_or(""), scale)
+                .map(|d| ColValue::Decimal(d, scale))
+                .ok_or("invalid DECIMAL literal")?
+        }
+        (ColType::Decimal { scale, .. }, SqlValue::Int(i)) => (*i as i128)
+            .checked_mul(pow10_i128(scale).ok_or("DECIMAL scale overflow")?)
+            .map(|d| ColValue::Decimal(d, scale))
+            .ok_or("DECIMAL overflow")?,
+        (ColType::Decimal { scale, .. }, SqlValue::Float(f)) => {
+            parse_decimal(&format!("{f}"), scale)
+                .map(|d| ColValue::Decimal(d, scale))
+                .ok_or("invalid DECIMAL value")?
+        }
+        // ⭐ F80: JSON — 存文本字节 (v1 不校验合法性)
+        (ColType::Json, SqlValue::Str(s)) => ColValue::Bytes(s.clone()),
+        // ⭐ F80: UUID — 解析 36/32 字符 hex → 16B
+        (ColType::Uuid, SqlValue::Str(s)) => parse_uuid(std::str::from_utf8(s).unwrap_or(""))
+            .map(ColValue::Bytes)
+            .ok_or("invalid UUID literal")?,
         (ColType::I64, SqlValue::Str(s)) => std::str::from_utf8(s)
             .ok()
             .and_then(|t| t.trim().parse::<i64>().ok())
@@ -7035,7 +7502,20 @@ fn sql_pk_bytes(ty: ColType, v: &ColValue) -> Result<Vec<u8>, String> {
     match (ty, v) {
         (ColType::I64, ColValue::I64(i)) => Ok(storage::keyspace::encode_idx(*i).to_vec()),
         (ColType::F64, ColValue::F64(f)) => Ok(storage::keyspace::encode_f64_ordered(*f).to_vec()),
-        (ColType::Str | ColType::Bytes, ColValue::Bytes(b)) if !b.is_empty() => Ok(b.clone()),
+        // ⭐ F80: Bool/Date/Time/Timestamp 以 i64 承载 → 保序数值编码
+        (
+            ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp,
+            ColValue::I64(i),
+        ) => Ok(storage::keyspace::encode_idx(*i).to_vec()),
+        (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b))
+            if !b.is_empty() =>
+        {
+            Ok(b.clone())
+        }
+        // ⭐ F81: Decimal PK → 16B i128 保序编码
+        (ColType::Decimal { .. }, ColValue::Decimal(x, _)) => {
+            Ok(storage::keyspace::encode_i128_ordered(*x).to_vec())
+        }
         (_, ColValue::Null) => Err("PRIMARY KEY must not be NULL".into()),
         _ => Err("bad PRIMARY KEY value".into()),
     }
@@ -7049,6 +7529,7 @@ fn eval_cond_leaf(schema: &TableSchema, values: &[ColValue], c: &Cond) -> bool {
         return false; // plan 已校验, 防御
     };
     let cv = &values[i as usize];
+    let colty = schema.columns[i as usize].ty; // ⭐ F80: 用于时间/布尔字面量强转
     // ⭐ S2: IN — 集合任一相等 (NULL 列恒 false)
     if c.op == CmpOp::In {
         // ⭐ F73: 大同型集合 → 二分 (解析/折叠期已 sort_in_set 排序去重);
@@ -7076,9 +7557,13 @@ fn eval_cond_leaf(schema: &TableSchema, values: &[ColValue], c: &Cond) -> bool {
                 _ => {}
             }
         }
-        return c.set.iter().any(|v| sql_cmp(cv, v) == Some(Ordering::Equal));
+        return c.set.iter().any(|v| {
+            let cvt = coerce_cmp_lit(colty, v);
+            sql_cmp(cv, cvt.as_ref().unwrap_or(v)) == Some(Ordering::Equal)
+        });
     }
-    match sql_cmp(cv, &c.val) {
+    let cval = coerce_cmp_lit(colty, &c.val);
+    match sql_cmp(cv, cval.as_ref().unwrap_or(&c.val)) {
         None => false,
         Some(o) => match c.op {
             CmpOp::Eq => o == Ordering::Equal,
@@ -7113,6 +7598,26 @@ fn eval_pred_sysq(schema: &TableSchema, values: &[ColValue], pred: &Pred<Cond>) 
     }
 }
 
+/// ⭐ F80: WHERE/比较字面量按目标列类型强制转换 — DATE/TIME/TIMESTAMP 的
+/// 字符串字面量 → i64 微秒 (SqlValue::Int), BOOL 文本 → 0/1. 无需转换返回 None.
+fn coerce_cmp_lit(ty: ColType, sv: &SqlValue) -> Option<SqlValue> {
+    let s = match sv {
+        SqlValue::Str(b) => std::str::from_utf8(b).ok()?,
+        _ => return None,
+    };
+    match ty {
+        ColType::Date => parse_date_micros(s).map(SqlValue::Int),
+        ColType::Time => parse_time_micros(s).map(SqlValue::Int),
+        ColType::Timestamp => parse_timestamp_micros(s).map(SqlValue::Int),
+        ColType::Bool => match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "t" | "yes" | "y" => Some(SqlValue::Int(1)),
+            "0" | "false" | "f" | "no" | "n" => Some(SqlValue::Int(0)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// 列值与字面量比较 (数值跨型比较; NULL/类型不符 → None = 条件 false).
 /// ⭐ P1: 数值列 vs 文本 → 按文本数字解析比较 (PG 文本参数弱类型, 与 sql_to_col 一致).
 fn sql_cmp(cv: &ColValue, sv: &SqlValue) -> Option<std::cmp::Ordering> {
@@ -7133,6 +7638,20 @@ fn sql_cmp(cv: &ColValue, sv: &SqlValue) -> Option<std::cmp::Ordering> {
         }
         (ColValue::F64(a), SqlValue::Str(s)) => {
             a.partial_cmp(&std::str::from_utf8(s).ok()?.trim().parse::<f64>().ok()?)
+        }
+        // ⭐ F81: DECIMAL 比较 — 字面量转同 scale 定标整数 (精确); Float 走 f64 兜底
+        (ColValue::Decimal(a, sc), SqlValue::Int(b)) => {
+            (*b as i128).checked_mul(pow10_i128(*sc)?).map(|bb| a.cmp(&bb))
+        }
+        (ColValue::Decimal(a, sc), SqlValue::Str(s)) => {
+            let t = std::str::from_utf8(s).ok()?.trim();
+            match parse_decimal(t, *sc) {
+                Some(bb) => Some(a.cmp(&bb)),
+                None => (*a as f64 / 10f64.powi(*sc as i32)).partial_cmp(&t.parse::<f64>().ok()?),
+            }
+        }
+        (ColValue::Decimal(a, sc), SqlValue::Float(b)) => {
+            (*a as f64 / 10f64.powi(*sc as i32)).partial_cmp(b)
         }
         _ => None,
     }
@@ -7261,22 +7780,28 @@ fn col_to_json(v: &ColValue) -> serde_json::Value {
             Ok(s) => serde_json::json!(s),
             Err(_) => serde_json::json!(crate::protocol::http::base64_encode(b)),
         },
+        // ⭐ F81: Decimal → JSON 字符串 (保精度; JSON number 会丢精度)
+        ColValue::Decimal(x, scale) => serde_json::json!(render_decimal(*x, *scale)),
     }
 }
 
 /// SELECT 结果渲染 (列定义/行值按投影序; per-proto 编码).
+/// ⭐ F76: names 与 proj 同序; 某项 Some 时用作输出列名 (AS 别名), 否则用 schema 列名.
 fn render_sql_rows(
     proto: ProtocolKind,
     binary: bool,
     schema: &TableSchema,
     proj: &[u16],
+    names: &[Option<String>],
     rows: &[Vec<ColValue>],
 ) -> Vec<u8> {
     let cols: Vec<(&str, ColType)> = proj
         .iter()
-        .map(|&i| {
+        .enumerate()
+        .map(|(k, &i)| {
             let c = &schema.columns[i as usize];
-            (c.name.as_str(), c.ty)
+            let name = names.get(k).and_then(|o| o.as_deref()).unwrap_or(c.name.as_str());
+            (name, c.ty)
         })
         .collect();
     let proj_rows: Vec<Vec<ColValue>> = rows
@@ -7294,11 +7819,23 @@ fn col_from_ordered_bytes(ty: ColType, raw: &[u8]) -> Option<ColValue> {
             .try_into()
             .ok()
             .map(|b| ColValue::I64(storage::keyspace::decode_idx(b))),
+        // ⭐ F80: Bool/Date/Time/Timestamp 以 i64 承载 → 同 I64 保序解码
+        ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp => raw
+            .try_into()
+            .ok()
+            .map(|b| ColValue::I64(storage::keyspace::decode_idx(b))),
         ColType::F64 => raw
             .try_into()
             .ok()
             .map(|b| ColValue::F64(storage::keyspace::decode_f64_ordered(b))),
-        ColType::Str | ColType::Bytes => Some(ColValue::Bytes(raw.to_vec())),
+        ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid => {
+            Some(ColValue::Bytes(raw.to_vec()))
+        }
+        // ⭐ F81: Decimal 覆盖索引值重建 (16B 保序 → i128; scale 从列类型)
+        ColType::Decimal { scale, .. } => raw
+            .try_into()
+            .ok()
+            .map(|b| ColValue::Decimal(storage::keyspace::decode_i128_ordered(b), scale)),
     }
 }
 
@@ -7352,6 +7889,8 @@ fn sql_order_cmp(a: &[ColValue], b: &[ColValue], order: &[(u16, bool)]) -> std::
             (ColValue::I64(x), ColValue::F64(y)) => (*x as f64).total_cmp(y),
             (ColValue::F64(x), ColValue::I64(y)) => x.total_cmp(&(*y as f64)),
             (ColValue::Bytes(x), ColValue::Bytes(y)) => x.cmp(y),
+            // ⭐ F81: Decimal 同列同 scale → 定标整数比较
+            (ColValue::Decimal(x, _), ColValue::Decimal(y, _)) => x.cmp(y),
             _ => Ordering::Equal, // 异型防御 (schema 同列不应发生)
         };
         let o = if desc { o.reverse() } else { o };
@@ -7401,32 +7940,43 @@ fn sql_run_agg_select(
     let mut spec_items: Vec<AggItem> = Vec::with_capacity(items.len());
     for it in &items {
         match it {
-            sql::SelectItem::Col(c) => {
+            sql::SelectItem::Col { name: c, alias } => {
                 let Some(i) = schema.col_by_name(c) else {
                     return fail(conn, format!("unknown column '{c}'"));
                 };
                 spec_items.push(AggItem {
-                    label: c.clone(),
+                    label: alias.clone().unwrap_or_else(|| c.clone()),
                     kind: AggItemKind::Col(i),
                     out_ty: schema.columns[i as usize].ty,
                 });
             }
-            sql::SelectItem::Agg { func, col } => {
-                let ci = match col {
-                    Some(c) => match schema.col_by_name(c) {
-                        Some(i) => Some(i),
-                        None => return fail(conn, format!("unknown column '{c}'")),
+            sql::SelectItem::Agg { func, arg, distinct, alias } => {
+                // ⭐ F78: 绑定表达式 (裸列退化) → (BoundExpr, 推导类型); COUNT(*) arg=None
+                let bound: Option<(BoundExpr, ColType)> = match arg {
+                    Some(e) => match bind_scalar_expr(&schema, e) {
+                        Ok(bt) => Some(bt),
+                        Err(msg) => return fail(conn, msg),
                     },
                     None => None,
                 };
-                let src_ty = ci.map(|i| schema.columns[i as usize].ty);
-                // SUM/AVG 仅数值列
+                // ⭐ F77: DISTINCT 仅 COUNT(DISTINCT col) (解析已拦; 双保险)
+                if *distinct
+                    && (*func != sql::AggFn::Count
+                        || arg.as_ref().and_then(|e| e.as_col()).is_none())
+                {
+                    return fail(conn, "DISTINCT is only supported in COUNT(col) (v1)".into());
+                }
+                let src_ty = bound.as_ref().map(|(_, t)| *t);
+                // SUM/AVG 仅数值 (⭐ F81: 含 DECIMAL)
                 if matches!(func, sql::AggFn::Sum | sql::AggFn::Avg)
-                    && !matches!(src_ty, Some(ColType::I64) | Some(ColType::F64))
+                    && !matches!(
+                        src_ty,
+                        Some(ColType::I64) | Some(ColType::F64) | Some(ColType::Decimal { .. })
+                    )
                 {
                     return fail(
                         conn,
-                        format!("{} requires a numeric column", func.label(col.as_deref())),
+                        format!("{} requires a numeric argument", func.label(None)),
                     );
                 }
                 let out_ty = match func {
@@ -7435,9 +7985,22 @@ fn sql_run_agg_select(
                     sql::AggFn::Avg => ColType::F64,
                     sql::AggFn::Min | sql::AggFn::Max => src_ty.unwrap_or(ColType::Bytes),
                 };
+                let inner = match arg {
+                    None => "*".to_string(),
+                    Some(e) => e.render(),
+                };
+                let default_label = if *distinct {
+                    format!("COUNT(DISTINCT {inner})")
+                } else {
+                    format!("{}({inner})", func.label(None).trim_end_matches("(*)"))
+                };
                 spec_items.push(AggItem {
-                    label: func.label(col.as_deref()),
-                    kind: AggItemKind::Agg { func: *func, col: ci },
+                    label: alias.clone().unwrap_or(default_label),
+                    kind: AggItemKind::Agg {
+                        func: *func,
+                        arg: bound.map(|(b, _)| b),
+                        distinct: *distinct,
+                    },
                     out_ty,
                 });
             }
@@ -7497,6 +8060,7 @@ fn sql_run_agg_select(
             offset: offset.unwrap_or(0),
             count: false,
             agg_spec: Some(spec),
+            out_names: Vec::new(),
         },
     );
     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -7538,27 +8102,125 @@ struct AggItem {
 enum AggItemKind {
     /// 组键列直出 (必 ∈ group_by, 解析层已校验).
     Col(u16),
-    Agg { func: sql::AggFn, col: Option<u16> },
+    /// ⭐ F78: arg = 已绑定列号的表达式 (None = COUNT(*)).
+    Agg { func: sql::AggFn, arg: Option<BoundExpr>, distinct: bool },
+}
+
+/// ⭐ F78: 已绑定 (列名→列号) 的聚合内标量表达式.
+enum BoundExpr {
+    Col(u16),
+    Lit(ColValue),
+    Bin { op: sql::ArithOp, l: Box<BoundExpr>, r: Box<BoundExpr> },
+}
+
+/// ⭐ F78: 逐行求值 — 任一操作数 NULL/非数值 → NULL; Div 除零 → NULL;
+/// 全整型且非 Div → I64 (溢出→NULL); 否则 F64.
+fn eval_bound_expr(e: &BoundExpr, row: &[ColValue]) -> ColValue {
+    match e {
+        BoundExpr::Col(i) => row.get(*i as usize).cloned().unwrap_or(ColValue::Null),
+        BoundExpr::Lit(v) => v.clone(),
+        BoundExpr::Bin { op, l, r } => {
+            let lv = eval_bound_expr(l, row);
+            let rv = eval_bound_expr(r, row);
+            // 提数: (值, 是否整型); 非数值/NULL → None
+            let num = |v: &ColValue| -> Option<(f64, bool)> {
+                match v {
+                    ColValue::I64(x) => Some((*x as f64, true)),
+                    ColValue::F64(x) => Some((*x, false)),
+                    _ => None,
+                }
+            };
+            let (Some((lf, li)), Some((rf, ri))) = (num(&lv), num(&rv)) else {
+                return ColValue::Null;
+            };
+            let both_int = li && ri && *op != sql::ArithOp::Div;
+            if both_int {
+                let (a, b) = (lf as i64, rf as i64);
+                let out = match op {
+                    sql::ArithOp::Add => a.checked_add(b),
+                    sql::ArithOp::Sub => a.checked_sub(b),
+                    sql::ArithOp::Mul => a.checked_mul(b),
+                    sql::ArithOp::Div => unreachable!(),
+                };
+                out.map(ColValue::I64).unwrap_or(ColValue::Null)
+            } else {
+                let out = match op {
+                    sql::ArithOp::Add => lf + rf,
+                    sql::ArithOp::Sub => lf - rf,
+                    sql::ArithOp::Mul => lf * rf,
+                    sql::ArithOp::Div => {
+                        if rf == 0.0 {
+                            return ColValue::Null;
+                        }
+                        lf / rf
+                    }
+                };
+                ColValue::F64(out)
+            }
+        }
+    }
+}
+
+/// ⭐ F78: 将解析期 ScalarExpr 绑定列号 + 推导输出类型 (未知列报错).
+fn bind_scalar_expr(
+    schema: &TableSchema,
+    e: &sql::ScalarExpr,
+) -> Result<(BoundExpr, ColType), String> {
+    match e {
+        sql::ScalarExpr::Col(name) => {
+            let i = schema.col_by_name(name).ok_or_else(|| format!("unknown column '{name}'"))?;
+            Ok((BoundExpr::Col(i), schema.columns[i as usize].ty))
+        }
+        sql::ScalarExpr::Lit(v) => {
+            let (cv, ty) = match v {
+                SqlValue::Int(x) => (ColValue::I64(*x), ColType::I64),
+                SqlValue::Float(x) => (ColValue::F64(*x), ColType::F64),
+                SqlValue::Str(b) => (ColValue::Bytes(b.clone()), ColType::Str),
+                _ => return Err("unsupported literal in aggregate expression".into()),
+            };
+            Ok((BoundExpr::Lit(cv), ty))
+        }
+        sql::ScalarExpr::Bin { op, l, r } => {
+            let (lb, lt) = bind_scalar_expr(schema, l)?;
+            let (rb, rt) = bind_scalar_expr(schema, r)?;
+            // 输出类型: Div → F64; 任一 F64 → F64; 否则 I64
+            let out_ty = if *op == sql::ArithOp::Div || lt == ColType::F64 || rt == ColType::F64 {
+                ColType::F64
+            } else {
+                ColType::I64
+            };
+            Ok((BoundExpr::Bin { op: *op, l: Box::new(lb), r: Box::new(rb) }, out_ty))
+        }
+    }
 }
 
 /// ⭐ G2 (F63): 聚合累加器 (NULL 忽略, COUNT(*) 除外; SUM 整列溢出报错).
 enum Accum {
     CountStar(u64),
     CountCol(u64),
+    /// ⭐ F77: COUNT(DISTINCT col) — 去重集 (类型标记编码, 不计 NULL).
+    CountDistinct(std::collections::HashSet<Vec<u8>>),
     SumI { acc: i64, seen: bool },
     SumF { acc: f64, seen: bool },
+    /// ⭐ F81: SUM(DECIMAL) → i128 定标累加, 输出同 scale Decimal.
+    SumDec { acc: i128, scale: u8, seen: bool },
     Avg { sum: f64, n: u64 },
     Min(Option<ColValue>),
     Max(Option<ColValue>),
 }
 
 impl Accum {
-    fn new(func: sql::AggFn, col: Option<u16>, col_ty: Option<ColType>) -> Self {
+    fn new(func: sql::AggFn, is_star: bool, col_ty: Option<ColType>, distinct: bool) -> Self {
         match func {
-            sql::AggFn::Count if col.is_none() => Accum::CountStar(0),
+            // ⭐ F77: COUNT(DISTINCT col) → 去重集
+            sql::AggFn::Count if distinct => Accum::CountDistinct(std::collections::HashSet::new()),
+            sql::AggFn::Count if is_star => Accum::CountStar(0),
             sql::AggFn::Count => Accum::CountCol(0),
             sql::AggFn::Sum => match col_ty {
                 Some(ColType::F64) => Accum::SumF { acc: 0.0, seen: false },
+                Some(ColType::Decimal { scale, .. }) => {
+                    Accum::SumDec { acc: 0, scale, seen: false }
+                }
                 _ => Accum::SumI { acc: 0, seen: false },
             },
             sql::AggFn::Avg => Accum::Avg { sum: 0.0, n: 0 },
@@ -7573,6 +8235,12 @@ impl Accum {
             Accum::CountCol(n) => {
                 if !matches!(v, ColValue::Null) {
                     *n += 1;
+                }
+            }
+            // ⭐ F77: COUNT(DISTINCT) — 非 NULL 值按类型标记编码入集
+            Accum::CountDistinct(set) => {
+                if !matches!(v, ColValue::Null) {
+                    set.insert(encode_col_key(v));
                 }
             }
             Accum::SumI { acc, seen } => match v {
@@ -7595,6 +8263,15 @@ impl Accum {
                 ColValue::Null => {}
                 _ => return Err("SUM requires a numeric column".into()),
             },
+            // ⭐ F81: SUM(DECIMAL) 定标 i128 累加 (同 scale)
+            Accum::SumDec { acc, seen, .. } => match v {
+                ColValue::Decimal(x, _) => {
+                    *acc = acc.checked_add(*x).ok_or("SUM overflow (DECIMAL)")?;
+                    *seen = true;
+                }
+                ColValue::Null => {}
+                _ => return Err("SUM requires a numeric column".into()),
+            },
             Accum::Avg { sum, n } => match v {
                 ColValue::F64(x) => {
                     *sum += x;
@@ -7602,6 +8279,11 @@ impl Accum {
                 }
                 ColValue::I64(x) => {
                     *sum += *x as f64;
+                    *n += 1;
+                }
+                // ⭐ F81: AVG(DECIMAL) → f64 (v1; 精度回退)
+                ColValue::Decimal(x, sc) => {
+                    *sum += *x as f64 / 10f64.powi(*sc as i32);
                     *n += 1;
                 }
                 ColValue::Null => {}
@@ -7628,10 +8310,15 @@ impl Accum {
     fn finish(self) -> ColValue {
         match self {
             Accum::CountStar(n) | Accum::CountCol(n) => ColValue::I64(n as i64),
+            // ⭐ F77: COUNT(DISTINCT) → 去重集基数
+            Accum::CountDistinct(set) => ColValue::I64(set.len() as i64),
             // SUM 空集 → NULL (SQL 语义)
             Accum::SumI { seen: false, .. } | Accum::SumF { seen: false, .. } => ColValue::Null,
             Accum::SumI { acc, .. } => ColValue::I64(acc),
             Accum::SumF { acc, .. } => ColValue::F64(acc),
+            // ⭐ F81: SUM(DECIMAL) 空集→NULL; 否则同 scale Decimal
+            Accum::SumDec { seen: false, .. } => ColValue::Null,
+            Accum::SumDec { acc, scale, .. } => ColValue::Decimal(acc, scale),
             Accum::Avg { n: 0, .. } => ColValue::Null,
             Accum::Avg { sum, n } => ColValue::F64(sum / n as f64),
             Accum::Min(v) | Accum::Max(v) => v.unwrap_or(ColValue::Null),
@@ -7651,8 +8338,13 @@ fn cmp_colvalue(a: &ColValue, b: &ColValue) -> std::cmp::Ordering {
         (ColValue::I64(x), ColValue::F64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
         (ColValue::F64(x), ColValue::I64(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
         (ColValue::Bytes(x), ColValue::Bytes(y)) => x.cmp(y),
+        // ⭐ F81: 同列 Decimal 同 scale → 定标整数直接比较
+        (ColValue::Decimal(x, _), ColValue::Decimal(y, _)) => x.cmp(y),
         (ColValue::I64(_) | ColValue::F64(_), ColValue::Bytes(_)) => Less,
         (ColValue::Bytes(_), ColValue::I64(_) | ColValue::F64(_)) => Greater,
+        // Decimal 与异型 (同列不会发生): 稳定兜底
+        (ColValue::Decimal(_, _), _) => Greater,
+        (_, ColValue::Decimal(_, _)) => Less,
     }
 }
 
@@ -7694,6 +8386,38 @@ fn eval_having_pred(
     }
 }
 
+/// ⭐ F77: 列值自包含类型标记编码 (只求相等性 + 确定序) —
+/// GROUP BY 组键与 COUNT(DISTINCT) 去重集同源, 保证一致. 0=Null/1=I64/2=F64/3=Bytes.
+fn encode_col_key_into(key: &mut Vec<u8>, v: &ColValue) {
+    match v {
+        ColValue::Null => key.push(0u8),
+        ColValue::I64(x) => {
+            key.push(1u8);
+            key.extend_from_slice(&((*x as u64) ^ (1u64 << 63)).to_be_bytes());
+        }
+        ColValue::F64(x) => {
+            key.push(2u8);
+            key.extend_from_slice(&x.to_bits().to_be_bytes());
+        }
+        ColValue::Bytes(b) => {
+            key.push(3u8);
+            key.extend_from_slice(&(b.len() as u32).to_be_bytes());
+            key.extend_from_slice(b);
+        }
+        // ⭐ F81: Decimal (tag 4 + 16B i128 LE); 同列同 scale → 定标整数唯一
+        ColValue::Decimal(x, _) => {
+            key.push(4u8);
+            key.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+}
+
+fn encode_col_key(v: &ColValue) -> Vec<u8> {
+    let mut k = Vec::new();
+    encode_col_key_into(&mut k, v);
+    k
+}
+
 fn materialize_agg_groups(
     spec: &AggSpec,
     rows: Vec<Vec<ColValue>>,
@@ -7710,12 +8434,9 @@ fn materialize_agg_groups(
             .iter()
             .map(|it| match &it.kind {
                 AggItemKind::Col(_) => Accum::CountStar(0), // 占位不用 (代表值直出)
-                AggItemKind::Agg { func, col } => {
-                    Accum::new(*func, *col, if it.out_ty == ColType::F64 {
-                        Some(ColType::F64)
-                    } else {
-                        Some(ColType::I64)
-                    })
+                AggItemKind::Agg { func, arg, distinct } => {
+                    // ⭐ F81: 直接传 out_ty (含 Decimal{scale}), 让 Accum 选 SumDec/SumF/SumI
+                    Accum::new(*func, arg.is_none(), Some(it.out_ty), *distinct)
                 }
             })
             .collect()
@@ -7728,22 +8449,7 @@ fn materialize_agg_groups(
         let mut key = Vec::new();
         for &gi in &spec.group_idx {
             // 自包含类型标记编码 (只求相等性 + 确定序; 代表值另存)
-            match &values[gi as usize] {
-                ColValue::Null => key.push(0u8), // NULL 归一组
-                ColValue::I64(x) => {
-                    key.push(1u8);
-                    key.extend_from_slice(&((*x as u64) ^ (1u64 << 63)).to_be_bytes());
-                }
-                ColValue::F64(x) => {
-                    key.push(2u8);
-                    key.extend_from_slice(&x.to_bits().to_be_bytes());
-                }
-                ColValue::Bytes(b) => {
-                    key.push(3u8);
-                    key.extend_from_slice(&(b.len() as u32).to_be_bytes());
-                    key.extend_from_slice(b);
-                }
-            }
+            encode_col_key_into(&mut key, &values[gi as usize]);
         }
         if !buckets.contains_key(&key) && buckets.len() >= AGG_MAX_GROUPS {
             return Err("too many groups (limit 65536)".into());
@@ -7752,12 +8458,15 @@ fn materialize_agg_groups(
             .entry(key)
             .or_insert_with(|| (values.clone(), new_accums(values)));
         for (it, acc) in spec.items.iter().zip(entry.1.iter_mut()) {
-            if let AggItemKind::Agg { col, .. } = &it.kind {
-                let v = match col {
-                    Some(ci) => &values[*ci as usize],
-                    None => &ColValue::I64(1), // COUNT(*) 任意非 Null
-                };
-                acc.feed(v)?;
+            if let AggItemKind::Agg { arg, .. } = &it.kind {
+                // ⭐ F78: arg=Some → 逐行求值 (裸列/字面量/算术); None(COUNT(*)) → 常量 1
+                match arg {
+                    Some(e) => {
+                        let v = eval_bound_expr(e, values);
+                        acc.feed(&v)?;
+                    }
+                    None => acc.feed(&ColValue::I64(1))?,
+                }
             }
         }
     }
@@ -7882,13 +8591,19 @@ fn materialize_select_agg(
         Some(l) => (start + l as usize).min(out_rows.len()),
         None => out_rows.len(),
     };
-    // 投影到输出列 (与 render_sql_rows 同义)
+    // 投影到输出列 (与 render_sql_rows 同义); ⭐ F76: out_names 有则用作列名 (AS 别名)
     let cols: Vec<(String, ColType)> = agg
         .proj
         .iter()
-        .map(|&i| {
+        .enumerate()
+        .map(|(k, &i)| {
             let c = &agg.schema.columns[i as usize];
-            (c.name.clone(), c.ty)
+            let name = agg
+                .out_names
+                .get(k)
+                .and_then(|o| o.clone())
+                .unwrap_or_else(|| c.name.clone());
+            (name, c.ty)
         })
         .collect();
     let proj_rows: Vec<Vec<ColValue>> = out_rows[start..end]
@@ -7904,21 +8619,12 @@ fn materialize_select_agg(
 
 /// 伪随机 salt (可打印区间 0x21..0x7E, 兼容各客户端对 NUL 敏感的解析).
 fn mysql_gen_salt(conn_id: u64, worker_id: u32) -> [u8; 20] {
-    let mut x = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9)
-        ^ (conn_id.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-        ^ ((worker_id as u64) << 32);
+    let _ = (conn_id, worker_id); // ⭐ F82: 改用 CSPRNG, 不再依赖 conn/worker 派生
+    // ⭐ F82: CSPRNG (/dev/urandom) 生成 salt, 映射到可打印区间 0x21..=0x7D (兼容旧客户端).
+    let rnd = crate::protocol::crypto::rand_bytes(20);
     let mut salt = [0u8; 20];
-    for b in salt.iter_mut() {
-        // splitmix64 步进
-        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = x;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        *b = 0x21 + (z % 93) as u8; // 0x21..=0x7D
+    for (b, r) in salt.iter_mut().zip(rnd) {
+        *b = 0x21 + (r % 93);
     }
     salt
 }
@@ -7936,6 +8642,7 @@ fn process_sql_input(
     db_view: &std::sync::Arc<shard_manager::DbDirView>,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
+    tls_config: &Option<std::sync::Arc<rustls::ServerConfig>>,
 ) {
     use crate::protocol::mysql as my;
     let mut cursor = 0usize;
@@ -7949,6 +8656,23 @@ fn process_sql_input(
         };
         let (phase, salt) = (st.phase, st.salt);
         let pwd = sql_password.as_deref().unwrap_or("");
+        // ⭐ F83: phase 0 且 conn 未升级 TLS 时, 短包 + CLIENT_SSL → SSLRequest, 升级后等加密的真响应
+        if phase == 0 && conn.tls.is_none() && payload.len() >= 4 {
+            let caps = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            if caps & my::CLIENT_SSL != 0 && payload.len() <= 36 {
+                if let Some(cfg) = tls_config {
+                    if !conn.start_tls(cfg.clone()) {
+                        conn.close_after_flush = true;
+                    }
+                    // 消费该 SSLRequest 包, 退出循环等 ClientHello + 加密 HandshakeResponse41
+                    break;
+                }
+                // 未配置 TLS 却收到 SSLRequest → 拒
+                conn.send_bytes(&my::build_err(pkt_seq.wrapping_add(1), 1043, "TLS not supported"));
+                conn.close_after_flush = true;
+                break;
+            }
+        }
         match phase {
             // ---- 等 HandshakeResponse41 ----
             0 => match my::parse_handshake_response(&payload) {
@@ -7973,7 +8697,19 @@ fn process_sql_input(
                         .plugin
                         .as_deref()
                         .is_none_or(|p| p == "mysql_native_password");
-                    if !native || (login.auth_resp.is_empty() && !pwd.is_empty()) {
+                    let is_caching = login.plugin.as_deref() == Some("caching_sha2_password");
+                    // ⭐ F82: caching_sha2 fast-auth — 服务端知明文口令直接验证 (免 RSA/TLS).
+                    //   成功 → fast_auth_success(0x01 0x03)+OK; 失败/其他 → 走 AuthSwitch 兜底.
+                    if is_caching && my::caching_sha2_password_ok(&salt, &login.auth_resp, pwd) {
+                        conn.send_bytes(&my::build_fast_auth_success(pkt_seq.wrapping_add(1)));
+                        conn.send_bytes(&my::build_ok(pkt_seq.wrapping_add(2), 0));
+                        if let Some(d) = want_db {
+                            conn.current_db = std::sync::Arc::from(d.as_str());
+                        }
+                        if let Some(st) = conn.mysql.as_mut() {
+                            st.phase = 2;
+                        }
+                    } else if !native || (login.auth_resp.is_empty() && !pwd.is_empty()) {
                         // 客户端默认 caching_sha2 (8.x) 或未带凭据 → 切换插件重试
                         conn.send_bytes(&my::build_auth_switch(pkt_seq.wrapping_add(1), &salt));
                         if let Some(st) = conn.mysql.as_mut() {
@@ -8148,6 +8884,7 @@ fn process_pg_input(
     db_view: &std::sync::Arc<shard_manager::DbDirView>,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
+    tls_config: &Option<std::sync::Arc<rustls::ServerConfig>>,
 ) {
     use crate::protocol::pg;
     let pwd = sql_password.as_deref().unwrap_or("");
@@ -8167,8 +8904,20 @@ fn process_pg_input(
                 if payload.len() == 4 {
                     let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                     match code {
-                        // SSL/GSS 协商 → 'N' 拒绝, 客户端回落明文继续 startup
-                        pg::SSL_REQUEST_CODE | pg::GSSENC_REQUEST_CODE => {
+                        // ⭐ F83: SSLRequest — 配置了 TLS → 回 'S' 并升级; 否则回 'N' 明文回落
+                        pg::SSL_REQUEST_CODE => {
+                            if let Some(cfg) = tls_config {
+                                conn.send_bytes(b"S"); // 明文 'S' (升级前最后一个明文字节)
+                                if !conn.start_tls(cfg.clone()) {
+                                    conn.close_after_flush = true;
+                                }
+                                // 后续 StartupMessage 走 TLS, 回到 epoll 等 ClientHello
+                                break;
+                            }
+                            conn.send_bytes(b"N");
+                            continue;
+                        }
+                        pg::GSSENC_REQUEST_CODE => {
                             conn.send_bytes(b"N");
                             continue;
                         }
@@ -8201,7 +8950,9 @@ fn process_pg_input(
                             conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
                             conn.pg_phase = 2;
                         } else {
-                            conn.send_bytes(&pg::build_auth_cleartext());
+                            // ⭐ F82: 宣告 SCRAM-SHA-256 (取代明文口令), 进 SASL 交换
+                            conn.send_bytes(&pg::build_auth_sasl());
+                            conn.pg_scram = None;
                             conn.pg_phase = 1;
                         }
                     }
@@ -8211,21 +8962,56 @@ fn process_pg_input(
                     }
                 }
             }
-            // ---- 等 PasswordMessage ----
+            // ---- SASL 交换 (SCRAM-SHA-256): 首条 SASLInitialResponse, 次条 SASLResponse ----
             1 => {
                 let Some((n, ty, payload)) = pg::read_frame(&conn.read_buf[cursor..]) else {
                     break;
                 };
                 cursor += n;
-                if ty == b'p' && pg::parse_password(payload) == pwd {
-                    conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
-                    conn.pg_phase = 2;
-                } else {
-                    conn.send_bytes(&pg::build_error(
-                        "28P01",
-                        "password authentication failed",
-                    ));
+                if ty != b'p' {
+                    conn.send_bytes(&pg::build_error("28P01", "expected SASL message"));
                     conn.close_after_flush = true;
+                    continue;
+                }
+                if conn.pg_scram.is_none() {
+                    // 首条: SASLInitialResponse (mechanism + client-first)
+                    let Some((mech, client_first)) = pg::parse_sasl_initial(payload) else {
+                        conn.send_bytes(&pg::build_error("28P01", "malformed SASL initial response"));
+                        conn.close_after_flush = true;
+                        continue;
+                    };
+                    if mech != "SCRAM-SHA-256" {
+                        conn.send_bytes(&pg::build_error("28P01", "unsupported SASL mechanism"));
+                        conn.close_after_flush = true;
+                        continue;
+                    }
+                    match pg::scram_server_first(&client_first) {
+                        Some((state, server_first)) => {
+                            conn.send_bytes(&pg::build_auth_sasl_continue(&server_first));
+                            conn.pg_scram = Some(state);
+                        }
+                        None => {
+                            conn.send_bytes(&pg::build_error("28P01", "malformed SCRAM client-first"));
+                            conn.close_after_flush = true;
+                        }
+                    }
+                } else {
+                    // 次条: SASLResponse (client-final) → 验证 proof
+                    let state = conn.pg_scram.take().expect("scram state present");
+                    match pg::scram_verify_final(&state, payload, pwd) {
+                        Some(server_final) => {
+                            conn.send_bytes(&pg::build_auth_sasl_final(&server_final));
+                            conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
+                            conn.pg_phase = 2;
+                        }
+                        None => {
+                            conn.send_bytes(&pg::build_error(
+                                "28P01",
+                                "password authentication failed",
+                            ));
+                            conn.close_after_flush = true;
+                        }
+                    }
                 }
             }
             // ---- 已认证: simple Query ----
@@ -8694,6 +9480,8 @@ fn mysql_err_packet(msg: &str) -> Vec<u8> {
         1792
     } else if msg.contains("Unknown database") {
         1049
+    } else if msg.contains("has no schema") || msg.contains("doesn't exist") {
+        1146 // ER_NO_SUCH_TABLE — ORM has_table 据此判表不存在后发 CREATE
     } else if msg.contains("expected") || msg.contains("unexpected") || msg.contains("unterminated")
     {
         1064

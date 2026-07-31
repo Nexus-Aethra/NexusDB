@@ -64,6 +64,7 @@ fn put_get_roundtrip() {
         auth_password: None,
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let addr = server.local_addr();
@@ -161,6 +162,7 @@ fn multi_request_single_connection() {
         auth_password: None,
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     let server = NetworkServer::start(cfg).expect("start");
     let addr = server.local_addr();
@@ -224,6 +226,7 @@ fn multi_connection_concurrent() {
         auth_password: None,
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     let server = NetworkServer::start(cfg).expect("start");
     let addr = server.local_addr();

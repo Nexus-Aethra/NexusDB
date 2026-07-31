@@ -10,6 +10,226 @@
 
 ---
 
+## 2026-08-01 会话十九-D (F83 TLS 传输加密 — rustls STARTTLS, 安全 P0 收官)
+
+SQL 双门面传输加密, opt-in。全 workspace **862/862** (明文路径零回归), clippy 0, psycopg3(sslmode=require, ssl_in_use=True)/mysql-connector(ssl_disabled=False) 实机加密连接验证。
+
+### 依赖 (唯一新增外部 crate)
+- `rustls 0.23` + **ring 后端** (`default-features=false, features=["ring","std","tls12","logging"]`) — 避开 aws-lc-rs 的 cmake C 构建; ring/rustls/pki-types 均在本地 registry 缓存, 编译通过。
+- 手写 PEM 解析 (`tls.rs`, 复用 crypto::base64_decode), 免 rustls-pemfile; 支持证书链 + PKCS8/PKCS1/SEC1 私钥。
+
+### 传输层 (最小侵入, 不动 EPOLLOUT)
+- `ConnState.tls: Option<Box<rustls::ServerConnection>>`; `start_tls` 就地升级。
+- `recv`: TLS 分支 read_tls→process_new_packets→冲刷 wants_write→reader 读明文入 read_buf (EOF+无明文=关闭)。
+- `send_bytes`: TLS 分支 writer 写明文→write_tls 泵密文 (沿用既有 spin-flush, 未引入写缓冲/EPOLLOUT — v1 与明文同语义)。
+- 协议解析层完全无感知 (继续吃 read_buf 明文)。
+
+### STARTTLS 中途升级 (两门面)
+- **PG**: phase 0 收 SSLRequest, 配置 TLS→回明文 'S' + start_tls + break (等 ClientHello); 未配置→'N' 明文回退 (原行为)。GSSENC→'N'。
+- **MySQL**: `build_handshake_v10_caps` 在 TLS 启用时宣告 `CLIENT_SSL`; phase 0 检测短包(<=36B)+CLIENT_SSL 位=SSLRequest→start_tls+break, 等加密 HandshakeResponse41; 未配置 TLS 收到 SSLRequest→1043 拒。
+- 传输 Plain→Tls 运行时切换; 'S'/首包握手为升级前最后明文字节。
+
+### 配置
+- `config`: `tls_cert`/`tls_key` PEM 路径 (两路径均非空才启用); main.rs 启动加载 `network::tls::load_server_config` 注入 SQL/PG 门面 WorkerConfig (RESP/HTTP/Binary 恒 None)。
+
+### 验证
+- 全量 862/862 (明文 e2e 全绿, 证明 opt-in 零回归); clippy 0。
+- 实机 (自签证书 + sql_password): **psycopg3** sslmode=require → **ssl_in_use=True** + SCRAM-over-TLS 登录+查询 OK, sslmode=disable → 明文回退 OK; **mysql-connector** ssl_disabled=False (强制 TLS) 登录+查询 OK, ssl_disabled=True → 明文 OK。
+
+### 边界 (v1)
+- opt-in: 不配证书 = 纯明文路径 (零成本, 与之前完全一致)。
+- 无 EPOLLOUT 写缓冲 (spin-flush; 慢客户端握手会短暂占 worker, 同明文既有特性); 无客户端证书认证 (with_no_client_auth); 无 SCRAM channel binding (SCRAM-SHA-256 而非 -PLUS); 未做会话恢复调优。
+- **至此 P0 安全 (F82 认证 + F83 TLS) 与数据类型 (F80/F81) 全部完成。**
+
+---
+
+## 2026-08-01 会话十九-C (F82 认证升级 — PG SCRAM-SHA-256 + MySQL caching_sha2 fast-auth)
+
+安全 P0 认证阶段 (不含 TLS, TLS 为 F83)。消除 PG 明文口令。全 workspace **858→862 tests** (+4 crypto 单元), clippy 0, psycopg3/mysql-connector 实机登录验证。
+
+### 零依赖手写密码学 (protocol/crypto.rs)
+- 延续项目手写 SHA-1 先例, 新增 **SHA-256 (FIPS 180-4) / HMAC-SHA256 (RFC 2104) / PBKDF2-HMAC-SHA256 (Hi) / base64**, 全部 RFC 测试向量校验通过 (4 单元测试)。
+- **CSPRNG**: `rand_bytes` 读 `/dev/urandom` (零依赖); `rand_printable` base64 字母表 nonce。
+- 不引 rustls/sha2/hmac 等外部 crate (保零大依赖纪律; TLS 才需 rustls, 留 F83)。
+
+### PG SCRAM-SHA-256 (RFC 5802/7677) — 消除明文口令
+- pg.rs: `build_auth_sasl` (code 10, 宣告 SCRAM-SHA-256) / `build_auth_sasl_continue` (11) / `build_auth_sasl_final` (12) / `parse_sasl_initial` / `ScramState` / `scram_server_first` (生成 CSPRNG salt+nonce, iter=4096) / `scram_verify_final` (proof 验证: 恢复 ClientKey = proof XOR ClientSignature, 校 SHA256==StoredKey)。
+- worker.rs: `ConnState.pg_scram`; process_pg_input phase 0 非空口令 → 发 SASL (取代 cleartext); phase 1 两步 SASL (首条 SASLInitialResponse→server-first, 次条 client-final→验证→SASLFinal+AuthOk)。服务端从明文 sql_password 现场派生, 无需存 verifier。
+- 破坏性: PG 认证从 cleartext(code 3) 改为 SCRAM(code 10); pg_e2e 测试客户端补 SCRAM 客户端实现。
+
+### MySQL caching_sha2 fast-auth (additive, 非破坏)
+- mysql.rs: `caching_sha2_password_ok` (scramble = SHA256(pw) XOR SHA256(SHA256(SHA256(pw))‖salt), 服务端知明文直接验证, 免 RSA/TLS full-auth) + `caching_sha2_token` (测试) + `build_fast_auth_success` (0x01 0x03)。
+- worker.rs phase 0: caching_sha2 插件且验证通过 → fast_auth_success + OK (phase 2); 失败/其他 → 保留既有 AuthSwitch→native 兜底 (native 本就是挑战响应, 现有测试与真实连接不变)。
+- CSPRNG: `mysql_gen_salt` 从 splitmix64 改为 `/dev/urandom` (salt 硬化)。
+
+### 验证
+- 单元: crypto SHA256/HMAC/PBKDF2/base64 RFC 向量; pg_e2e pg_auth_password 走真实 SCRAM (成功+错密码 28P01)。
+- 实机 (sql_password=s3cret): **psycopg3** 正确口令 SCRAM 登录+查询 OK / 错口令拒; **mysql-connector** 默认 + 显式 `auth_plugin=caching_sha2_password` 均登录+查询 OK / 错口令 1045 拒。
+
+### 边界 (v1)
+- 单一 sql_password (无 per-user 账户表); PG 无 channel binding (SCRAM-SHA-256-PLUS 留 TLS 阶段); caching_sha2 fast-auth 仅 (服务端知明文即可验证, 无凭据缓存表), 无 RSA full-auth (非 TLS 下无需)。传输加密 (TLS) 仍缺 → F83。
+
+---
+
+## 2026-08-01 会话十九-B (F81 DECIMAL 定点小数 — P0 数据类型第二阶段)
+
+金额精确类型。唯一需动 row/keyspace 结构的类型。全 workspace **856→858 tests** (+2), clippy 0, mysql+pg 实机 (psycopg3/mysql-connector 文本+预处理) 均返回原生 `Decimal` 且精度不丢。
+
+### 承载: scale 入类型, i128 入值 (双源, 各司其职)
+- **`ColType::Decimal { precision, scale }`** (放在类型里): scale 全程可得 → 转换/渲染/DDL 无需改签名; 避免给 `Column` 加字段 (零 struct 字面量 churn)。schema FMT_VER 3→4 (Decimal 列类型字节后追加 precision+scale; decode 兼容 v1-3)。
+- **`ColValue::Decimal(i128, u8)`** (值自带 scale): 变长区 16B i128 LE 承载 (is_fixed=false, 不动 row 8B 定长假设); 渲染/比较自描述。
+
+### 关键改动点
+- row.rs: encode_row 变长分支写 16B i128 (var_total += 16); read_col 变长读 16B + schema 列 scale → Decimal。
+- keyspace.rs: `IVAL_DECIMAL` (0x03) 型别字节 + `encode_i128_ordered` (符号翻转 BE 16B) + `encode_index_decimal` (17B); split_index_val/decode_index_val 加 17B 定长分支。sql_rows.rs index_val_bytes 加 Decimal 臂。
+- worker.rs: `parse_decimal(str, scale)` (精确, 超位截断) + `render_decimal(i128, scale)`; sql_to_col (Str 精确 / Int 精确 / Float 经最短文本); sql_cmp / cmp_colvalue / sql_order_cmp / Accum::SumDec (i128 累加) + Avg(f64 回退) / sql_pk_bytes / col_from_ordered_bytes / join_key / encode_col_key / colval_to_sqlval / col_to_json 全加 Decimal 臂; SUM/AVG 数值守卫放行 Decimal; materialize_agg_groups Accum::new 传真实 out_ty (含 scale) 而非折叠 F64/I64。
+- sql.rs: parse_col_type 特判 DECIMAL/NUMERIC/DEC(p,s) 捕获精度标度 (默认 (10,0); >38 拒)。
+- 协议: mysql NEWDECIMAL(246) 文本+二进制均 lenenc 定点文本; pg NUMERIC(1700) text_cell 定点文本; coltype_sql_name=decimal; SHOW CREATE=decimal(p,s)。
+
+### 验证
+- storage 单元 `f81_decimal_roundtrip` (正/负/NULL/大数 16B roundtrip + FMT_VER4 schema 保 precision/scale)。
+- e2e `mysql_decimal` (字符串精确插入 + 字面量 + SUM 精确 212.83 + WHERE 比较 + ORDER + MIN/MAX)。
+- 实机: psycopg3 与 mysql-connector (文本+预处理) 均返回原生 `Decimal('100.50')`/`Decimal('0.0725')`, SUM=`Decimal('200.49')`, 精度不丢。
+
+### 边界 (v1)
+- i128 → 精度 <= 38 位; SUM 溢出报错; AVG(DECIMAL)→f64 (精度回退)。
+- SQL 字面量 `12.34` 经 f64 最短文本转定标 (常见值精确; ORM 字符串参数路径完全精确)。
+- 超小数位截断 (不四舍五入)。
+
+---
+
+## 2026-08-01 会话十九 (F80 数据类型扩展 P0-1 — BOOL/DATE/TIME/TIMESTAMP/JSON/UUID)
+
+生产可用性 P0 第一阶段 (数据类型与安全 4 阶段计划的 F80)。新增 6 个业务数据类型, 全 workspace **854→856 tests** (+2), clippy 0, mysql+pg 双门面实机驱动验证 (含 mysql 二进制/预处理协议)。
+
+### 承载策略 (零 row/keyspace 结构改动)
+
+- **BOOL/DATE/TIME/TIMESTAMP → i64 承载** (复用 8B 定长槽 + `encode_idx` 保序索引): Bool 存 0/1; Date/Time/Timestamp 统一存 **i64 微秒** (Date=当天 00:00 微秒, Time=距零点微秒, Timestamp=距 epoch 微秒), 无时区 (UTC 裸值 v1)。
+- **JSON/UUID → Bytes 承载**: Json 存文本字节 (v1 不校验/不建路径索引); Uuid 存 16B。
+- `ColType` 加 6 变体 (to_byte 5-10 / from_byte / is_fixed: 前 4 定长, Json/Uuid 变长); ColValue **不新增变体** (语义由列 ColType 决定)。
+
+### 关键改动点
+
+- **解析** (sql.rs): 抽 `parse_col_type` 消除 create/alter 重复 (加 BOOLEAN 独立 Bool 而非折 I64 / DATE / TIME / TIMESTAMP·DATETIME / JSON·JSONB / UUID; 吞 `(n)`/`(p,s)` 参数); `value()` 加 `TRUE/FALSE`→Int(1/0) 与 `DATE|TIME|TIMESTAMP|DATETIME '...'` 前缀字面量; WHERE RHS 的 ColRef 守卫排除这些字面量关键字 (否则 `active=TRUE` 被误判关联子查询)。
+- **值转换** (worker.rs): 自包含日期数学 `days_from_civil`/`civil_from_days` (Howard Hinnant); `parse_{date,time,timestamp}_micros` + `render_{date,time,timestamp}` + `parse/render_uuid`; sql_to_col 加各类型臂 (bool 认 1/true/t/yes; 时间文本→微秒; uuid 32/36 hex→16B); sql_pk_bytes / index_val_bytes(storage) / col_from_ordered_bytes 加臂 (定长系→encode_idx, 字节系→encode_index_bytes)。
+- **WHERE 时间比较** (worker.rs): `coerce_cmp_lit` 在 `eval_cond_leaf` (有列 ColType) 把 DATE/TIME/TIMESTAMP 的字符串字面量转微秒、BOOL 文本转 0/1 后再 `sql_cmp`; ORDER BY 按 i64 微秒天然正确。
+- **渲染按 (ColType,ColValue)**: pg `text_cell(ty,v)` (Bool→'t'/'f', 时间→格式化, Uuid→36 字符) + type_oid 加 BOOL16/DATE1082/TIME1083/TIMESTAMP1114/JSON114/UUID2950; mysql 文本行按列类型渲染 (Bool→'1'/'0') + `mysql_type` 加 TINY1/DATE10/TIME11/DATETIME12/JSON245/VAR_STRING; **mysql 二进制协议** 加 `encode_bin_date/datetime/time` (length-prefixed 格式) 供预处理结果集正确编码。
+- **元数据**: coltype_sql_name + DESCRIBE (复用 coltype_sql_name) + SHOW CREATE 内联 match 加新类型名 (Bool→tinyint(1)/Uuid→char(36))。
+
+### 验证
+
+- storage 单元 `f80_new_types_roundtrip` (定长/变长/NULL 各类型 row 编解码 + 单列读)。
+- e2e `mysql_types` (建表 6 类型→插入 TRUE/DATE/TIMESTAMP/JSON/UUID→查回渲染→WHERE bool·date→ORDER date→WHERE timestamp)。
+- 实机: **psycopg3** BOOLEAN→`True` / DATE→`datetime.date` / TIMESTAMP→`datetime.datetime` / JSON→`dict` / UUID→`UUID(..)`; **mysql-connector** 文本+预处理(二进制)均返回原生 `datetime` 对象。
+- 破坏性变更: DESCRIBE 中 BOOLEAN 列从 `bigint` → `boolean` (BOOLEAN 现为独立类型; 更新 `mysql_dialect_and_tools` 断言)。
+
+### gotcha
+- 回归须 `RUST_MIN_STACK=67108864 TMPDIR=$PWD/target/nxtmp` (storage async 帧大栈 + /tmp 只读; 缺 RUST_MIN_STACK → list_ops 等 stack overflow SIGABRT)。
+
+---
+
+## 2026-07-31 会话十八 (F78 表达式聚合 / F79 ALTER TABLE — ORM P2 完结)
+
+ORM 对接最后两项。ORM 探测 **15/17 → 17/17** — P0/P1/P2 全部完成。
+
+### F78: 聚合内算术表达式 SUM(a+b) / COUNT(v-1) / AVG(x/2)
+
+- tokenizer 加 `Plus/Minus/Slash`; 二元减号 vs 负数字面量按前一 token 是否值结尾区分 (保 `WHERE x=-1`)。
+- `ScalarExpr` AST (Col/Lit/Bin{Add,Sub,Mul,Div}) + 递归下降 (加减>乘除>因子, 括号); `SelectItem::Agg.col: Option<String>` → `arg: Option<ScalarExpr>` (None=COUNT(*), 裸列退化 Col)。
+- worker `BoundExpr` (列名已绑定列号) + `eval_bound_expr` 逐行求值→ColValue→feed; bind_scalar_expr 推导输出类型 (全整且非 Div→I64, Div/任一F64→F64)。任一操作数 NULL/非数值→NULL; 除零→NULL; 整溢出→NULL (不中断聚合)。
+- 单列聚合退化为 Col 求值, 零回归; label/out_name 表达式原文重建。
+
+### F79: ALTER TABLE ADD COLUMN (storage 多版本行解码, 零数据重写)
+
+- 核心: `read_col` 布局全由当前 schema 推导 + 行首版本字节强校 → “只改 schema 不重写”不可行。方案: 多版本解码。
+- schema.rs: `TableSchema` 加 `version_ncols: Vec<u16>` (各版本列数); FMT_VER 2→3 (decode 兼容 v1/v2); `with_added_column` (version+1, 追加列, 记新版本列数); `col_count_at(ver)`。
+- row.rs `read_col`: 行首 `rv` → `n_old=col_count_at(rv)`; 校 `rv<=schema.version`; 列 `>= n_old` → NULL; bitmap/定长/变长布局按 `columns[..n_old]` 推导 (append-only 保前缀布局一致)。
+- sql.rs: `SqlStmt::AlterTable{table,add:Column}` + parse_alter (仅 ADD 可空列; NOT NULL/DROP/MODIFY 拒)。
+- worker.rs: dispatch AlterTable 走 schema-fetch (缓存/GetSchemaOp) → sql_run_dml 基于旧 schema 合成新 schema → 广播 SetSchemaOp (复用 CREATE 链路); SqlDdlAgg 加 `alter` 标志, 完成时递增 ddl_epoch (同 DROP 先例) 使其他 worker 旧 schema 失效。旧行下次 UPDATE 自然重写为新版本。
+
+### 验收
+
+- storage 单元 add_column_old_rows_read_null (旧行新列读 NULL + FMT_VER3 roundtrip); e2e mysql_expr_agg + mysql_alter_table
+- **ORM 实机 17/17** (全部通); mysql+pg 双门面一致 (SUM(amt+1)=353, ALTER 加列旧行 NULL, DROP COLUMN 拒)
+- 全 workspace **854/854 (45s)** + clippy 0
+- **ORM 对接 P0(F76)+P1(F77)+P2(F78/F79) 全部完成**
+
+### 边界 (v1)
+
+- F78: 仅 +−*/; 无函数嵌套/字符串拼接; 除零→NULL。F79: 仅 ADD 可空列; DROP/MODIFY/RENAME/NOT NULL 拒; version u8 上限 255 次 ALTER。
+
+### gotcha
+
+- ALTER 后必递增 ddl_epoch, 否则其他 worker 用旧列数解码新写行→错位
+- read_col 多版本依赖 ADD 仅追加 (不重排/不删): 前 n_old 列与旧版本逐字节一致
+- orm_probe run_raw 对 DDL (无行集) 需先判 returns_rows 再 fetchall, 否则误报 (非 NexusDB bug)
+
+---
+
+## 2026-07-31 会话十七 (F77: DISTINCT 补全 — ORM P1)
+
+补齐 ORM P1 两项, ORM 探测 **13/17 → 15/17** (剩 SUM(表达式)/ALTER 为 P2)。两项正交, 均在聚合完成点 (materialize_agg_groups) gather 后全局去重, 无跨 shard 改动。
+
+### F77-A: SELECT DISTINCT (解析期 desugar → GROUP BY)
+
+- `SELECT DISTINCT a,b` ≡ `SELECT a,b GROUP BY a,b`: parse_select 捕获 DISTINCT, group_by 解完后 desugar 为全投影列的 group_by, 复用现有分桶去重路径 — 零新 AST 字段、零 worker 新逻辑。
+- 拒绝面: `DISTINCT *` / DISTINCT+聚合 / DISTINCT+显式 GROUP BY / DISTINCT+JOIN / DISTINCT+派生表 / 系统表 → 清晰 Err。
+
+### F77-B: COUNT(DISTINCT col)
+
+- `SelectItem::Agg` + `AggItemKind::Agg` 加 `distinct: bool`; 解析 `COUNT(DISTINCT col)` (DISTINCT 仅 COUNT 且必带列; SUM/AVG/MIN/MAX(DISTINCT) 与 `COUNT(DISTINCT *)` 拒)。
+- 新 `Accum::CountDistinct(HashSet<Vec<u8>>)`: feed 非 NULL 值按类型标记编码入集, finish 返回集基数; NULL 不计 (SQL 标准)。
+- 抽出 `encode_col_key`/`encode_col_key_into` (0=Null/1=I64/2=F64/3=Bytes), GROUP BY 组键与去重集同源; 全 shard gather 后单桶/多桶均在 worker 内存去重 → 跨 shard 正确。
+
+### 验收
+
+- e2e `mysql_distinct` (单/多列 DISTINCT + LIMIT + GROUP BY 内 COUNT(DISTINCT) + 4 错误面) 全绿
+- ORM 实机 15/17 (raw SELECT DISTINCT + COUNT(DISTINCT) 转 OK); mysql+pg 双门面一致
+- 全 workspace **851/851 (52s)** + clippy 0
+
+### gotcha
+
+- **lld 链接器需可写 TMPDIR**: 启用 rust-lld 后, 不仅测试、**连 `cargo build` 也需 `TMPDIR=$PWD/target/nxtmp`** (lld 在只读 /tmp 建临时文件会 SIGABRT). 所有 cargo 命令统一带 TMPDIR
+- COUNT(DISTINCT) label = `COUNT(DISTINCT col)` (无 alias 时); out_name 与 worker spec label 两处同步
+
+---
+
+## 2026-07-31 会话十六 (F76: ORM 对接 P0 + 回归提速)
+
+以 SQLAlchemy 2.0 + mysql-connector 实机探测驱动, 补齐阻断 ORM 基础闭环的解析/渲染缺口。
+ORM 探测从 **0/17 → 13/17** (剩 4 为 P1/P2: DISTINCT/COUNT(DISTINCT)/SUM(expr)/ALTER)。
+
+### 交付 (均在 protocol/sql.rs 解析层 + worker.rs 投影渲染; 零存储/调度改动)
+
+| # | 缺口 | 修复 |
+|---|---|---|
+| P0-1 | 列别名 `[AS] alias` | `SelectItem::{Col,Agg}` 加 `alias`; parse_col_alias; out_names 贯穿 SqlRowCtx/SqlSelectAgg + render_sql_rows/materialize_select_agg/AggItem.label 三路渲染 (alias>label>列名) |
+| P0-2 | 单表限定列 `表.列` | strip_qual_in_stmt 在 sql_run_dml 入口剥前缀 (匹配表名; JOIN 走 QualCol 不经此) |
+| P0-3 | `db.table` / `` `db`.`tbl` `` 限定名 | tokenizer 拼反引号点分名; strip_db_qual + P::table_ident 在各表位剥 db 段 (系统表按全名先判) |
+| P0-4 | `LIMIT offset, count` | 两处 LIMIT 分支支持逗号形态 (首数=offset, 次数=limit) |
+| 额外 | create_all 阻断 | DESCRIBE/查不存在表 → MySQL 1146 (非 1105), ORM has_table 据此发 CREATE; parse_create 支持表级 `PRIMARY KEY(col)`/`UNIQUE`/`KEY`/`FOREIGN KEY`/`CONSTRAINT` + 吃 `AUTO_INCREMENT`/`DEFAULT`/`COMMENT` |
+
+### 验收
+
+- e2e `mysql_orm_shapes` (AS/限定列/db.table/反引号/LIMIT n,m/DESCRIBE 1146/聚合 AS) 全绿
+- **SQLAlchemy ORM 实机**: create_all→增删改查→JOIN→group by→分页→反射 13/17 (P0 全部通); mysql+pg 双门面一致
+- 全 workspace 850/850 + clippy 0
+
+### 回归提速 (环境)
+
+- **rust-lld 链接器**: `.cargo/config.toml` + `.linker/ld.lld`→工具链 rust-lld 符链 (零安装零下载). 增量重链接 长时空屏→**~1s**
+- **cargo-nextest**: 并行执行 + 实时进度 + 慢测超时终止 (`.config/nextest.toml`). 全量 850 测试 **57s**
+- **关键: 跑测试必须 `TMPDIR=$PWD/target/nxtmp`** — 沙箱 /tmp 只读且不稳定, e2e 用 tempfile::tempdir() 写库到 /tmp 会导致并发下 I/O 失败/页损坏 (“bad page type got Meta”)/引擎初始化失败→hang. 与 io_uring / 代码无关
+- shard 引擎初始化失败日志现携带真实 StorageError (便于定位)
+
+### gotcha
+
+- `pkill -f` 在沙箱下会匹配自身 bwrap 包装串而自杀; 用 `pkill -x` 或按 PID
+- nextest 跨二进制全并行会放大 e2e 写临时目录的 FS 压力; TMPDIR 指向工作区可彻底避开
+- 输出用 `\| grep`/`\| tail` 会缓冲到进程结束才显示→误以为卡死; 长命令写日志文件再读或不管道
+
+---
+
 ## 2026-07-31 会话十五 (F73 大 IN / F74 关联 EXISTS 去相关 / F75 派生表参与 JOIN)
 
 子查询后续三件套, 收尾 Phase 3 已知遗留。三项独立交付, 统一跨协议对拍。

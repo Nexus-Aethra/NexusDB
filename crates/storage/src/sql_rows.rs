@@ -140,7 +140,18 @@ pub fn index_val_bytes(ty: ColType, v: &ColValue) -> Option<Vec<u8>> {
         (ColType::F64, ColValue::F64(x)) => {
             Some(ks::encode_index_num(ks::encode_f64_ordered(*x)))
         }
-        (ColType::Str | ColType::Bytes, ColValue::Bytes(b)) => Some(ks::encode_index_bytes(b)),
+        // ⭐ F80: Bool/Date/Time/Timestamp 以 i64 承载 → 复用保序数值索引
+        (
+            ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp,
+            ColValue::I64(x),
+        ) => Some(ks::encode_index_num(ks::encode_idx(*x))),
+        (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b)) => {
+            Some(ks::encode_index_bytes(b))
+        }
+        // ⭐ F81: Decimal → 17B 保序索引值
+        (ColType::Decimal { .. }, ColValue::Decimal(x, _)) => {
+            Some(ks::encode_index_decimal(ks::encode_i128_ordered(*x)))
+        }
         _ => None,
     }
 }

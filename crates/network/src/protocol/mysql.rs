@@ -122,6 +122,47 @@ pub fn native_password_token(salt: &[u8; 20], password: &str) -> Vec<u8> {
     (0..20).map(|i| stage1[i] ^ scramble[i]).collect()
 }
 
+/// ⭐ F82: `caching_sha2_password` fast-auth 校验.
+/// scramble = SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) ‖ nonce); nonce = 20B salt.
+/// 服务端知道明文口令即可直接验证 (免 RSA/TLS full-auth). 空口令 ⇔ 空响应.
+pub fn caching_sha2_password_ok(salt: &[u8; 20], auth_resp: &[u8], password: &str) -> bool {
+    use crate::protocol::crypto::sha256;
+    if password.is_empty() {
+        return auth_resp.is_empty();
+    }
+    if auth_resp.len() != 32 {
+        return false;
+    }
+    let s1 = sha256(password.as_bytes());
+    let s2 = sha256(&s1);
+    let mut buf = Vec::with_capacity(52);
+    buf.extend_from_slice(&s2);
+    buf.extend_from_slice(salt);
+    let inner = sha256(&buf);
+    // auth_resp XOR inner == s1  ⇔  校验通过
+    (0..32).all(|i| auth_resp[i] ^ inner[i] == s1[i])
+}
+
+/// ⭐ F82: caching_sha2 客户端侧 fast-auth token (e2e 测试用).
+pub fn caching_sha2_token(salt: &[u8; 20], password: &str) -> Vec<u8> {
+    use crate::protocol::crypto::sha256;
+    if password.is_empty() {
+        return Vec::new();
+    }
+    let s1 = sha256(password.as_bytes());
+    let s2 = sha256(&s1);
+    let mut buf = Vec::with_capacity(52);
+    buf.extend_from_slice(&s2);
+    buf.extend_from_slice(salt);
+    let inner = sha256(&buf);
+    (0..32).map(|i| s1[i] ^ inner[i]).collect()
+}
+
+/// ⭐ F82: caching_sha2 fast_auth_success 包 (0x01 0x03); 其后再发 OK.
+pub fn build_fast_auth_success(seq: u8) -> Vec<u8> {
+    write_packet(seq, &[0x01, 0x03])
+}
+
 // =====================================================================
 // 帧
 // =====================================================================
@@ -179,16 +220,25 @@ pub fn lenenc_bytes(out: &mut Vec<u8>, b: &[u8]) {
 
 /// HandshakeV10 (连接建立后服务端首包, seq=0).
 pub fn build_handshake_v10(salt: &[u8; 20], thread_id: u32) -> Vec<u8> {
+    build_handshake_v10_caps(salt, thread_id, false)
+}
+
+/// ⭐ F83: CLIENT_SSL capability bit.
+pub const CLIENT_SSL: u32 = 0x0000_0800;
+
+/// HandshakeV10, 可选宣告 CLIENT_SSL (tls=true 时客户端可发 SSLRequest 升级).
+pub fn build_handshake_v10_caps(salt: &[u8; 20], thread_id: u32, tls: bool) -> Vec<u8> {
+    let caps = if tls { SERVER_CAPS | CLIENT_SSL } else { SERVER_CAPS };
     let mut p = Vec::with_capacity(96);
     p.push(10); // protocol version
     p.extend_from_slice(b"8.0.0-NexusDB\0");
     p.extend_from_slice(&thread_id.to_le_bytes());
     p.extend_from_slice(&salt[..8]); // auth-plugin-data part 1
     p.push(0); // filler
-    p.extend_from_slice(&(SERVER_CAPS as u16).to_le_bytes()); // caps lower
+    p.extend_from_slice(&(caps as u16).to_le_bytes()); // caps lower
     p.push(CHARSET_UTF8MB4);
     p.extend_from_slice(&STATUS_AUTOCOMMIT.to_le_bytes());
-    p.extend_from_slice(&((SERVER_CAPS >> 16) as u16).to_le_bytes()); // caps upper
+    p.extend_from_slice(&((caps >> 16) as u16).to_le_bytes()); // caps upper
     p.push(21); // auth plugin data total len (20 + NUL)
     p.extend_from_slice(&[0u8; 10]); // reserved
     p.extend_from_slice(&salt[8..20]); // part 2 (12B)
@@ -322,10 +372,17 @@ pub fn build_eof(seq: u8) -> Vec<u8> {
 
 fn mysql_type(ty: ColType) -> u8 {
     match ty {
-        ColType::I64 => 8,    // LONGLONG
-        ColType::F64 => 5,    // DOUBLE
-        ColType::Str => 253,  // VAR_STRING
+        ColType::I64 => 8,     // LONGLONG
+        ColType::F64 => 5,     // DOUBLE
+        ColType::Str => 253,   // VAR_STRING
         ColType::Bytes => 252, // BLOB
+        ColType::Bool => 1,    // TINY (tinyint(1))
+        ColType::Date => 10,   // DATE
+        ColType::Time => 11,   // TIME
+        ColType::Timestamp => 12, // DATETIME
+        ColType::Json => 245,  // JSON
+        ColType::Uuid => 253,  // VAR_STRING (char(36))
+        ColType::Decimal { .. } => 246, // NEWDECIMAL
     }
 }
 
@@ -368,12 +425,30 @@ pub fn build_result_set(
     // 文本行
     for r in rows {
         let mut p = Vec::new();
-        for v in r {
+        for (ci, v) in r.iter().enumerate() {
+            let ty = cols.get(ci).map(|(_, t)| *t).unwrap_or(ColType::Str);
             match v {
                 ColValue::Null => p.push(0xFB),
-                ColValue::I64(x) => lenenc_bytes(&mut p, x.to_string().as_bytes()),
+                // ⭐ F80: 按列 ColType 渲染 (Bool→'1'/'0', Date/Time/Timestamp→格式化)
+                ColValue::I64(x) => {
+                    let s = match ty {
+                        ColType::Bool => (if *x != 0 { "1" } else { "0" }).to_string(),
+                        ColType::Date => crate::worker::render_date(*x),
+                        ColType::Time => crate::worker::render_time(*x),
+                        ColType::Timestamp => crate::worker::render_timestamp(*x),
+                        _ => x.to_string(),
+                    };
+                    lenenc_bytes(&mut p, s.as_bytes());
+                }
                 ColValue::F64(f) => lenenc_bytes(&mut p, format!("{f}").as_bytes()),
-                ColValue::Bytes(b) => lenenc_bytes(&mut p, b),
+                ColValue::Bytes(b) => match ty {
+                    ColType::Uuid => lenenc_bytes(&mut p, crate::worker::render_uuid(b).as_bytes()),
+                    _ => lenenc_bytes(&mut p, b),
+                },
+                // ⭐ F81: Decimal → 定点文本 (NEWDECIMAL 文本协议)
+                ColValue::Decimal(x, scale) => {
+                    lenenc_bytes(&mut p, crate::worker::render_decimal(*x, *scale).as_bytes())
+                }
             }
         }
         push(&mut out, &mut seq, &p);
@@ -602,20 +677,76 @@ pub fn build_binary_result_set(
         let bitmap_at = p.len();
         p.extend(std::iter::repeat_n(0u8, bitmap_len));
         for (i, v) in r.iter().enumerate() {
+            let ty = cols.get(i).map(|(_, t)| *t).unwrap_or(ColType::Str);
             match v {
                 ColValue::Null => {
                     let bit = i + 2;
                     p[bitmap_at + bit / 8] |= 1 << (bit % 8);
                 }
-                ColValue::I64(x) => p.extend_from_slice(&x.to_le_bytes()),
+                // ⭐ F80: 按列 ColType 走 MySQL 二进制编码 (DATE/TIME/DATETIME 特殊格式)
+                ColValue::I64(x) => match ty {
+                    ColType::Bool => p.push(if *x != 0 { 1 } else { 0 }), // TINY 1B
+                    ColType::Date => encode_bin_date(&mut p, *x),
+                    ColType::Time => encode_bin_time(&mut p, *x),
+                    ColType::Timestamp => encode_bin_datetime(&mut p, *x),
+                    _ => p.extend_from_slice(&x.to_le_bytes()),
+                },
                 ColValue::F64(x) => p.extend_from_slice(&x.to_le_bytes()),
-                ColValue::Bytes(b) => lenenc_bytes(&mut p, b),
+                ColValue::Bytes(b) => match ty {
+                    ColType::Uuid => lenenc_bytes(&mut p, crate::worker::render_uuid(b).as_bytes()),
+                    _ => lenenc_bytes(&mut p, b),
+                },
+                // ⭐ F81: NEWDECIMAL 二进制 = lenenc 定点文本
+                ColValue::Decimal(x, scale) => {
+                    lenenc_bytes(&mut p, crate::worker::render_decimal(*x, *scale).as_bytes())
+                }
             }
         }
         push(&mut out, &mut seq, &p);
     }
     push(&mut out, &mut seq, &build_eof_payload());
     out
+}
+
+/// ⭐ F80: MySQL 二进制 DATE 编码 (length + year u16 + month + day). 微秒截去.
+fn encode_bin_date(p: &mut Vec<u8>, micros: i64) {
+    let (y, m, d, _, _, _, _) = crate::worker::datetime_parts(micros);
+    p.push(4);
+    p.extend_from_slice(&y.to_le_bytes());
+    p.push(m);
+    p.push(d);
+}
+
+/// ⭐ F80: MySQL 二进制 DATETIME 编码 (length 7 无微秒 / 11 含微秒).
+fn encode_bin_datetime(p: &mut Vec<u8>, micros: i64) {
+    let (y, mo, d, h, mi, s, us) = crate::worker::datetime_parts(micros);
+    if us == 0 {
+        p.push(7);
+        p.extend_from_slice(&y.to_le_bytes());
+        p.extend_from_slice(&[mo, d, h, mi, s]);
+    } else {
+        p.push(11);
+        p.extend_from_slice(&y.to_le_bytes());
+        p.extend_from_slice(&[mo, d, h, mi, s]);
+        p.extend_from_slice(&us.to_le_bytes());
+    }
+}
+
+/// ⭐ F80: MySQL 二进制 TIME 编码 (length + is_neg + days u32 + h + m + s [+ micro u32]).
+fn encode_bin_time(p: &mut Vec<u8>, micros: i64) {
+    let (h, mi, s, us) = crate::worker::time_parts(micros);
+    if us == 0 {
+        p.push(8);
+        p.push(0); // is_negative
+        p.extend_from_slice(&0u32.to_le_bytes()); // days
+        p.extend_from_slice(&[h, mi, s]);
+    } else {
+        p.push(12);
+        p.push(0);
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.extend_from_slice(&[h, mi, s]);
+        p.extend_from_slice(&us.to_le_bytes());
+    }
 }
 
 #[cfg(test)]

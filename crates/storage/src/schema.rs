@@ -15,6 +15,15 @@ pub enum ColType {
     F64,
     Str,
     Bytes,
+    Bool,
+    Date,
+    Time,
+    Timestamp,
+    Json,
+    Uuid,
+    /// ⭐ F81: 定点小数. precision=总位数(仅回显), scale=小数位.
+    /// 值以 i128 承载 (变长区 16B LE); scale 随类型 → 转换/渲染/比较全程可得.
+    Decimal { precision: u8, scale: u8 },
 }
 
 impl ColType {
@@ -24,6 +33,13 @@ impl ColType {
             ColType::F64 => 2,
             ColType::Str => 3,
             ColType::Bytes => 4,
+            ColType::Bool => 5,
+            ColType::Date => 6,
+            ColType::Time => 7,
+            ColType::Timestamp => 8,
+            ColType::Json => 9,
+            ColType::Uuid => 10,
+            ColType::Decimal { .. } => 11,
         }
     }
 
@@ -33,13 +49,29 @@ impl ColType {
             2 => Some(ColType::F64),
             3 => Some(ColType::Str),
             4 => Some(ColType::Bytes),
+            5 => Some(ColType::Bool),
+            6 => Some(ColType::Date),
+            7 => Some(ColType::Time),
+            8 => Some(ColType::Timestamp),
+            9 => Some(ColType::Json),
+            10 => Some(ColType::Uuid),
+            // 11 (Decimal) 需读取额外 precision/scale 字节, 由 decode 特判处理.
             _ => None,
         }
     }
 
-    /// 定长列 (I64/F64, 8B) — row 编码不记偏移.
+    /// 定长列 (row 编码不记偏移, 8B 槽). ⭐ F80: Bool/Date/Time/Timestamp 以 i64 承载也定长.
+    /// ⭐ F81: Decimal 走变长区 (16B i128), 非定长.
     pub fn is_fixed(self) -> bool {
-        matches!(self, ColType::I64 | ColType::F64)
+        matches!(
+            self,
+            ColType::I64
+                | ColType::F64
+                | ColType::Bool
+                | ColType::Date
+                | ColType::Time
+                | ColType::Timestamp
+        )
     }
 }
 
@@ -74,11 +106,16 @@ pub struct TableSchema {
     pub indexes: Vec<IndexDef>,
     /// 下一个可分配的 iid (只增; 删索引不回收 iid, 防旧索引行误匹配).
     pub next_iid: u32,
+    /// ⭐ F79 (ALTER): 各版本的列数 (index=version-1 → 该版本写入时的列数).
+    /// ADD COLUMN 只追加列 → 旧行 (版本较小) 按其版本列数解码, 超出列补 NULL.
+    pub version_ncols: Vec<u16>,
 }
 
 /// 序列化格式版本 (与 schema.version 无关, 是编码布局版本).
 /// ⭐ F65: 1→2 索引项加 1B global 标志; decode 兼容 v1 (global=false).
-const FMT_VER: u8 = 2;
+/// ⭐ F79: 2→3 尾部加 version_ncols; decode 兼容 v1/v2 (version_ncols=[当前列数]).
+/// ⭐ F81: 3→4 Decimal 列在类型字节后追加 precision+scale; decode 兼容 v1-3 (无 Decimal 列).
+const FMT_VER: u8 = 4;
 
 /// schema 反序列化错误.
 #[derive(Debug, PartialEq, Eq)]
@@ -141,7 +178,41 @@ impl TableSchema {
                 next_iid += 1;
             }
         }
-        Ok(Self { version: 1, columns, pk_col, indexes, next_iid })
+        Ok(Self {
+            version: 1,
+            version_ncols: vec![columns.len() as u16],
+            columns,
+            pk_col,
+            indexes,
+            next_iid,
+        })
+    }
+
+    /// ⭐ F79 (ALTER): 追加一列产新 schema (version+1, 记录新版本列数).
+    /// 仅追加到末尾; pk_col/indexes 不变 (不移位). version 超 255 报错.
+    pub fn with_added_column(&self, col: Column) -> Result<Self, SchemaError> {
+        let new_ver = self.version.checked_add(1).ok_or(SchemaError::BadFormat)?;
+        let mut columns = self.columns.clone();
+        columns.push(col);
+        let mut version_ncols = self.version_ncols.clone();
+        version_ncols.push(columns.len() as u16);
+        Ok(Self {
+            version: new_ver,
+            columns,
+            pk_col: self.pk_col,
+            indexes: self.indexes.clone(),
+            next_iid: self.next_iid,
+            version_ncols,
+        })
+    }
+
+    /// ⭐ F79: 某行版本写入时的列数 (行首部 version 字节 → 列数). 未知版本回退当前列数.
+    pub fn col_count_at(&self, ver: u8) -> usize {
+        if ver >= 1 && (ver as usize) <= self.version_ncols.len() {
+            self.version_ncols[ver as usize - 1] as usize
+        } else {
+            self.columns.len()
+        }
     }
 
     /// 按列名查列下标.
@@ -164,6 +235,11 @@ impl TableSchema {
             out.push(c.name.len() as u8);
             out.extend_from_slice(c.name.as_bytes());
             out.push(c.ty.to_byte());
+            // ⭐ F81 (FMT_VER 4): Decimal 列在类型字节后追加 precision + scale
+            if let ColType::Decimal { precision, scale } = c.ty {
+                out.push(precision);
+                out.push(scale);
+            }
             out.push(c.nullable as u8);
         }
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
@@ -174,6 +250,11 @@ impl TableSchema {
             out.push(i.global as u8); // ⭐ F65 (FMT_VER 2)
         }
         out.extend_from_slice(&self.next_iid.to_le_bytes());
+        // ⭐ F79 (FMT_VER 3): version_ncols 尾部
+        out.push(self.version_ncols.len() as u8);
+        for &nc in &self.version_ncols {
+            out.extend_from_slice(&nc.to_le_bytes());
+        }
         out
     }
 
@@ -181,7 +262,7 @@ impl TableSchema {
     pub fn decode(buf: &[u8]) -> Result<Self, SchemaError> {
         let mut r = Reader { buf, pos: 0 };
         let fmt = r.u8()?;
-        if fmt != FMT_VER && fmt != 1 {
+        if fmt != FMT_VER && fmt != 1 && fmt != 2 && fmt != 3 {
             return Err(SchemaError::BadFormat);
         }
         let version = r.u8()?;
@@ -193,7 +274,15 @@ impl TableSchema {
             let name = std::str::from_utf8(r.bytes(nlen)?)
                 .map_err(|_| SchemaError::BadFormat)?
                 .to_string();
-            let ty = ColType::from_byte(r.u8()?).ok_or(SchemaError::BadFormat)?;
+            let tb = r.u8()?;
+            // ⭐ F81: Decimal 类型字节后跟 precision + scale
+            let ty = if tb == 11 {
+                let precision = r.u8()?;
+                let scale = r.u8()?;
+                ColType::Decimal { precision, scale }
+            } else {
+                ColType::from_byte(tb).ok_or(SchemaError::BadFormat)?
+            };
             let nullable = r.u8()? != 0;
             columns.push(Column { name, ty, nullable });
         }
@@ -213,7 +302,18 @@ impl TableSchema {
         if pk_col as usize >= columns.len() {
             return Err(SchemaError::BadRef);
         }
-        Ok(Self { version, columns, pk_col, indexes, next_iid })
+        // ⭐ F79 (FMT_VER 3): version_ncols; v1/v2 无此段 → 单版本=当前列数
+        let version_ncols = if fmt >= 3 {
+            let nv = r.u8()? as usize;
+            let mut v = Vec::with_capacity(nv);
+            for _ in 0..nv {
+                v.push(r.u16()?);
+            }
+            if v.is_empty() { vec![columns.len() as u16] } else { v }
+        } else {
+            vec![columns.len() as u16]
+        };
+        Ok(Self { version, columns, pk_col, indexes, next_iid, version_ncols })
     }
 }
 

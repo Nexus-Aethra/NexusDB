@@ -2,9 +2,11 @@
 
 > 面向写密集/低延迟的单机数据库 —— Share-Nothing + per-core thread + io_uring + 自实现协程调度器, 多协议统一接入 (Redis 兼容 ✅, PG/MySQL/Mongo 设计路线中).
 
-[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-700%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
+[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-862%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
 > 设计架构见 [DESIGN.md](./DESIGN.md); 接手 / 进度 见 [AGENTS.md](./AGENTS.md); 修复历史 见 [CHANGELOG.md](./CHANGELOG.md).
+>
+> 📖 **使用者上手指南 (功能介绍 + 各驱动接入 + SQL/类型/安全示例 + 性能): [docs/GUIDE.md](./docs/GUIDE.md)**
 
 ---
 
@@ -17,7 +19,7 @@
 **协议层**
 - **五协议监听**: RESP2 6379 + **REST (HTTP/1.1 JSON + CORS + Bearer) 6778** + SQL 双门面 (MySQL wire 5434 / PostgreSQL wire 5435, 共内核) + Binary 5433 (内部), 均含 `KvLimits` 协议层长度拦截, TCP_NODELAY
 - **可观测性**: `/metrics` (Prometheus) + `/v1/status` + `/v1/debug/*` (进程级原子计数, 热路径零锁)
-- **SQL 能力**: CREATE/INSERT 多行/SELECT (投影·ORDER BY·聚合 COUNT/SUM/AVG/MIN/MAX·GROUP BY·HAVING·IN·BETWEEN·LIKE·WHERE 支持 OR/NOT/括号嵌套·全表扫)/UPDATE/DELETE/DROP/USE/DESCRIBE; 本地二级索引 + 双层布隆剪枝 + 覆盖索引/UNIQUE 早停 + GLOBAL UNIQUE (跨 shard 全局唯一)
+- **SQL 能力**: CREATE/ALTER TABLE ADD COLUMN/INSERT 多行/SELECT (投影·列别名 AS·ORDER BY·聚合 COUNT/SUM/AVG/MIN/MAX 含表达式 SUM(a+b)·COUNT(DISTINCT)·SELECT DISTINCT·GROUP BY·HAVING·IN·BETWEEN·LIKE·WHERE 支持 OR/NOT/括号嵌套·全表扫·单表限定列 表.列·MySQL `LIMIT offset,count`·`db.table` 限定名)/UPDATE/DELETE/DROP/USE/DESCRIBE; 本地二级索引 + 双层布隆剪枝 + 覆盖索引/UNIQUE 早停 + GLOBAL UNIQUE (跨 shard 全局唯一); SQLAlchemy ORM 基础 CRUD/JOIN/分页/反射/迁移(ADD COLUMN)实机通
 - **子查询 (非关联 WHERE + FROM 派生表 + 单等值关联 EXISTS)**: `IN/NOT IN (SELECT..)` / `标量 x op (SELECT..)` / `[NOT] EXISTS (SELECT..)` — 内层先跑→折叠字面量/恒真恒假→外层走现有索引路径 (大 IN 上限 65536 + 同型集合二分求值), DELETE/UPDATE 同支持; `SELECT .. FROM (SELECT ..) t [WHERE/ORDER/LIMIT]` 且可参与 JOIN (内层物化预填, 含聚合/GROUP BY, 孤 COUNT(*)); 单等值关联 `EXISTS/NOT EXISTS` 自动去相关为 IN; mysql+pg 驱动实机一致 (关联 IN/标量ヽJOIN 右侧派生表后续)
 - **JOIN (多表等值)**: N 表左深 `INNER|LEFT|RIGHT|FULL|CROSS JOIN ... ON/USING` — worker 完成点 hash join (shard 只本地扫描, 零跨线程), 多条件 ON + 非等值残余, 谓词/投影下推 + 索引驱动 gather + probe 侧键集合索引点查 (前序表 join 键下推, ~6x 提速), 表别名/限定列/ORDER/LIMIT; mysql+pg 驱动实机一致 (子查询后续)
 - **系统表 / 内省 (GUI/ORM 反射)**: information_schema (tables/columns/key_column_usage/schemata) + pg_catalog flat 单表 + SHOW [FULL] TABLES/COLUMNS/CREATE TABLE/DATABASES + 反引号标识符 + `SELECT @@var` stub; SQLAlchemy `inspect()` 实机反射通 (psql `\d` 的 pg_catalog JOIN 留后)
@@ -276,8 +278,8 @@ Overflow 数据页:
 |---|---|---|---|
 | RESP2 (Redis 兼容) | 6379 | ✅ 完整 | **五大数据结构 + Geo + Bitmap** 全命令面, 清单见下表; 大 value 溢出页自动走 |
 | **HTTP REST** | **6778** | ✅ | **KV + SQL JSON 接口** + CORS + Bearer 鉴权 + `/metrics` (Prometheus); AI 工具/Web 前端/监控接入, 见 REST 节 |
-| **MySQL (wire)** | **5434** | ✅ SQL 子集 | **mysql cli 直连** + `mysql_native_password` 登录 (AuthSwitch 兜底); 语法见下方 SQL 门面节 |
-| **PostgreSQL (wire)** | **5435** | ✅ SQL 子集 | **psql 直连** + cleartext 认证 (SSLRequest 拒绝回落); 与 MySQL 门面**共内核**, 同库互读写 |
+| **MySQL (wire)** | **5434** | ✅ SQL 子集 | **mysql cli 直连** + `mysql_native_password` / `caching_sha2_password` fast-auth 登录 + **TLS (opt-in)**; 语法见下方 SQL 门面节 |
+| **PostgreSQL (wire)** | **5435** | ✅ SQL 子集 | **psql 直连** + **SCRAM-SHA-256 认证** + **TLS (opt-in, SSLRequest→'S')**; 与 MySQL 门面**共内核**, 同库互读写 |
 | Binary (自研) | 5433 | ⚠️ 内部 | 内部协议 (测试/压测工具); 对外接入请用 REST/RESP/SQL 门面, 后续版本默认禁用 |
 | MongoDB (BSON) | - | 🚧 设计路线 | 见 [DESIGN.md §10](./DESIGN.md) |
 
@@ -342,7 +344,7 @@ DELETE FROM users WHERE score < 60;                        -- 索引/全表条�
 DROP TABLE users;  USE db1;  DESCRIBE users;               -- 工具命令
 ```
 
-类型: `INT/BIGINT/SMALLINT/BOOLEAN → I64`, `DOUBLE [PRECISION]/FLOAT/REAL → F64`, `TEXT/VARCHAR(n)/CHAR(n) → Str`, `BLOB/BYTEA → Bytes`。
+类型: `INT/BIGINT/SMALLINT → I64`, `BOOLEAN/BOOL → Bool`, `DOUBLE [PRECISION]/FLOAT/REAL → F64`, `DECIMAL/NUMERIC(p,s) → 定点 i128 (精确金额, 精度<=38)`, `TEXT/VARCHAR(n)/CHAR(n) → Str`, `BLOB/BYTEA → Bytes`, `DATE/TIME/TIMESTAMP/DATETIME → i64 微秒 (UTC 裸值)`, `JSON/JSONB → 文本 Bytes`, `UUID → 16B`。时间/布尔/UUID/DECIMAL 按列类型在两门面原生渲染 (psycopg3 → date/datetime/bool/UUID/Decimal, mysql-connector 文本+预处理均原生 datetime/Decimal, 精度不丢)。
 
 **执行模型 (本地二级索引 + 双层剪枝)**:
 
@@ -364,7 +366,7 @@ DROP TABLE users;  USE db1;  DESCRIBE users;               -- 工具命令
 | DELETE / INSERT (pk) | ~11K qps | 0.11ms |
 | 全表扫 5K 行 (+过滤/COUNT) | ~70 qps | 55ms |
 
-> SQL gap (记录在案): JOIN/OR/子查询已交付 (F67-F75, 见上方能力表; 剩余缺口 = 关联 IN/标量、多重相关 EXISTS、JOIN 右侧派生表); 无 ALTER / TLS / SCRAM (PG 仅 cleartext); 聚合不支持表达式 SUM(a+b)/COUNT(DISTINCT)/GROUP_CONCAT/别名 AS/窗口函数 (GROUP BY 当前全量收行, shard 端部分聚合下推留后); LIKE 仅前缀模式; 普通 **UNIQUE 跨 shard best-effort** (探测仅本 shard) — 需全局唯一用 `GLOBAL UNIQUE` (email-shard 占坑, 事务内写/UPDATE 该列为 v1 边界); 非事务的 DELETE/UPDATE 两阶段与多行 INSERT 非原子 (事务内单 shard 原子); 事务跨 shard best-effort; ORDER BY 无 top-k (全量排序); schema 广播非原子 (幂等重试)。
+> SQL gap (记录在案): JOIN/OR/子查询已交付 (F67-F75, 见上方能力表; 剩余缺口 = 关联 IN/标量、多重相关 EXISTS、JOIN 右侧派生表); 无客户端证书双向认证 / 无 SCRAM channel binding (TLS 传输加密已交付: PG SCRAM-SHA-256 + MySQL caching_sha2 认证, rustls STARTTLS opt-in; 单一 sql_password 无 per-user 权限体系); 聚合不支持表达式 SUM(a+b)/COUNT(DISTINCT)/GROUP_CONCAT/别名 AS/窗口函数 (GROUP BY 当前全量收行, shard 端部分聚合下推留后); LIKE 仅前缀模式; 普通 **UNIQUE 跨 shard best-effort** (探测仅本 shard) — 需全局唯一用 `GLOBAL UNIQUE` (email-shard 占坑, 事务内写/UPDATE 该列为 v1 边界); 非事务的 DELETE/UPDATE 两阶段与多行 INSERT 非原子 (事务内单 shard 原子); 事务跨 shard best-effort; ORDER BY 无 top-k (全量排序); schema 广播非原子 (幂等重试)。
 
 ### REST 门面 (HTTP/1.1, 6778, 2026-07-30)
 
@@ -414,8 +416,10 @@ pg_addr = "0.0.0.0:5435"         # SQL 门面 PostgreSQL wire (空字符串 = �
 http_addr = "0.0.0.0:6778"       # REST 门面 (空字符串 = 禁用)
 http_cors_origin = ""            # CORS Allow-Origin ("*"/具体 origin, 空 = 不发)
 http_token = ""                  # REST Bearer token (空 = 免鉴权)
-sql_password = ""                # SQL 登录密码, 两门面共用 (空 = 免密)
+sql_password = ""                # SQL 登录密码, 两门面共用 (空 = 免密; 非空 PG 走 SCRAM-SHA-256)
 redis_password = ""              # AUTH 密码
+tls_cert = ""                    # ⭐ SQL/PG 门面 TLS 证书 PEM 路径 (空 = 明文; 两项均非空才启用)
+tls_key = ""                     # ⭐ TLS 私钥 PEM 路径 (PKCS8/PKCS1/SEC1)
 max_key_bytes = 1024             # key 上限 (协议层拦截)
 max_value_bytes = 1048576        # value 上限 (>4KB 自动走溢出页)
 

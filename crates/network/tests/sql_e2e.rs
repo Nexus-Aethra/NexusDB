@@ -42,6 +42,7 @@ fn start_sql_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>
         auth_password: password.map(|s| s.to_string()),
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     (server, mgr)
@@ -351,7 +352,7 @@ fn mysql_sql_full_flow() {
     assert_eq!(c.query("SELECT * FROM users WHERE nope = 1").err_code(), Some(1054));
     // ⭐ S2: 无 WHERE 从报错变为全表扫 (行为升级; 0..20 + 上方 INSERT id=100)
     assert_eq!(c.ids("SELECT * FROM users").len(), 21);
-    assert_eq!(c.query("SELECT * FROM plainkv WHERE id = 1").err_code(), Some(1105));
+    assert_eq!(c.query("SELECT * FROM plainkv WHERE id = 1").err_code(), Some(1146));
     assert_eq!(c.query("INSERT INTO users (id, name) VALUES ('x', 'y')").err_code(), Some(1105));
 
     // schema miss 续跑 (新连接)
@@ -532,7 +533,7 @@ fn mysql_dml_full() {
         QueryResult::Ok { affected: 1 }
     );
     assert_eq!(c.query("DROP TABLE items"), QueryResult::Ok { affected: 0 });
-    assert_eq!(c.query("SELECT * FROM items WHERE id = 7").err_code(), Some(1105));
+    assert_eq!(c.query("SELECT * FROM items WHERE id = 7").err_code(), Some(1146));
     assert_eq!(
         c.query("CREATE TABLE items (id INT PRIMARY KEY, cat TEXT NOT NULL, INDEX(cat))"),
         QueryResult::Ok { affected: 0 }
@@ -661,7 +662,7 @@ fn mysql_dialect_and_tools() {
     assert_eq!(rows[0][3].as_deref(), Some("PRI"));
     assert_eq!(rows[1][3].as_deref(), Some("UNI"));
     assert_eq!(rows[1][2].as_deref(), Some("NO"), "UNIQUE 隐含 NOT NULL");
-    assert_eq!(rows[3][1].as_deref(), Some("bigint"), "BOOLEAN → I64");
+    assert_eq!(rows[3][1].as_deref(), Some("boolean"), "⭐ F80: BOOLEAN 独立类型");
 
     // SET / SELECT version() stub
     assert_eq!(c.query("SET NAMES utf8mb4"), QueryResult::Ok { affected: 0 });
@@ -1017,6 +1018,7 @@ fn start_sql_server_n(workers: usize) -> (NetworkServer, Arc<ShardManager>) {
         auth_password: None,
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     (NetworkServer::start(cfg).expect("start server"), mgr)
 }
@@ -1202,6 +1204,7 @@ fn mysql_txn_unique_single_shard() {
         auth_password: None,
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
@@ -1625,6 +1628,7 @@ fn mysql_plain_unique_unchanged() {
         auth_password: None,
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
@@ -2142,6 +2146,292 @@ fn mysql_derived_join() {
     assert_eq!(
         c.ids("SELECT u.id FROM u JOIN o ON u.id = o.uid ORDER BY o.id"),
         vec!["1", "3", "3"]
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F76: ORM 对接 P0 — 列别名 AS / 单表限定列 / db.table 限定 / LIMIT n,m / DESCRIBE 1146.
+#[test]
+fn mysql_orm_shapes() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    // DESCRIBE 不存在表 → 1146 (ORM has_table 据此判不存在后发 CREATE)
+    assert_eq!(c.query("DESCRIBE default.orm_t").err_code(), Some(1146));
+    c.query("CREATE TABLE orm_t (id INT PRIMARY KEY, name TEXT, age INT, INDEX(age))");
+    for i in 1..=5 {
+        c.query(&format!("INSERT INTO orm_t VALUES ({i}, 'u{i}', {})", 20 + i));
+    }
+    // 列别名 AS (输出列名 = 别名)
+    let r = c.query("SELECT id AS x FROM orm_t WHERE id = 1");
+    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    assert_eq!(rows, &vec![vec![Some("1".into())]]);
+    // 单表限定列 表.列 (投影 + WHERE + ORDER)
+    assert_eq!(
+        c.ids("SELECT orm_t.id FROM orm_t WHERE orm_t.age > 22 ORDER BY orm_t.id"),
+        vec!["3", "4", "5"]
+    );
+    // 限定列 + AS
+    let r = c.query("SELECT orm_t.id AS uid FROM orm_t WHERE id = 2");
+    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    assert_eq!(rows, &vec![vec![Some("2".into())]]);
+    // db.table 限定 (裸 + 反引号)
+    assert_eq!(c.ids("SELECT id FROM default.orm_t WHERE id = 3"), vec!["3"]);
+    assert_eq!(c.ids("SELECT id FROM `default`.`orm_t` WHERE id = 3"), vec!["3"]);
+    // DESCRIBE 现存在表 → 成功
+    assert!(matches!(c.query("DESCRIBE default.orm_t"), QueryResult::Rows(_)));
+    // LIMIT offset,count 逗号形态 → 第 2 行起 1 行 = id2
+    assert_eq!(c.ids("SELECT id FROM orm_t ORDER BY id LIMIT 1, 1"), vec!["2"]);
+    // 聚合列 AS
+    let r = c.query("SELECT COUNT(*) AS cnt FROM orm_t");
+    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    assert_eq!(rows, &vec![vec![Some("5".into())]]);
+    // 零回归: 无限定无别名常规查询
+    assert_eq!(c.ids("SELECT id FROM orm_t WHERE age = 22"), vec!["2"]);
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F77: SELECT DISTINCT (desugar→GROUP BY) + COUNT(DISTINCT col).
+#[test]
+fn mysql_distinct() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE s (id INT PRIMARY KEY, g INT, v INT)");
+    // g: 1,1,2,2,3  v: 10,10,20,30,30
+    c.query("INSERT INTO s VALUES (1, 1, 10)");
+    c.query("INSERT INTO s VALUES (2, 1, 10)");
+    c.query("INSERT INTO s VALUES (3, 2, 20)");
+    c.query("INSERT INTO s VALUES (4, 2, 30)");
+    c.query("INSERT INTO s VALUES (5, 3, 30)");
+
+    // SELECT DISTINCT 单列 → {1,2,3}
+    assert_eq!(c.ids("SELECT DISTINCT g FROM s ORDER BY g"), vec!["1", "2", "3"]);
+    // DISTINCT + LIMIT
+    assert_eq!(c.ids("SELECT DISTINCT g FROM s ORDER BY g LIMIT 2"), vec!["1", "2"]);
+    // DISTINCT 多列组合去重: (g,v) 不同组合 = {(1,10),(2,20),(2,30),(3,30)} = 4 行
+    let r = c.query("SELECT DISTINCT g, v FROM s ORDER BY g, v");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![Some("1".into()), Some("10".into())],
+            vec![Some("2".into()), Some("20".into())],
+            vec![Some("2".into()), Some("30".into())],
+            vec![Some("3".into()), Some("30".into())],
+        ])
+    );
+    // COUNT(DISTINCT g) 全表 → 3
+    let r = c.query("SELECT COUNT(DISTINCT g) FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("3".into())]]));
+    // COUNT(DISTINCT v) → {10,20,30} = 3
+    let r = c.query("SELECT COUNT(DISTINCT v) AS n FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("3".into())]]));
+    // GROUP BY 内 COUNT(DISTINCT v): g=1→{10}=1, g=2→{20,30}=2, g=3→{30}=1
+    let r = c.query("SELECT g, COUNT(DISTINCT v) FROM s GROUP BY g ORDER BY g");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![Some("1".into()), Some("1".into())],
+            vec![Some("2".into()), Some("2".into())],
+            vec![Some("3".into()), Some("1".into())],
+        ])
+    );
+    // 普通 COUNT(*) 零回归 → 5
+    let r = c.query("SELECT COUNT(*) FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("5".into())]]));
+
+    // 报错面
+    assert!(matches!(c.query("SELECT DISTINCT * FROM s"), QueryResult::Err { .. }));
+    assert!(matches!(c.query("SELECT DISTINCT COUNT(*) FROM s"), QueryResult::Err { .. }));
+    assert!(matches!(c.query("SELECT SUM(DISTINCT v) FROM s"), QueryResult::Err { .. }));
+    assert!(matches!(c.query("SELECT COUNT(DISTINCT *) FROM s"), QueryResult::Err { .. }));
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F78: 聚合内算术表达式 SUM(a+b) / COUNT(v-1) / AVG(x/2).
+#[test]
+fn mysql_expr_agg() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE s (id INT PRIMARY KEY, g INT, v INT)");
+    c.query("INSERT INTO s VALUES (1, 1, 10)");
+    c.query("INSERT INTO s VALUES (2, 1, 20)");
+    c.query("INSERT INTO s VALUES (3, 2, 30)");
+
+    // SUM(v + 1) = (10+1)+(20+1)+(30+1) = 63
+    let r = c.query("SELECT SUM(v + 1) FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("63".into())]]));
+    // SUM(v * 2) = 120
+    let r = c.query("SELECT SUM(v * 2) FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("120".into())]]));
+    // SUM(v - 5) = 5+15+25 = 45
+    let r = c.query("SELECT SUM(v - 5) FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("45".into())]]));
+    // COUNT(v - 1) = 3 (非 NULL 行数)
+    let r = c.query("SELECT COUNT(v - 1) FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("3".into())]]));
+    // AVG(v / 2) = (5+10+15)/3 = 10.0
+    let r = c.query("SELECT AVG(v / 2) FROM s");
+    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0][0].as_deref().unwrap().starts_with("10"));
+    // GROUP BY 内表达式聚合: g=1→SUM(v+1)=32, g=2→SUM(v+1)=31
+    let r = c.query("SELECT g, SUM(v + 1) FROM s GROUP BY g ORDER BY g");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![Some("1".into()), Some("32".into())],
+            vec![Some("2".into()), Some("31".into())],
+        ])
+    );
+    // 括号 + 优先级: SUM((v + 1) * 2) = (11+21+31)*... = 22+42+62 = 126
+    let r = c.query("SELECT SUM((v + 1) * 2) FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("126".into())]]));
+    // 除零 → 该行 NULL; SUM 忽略 → SUM(v/0) 全 NULL → NULL
+    let r = c.query("SELECT SUM(v / 0) FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![None]]));
+    // 单列聚合零回归
+    let r = c.query("SELECT SUM(v) FROM s");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("60".into())]]));
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F79: ALTER TABLE ADD COLUMN (多版本解码, 旧行读 NULL).
+#[test]
+fn mysql_alter_table() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    c.query("INSERT INTO t VALUES (1, 'a')");
+    c.query("INSERT INTO t VALUES (2, 'b')");
+    // ALTER ADD COLUMN
+    assert_eq!(c.query("ALTER TABLE t ADD COLUMN age INT"), QueryResult::Ok { affected: 0 });
+    // 旧行新列读 NULL
+    let r = c.query("SELECT id, age FROM t ORDER BY id");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![
+            vec![Some("1".into()), None],
+            vec![Some("2".into()), None],
+        ])
+    );
+    // 新行带 age
+    c.query("INSERT INTO t VALUES (3, 'c', 30)");
+    assert_eq!(c.ids("SELECT id FROM t WHERE age = 30"), vec!["3"]);
+    // ALTER 后 DESCRIBE 见新列
+    let r = c.query("DESCRIBE t");
+    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    assert!(rows.iter().any(|row| row[0].as_deref() == Some("age")));
+    // 再 ADD 一列 (COLUMN 可省) + 旧行仍读 NULL
+    assert_eq!(c.query("ALTER TABLE t ADD email TEXT"), QueryResult::Ok { affected: 0 });
+    let r = c.query("SELECT id, email FROM t WHERE id = 1");
+    assert_eq!(r, QueryResult::Rows(vec![vec![Some("1".into()), None]]));
+    // 重复列名 → 报错
+    assert!(matches!(c.query("ALTER TABLE t ADD COLUMN name TEXT"), QueryResult::Err { .. }));
+    // NOT NULL → 报错 (v1)
+    assert!(matches!(c.query("ALTER TABLE t ADD COLUMN x INT NOT NULL"), QueryResult::Err { .. }));
+    // DROP COLUMN → 报错 (v1)
+    assert!(matches!(c.query("ALTER TABLE t DROP COLUMN name"), QueryResult::Err { .. }));
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F80: 新数据类型 (BOOLEAN/DATE/TIME/TIMESTAMP/JSON/UUID) 建表→插入→查回→WHERE→ORDER.
+#[test]
+fn mysql_types() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query(
+        "CREATE TABLE t (id INT PRIMARY KEY, active BOOLEAN, created DATE, \
+         ts TIMESTAMP, meta JSON, uid UUID)",
+    );
+    c.query(
+        "INSERT INTO t VALUES (1, TRUE, DATE '2024-01-15', \
+         TIMESTAMP '2024-01-15 10:30:00', '{\"a\":1}', \
+         '550e8400-e29b-41d4-a716-446655440000')",
+    );
+    c.query(
+        "INSERT INTO t VALUES (2, FALSE, DATE '2023-12-01', \
+         TIMESTAMP '2023-12-01 08:00:00', '{\"b\":2}', \
+         '550e8400-e29b-41d4-a716-446655440001')",
+    );
+    // 查回渲染: bool→'1'/'0', date→'YYYY-MM-DD', timestamp→格式化, json→原文, uuid→36字符
+    let r = c.query("SELECT active, created, ts, meta, uid FROM t WHERE id = 1");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![vec![
+            Some("1".into()),
+            Some("2024-01-15".into()),
+            Some("2024-01-15 10:30:00".into()),
+            Some("{\"a\":1}".into()),
+            Some("550e8400-e29b-41d4-a716-446655440000".into()),
+        ]])
+    );
+    // WHERE bool = TRUE
+    assert_eq!(c.ids("SELECT id FROM t WHERE active = TRUE"), vec!["1"]);
+    assert_eq!(c.ids("SELECT id FROM t WHERE active = FALSE"), vec!["2"]);
+    // WHERE date 比较 (字面量按列类型强转微秒)
+    assert_eq!(c.ids("SELECT id FROM t WHERE created > DATE '2024-01-01'"), vec!["1"]);
+    assert_eq!(c.ids("SELECT id FROM t WHERE created < DATE '2024-01-01'"), vec!["2"]);
+    // ORDER BY date (按微秒排序): 2023 先于 2024
+    assert_eq!(c.ids("SELECT id FROM t ORDER BY created"), vec!["2", "1"]);
+    assert_eq!(c.ids("SELECT id FROM t ORDER BY created DESC"), vec!["1", "2"]);
+    // WHERE timestamp
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE ts >= TIMESTAMP '2024-01-01 00:00:00'"),
+        vec!["1"]
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ F81: DECIMAL 定点小数 — 建表→插入(字符串精确/字面量)→查回不丢精度→SUM→WHERE→ORDER.
+#[test]
+fn mysql_decimal() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE acct (id INT PRIMARY KEY, bal DECIMAL(18,2), rate DECIMAL(10,4))");
+    c.query("INSERT INTO acct VALUES (1, '100.50', '0.0725')");
+    c.query("INSERT INTO acct VALUES (2, '99.99', '1.2500')");
+    c.query("INSERT INTO acct VALUES (3, 12.34, 0.5)"); // 字面量路径
+    // 查回渲染: 定点文本, scale 补零, 不丢精度
+    assert_eq!(
+        c.query("SELECT bal, rate FROM acct WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("100.50".into()), Some("0.0725".into())]])
+    );
+    assert_eq!(
+        c.query("SELECT bal, rate FROM acct WHERE id = 3"),
+        QueryResult::Rows(vec![vec![Some("12.34".into()), Some("0.5000".into())]])
+    );
+    // SUM(DECIMAL) 精确: 100.50 + 99.99 + 12.34 = 212.83
+    assert_eq!(
+        c.query("SELECT SUM(bal) FROM acct"),
+        QueryResult::Rows(vec![vec![Some("212.83".into())]])
+    );
+    // WHERE decimal 比较 (字面量转同 scale): 100.50>100 ✓, 99.99/12.34 ✗
+    assert_eq!(c.ids("SELECT id FROM acct WHERE bal > 100"), vec!["1"]);
+    assert_eq!(c.ids("SELECT id FROM acct WHERE bal < '50.00'"), vec!["3"]);
+    // ORDER BY decimal (按定标整数): 12.34 < 99.99 < 100.50
+    assert_eq!(c.ids("SELECT id FROM acct ORDER BY bal"), vec!["3", "2", "1"]);
+    assert_eq!(c.ids("SELECT id FROM acct ORDER BY bal DESC"), vec!["1", "2", "3"]);
+    // MIN/MAX 保持 Decimal 渲染
+    assert_eq!(
+        c.query("SELECT MIN(bal), MAX(bal) FROM acct"),
+        QueryResult::Rows(vec![vec![Some("12.34".into()), Some("100.50".into())]])
     );
 
     drop(c);

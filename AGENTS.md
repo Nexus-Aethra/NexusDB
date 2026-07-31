@@ -24,6 +24,65 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 
 ## 当前进度
 
+### 2026-08-01 会话十九-D 总览 (F83 TLS 传输加密 — rustls STARTTLS, 安全 P0 收官, 细节见 CHANGELOG)
+
+- **SQL 双门面 TLS** (opt-in)。唯一新增外部 crate: `rustls 0.23` + **ring 后端** (避 aws-lc cmake); 手写 PEM 解析 (tls.rs, 复用 crypto::base64_decode)。
+- 传输层最小侵入: `ConnState.tls: Option<Box<ServerConnection>>` + start_tls; recv (read_tls→process→冲刷→读明文) / send_bytes (writer→write_tls 泵) TLS 分支; 沿用 spin-flush **不引 EPOLLOUT** (v1); 协议解析层无感知。
+- STARTTLS: PG SSLRequest→'S'+升级 (未配→'N' 回退); MySQL `build_handshake_v10_caps` 宣告 CLIENT_SSL + 短包检测 SSLRequest→升级 (未配→1043)。config tls_cert/tls_key + main.rs 注入 SQL/PG (RESP/HTTP/Binary None)。
+- 实机: psycopg3 sslmode=require **ssl_in_use=True** SCRAM-over-TLS OK / sslmode=disable 明文回退; mysql-connector ssl_disabled=False OK / True 明文。全量 **862/862** (明文零回归) clippy 0。
+- **P0 (数据类型 F80/F81 + 安全 F82/F83) 全部完成**。边界: opt-in 不配证书=纯明文零成本; 无客户端证书认证/无 channel binding/spin-flush 无写缓冲。
+
+### 2026-08-01 会话十九-C 总览 (F82 认证升级 — PG SCRAM-SHA-256 + MySQL caching_sha2, 细节见 CHANGELOG)
+
+- **安全 P0 认证** (不含 TLS=F83)。零依赖手写密码学 `protocol/crypto.rs`: SHA-256/HMAC-SHA256/PBKDF2/base64 (RFC 向量过) + CSPRNG (`/dev/urandom`)。不引 rustls/sha2 (留 F83 才需 rustls)。
+- **PG SCRAM-SHA-256** (RFC 5802): 消除明文口令。pg.rs SASL 帧 (code 10/11/12) + ScramState + scram_server_first/verify_final (从明文 sql_password 现场派生, proof 验证); worker pg_phase SASL 两步交换 + ConnState.pg_scram。破坏性: PG 认证 cleartext→SCRAM。
+- **MySQL caching_sha2 fast-auth** (additive 非破坏): caching_sha2_password_ok (服务端知明文直接验证, 免 RSA/TLS) + fast_auth_success(0x01 0x03); 失败/其他保留 AuthSwitch→native 兜底; mysql_gen_salt 改 CSPRNG。
+- 实机 (sql_password=s3cret): psycopg3 SCRAM 登录+查询 OK/错口令拒; mysql-connector 默认+显式 caching_sha2 均 OK/错口令 1045。全量 **862/862** clippy 0。
+- 边界: 单一 sql_password (无 per-user); 无 channel binding; **传输加密 TLS 仍缺 → F83** (最后阶段)。
+
+### 2026-08-01 会话十九-B 总览 (F81 DECIMAL 定点小数 — P0 数据类型第二阶段, 细节见 CHANGELOG)
+
+- **金额精确类型 DECIMAL** (唯一动 row/keyspace 结构的类型)。承载双源: **`ColType::Decimal{precision,scale}`** (scale 入类型→转换/渲染/DDL 零签名改动, 避免 Column 加字段) + **`ColValue::Decimal(i128,u8)`** (值自带 scale, 变长区 16B i128 承载, 不动 row 8B 定长假设)。schema FMT_VER 3→4 (兼容 v1-3)。
+- keyspace: IVAL_DECIMAL(0x03) + encode_i128_ordered(符号翻转BE 16B) + 17B 索引值; worker: parse_decimal/render_decimal + sql_to_col/sql_cmp/cmp_colvalue/sql_order_cmp/Accum::SumDec/pk/index/json 全加 Decimal 臂 + Accum::new 传真实 out_ty; sql.rs parse DECIMAL(p,s); 协议 NEWDECIMAL(246)/NUMERIC(1700) 定点文本 (mysql 文本+二进制均 lenenc)。
+- 实机: psycopg3 + mysql-connector (文本+预处理) 均返回原生 `Decimal`, 精度不丢, SUM 精确; 全量 **858/858** clippy 0。
+- 边界: i128 精度<=38; AVG→f64 回退; SUM 溢出报错; SQL 字面量经 f64 最短文本(常见精确), ORM 字符串参数完全精确; 超位截断不四舍五入。
+
+### 2026-08-01 会话十九总览 (F80 数据类型扩展 P0-1 — BOOL/DATE/TIME/TIMESTAMP/JSON/UUID, 细节见 CHANGELOG)
+
+- **生产可用性 P0** (数据类型与安全 4 阶段计划: F80 类型-整数/字节系 → F81 DECIMAL → F82 认证 → F83 TLS)。本轮 F80:
+  - `ColType` 加 6 变体; **BOOL/DATE/TIME/TIMESTAMP 以 i64 承载** (复用 8B 定长槽 + encode_idx; 时间统一 i64 微秒 UTC 裸值); **JSON/UUID 以 Bytes 承载**; ColValue 不新增变体 (语义由列 ColType 决定)。
+  - 解析: 抽 `parse_col_type` (create/alter 共用); `value()` 认 TRUE/FALSE + `DATE|TIMESTAMP '...'` 前缀; WHERE RHS ColRef 守卫排除字面量关键字。
+  - worker: 自包含日期数学 (days_from_civil/civil_from_days) + parse/render_{date,time,timestamp}/uuid; `coerce_cmp_lit` 在 eval_cond_leaf 按列类型强转 WHERE 时间/布尔字面量。
+  - 渲染**按 (ColType,ColValue)**: pg text_cell(ty,v) + type_oid; mysql 文本 + **二进制协议 encode_bin_date/datetime/time** (预处理结果集); mysql_type / coltype_sql_name / SHOW CREATE 加类型名。
+- 实机: e2e mysql_types + storage 单元 f80_new_types_roundtrip; **psycopg3** 原生 True/date/datetime/dict/UUID, **mysql-connector** 文本+预处理均原生 datetime; 全量 **856/856** clippy 0。
+- 边界: 时间无时区 (UTC v1); JSON 文本存储不建路径索引/单行 <64KB; 破坏性: DESCRIBE BOOLEAN 列 bigint→boolean。
+
+### 2026-07-31 会话十八总览 (F78 表达式聚合 / F79 ALTER — ORM P2 完结, 细节见 CHANGELOG)
+
+- **ORM P2** (15/17→17/17, P0/P1/P2 全完成):
+  - **F78 表达式聚合** SUM(a+b)/COUNT(v-1)/AVG(x/2): tokenizer +−*/; ScalarExpr AST + 递归下降; SelectItem::Agg.col→arg:Option<ScalarExpr>; worker BoundExpr + eval_bound_expr 逐行求值嗂 Accum (除零/非数/溢出→NULL)
+  - **F79 ALTER TABLE ADD COLUMN**: storage 多版本行解码 (TableSchema.version_ncols + FMT_VER3 + read_col 按行首版本字节取列数, 超出列补 NULL, 零数据重写); parse_alter; dispatch 基于旧 schema 合成新 schema 广播 SetSchemaOp + ddl_epoch递增
+- 实机: e2e + ORM 17/17 + mysql/pg 一致; 全量 854/854 (45s) clippy 0
+- 边界: F78 仅 +−*/无函数嵌套; F79 仅 ADD 可空列 (DROP/MODIFY/NOT NULL 拒, version u8 上限 255)
+- **ORM 对接 P0/P1/P2 全部完成** (列别名/限定列/db.table/LIMIT n,m/DISTINCT/COUNT(DISTINCT)/表达式聚合/ALTER ADD COLUMN + create_all)
+
+### 2026-07-31 会话十七总览 (F77: DISTINCT 补全 ORM P1, 细节见 CHANGELOG)
+
+- **ORM P1** (13/17→15/17): `SELECT DISTINCT` (解析期 desugar→GROUP BY, 零新字段零 worker 新逻辑) + `COUNT(DISTINCT col)` (SelectItem::Agg/AggItemKind 加 distinct + 新 Accum::CountDistinct 去重集)
+- 两项均在聚合完成点 gather 后全局去重 (encode_col_key 与 GROUP BY 组键同源), 无跨 shard 改动
+- 拒绝: DISTINCT * / DISTINCT+聚合/GROUP BY/JOIN/派生表/系统表; SUM/AVG/MIN/MAX(DISTINCT)
+- 剩余 P2: SUM(表达式) / ALTER TABLE
+- 实机: e2e mysql_distinct + ORM 15/17 + mysql/pg 一致; 全量 851/851 (52s) clippy 0
+- **❗lld 链接器使所有 cargo 命令 (含 build) 都需 `TMPDIR=$PWD/target/nxtmp`** (只读 /tmp 下 lld 建临时文件会 SIGABRT)
+
+### 2026-07-31 会话十六总览 (F76: ORM 对接 P0 + 回归提速, 细节见 CHANGELOG)
+
+- **ORM 对接 P0** (以 SQLAlchemy 实机探测驱动, 0/17→13/17): 列别名 AS / 单表限定列 `表.列` / `db.table` (含反引号) / `LIMIT offset,count`; 额外解 create_all 阻断 (DESCRIBE不存在表→MySQL 1146; 表级 PRIMARY KEY/UNIQUE/KEY/FOREIGN KEY/CONSTRAINT + 吃 AUTO_INCREMENT/DEFAULT)
+- 均在 protocol/sql.rs 解析层 + worker.rs 投影渲染 (out_names 三路: alias>label>列名); 零存储/调度改动
+- 剩余缺口 (P1/P2): DISTINCT / COUNT(DISTINCT) / SUM(表达式) / ALTER TABLE
+- **回归提速 (已配置)**: rust-lld 链接器 (.cargo/config.toml + .linker/ld.lld, 零安装) 使重链接 ~1s; cargo-nextest (并行+进度+超时, .config/nextest.toml) 全量 850 测试 57s
+- **❗跑测试必加 `TMPDIR=$PWD/target/nxtmp`**: 沙箱 /tmp 只读不稳定, e2e 写临时库到 /tmp 会导致并发下引擎初始化失败/页损坏→hang (非 io_uring/非代码 bug)
+
 ### 2026-07-31 会话十五总览 (F73/F74/F75, 细节见 CHANGELOG)
 
 - **子查询后续三件套** (Phase 3 已知遗留收尾):

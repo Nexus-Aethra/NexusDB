@@ -44,6 +44,7 @@ fn start_server(auth_password: Option<&str>) -> (NetworkServer, Arc<ShardManager
         auth_password: auth_password.map(|s| s.to_string()),
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     (server, mgr)

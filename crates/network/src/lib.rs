@@ -20,6 +20,7 @@ pub mod kv_to_shard;
 pub mod protocol;
 pub mod reply_bus;
 pub mod server;
+pub mod tls;
 pub mod value_codec;
 pub mod worker;
 pub use worker::{SqlSharedRoutes, new_sql_shared};

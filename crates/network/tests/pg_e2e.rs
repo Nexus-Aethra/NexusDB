@@ -38,6 +38,7 @@ fn start_pg_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>)
         auth_password: password.map(|s| s.to_string()),
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
+        tls_config: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     (server, mgr)
@@ -132,6 +133,9 @@ impl PgConn {
             assert_eq!(one[0], b'N', "SSL 应被拒绝");
         }
         c.send_startup("tester", None);
+        // ⭐ F82: SCRAM-SHA-256 客户端状态
+        let mut scram_cf_bare: Vec<u8> = Vec::new();
+        let mut scram_cnonce: Vec<u8> = Vec::new();
         loop {
             let (ty, p) = c.read_frame();
             match ty {
@@ -140,11 +144,61 @@ impl PgConn {
                     match code {
                         0 => {} // AuthenticationOk
                         3 => {
-                            // cleartext password
+                            // cleartext password (兼容分支; 现服务端默认 SCRAM)
                             let mut pw = password.unwrap_or("").as_bytes().to_vec();
                             pw.push(0);
                             c.send_frame(b'p', &pw);
                         }
+                        10 => {
+                            // AuthenticationSASL → 发 SASLInitialResponse (SCRAM-SHA-256)
+                            use network::protocol::crypto as cr;
+                            scram_cnonce = cr::rand_printable(24);
+                            let cf_bare =
+                                format!("n=,r={}", String::from_utf8_lossy(&scram_cnonce));
+                            scram_cf_bare = cf_bare.clone().into_bytes();
+                            let client_first = format!("n,,{cf_bare}");
+                            let mut payload = b"SCRAM-SHA-256\0".to_vec();
+                            payload.extend_from_slice(&(client_first.len() as u32).to_be_bytes());
+                            payload.extend_from_slice(client_first.as_bytes());
+                            c.send_frame(b'p', &payload);
+                        }
+                        11 => {
+                            // AuthenticationSASLContinue: server-first "r=..,s=..,i=.."
+                            use network::protocol::crypto as cr;
+                            let server_first = &p[4..];
+                            let sf = String::from_utf8_lossy(server_first).into_owned();
+                            let nonce = sf.split(',').find_map(|k| k.strip_prefix("r=")).unwrap();
+                            let salt_b64 =
+                                sf.split(',').find_map(|k| k.strip_prefix("s=")).unwrap();
+                            let iter: u32 = sf
+                                .split(',')
+                                .find_map(|k| k.strip_prefix("i="))
+                                .unwrap()
+                                .parse()
+                                .unwrap();
+                            assert!(
+                                nonce.as_bytes().starts_with(&scram_cnonce),
+                                "server nonce must extend client nonce"
+                            );
+                            let salt = cr::base64_decode(salt_b64.as_bytes()).unwrap();
+                            let pw = password.unwrap_or("");
+                            let salted = cr::pbkdf2_sha256_32(pw.as_bytes(), &salt, iter);
+                            let client_key = cr::hmac_sha256(&salted, b"Client Key");
+                            let stored_key = cr::sha256(&client_key);
+                            let cfwp = format!("c=biws,r={nonce}");
+                            let mut auth_msg = scram_cf_bare.clone();
+                            auth_msg.push(b',');
+                            auth_msg.extend_from_slice(server_first);
+                            auth_msg.push(b',');
+                            auth_msg.extend_from_slice(cfwp.as_bytes());
+                            let client_sig = cr::hmac_sha256(&stored_key, &auth_msg);
+                            let proof: Vec<u8> =
+                                (0..32).map(|i| client_key[i] ^ client_sig[i]).collect();
+                            let client_final =
+                                format!("{cfwp},p={}", cr::base64_encode(&proof));
+                            c.send_frame(b'p', client_final.as_bytes());
+                        }
+                        12 => {} // AuthenticationSASLFinal (v=..) — 忽略验证
                         other => panic!("unexpected auth code {other}"),
                     }
                 }
@@ -343,6 +397,7 @@ fn pg_mysql_cross_read() {
         auth_password: None,
         worker_id_base: base,
         sql_shared: shared.clone(),
+        tls_config: None,
     };
     let pg_server = NetworkServer::start(mk(ProtocolKind::Pg, 0)).expect("pg server");
     let my_server = NetworkServer::start(mk(ProtocolKind::Sql, 1)).expect("mysql server");

@@ -233,6 +233,16 @@ pub fn decode_idx(b: [u8; 8]) -> i64 {
     (u64::from_be_bytes(b) ^ 0x8000_0000_0000_0000) as i64
 }
 
+/// ⭐ F81: i128 → 16B 符号翻转 BE 保序编码 (Decimal 定标整数; memcmp 保序).
+pub fn encode_i128_ordered(i: i128) -> [u8; 16] {
+    ((i as u128) ^ (1u128 << 127)).to_be_bytes()
+}
+
+/// 逆变换: 16B → i128.
+pub fn decode_i128_ordered(b: [u8; 16]) -> i128 {
+    (u128::from_be_bytes(b) ^ (1u128 << 127)) as i128
+}
+
 // =====================================================================
 // ⭐ Q3 (SQL 索引): 本地二级索引行 [I][iid u32 BE][memcmp 保序值][PK] → 空值
 // =====================================================================
@@ -263,6 +273,8 @@ pub fn unique_slot_key(iid: u32, enc_val: &[u8]) -> Vec<u8> {
 /// 索引值段的型别字节 (参与排序: 数值 < 字节串).
 pub const IVAL_NUM: u8 = 0x01;
 pub const IVAL_BYTES: u8 = 0x02;
+/// ⭐ F81: Decimal 索引值型别字节 (17B: 型别 + 16B i128 符号翻转 BE 保序).
+pub const IVAL_DECIMAL: u8 = 0x03;
 
 /// 整个 iid 的扫描前缀: `[I][iid u32 BE]`.
 pub fn index_prefix(iid: u32) -> Vec<u8> {
@@ -291,6 +303,14 @@ pub fn encode_index_num(ordered8: [u8; 8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(9);
     out.push(IVAL_NUM);
     out.extend_from_slice(&ordered8);
+    out
+}
+
+/// ⭐ F81: Decimal 列索引值: `[IVAL_DECIMAL][16B i128 保序]` (17B 定长).
+pub fn encode_index_decimal(ordered16: [u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    out.push(IVAL_DECIMAL);
+    out.extend_from_slice(&ordered16);
     out
 }
 
@@ -331,6 +351,12 @@ pub fn split_index_val(rest: &[u8]) -> Option<(&[u8], &[u8])> {
             }
             Some((&rest[..9], &rest[9..]))
         }
+        IVAL_DECIMAL => {
+            if rest.len() < 17 {
+                return None;
+            }
+            Some((&rest[..17], &rest[17..]))
+        }
         IVAL_BYTES => {
             let body = &rest[1..];
             let mut i = 0usize;
@@ -354,6 +380,7 @@ pub fn split_index_val(rest: &[u8]) -> Option<(&[u8], &[u8])> {
 pub fn decode_index_val(enc_val: &[u8]) -> Option<Vec<u8>> {
     match *enc_val.first()? {
         IVAL_NUM => (enc_val.len() == 9).then(|| enc_val[1..9].to_vec()),
+        IVAL_DECIMAL => (enc_val.len() == 17).then(|| enc_val[1..17].to_vec()),
         IVAL_BYTES => {
             let body = enc_val.get(1..enc_val.len().checked_sub(2)?)?;
             let mut val = Vec::with_capacity(body.len());

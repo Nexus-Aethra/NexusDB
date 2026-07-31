@@ -38,6 +38,11 @@ pub struct NetworkServerConfig {
     pub auth_password: Option<String>,
     /// worker_id 起点 (多协议 server 并存时隔开 reply_bus 空间).
     pub worker_id_base: u32,
+    /// ⭐ ORM-B2: 进程级共享路由缓存 — 同一数据集群 (同 ShardManager) 的
+    /// 全部 SQL 门面必须传同一个实例 (跨门面 INSERT/SELECT 一致性).
+    pub sql_shared: std::sync::Arc<crate::worker::SqlSharedRoutes>,
+    /// ⭐ F83: TLS 配置 (None = 明文; Some = SQL 门面支持 STARTTLS 升级).
+    pub tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 pub struct NetworkServer {
@@ -94,6 +99,10 @@ impl NetworkServer {
                 protocol: config.protocol,
                 limits: config.limits,
                 auth_password: config.auth_password.clone(),
+                // ⭐ D3 (分库): SELECT n → db name 翻译视图 (Arc 共享只读)
+                db_view: config.shard_manager.db_view(),
+                sql_shared: config.sql_shared.clone(),
+                tls_config: config.tls_config.clone(),
             });
         }
         let worker_pool = WorkerPool::start(worker_configs)?;

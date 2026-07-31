@@ -52,6 +52,15 @@ pub fn sort_in_set(set: &mut Vec<SqlValue>) {
     }
 }
 
+/// ⭐ F76: 剥 db 限定前缀 — `db.tbl` / `db.tbl` (反引号已在 tokenizer 拼为单 Ident) → `tbl`.
+/// 表名不含 '.', 取最后一段即去 db 限定. v1 不支持真跨库 (归一为当前库同名表).
+fn strip_db_qual(name: String) -> String {
+    match name.rsplit_once('.') {
+        Some((_, tbl)) => tbl.to_string(),
+        None => name,
+    }
+}
+
 /// 比较算子 (WHERE 条件).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
@@ -90,12 +99,106 @@ impl AggFn {
     }
 }
 
-/// ⭐ G1 (F63): SELECT 投影项 — 纯列或聚合函数 (无表达式/别名).
+/// ⭐ G1 (F63): SELECT 投影项 — 纯列或聚合函数. ⭐ F76: 可带输出列别名 (AS).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
+    Col { name: String, alias: Option<String> },
+    /// arg = None 仅 COUNT(*). ⭐ F77: distinct = COUNT(DISTINCT col). ⭐ F78: arg 可为表达式.
+    Agg { func: AggFn, arg: Option<ScalarExpr>, distinct: bool, alias: Option<String> },
+}
+
+/// ⭐ F78: 算术运算符.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl ArithOp {
+    fn sym(self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+        }
+    }
+}
+
+/// ⭐ F78: 聚合内标量表达式 (列引用 / 字面量 / 二元算术).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarExpr {
     Col(String),
-    /// col = None 仅 COUNT(*).
-    Agg { func: AggFn, col: Option<String> },
+    Lit(SqlValue),
+    Bin { op: ArithOp, l: Box<ScalarExpr>, r: Box<ScalarExpr> },
+}
+
+impl ScalarExpr {
+    /// 原文重建 (聚合 label / HAVING/ORDER 匹配用).
+    pub fn render(&self) -> String {
+        match self {
+            ScalarExpr::Col(c) => c.clone(),
+            ScalarExpr::Lit(v) => match v {
+                SqlValue::Int(i) => i.to_string(),
+                SqlValue::Float(f) => f.to_string(),
+                SqlValue::Str(b) => format!("'{}'", String::from_utf8_lossy(b)),
+                _ => "?".to_string(),
+            },
+            ScalarExpr::Bin { op, l, r } => format!("{} {} {}", l.render(), op.sym(), r.render()),
+        }
+    }
+    /// 是否单一裸列引用 (COUNT(DISTINCT col) / 单列聚合退化判定).
+    pub fn as_col(&self) -> Option<&str> {
+        match self {
+            ScalarExpr::Col(c) => Some(c),
+            _ => None,
+        }
+    }
+    /// 收集所有列引用 (只读, 供绑定/校验).
+    pub fn for_each_col<F: FnMut(&str)>(&self, f: &mut F) {
+        match self {
+            ScalarExpr::Col(c) => f(c),
+            ScalarExpr::Lit(_) => {}
+            ScalarExpr::Bin { l, r, .. } => {
+                l.for_each_col(f);
+                r.for_each_col(f);
+            }
+        }
+    }
+    /// 就地改写所有列名 (供 strip_qual 剥表限定前缀).
+    pub fn for_each_col_mut<F: FnMut(&mut String)>(&mut self, f: &mut F) {
+        match self {
+            ScalarExpr::Col(c) => f(c),
+            ScalarExpr::Lit(_) => {}
+            ScalarExpr::Bin { l, r, .. } => {
+                l.for_each_col_mut(f);
+                r.for_each_col_mut(f);
+            }
+        }
+    }
+}
+
+impl SelectItem {
+    /// ⭐ F76: 输出列名 — alias 优先, 否则列名 / 聚合 label.
+    pub fn out_name(&self) -> String {
+        match self {
+            SelectItem::Col { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
+            SelectItem::Agg { func, arg, distinct, alias } => alias.clone().unwrap_or_else(|| {
+                let inner = match arg {
+                    None => "*".to_string(),
+                    Some(e) => e.render(),
+                };
+                let fname = func.label(None).trim_end_matches("(*)").to_string();
+                if *distinct {
+                    format!("{fname}(DISTINCT {inner})")
+                } else {
+                    format!("{fname}({inner})")
+                }
+            }),
+        }
+    }
 }
 
 /// 单个 WHERE 条件 `col op lit` (AND 连接).
@@ -267,6 +370,8 @@ pub enum SqlStmt {
     Update { table: String, sets: Vec<(String, SqlValue)>, conds: Pred<Cond> },
     /// ⭐ S1: DROP TABLE t.
     DropTable { table: String },
+    /// ⭐ F79: ALTER TABLE t ADD COLUMN c TYPE (v1 仅追加可空列).
+    AlterTable { table: String, add: Column },
     /// ⭐ S3: USE db — 连接级切库 (worker 校验存在).
     Use { db: String },
     /// ⭐ S3: DESCRIBE t / DESC t — schema 渲染 (worker 本地).
@@ -370,6 +475,10 @@ enum Tok {
     Question,
     /// ⭐ P1: `$n` 占位符 (PG 风格, 1-based 显式编号).
     Dollar(u16),
+    /// ⭐ F78: 算术运算符 (聚合内表达式; * 复用 Star).
+    Plus,
+    Minus,
+    Slash,
 }
 
 fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
@@ -478,18 +587,45 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
                 }
                 toks.push(Tok::Str(s));
             }
-            b'-' | b'0'..=b'9' => {
-                // 数字 (负号/小数点/科学计数不含 e, v1 够用)
+            b'+' => {
+                toks.push(Tok::Plus);
+                i += 1;
+            }
+            b'/' => {
+                toks.push(Tok::Slash);
+                i += 1;
+            }
+            b'-' => {
+                // ⭐ F78: 二元减号 vs 负数字面量 — 前一 token 是值结尾 (ident/num/str/`)`)
+                // 则为二元减; 否则为负数前缀 (保留旧行为: WHERE x = -1).
+                let prev_is_value = matches!(
+                    toks.last(),
+                    Some(Tok::Ident(_) | Tok::Num(_) | Tok::Str(_) | Tok::RParen)
+                );
+                if prev_is_value {
+                    toks.push(Tok::Minus);
+                    i += 1;
+                } else {
+                    let start = i;
+                    i += 1;
+                    while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                        i += 1;
+                    }
+                    let t = &input[start..i];
+                    if t == "-" {
+                        return Err("bare '-' is not a number".into());
+                    }
+                    toks.push(Tok::Num(t.to_string()));
+                }
+            }
+            b'0'..=b'9' => {
+                // 正数 (小数点; 科计数不含 e, v1 够用)
                 let start = i;
                 i += 1;
                 while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
                     i += 1;
                 }
-                let t = &input[start..i];
-                if t == "-" {
-                    return Err("bare '-' is not a number".into());
-                }
-                toks.push(Tok::Num(t.to_string()));
+                toks.push(Tok::Num(input[start..i].to_string()));
             }
             _ if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;
@@ -501,16 +637,37 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
             }
             // ⭐ F66: 反引号标识符 `name` (MySQL 引用; SQLAlchemy SHOW ... FROM `db`)
             b'`' => {
-                i += 1;
-                let start = i;
-                while i < b.len() && b[i] != b'`' {
-                    i += 1;
+                // ⭐ F76: 支持 `db`.`tbl` / `db`.tbl 点分限定 — 拼成单 Ident "db.tbl"
+                let mut name = String::new();
+                loop {
+                    if b.get(i) == Some(&b'`') {
+                        i += 1;
+                        let start = i;
+                        while i < b.len() && b[i] != b'`' {
+                            i += 1;
+                        }
+                        if i >= b.len() {
+                            return Err("unterminated `identifier`".into());
+                        }
+                        name.push_str(&input[start..i]);
+                        i += 1; // 跳过右反引号
+                    } else {
+                        // 裸段 (点后未加反引号: `db`.tbl)
+                        let start = i;
+                        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                            i += 1;
+                        }
+                        name.push_str(&input[start..i]);
+                    }
+                    // 点分隔 → 继续下一段; 否则结束
+                    if b.get(i) == Some(&b'.') {
+                        name.push('.');
+                        i += 1;
+                    } else {
+                        break;
+                    }
                 }
-                if i >= b.len() {
-                    return Err("unterminated `identifier`".into());
-                }
-                toks.push(Tok::Ident(input[start..i].to_string()));
-                i += 1; // 跳过右反引号
+                toks.push(Tok::Ident(name));
             }
             _ => return Err(format!("unexpected character '{}'", c as char)),
         }
@@ -582,6 +739,11 @@ impl P {
         }
     }
 
+    /// ⭐ F76: 表位置标识符 — 读 ident 并剥 db 限定前缀 (`db.tbl` → `tbl`).
+    fn table_ident(&mut self) -> Result<String, String> {
+        Ok(strip_db_qual(self.ident()?))
+    }
+
     fn expect(&mut self, want: &Tok, what: &str) -> Result<(), String> {
         let t = self.next()?;
         if &t == want { Ok(()) } else { Err(format!("expected {what}, got {t:?}")) }
@@ -597,7 +759,24 @@ impl P {
                 }
             }
             Tok::Str(s) => Ok(SqlValue::Str(s)),
-            Tok::Ident(s) if s.eq_ignore_ascii_case("NULL") => Ok(SqlValue::Null),
+            // ⭐ F80: NULL / TRUE / FALSE / 时间前缀字面量 DATE|TIME|TIMESTAMP|DATETIME '...'
+            Tok::Ident(s) => {
+                match s.to_ascii_uppercase().as_str() {
+                    "NULL" => Ok(SqlValue::Null),
+                    "TRUE" => Ok(SqlValue::Int(1)),
+                    "FALSE" => Ok(SqlValue::Int(0)),
+                    "DATE" | "TIME" | "TIMESTAMP" | "DATETIME"
+                        if matches!(self.peek(), Some(Tok::Str(_))) =>
+                    {
+                        // 前缀标注: 内层字符串按目标列 ColType 在 worker 解析
+                        match self.next()? {
+                            Tok::Str(b) => Ok(SqlValue::Str(b)),
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => Err(format!("expected literal, got identifier {s}")),
+                }
+            }
             // ⭐ P1: 占位符 → Param (0-based; ?/$ 混用报错)
             Tok::Question => {
                 if self.saw_dollar {
@@ -768,6 +947,7 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("DELETE") => parse_delete(&mut p),
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("UPDATE") => parse_update(&mut p),
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("DROP") => parse_drop(&mut p),
+        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("ALTER") => parse_alter(&mut p),
         // ⭐ S3: 工具命令
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("USE") => {
             p.next()?;
@@ -779,7 +959,7 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
             if s.eq_ignore_ascii_case("DESCRIBE") || s.eq_ignore_ascii_case("DESC") =>
         {
             p.next()?;
-            let table = p.ident()?;
+            let table = p.table_ident()?;
             p.done()?;
             Ok(SqlStmt::Describe { table })
         }
@@ -943,15 +1123,31 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
     })
 }
 
+/// ⭐ F76: 读 `(col [, col ...])` 列名列表 (表级约束用; 反引号已在 tokenizer 去).
+fn read_col_list(p: &mut P) -> Result<Vec<String>, String> {
+    p.expect(&Tok::LParen, "(")?;
+    let mut cols = Vec::new();
+    loop {
+        cols.push(p.ident()?);
+        match p.next()? {
+            Tok::Comma => continue,
+            Tok::RParen => break,
+            other => return Err(format!("expected ',' or ')' in column list, got {other:?}")),
+        }
+    }
+    Ok(cols)
+}
+
 /// `CREATE TABLE t (col TYPE [PRIMARY KEY] [NOT NULL], ..., INDEX(col), ...)`
 fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("CREATE")?;
     p.kw("TABLE")?;
-    let table = p.ident()?;
+    let table = p.table_ident()?;
     p.expect(&Tok::LParen, "(")?;
 
     let mut columns: Vec<Column> = Vec::new();
     let mut pk: Option<u16> = None;
+    let mut pk_name: Option<String> = None; // ⭐ F76: 表级 PRIMARY KEY (col)
     let mut index_names: Vec<String> = Vec::new();
     let mut unique_names: Vec<String> = Vec::new(); // ⭐ O3
     let mut global_unique_names: Vec<String> = Vec::new(); // ⭐ F65
@@ -960,30 +1156,54 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
             p.expect(&Tok::LParen, "(")?;
             index_names.push(p.ident()?);
             p.expect(&Tok::RParen, ")")?;
+        } else if p.try_kw("CONSTRAINT") {
+            // ⭐ F76: CONSTRAINT [name] <PRIMARY KEY|UNIQUE|FOREIGN KEY> — 吃可选名后
+            // continue 重进循环, 由下方 PRIMARY/UNIQUE/FOREIGN 分支处理实体
+            if !matches!(p.peek(), Some(Tok::Ident(s)) if
+                s.eq_ignore_ascii_case("PRIMARY") || s.eq_ignore_ascii_case("UNIQUE")
+                    || s.eq_ignore_ascii_case("FOREIGN") || s.eq_ignore_ascii_case("KEY"))
+            {
+                let _ = p.ident()?; // 约束名
+            }
+            continue;
+        } else if p.try_kw("PRIMARY") {
+            p.kw("KEY")?;
+            let cols = read_col_list(p)?;
+            pk_name = cols.into_iter().next(); // v1 单列 pk (复合取首列)
+        } else if p.try_kw("UNIQUE") {
+            p.try_kw("KEY");
+            // 可选索引名 (非左括号时)
+            if p.peek() != Some(&Tok::LParen) {
+                let _ = p.ident()?;
+            }
+            let cols = read_col_list(p)?;
+            if let Some(c) = cols.into_iter().next() {
+                unique_names.push(c);
+            }
+        } else if p.try_kw("KEY") {
+            if p.peek() != Some(&Tok::LParen) {
+                let _ = p.ident()?;
+            }
+            let cols = read_col_list(p)?;
+            if let Some(c) = cols.into_iter().next() {
+                index_names.push(c);
+            }
+        } else if p.try_kw("FOREIGN") {
+            // ⭐ F76: FOREIGN KEY (col) REFERENCES t (col) [ON ...] — v1 吞 (不强制外键)
+            p.kw("KEY")?;
+            let _ = read_col_list(p)?;
+            p.kw("REFERENCES")?;
+            let _ = p.ident()?;
+            if p.peek() == Some(&Tok::LParen) {
+                let _ = read_col_list(p)?;
+            }
+            // 吞 ON DELETE/UPDATE ... 至下个 , 或 )
+            while !matches!(p.peek(), Some(Tok::Comma) | Some(Tok::RParen) | None) {
+                p.i += 1;
+            }
         } else {
             let name = p.ident()?;
-            let ty_name = p.ident()?;
-            let ty = match ty_name.to_ascii_uppercase().as_str() {
-                "INT" | "BIGINT" | "INTEGER" | "SMALLINT" => ColType::I64,
-                // ⭐ S3: BOOLEAN → I64 (0/1); PG `DOUBLE PRECISION` 双词在下方吞
-                "BOOLEAN" | "BOOL" => ColType::I64,
-                "DOUBLE" | "FLOAT" | "REAL" => ColType::F64,
-                "TEXT" | "VARCHAR" | "CHAR" | "STRING" => ColType::Str,
-                "BLOB" | "BYTES" | "BYTEA" => ColType::Bytes, // ⭐ S3: PG BYTEA
-                other => return Err(format!("unknown type {other}")),
-            };
-            // ⭐ S3: 方言噪声 — `DOUBLE PRECISION` 第二词 / `VARCHAR(n)` 长度参数
-            if ty_name.eq_ignore_ascii_case("DOUBLE") {
-                p.try_kw("PRECISION");
-            }
-            if p.peek() == Some(&Tok::LParen) {
-                p.next()?;
-                match p.next()? {
-                    Tok::Num(_) => {}
-                    other => return Err(format!("expected type length, got {other:?}")),
-                }
-                p.expect(&Tok::RParen, ")")?;
-            }
+            let ty = parse_col_type(p)?;
             let mut nullable = true;
             let mut is_pk = false;
             loop {
@@ -1004,6 +1224,14 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                     // NULL 不入索引, 无法参与唯一性, 直接拒绝更诚实)
                     unique_names.push(name.clone());
                     nullable = false;
+                } else if p.try_kw("AUTO_INCREMENT") || p.try_kw("AUTOINCREMENT") {
+                    // ⭐ F76: 吃 AUTO_INCREMENT (v1 不做服务端自增; ORM 提供显式 id)
+                } else if p.try_kw("DEFAULT") {
+                    // ⭐ F76: 吃 DEFAULT <字面量> (v1 不落默认值)
+                    let _ = p.value()?;
+                } else if p.try_kw("COMMENT") {
+                    // ⭐ F76: 吃 COMMENT '…'
+                    let _ = p.value()?;
                 } else {
                     break;
                 }
@@ -1024,6 +1252,17 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
     }
     p.done()?;
 
+    // ⭐ F76: 表级 PRIMARY KEY (col) → 解析列位 (内联 pk 优先); 并置该列 NOT NULL
+    if pk.is_none()
+        && let Some(n) = &pk_name
+    {
+        let i = columns
+            .iter()
+            .position(|c| c.name == *n)
+            .ok_or_else(|| format!("PRIMARY KEY on unknown column {n}"))?;
+        columns[i].nullable = false;
+        pk = Some(i as u16);
+    }
     let pk = pk.ok_or("PRIMARY KEY required")?;
     let col_pos = |n: &str, what: &str| -> Result<u16, String> {
         columns
@@ -1053,7 +1292,7 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
 fn parse_insert(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("INSERT")?;
     p.kw("INTO")?;
-    let table = p.ident()?;
+    let table = p.table_ident()?;
     let mut cols: Vec<String> = Vec::new();
     if p.peek() == Some(&Tok::LParen) {
         p.next()?;
@@ -1133,7 +1372,7 @@ fn parse_derived(p: &mut P, items: Vec<SelectItem>, top: bool) -> Result<SqlStmt
     if items.iter().any(|i| matches!(i, SelectItem::Agg { .. })) {
         // v1 特判: 唯一投影项为 COUNT(*) 允许 (行数统计); 其余聚合拒
         let lone_count = items.len() == 1
-            && matches!(&items[0], SelectItem::Agg { func: AggFn::Count, col: None });
+            && matches!(&items[0], SelectItem::Agg { func: AggFn::Count, arg: None, .. });
         if !lone_count {
             return Err("aggregate on derived table is not supported (v1, except lone COUNT(*))".into());
         }
@@ -1312,8 +1551,13 @@ fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::Subquery(stmt), set: vec![] }));
         }
         // ⭐ F74: col op ident (非 NULL) → ColRef (关联子查询相关列; decorrelate 前收集)
+        // ⭐ F80: 但排除字面量前导关键字 (NULL/TRUE/FALSE 及 DATE|TIME|TIMESTAMP|DATETIME '...'),
+        //   它们应落到 value() 解析为字面量而非列引用.
         if let Some(Tok::Ident(s)) = p.peek()
-            && !s.eq_ignore_ascii_case("NULL")
+            && !matches!(
+                s.to_ascii_uppercase().as_str(),
+                "NULL" | "TRUE" | "FALSE" | "DATE" | "TIME" | "TIMESTAMP" | "DATETIME"
+            )
         {
             let rhs = p.ident()?;
             return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::ColRef(rhs), set: vec![] }));
@@ -1335,7 +1579,7 @@ fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
 fn parse_delete(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("DELETE")?;
     p.kw("FROM")?;
-    let table = p.ident()?;
+    let table = p.table_ident()?;
     let conds = parse_where(p)?;
     p.done()?;
     Ok(SqlStmt::Delete { table, conds })
@@ -1344,7 +1588,7 @@ fn parse_delete(p: &mut P) -> Result<SqlStmt, String> {
 /// ⭐ S1: `UPDATE t SET c = v [, c2 = v2 ...] WHERE ...`
 fn parse_update(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("UPDATE")?;
-    let table = p.ident()?;
+    let table = p.table_ident()?;
     p.kw("SET")?;
     let mut sets: Vec<(String, SqlValue)> = Vec::new();
     loop {
@@ -1362,13 +1606,155 @@ fn parse_update(p: &mut P) -> Result<SqlStmt, String> {
     Ok(SqlStmt::Update { table, sets, conds })
 }
 
+/// ⭐ F80: 列类型名 → ColType (parse_create/parse_alter 共用). 吞方言噪声
+/// (`DOUBLE PRECISION` / `VARCHAR(n)` / `DECIMAL(p,s)` 长度与精度参数).
+fn parse_col_type(p: &mut P) -> Result<ColType, String> {
+    let ty_name = p.ident()?;
+    let up = ty_name.to_ascii_uppercase();
+    // ⭐ F81: DECIMAL/NUMERIC(p,s) — 捕获精度与标度存入类型
+    if up == "DECIMAL" || up == "NUMERIC" || up == "DEC" {
+        let (mut precision, mut scale) = (10u8, 0u8);
+        if p.peek() == Some(&Tok::LParen) {
+            p.next()?;
+            precision = match p.next()? {
+                Tok::Num(n) => n.parse::<u8>().map_err(|_| "bad DECIMAL precision".to_string())?,
+                other => return Err(format!("expected DECIMAL precision, got {other:?}")),
+            };
+            if p.peek() == Some(&Tok::Comma) {
+                p.next()?;
+                scale = match p.next()? {
+                    Tok::Num(n) => n.parse::<u8>().map_err(|_| "bad DECIMAL scale".to_string())?,
+                    other => return Err(format!("expected DECIMAL scale, got {other:?}")),
+                };
+            }
+            p.expect(&Tok::RParen, ")")?;
+        }
+        if scale > 38 || precision > 38 {
+            return Err("DECIMAL precision/scale must be <= 38".into());
+        }
+        return Ok(ColType::Decimal { precision, scale });
+    }
+    let ty = match up.as_str() {
+        "INT" | "BIGINT" | "INTEGER" | "SMALLINT" => ColType::I64,
+        "BOOLEAN" | "BOOL" => ColType::Bool,
+        "DOUBLE" | "FLOAT" | "REAL" => ColType::F64,
+        "TEXT" | "VARCHAR" | "CHAR" | "STRING" => ColType::Str,
+        "BLOB" | "BYTES" | "BYTEA" => ColType::Bytes,
+        "DATE" => ColType::Date,
+        "TIME" => ColType::Time,
+        "TIMESTAMP" | "DATETIME" => ColType::Timestamp,
+        "JSON" | "JSONB" => ColType::Json,
+        "UUID" => ColType::Uuid,
+        other => return Err(format!("unknown type {other}")),
+    };
+    if ty_name.eq_ignore_ascii_case("DOUBLE") {
+        p.try_kw("PRECISION");
+    }
+    // 长度参数: (n) — 吞
+    if p.peek() == Some(&Tok::LParen) {
+        p.next()?;
+        loop {
+            match p.next()? {
+                Tok::Num(_) => {}
+                other => return Err(format!("expected type length, got {other:?}")),
+            }
+            match p.next()? {
+                Tok::Comma => continue,
+                Tok::RParen => break,
+                other => return Err(format!("expected ',' or ')' in type params, got {other:?}")),
+            }
+        }
+    }
+    Ok(ty)
+}
+
 /// ⭐ S1: `DROP TABLE t`
 fn parse_drop(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("DROP")?;
     p.kw("TABLE")?;
-    let table = p.ident()?;
+    let table = p.table_ident()?;
     p.done()?;
     Ok(SqlStmt::DropTable { table })
+}
+
+/// ⭐ F79: `ALTER TABLE t ADD [COLUMN] name TYPE [NULL|NOT NULL] [DEFAULT v]`.
+/// v1 仅支持追加可空列 (NOT NULL 无法回填旧行 → 拒); DROP/MODIFY/RENAME 拒.
+fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
+    p.kw("ALTER")?;
+    p.kw("TABLE")?;
+    let table = p.table_ident()?;
+    if !p.try_kw("ADD") {
+        return Err("only ALTER TABLE ADD COLUMN is supported (v1)".into());
+    }
+    p.try_kw("COLUMN"); // 可选
+    let name = p.ident()?;
+    let ty = parse_col_type(p)?;
+    // 列属性: NULL/NOT NULL/DEFAULT(吞); NOT NULL 无法回填旧行 → 拒
+    let mut nullable = true;
+    loop {
+        if p.try_kw("NOT") {
+            p.kw("NULL")?;
+            nullable = false;
+        } else if p.try_kw("NULL") {
+            nullable = true;
+        } else if p.try_kw("DEFAULT") {
+            let _ = p.value()?; // v1 吞默认值 (旧行仍读 NULL)
+        } else {
+            break;
+        }
+    }
+    if !nullable {
+        return Err(
+            "ADD COLUMN NOT NULL is not supported (v1); add a nullable column".into(),
+        );
+    }
+    p.done()?;
+    Ok(SqlStmt::AlterTable { table, add: Column { name, ty, nullable } })
+}
+
+/// ⭐ F78: 聚合内标量表达式递归下降 — 加减 > 乘除 > 因子 (列/字面量/括号).
+fn parse_scalar_expr(p: &mut P) -> Result<ScalarExpr, String> {
+    let mut lhs = parse_scalar_term(p)?;
+    loop {
+        let op = match p.peek() {
+            Some(Tok::Plus) => ArithOp::Add,
+            Some(Tok::Minus) => ArithOp::Sub,
+            _ => break,
+        };
+        p.next()?;
+        let rhs = parse_scalar_term(p)?;
+        lhs = ScalarExpr::Bin { op, l: Box::new(lhs), r: Box::new(rhs) };
+    }
+    Ok(lhs)
+}
+
+fn parse_scalar_term(p: &mut P) -> Result<ScalarExpr, String> {
+    let mut lhs = parse_scalar_factor(p)?;
+    loop {
+        let op = match p.peek() {
+            Some(Tok::Star) => ArithOp::Mul,
+            Some(Tok::Slash) => ArithOp::Div,
+            _ => break,
+        };
+        p.next()?;
+        let rhs = parse_scalar_factor(p)?;
+        lhs = ScalarExpr::Bin { op, l: Box::new(lhs), r: Box::new(rhs) };
+    }
+    Ok(lhs)
+}
+
+fn parse_scalar_factor(p: &mut P) -> Result<ScalarExpr, String> {
+    match p.peek() {
+        Some(Tok::LParen) => {
+            p.next()?;
+            let e = parse_scalar_expr(p)?;
+            p.expect(&Tok::RParen, ")")?;
+            Ok(e)
+        }
+        Some(Tok::Num(_)) | Some(Tok::Str(_)) => Ok(ScalarExpr::Lit(p.value()?)),
+        Some(Tok::Ident(_)) => Ok(ScalarExpr::Col(p.ident()?)),
+        other => Err(format!("expected column/number/expression, got {other:?}")),
+    }
 }
 
 /// ⭐ F66: 拆分系统表名 `catalog.table` — 仅 information_schema / pg_catalog
@@ -1408,13 +1794,28 @@ fn parse_select_tail(
         }
     }
     let mut limit = None;
+    let mut offset = None;
     if p.try_kw("LIMIT") {
         match p.next()? {
-            Tok::Num(n) => limit = Some(n.parse::<u32>().map_err(|_| format!("bad LIMIT {n}"))?),
+            Tok::Num(n) => {
+                let a = n.parse::<u32>().map_err(|_| format!("bad LIMIT {n}"))?;
+                // ⭐ F76: MySQL `LIMIT offset, count` 逗号形态
+                if p.peek() == Some(&Tok::Comma) {
+                    p.next()?;
+                    match p.next()? {
+                        Tok::Num(m) => {
+                            offset = Some(a);
+                            limit = Some(m.parse::<u32>().map_err(|_| format!("bad LIMIT {m}"))?);
+                        }
+                        other => return Err(format!("expected LIMIT count, got {other:?}")),
+                    }
+                } else {
+                    limit = Some(a);
+                }
+            }
             other => return Err(format!("expected LIMIT count, got {other:?}")),
         }
     }
-    let mut offset = None;
     if p.try_kw("OFFSET") {
         match p.next()? {
             Tok::Num(n) => offset = Some(n.parse::<u32>().map_err(|_| format!("bad OFFSET {n}"))?),
@@ -1460,7 +1861,7 @@ fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
         if !(p.try_kw("FROM") || p.try_kw("IN")) {
             return Err("expected FROM after SHOW COLUMNS".into());
         }
-        let table = p.ident()?;
+        let table = p.table_ident()?;
         if p.try_kw("FROM") || p.try_kw("IN") {
             let _ = p.ident()?;
         }
@@ -1472,7 +1873,7 @@ fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
     } else if p.try_kw("CREATE") {
         // SHOW CREATE TABLE t — SQLAlchemy MySQL 方言从 DDL 解析列
         p.kw("TABLE")?;
-        let table = p.ident()?;
+        let table = p.table_ident()?;
         p.done()?;
         Ok(mk("create_table", table_leaf(table)))
     } else {
@@ -1521,6 +1922,27 @@ fn parse_opt_alias(p: &mut P) -> Option<String> {
             up.as_str(),
             "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS"
                 | "ON" | "WHERE" | "ORDER" | "LIMIT" | "OFFSET" | "GROUP" | "HAVING" | "USING"
+        );
+        if !reserved {
+            let a = s.clone();
+            p.i += 1;
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// ⭐ F76: 投影列输出别名 — `[AS] alias` (仅非保留字; FROM/子句关键字不当别名).
+fn parse_col_alias(p: &mut P) -> Option<String> {
+    if p.try_kw("AS") {
+        return p.ident().ok();
+    }
+    if let Some(Tok::Ident(s)) = p.peek() {
+        let up = s.to_ascii_uppercase();
+        let reserved = matches!(
+            up.as_str(),
+            "FROM" | "AS" | "WHERE" | "ORDER" | "GROUP" | "HAVING" | "LIMIT" | "OFFSET"
+                | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "ON" | "USING"
         );
         if !reserved {
             let a = s.clone();
@@ -1603,7 +2025,7 @@ fn parse_join_from(
         if p.peek_paren_select() {
             return Err("derived table on JOIN right side is not supported (v1)".into());
         }
-        let table = p.ident()?;
+        let table = p.table_ident()?;
         let alias = parse_opt_alias(p).unwrap_or_else(|| table.clone());
         let on = if kind == JoinKind::Cross {
             Vec::new()
@@ -1641,7 +2063,7 @@ fn parse_join_from(
     let items: Vec<JoinItem> = sel_items
         .iter()
         .map(|it| match it {
-            SelectItem::Col(s) => Ok(JoinItem::Col(QualCol::parse(s))),
+            SelectItem::Col { name, .. } => Ok(JoinItem::Col(QualCol::parse(name))),
             SelectItem::Agg { .. } => {
                 Err("aggregate functions are not supported in JOIN queries".to_string())
             }
@@ -1708,6 +2130,8 @@ fn parse_having_not(p: &mut P) -> Result<Pred<Cond>, String> {
 /// [LIMIT n] [OFFSET m]`. ⭐ F71: top=false 为子查询上下文 (不调 done, 不走 stub).
 fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     p.kw("SELECT")?;
+    // ⭐ F77: SELECT DISTINCT — 在投影前捕获; 后续 desugar 成 GROUP BY 全投影列.
+    let distinct = p.try_kw("DISTINCT");
     // ⭐ O1: 投影列表 (Star = 全列); ⭐ G1 (F63): 列/聚合函数混合项
     let mut items: Vec<SelectItem> = Vec::new();
     if p.peek() == Some(&Tok::Star) {
@@ -1743,19 +2167,35 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                     other => return Err(format!("unknown function '{other}'")),
                 };
                 p.next()?; // (
-                let col = if p.peek() == Some(&Tok::Star) {
+                // ⭐ F77: COUNT(DISTINCT ...) — DISTINCT 仅 COUNT
+                let distinct = p.try_kw("DISTINCT");
+                if distinct && func != AggFn::Count {
+                    return Err("DISTINCT is only supported in COUNT (v1)".into());
+                }
+                let arg = if p.peek() == Some(&Tok::Star) {
                     if func != AggFn::Count {
                         return Err(format!("{name}(*) is not valid (only COUNT(*))"));
+                    }
+                    if distinct {
+                        return Err("COUNT(DISTINCT *) is not valid".into());
                     }
                     p.next()?;
                     None
                 } else {
-                    Some(p.ident()?)
+                    // ⭐ F78: 聚合内标量表达式 (裸列退化为 ScalarExpr::Col)
+                    let e = parse_scalar_expr(p)?;
+                    // ⭐ F77: DISTINCT 仅允许单裸列
+                    if distinct && e.as_col().is_none() {
+                        return Err("COUNT(DISTINCT ...) requires a single column (v1)".into());
+                    }
+                    Some(e)
                 };
                 p.expect(&Tok::RParen, ")")?;
-                items.push(SelectItem::Agg { func, col });
+                let alias = parse_col_alias(p);
+                items.push(SelectItem::Agg { func, arg, distinct, alias });
             } else {
-                items.push(SelectItem::Col(name));
+                let alias = parse_col_alias(p);
+                items.push(SelectItem::Col { name, alias });
             }
             if p.peek() == Some(&Tok::Comma) {
                 p.next()?;
@@ -1765,6 +2205,10 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
         }
     }
     p.kw("FROM")?;
+    // ⭐ F77: DISTINCT 仅支持单表命名列投影; 派生表/JOIN/系统表 拒
+    if distinct && p.peek_paren_select() {
+        return Err("DISTINCT with a derived table is not supported (v1)".into());
+    }
     // ⭐ F72: FROM 派生表 `(SELECT ...) alias` — items (外层投影) 已解完, 传入.
     if p.peek_paren_select() {
         return parse_derived(p, items, top);
@@ -1773,6 +2217,9 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     // ⭐ F66: 系统表拦截 — `information_schema.X` / `pg_catalog.X` (大小写不敏)
     // 走虚拟表合成路径; 尾部只解 WHERE/ORDER/LIMIT/OFFSET (不支持 GROUP/HAVING)
     if let Some((cat, tbl)) = split_system_table(&table) {
+        if distinct {
+            return Err("DISTINCT on system tables is not supported (v1)".into());
+        }
         let conds = parse_where(p)?;
         let (order, limit, offset) = parse_select_tail(p)?;
         if top {
@@ -1781,7 +2228,7 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
         let cols: Vec<String> = items
             .iter()
             .filter_map(|i| match i {
-                SelectItem::Col(c) => Some(c.clone()),
+                SelectItem::Col { name, .. } => Some(name.clone()),
                 SelectItem::Agg { .. } => None,
             })
             .collect();
@@ -1795,8 +2242,13 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             offset,
         });
     }
+    // ⭐ F76: 非系统表 → 剥 db 限定前缀 (`default.t` → `t`); 系统表已在上方按全名分派
+    let table = strip_db_qual(table);
     // ⭐ F67 (JOIN): 表名后 3 token 内出现 JOIN/INNER/LEFT → 转 JOIN 解析
     if is_join_ahead(p) {
+        if distinct {
+            return Err("DISTINCT with JOIN is not supported (v1)".into());
+        }
         return parse_join(p, items, table);
     }
     let conds = parse_where(p)?;
@@ -1813,6 +2265,25 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             }
         }
     }
+    // ⭐ F77: SELECT DISTINCT desugar → GROUP BY 全投影列 (复用分桶去重路径)
+    if distinct {
+        if items.iter().any(|i| matches!(i, SelectItem::Agg { .. })) {
+            return Err("DISTINCT with aggregate is not supported (v1)".into());
+        }
+        if !group_by.is_empty() {
+            return Err("DISTINCT with GROUP BY is not supported (v1)".into());
+        }
+        if items.is_empty() {
+            return Err("SELECT DISTINCT * is not supported (v1); list columns explicitly".into());
+        }
+        group_by = items
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::Col { name, .. } => Some(name.clone()),
+                SelectItem::Agg { .. } => None,
+            })
+            .collect();
+    }
     // ⭐ G1 (F63): HAVING — 条件列写聚合原文 (如 SUM(x)) 或 group 列名,
     // 与输出列 label 同规则匹配 (大写归一). ⭐ F69: 支持 OR/NOT/括号.
     let having: Pred<Cond> = if p.try_kw("HAVING") {
@@ -1825,7 +2296,7 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     // 有聚合项时 * 投影 (items 空) 非法由 worker 拒 (需 schema 不在此层)
     if !group_by.is_empty() {
         for it in &items {
-            if let SelectItem::Col(c) = it
+            if let SelectItem::Col { name: c, .. } = it
                 && !group_by.iter().any(|g| g.eq_ignore_ascii_case(c))
             {
                 return Err(format!(
@@ -1877,16 +2348,29 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
         }
     }
     let mut limit = None;
+    let mut offset = None;
     if p.try_kw("LIMIT") {
         match p.next()? {
             Tok::Num(n) => {
-                limit = Some(n.parse::<u32>().map_err(|_| format!("bad LIMIT {n}"))?);
+                let a = n.parse::<u32>().map_err(|_| format!("bad LIMIT {n}"))?;
+                // ⭐ F76: MySQL `LIMIT offset, count` 逗号形态
+                if p.peek() == Some(&Tok::Comma) {
+                    p.next()?;
+                    match p.next()? {
+                        Tok::Num(m) => {
+                            offset = Some(a);
+                            limit = Some(m.parse::<u32>().map_err(|_| format!("bad LIMIT {m}"))?);
+                        }
+                        other => return Err(format!("expected LIMIT count, got {other:?}")),
+                    }
+                } else {
+                    limit = Some(a);
+                }
             }
             other => return Err(format!("expected LIMIT count, got {other:?}")),
         }
     }
     // ⭐ S2: OFFSET n (PG/MySQL 通用形态)
-    let mut offset = None;
     if p.try_kw("OFFSET") {
         match p.next()? {
             Tok::Num(n) => {
@@ -1990,11 +2474,11 @@ mod tests {
         // ⭐ O1: 投影列
         let s = parse(b"SELECT a, b FROM t WHERE a = 1").unwrap();
         let SqlStmt::Select { items, .. } = s else { panic!() };
-        assert_eq!(items, vec![SelectItem::Col("a".into()), SelectItem::Col("b".into())]);
+        assert_eq!(items, vec![SelectItem::Col { name: "a".into(), alias: None }, SelectItem::Col { name: "b".into(), alias: None }]);
         // ⭐ S2: 新算子/子句
         let s = parse(b"SELECT COUNT(*) FROM t WHERE a IN (1, 2, 3)").unwrap();
         let SqlStmt::Select { items, conds, .. } = s else { panic!() };
-        assert_eq!(items, vec![SelectItem::Agg { func: AggFn::Count, col: None }]);
+        assert_eq!(items, vec![SelectItem::Agg { func: AggFn::Count, arg: None, distinct: false, alias: None }]);
         let cj = conds.as_conjuncts().unwrap();
         assert_eq!(cj[0].op, CmpOp::In);
         assert_eq!(cj[0].set.len(), 3);
