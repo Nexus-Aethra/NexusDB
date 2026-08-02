@@ -1,455 +1,9 @@
-//! ⭐ X1 (SQL 落地): 最小 SQL 子集解析器 — 纯函数, 手写 tokenizer, 零依赖.
-//!
-//! 支持 (v1):
-//! - `CREATE TABLE t (col TYPE [PRIMARY KEY] [NOT NULL], ..., INDEX(col), ...)`
-//! - `INSERT INTO t [(c1,...)] VALUES (v1,...)`
-//! - `SELECT * FROM t [WHERE col op lit [AND ...]] [LIMIT n]`
-//!
-//! 关键字大小写不敏感; 表/列名保留原样. 字符串字面量 '单引号' ('' 转义).
-//! RESP array 参数已被客户端分词 → caller 先空格 join 再整体 tokenize
-//! (引号内空格由 redis-cli 的引号语法保留在单参数内, join 后仍在引号内).
+//! ⭐ X1 (SQL 落地): 手写 tokenizer + tree-walking parser — 纯函数, 零依赖.
+//! 从 sql.rs 拆分 (2026-08). AST 类型见 ast.rs.
 
+use super::ast::*;
 use storage::schema::{ColType, Column, TableSchema};
 
-/// SQL 字面量 (类型转换在 worker 按 schema 列类型做).
-#[derive(Debug, Clone, PartialEq)]
-pub enum SqlValue {
-    Int(i64),
-    Float(f64),
-    Str(Vec<u8>),
-    Null,
-    /// ⭐ P1: 预处理占位符 (`?` 按序 / `$n` 显式, 0-based); 执行前必经
-    /// bind_params 替换, 泄漏到执行层是 bug (sql_to_col 防御报错).
-    Param(u16),
-    /// ⭐ F71 (子查询): 非关联子查询占位 (scalar / IN / EXISTS 内层 SELECT).
-    /// worker dispatch 前必经子查询折叠替换为字面量, 泄漏到执行层是 bug
-    /// (sql_to_col 防御报错). 与 Param 同构的“执行前必解”占位.
-    Subquery(Box<SqlStmt>),
-    /// ⭐ F74 (关联子查询): 列引用 `[表/别名.]列` — 仅出现在内层
-    /// WHERE 比较 RHS (相关条件). decorrelate_pred 改写为非关联 IN 后消失;
-    /// 泄漏到执行层是 bug (sql_to_col 防御报错). 同 “执行前必解”占位家族.
-    ColRef(String),
-}
-
-/// ⭐ F73: IN 集合原地排序去重 (同型集合: 全 Int 按值 / 全 Str 按字节序).
-/// 大集合求值走二分依赖有序; 混型 (含 Float / 跨型) 保持原序不动 (求值回退线性).
-/// 成员语义不变 (集合无序), 仅重排 + 去重.
-pub fn sort_in_set(set: &mut Vec<SqlValue>) {
-    let all_int = set.iter().all(|v| matches!(v, SqlValue::Int(_)));
-    let all_str = set.iter().all(|v| matches!(v, SqlValue::Str(_)));
-    if all_int {
-        set.sort_by_key(|v| match v {
-            SqlValue::Int(i) => *i,
-            _ => unreachable!(),
-        });
-        set.dedup();
-    } else if all_str {
-        set.sort_by(|a, b| match (a, b) {
-            (SqlValue::Str(x), SqlValue::Str(y)) => x.cmp(y),
-            _ => unreachable!(),
-        });
-        set.dedup();
-    }
-}
-
-/// ⭐ F76: 剥 db 限定前缀 — `db.tbl` / `db.tbl` (反引号已在 tokenizer 拼为单 Ident) → `tbl`.
-/// 表名不含 '.', 取最后一段即去 db 限定. v1 不支持真跨库 (归一为当前库同名表).
-fn strip_db_qual(name: String) -> String {
-    match name.rsplit_once('.') {
-        Some((_, tbl)) => tbl.to_string(),
-        None => name,
-    }
-}
-
-/// 比较算子 (WHERE 条件).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CmpOp {
-    Eq,
-    Gt,
-    Ge,
-    Lt,
-    Le,
-    /// ⭐ S2: 不等 (纯残余过滤, 不产界).
-    Ne,
-    /// ⭐ S2: IN 集合 (值在 Cond::set; 索引列可提 [min,max] 界 + 残余精确).
-    In,
-}
-
-/// ⭐ G1 (F63): 聚合函数.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AggFn {
-    Count,
-    Sum,
-    Avg,
-    Min,
-    Max,
-}
-
-impl AggFn {
-    /// 输出列 label (与 HAVING/ORDER BY 匹配规则同源: 大写函数名 + 原列名).
-    pub fn label(&self, col: Option<&str>) -> String {
-        let name = match self {
-            AggFn::Count => "COUNT",
-            AggFn::Sum => "SUM",
-            AggFn::Avg => "AVG",
-            AggFn::Min => "MIN",
-            AggFn::Max => "MAX",
-        };
-        format!("{name}({})", col.unwrap_or("*"))
-    }
-}
-
-/// ⭐ G1 (F63): SELECT 投影项 — 纯列或聚合函数. ⭐ F76: 可带输出列别名 (AS).
-#[derive(Debug, Clone, PartialEq)]
-pub enum SelectItem {
-    Col { name: String, alias: Option<String> },
-    /// arg = None 仅 COUNT(*). ⭐ F77: distinct = COUNT(DISTINCT col). ⭐ F78: arg 可为表达式.
-    Agg { func: AggFn, arg: Option<ScalarExpr>, distinct: bool, alias: Option<String> },
-}
-
-/// ⭐ F78: 算术运算符.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArithOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-}
-
-impl ArithOp {
-    fn sym(self) -> &'static str {
-        match self {
-            ArithOp::Add => "+",
-            ArithOp::Sub => "-",
-            ArithOp::Mul => "*",
-            ArithOp::Div => "/",
-        }
-    }
-}
-
-/// ⭐ F78: 聚合内标量表达式 (列引用 / 字面量 / 二元算术).
-#[derive(Debug, Clone, PartialEq)]
-pub enum ScalarExpr {
-    Col(String),
-    Lit(SqlValue),
-    Bin { op: ArithOp, l: Box<ScalarExpr>, r: Box<ScalarExpr> },
-}
-
-impl ScalarExpr {
-    /// 原文重建 (聚合 label / HAVING/ORDER 匹配用).
-    pub fn render(&self) -> String {
-        match self {
-            ScalarExpr::Col(c) => c.clone(),
-            ScalarExpr::Lit(v) => match v {
-                SqlValue::Int(i) => i.to_string(),
-                SqlValue::Float(f) => f.to_string(),
-                SqlValue::Str(b) => format!("'{}'", String::from_utf8_lossy(b)),
-                _ => "?".to_string(),
-            },
-            ScalarExpr::Bin { op, l, r } => format!("{} {} {}", l.render(), op.sym(), r.render()),
-        }
-    }
-    /// 是否单一裸列引用 (COUNT(DISTINCT col) / 单列聚合退化判定).
-    pub fn as_col(&self) -> Option<&str> {
-        match self {
-            ScalarExpr::Col(c) => Some(c),
-            _ => None,
-        }
-    }
-    /// 收集所有列引用 (只读, 供绑定/校验).
-    pub fn for_each_col<F: FnMut(&str)>(&self, f: &mut F) {
-        match self {
-            ScalarExpr::Col(c) => f(c),
-            ScalarExpr::Lit(_) => {}
-            ScalarExpr::Bin { l, r, .. } => {
-                l.for_each_col(f);
-                r.for_each_col(f);
-            }
-        }
-    }
-    /// 就地改写所有列名 (供 strip_qual 剥表限定前缀).
-    pub fn for_each_col_mut<F: FnMut(&mut String)>(&mut self, f: &mut F) {
-        match self {
-            ScalarExpr::Col(c) => f(c),
-            ScalarExpr::Lit(_) => {}
-            ScalarExpr::Bin { l, r, .. } => {
-                l.for_each_col_mut(f);
-                r.for_each_col_mut(f);
-            }
-        }
-    }
-}
-
-impl SelectItem {
-    /// ⭐ F76: 输出列名 — alias 优先, 否则列名 / 聚合 label.
-    pub fn out_name(&self) -> String {
-        match self {
-            SelectItem::Col { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
-            SelectItem::Agg { func, arg, distinct, alias } => alias.clone().unwrap_or_else(|| {
-                let inner = match arg {
-                    None => "*".to_string(),
-                    Some(e) => e.render(),
-                };
-                let fname = func.label(None).trim_end_matches("(*)").to_string();
-                if *distinct {
-                    format!("{fname}(DISTINCT {inner})")
-                } else {
-                    format!("{fname}({inner})")
-                }
-            }),
-        }
-    }
-}
-
-/// 单个 WHERE 条件 `col op lit` (AND 连接).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Cond {
-    pub col: String,
-    pub op: CmpOp,
-    pub val: SqlValue,
-    /// ⭐ S2: 仅 In 使用 (非空); 其它算子恒空.
-    pub set: Vec<SqlValue>,
-}
-
-/// ⭐ F71 (子查询): EXISTS 哨兵列名 — 真实列名不可为空, 以此区分 EXISTS(无列)
-/// 与 scalar/IN(有列) 子查询叶子. 折叠前临时存在, 折叠后消失.
-pub const EXISTS_SENTINEL_COL: &str = "";
-
-/// ⭐ F69: 谓词表达式树 (AND/OR/NOT/括号) — 泛型于叶子类型 C.
-/// WHERE 用 `Pred<Cond>`, JOIN WHERE 用 `Pred<JoinCond>`, HAVING 用下标域叶子.
-/// 无 WHERE = `And(vec![])` (恒真).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Pred<C> {
-    Leaf(C),
-    And(Vec<Pred<C>>),
-    Or(Vec<Pred<C>>),
-    Not(Box<Pred<C>>),
-}
-
-impl<C> Pred<C> {
-    /// 纯 leaf 合取 (无 Or/Not) → Some(平铺叶子); 含 Or/Not → None.
-    /// 供索引界推导/下推/bloom 等 AND-优化路径提取平铺列表.
-    pub fn as_conjuncts(&self) -> Option<Vec<&C>> {
-        match self {
-            Pred::Leaf(c) => Some(vec![c]),
-            Pred::And(v) => {
-                let mut out = Vec::new();
-                for p in v {
-                    out.extend(p.as_conjuncts()?);
-                }
-                Some(out)
-            }
-            Pred::Or(_) | Pred::Not(_) => None,
-        }
-    }
-
-    /// 全部叶子 (不论结构; 覆盖索引列名收集用).
-    pub fn leaves(&self) -> Vec<&C> {
-        match self {
-            Pred::Leaf(c) => vec![c],
-            Pred::And(v) | Pred::Or(v) => v.iter().flat_map(|p| p.leaves()).collect(),
-            Pred::Not(b) => b.leaves(),
-        }
-    }
-
-    /// 恒真 (空 AND) — 等价于无 WHERE.
-    pub fn is_true(&self) -> bool {
-        matches!(self, Pred::And(v) if v.is_empty())
-    }
-
-    /// 递归换叶子类型 (Cond → JoinCond 复用).
-    pub fn map<D>(&self, f: &impl Fn(&C) -> D) -> Pred<D> {
-        match self {
-            Pred::Leaf(c) => Pred::Leaf(f(c)),
-            Pred::And(v) => Pred::And(v.iter().map(|p| p.map(f)).collect()),
-            Pred::Or(v) => Pred::Or(v.iter().map(|p| p.map(f)).collect()),
-            Pred::Not(b) => Pred::Not(Box::new(b.map(f))),
-        }
-    }
-
-    /// 递归换叶子 (可失败; bind_params 占位符替换用).
-    pub fn try_map<D, E>(&self, f: &impl Fn(&C) -> Result<D, E>) -> Result<Pred<D>, E> {
-        Ok(match self {
-            Pred::Leaf(c) => Pred::Leaf(f(c)?),
-            Pred::And(v) => Pred::And(v.iter().map(|p| p.try_map(f)).collect::<Result<_, _>>()?),
-            Pred::Or(v) => Pred::Or(v.iter().map(|p| p.try_map(f)).collect::<Result<_, _>>()?),
-            Pred::Not(b) => Pred::Not(Box::new(b.try_map(f)?)),
-        })
-    }
-}
-
-/// ⭐ F67 (JOIN): 限定列名 `[表/别名.]列`. qualifier=None 表示未限定.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QualCol {
-    pub qualifier: Option<String>,
-    pub col: String,
-}
-
-impl QualCol {
-    /// 按首个 `.` 拆 (tokenizer 把 `u.id` 当单 Ident); 无点 → qualifier None.
-    pub fn parse(s: &str) -> QualCol {
-        match s.split_once('.') {
-            Some((q, c)) => QualCol { qualifier: Some(q.to_string()), col: c.to_string() },
-            None => QualCol { qualifier: None, col: s.to_string() },
-        }
-    }
-}
-
-/// ⭐ F67/F68 (JOIN): JOIN 种类.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinKind {
-    Inner,
-    Left,
-    /// ⭐ F68: 未匹配右行补左 NULL.
-    Right,
-    /// ⭐ F68: 双侧未匹配都补 NULL.
-    Full,
-    /// ⭐ F68: 笛卡尔积 (无 ON).
-    Cross,
-}
-
-/// ⭐ F68 (JOIN): 表引用 `表名 [AS] 别名` (无别名时 alias = 表名).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableRef {
-    pub table: String,
-    pub alias: String,
-}
-
-/// ⭐ F68 (JOIN): 单个 ON 谓词. Eq 供组合 hash 键; Cmp = 非等值 col-col 残余.
-#[derive(Debug, Clone, PartialEq)]
-pub enum OnPred {
-    Eq(QualCol, QualCol),
-    Cmp { left: QualCol, op: CmpOp, right: QualCol },
-}
-
-/// ⭐ F68 (JOIN): 一个 JOIN 子句 (左深链中的一步). CROSS 时 on 空.
-#[derive(Debug, Clone, PartialEq)]
-pub struct JoinClause {
-    pub kind: JoinKind,
-    pub table: TableRef,
-    pub on: Vec<OnPred>,
-}
-
-/// ⭐ F67 (JOIN): 投影项 (v1 无聚合/输出别名). 空 items = `*`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum JoinItem {
-    Col(QualCol),
-}
-
-/// ⭐ F67 (JOIN): WHERE 条件 `限定列 op 字面量` (复用 CmpOp/SqlValue).
-#[derive(Debug, Clone, PartialEq)]
-pub struct JoinCond {
-    pub col: QualCol,
-    pub op: CmpOp,
-    pub val: SqlValue,
-    pub set: Vec<SqlValue>,
-}
-
-/// 解析结果 AST.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SqlStmt {
-    /// CREATE TABLE: schema 已构建完成 (含 pk / 索引 iid 分配).
-    /// `if_not_exists=true` → 表已存在时静默跳过 (不报错).
-    CreateTable { table: String, schema: TableSchema, if_not_exists: bool },
-    /// INSERT: cols 为空 = 全列序; ⭐ S1: rows 支持多行 VALUES.
-    Insert { table: String, cols: Vec<String>, rows: Vec<Vec<SqlValue>> },
-    /// SELECT: items 空 = `*` 全列 (⭐ O1 投影; ⭐ G1/F63 列+聚合混合).
-    /// group_by/having 见 G1; order = (列名或聚合 label, desc); offset 排序后截断.
-    Select {
-        table: String,
-        items: Vec<SelectItem>,
-        conds: Pred<Cond>,
-        limit: Option<u32>,
-        order: Vec<(String, bool)>,
-        offset: Option<u32>,
-        group_by: Vec<String>,
-        having: Pred<Cond>,
-    },
-    /// ⭐ S1: DELETE FROM t WHERE ... (WHERE 必带 — 全删由全表扫路径支撑).
-    Delete { table: String, conds: Pred<Cond> },
-    /// ⭐ S1: UPDATE t SET c=v[, ...] WHERE ... (禁改 pk 列, 规划层拦).
-    Update { table: String, sets: Vec<(String, SqlValue)>, conds: Pred<Cond> },
-    /// ⭐ S1: DROP TABLE t.
-    DropTable { table: String },
-    /// ⭐ F79: ALTER TABLE t ADD COLUMN c TYPE (v1 仅追加可空列).
-    AlterTable { table: String, add: Column },
-    /// ⭐ S3: USE db — 连接级切库 (worker 校验存在).
-    Use { db: String },
-    /// ⭐ S3: DESCRIBE t / DESC t — schema 渲染 (worker 本地).
-    Describe { table: String },
-    /// ⭐ S3: psql/工具兼容 stub — `SET ...` 忽略回 OK.
-    SetStub,
-    /// ⭐ S3: `SELECT version()` — 单行版本串.
-    VersionStub,
-    /// ⭐ S5: `SELECT DATABASE()` — 单行当前库名 (mysql cli USE 后探测).
-    DatabaseStub,
-    /// ⭐ F66: 系统表查询 (information_schema.* / pg_catalog.*) — 虚拟表,
-    /// worker 从活元数据合成结果集. cols 空 = `*`.
-    SystemQuery {
-        catalog: String,
-        table: String,
-        cols: Vec<String>,
-        conds: Pred<Cond>,
-        order: Vec<(String, bool)>,
-        limit: Option<u32>,
-        offset: Option<u32>,
-    },
-    /// ⭐ F66: `SELECT @@var [, @@var2]` 系统变量 (SQLAlchemy/驱动初始化探测).
-    /// vars = 去 @@ 的变量名列表; worker 回合理值单行.
-    SystemVarStub { vars: Vec<String> },
-    /// ⭐ F72 (子查询): FROM 派生表 `(SELECT ...) alias`. inner 先物化成
-    /// 虚拟表 (worker 内存), 外层在其上过滤/投影/排序/截断.
-    /// v1: 派生表为唯一数据源 (不参与 JOIN); 外层无 GROUP BY/HAVING/聚合
-    /// 投影 (COUNT(*) worker 特判除外); 外层 WHERE 不含子查询.
-    SelectDerived {
-        inner: Box<SqlStmt>,
-        alias: String,
-        items: Vec<SelectItem>,
-        conds: Pred<Cond>,
-        order: Vec<(String, bool)>,
-        limit: Option<u32>,
-        offset: Option<u32>,
-    },
-    /// ⭐ F67/F68 (JOIN): N 表左深 hash join — worker 侧执行.
-    /// 别名无时 = 表名; items 空 = `*` 展开各表全列; joins 为左深链.
-    /// ⭐ F75: from_inner=Some 时 from 为派生表 (from.table=别名), 内层先物化预填 tables[0].
-    SelectJoin {
-        from: TableRef,
-        from_inner: Option<Box<SqlStmt>>,
-        joins: Vec<JoinClause>,
-        items: Vec<JoinItem>,
-        conds: Pred<JoinCond>,
-        order: Vec<(QualCol, bool)>,
-        limit: Option<u32>,
-        offset: Option<u32>,
-    },
-    /// ⭐ 事务 v1 (F61): BEGIN / START TRANSACTION.
-    /// ⭐ v2 (F62): 可选隔离级别与读写属性尾缀.
-    Begin { iso: Option<TxnIso>, read_only: Option<bool> },
-    /// ⭐ 事务 v1 (F61): COMMIT.
-    Commit,
-    /// ⭐ 事务 v1 (F61): ROLLBACK.
-    Rollback,
-    /// ⭐ v2 (F62): SET [SESSION] TRANSACTION ... (session=连接默认 / 否则当前事务).
-    SetTransaction { iso: Option<TxnIso>, read_only: Option<bool>, session: bool },
-    /// ⭐ v2 (F62): SAVEPOINT name.
-    Savepoint { name: String },
-    /// ⭐ v2 (F62): ROLLBACK TO [SAVEPOINT] name.
-    RollbackTo { name: String },
-    /// ⭐ v2 (F62): RELEASE [SAVEPOINT] name.
-    Release { name: String },
-}
-
-/// ⭐ v2 (F62): 隔离级别 (四级归并两档: RU→RC, RR→Serializable —
-/// 行级 OCC backward validation, 不防幻读, 文档化).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TxnIso {
-    #[default]
-    ReadCommitted,
-    Serializable,
-}
-
-// =====================================================================
 // tokenizer
 // =====================================================================
 
@@ -480,6 +34,11 @@ enum Tok {
     Plus,
     Minus,
     Slash,
+    /// ⭐ compat: 数组类型后缀 `[]` (TEXT[] → Str[] 标记).
+    LBracket,
+    RBracket,
+    /// ⭐ compat: `::` 类型转换后缀 (`'{}'::jsonb`).
+    Colon,
 }
 
 fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
@@ -539,6 +98,47 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
                     i += 2;
                 } else {
                     return Err("unexpected '!'".into());
+                }
+            }
+            b'"' => {
+                // ⭐ compat: 双引号标识符 `"uuid-ossp"` / `"col name"` → Ident (去引号)
+                let mut s = Vec::new();
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return Err("unterminated quoted identifier".into()),
+                        Some(b'"') => {
+                            if b.get(i + 1) == Some(&b'"') {
+                                s.push(b'"');
+                                i += 2;
+                            } else {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        Some(&ch) => {
+                            s.push(ch);
+                            i += 1;
+                        }
+                    }
+                }
+                toks.push(Tok::Ident(String::from_utf8_lossy(&s).into_owned()));
+            }
+            b'[' => {
+                toks.push(Tok::LBracket);
+                i += 1;
+            }
+            b']' => {
+                toks.push(Tok::RBracket);
+                i += 1;
+            }
+            b':' => {
+                // ⭐ compat: `::` 类型转换 (`'{}'::jsonb`) — 双冒号合成单 token
+                if b.get(i + 1) == Some(&b':') {
+                    toks.push(Tok::Colon);
+                    i += 2;
+                } else {
+                    return Err("unexpected ':'".into());
                 }
             }
             b'?' => {
@@ -822,6 +422,94 @@ impl P {
 
 /// 入口: RESP 参数 join 后的完整语句 → AST.
 /// 首关键字必须是 CREATE / INSERT / SELECT (caller 已粗判).
+/// ⭐ compat: 按 `;` 分割多条 SQL 语句 (字符串/注释感知).
+/// 处理: `'...'`(含 '' 转义) / `"..."`(含 "" 转义) / `$$...$$` dollar-quote /
+/// `--` 行注释 / `/* */` 块注释。返回非空语句 (trim 后, 尾分号已去)。
+pub fn split_sql_statements(input: &str) -> Vec<String> {
+    let b = input.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        if b.get(i + 1) == Some(&b'"') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'$' => {
+                // dollar-quote: $$...$$ 或 $tag$...$tag$
+                let mut tag_end = i + 1;
+                while tag_end < b.len() && b[tag_end].is_ascii_alphanumeric() {
+                    tag_end += 1;
+                }
+                if tag_end < b.len() && b[tag_end] == b'$' {
+                    let tag = &input[i..=tag_end];
+                    // 查找闭合 tag
+                    let rest = &input[tag_end + 1..];
+                    if let Some(pos) = rest.find(tag) {
+                        i = tag_end + 1 + pos + tag.len();
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                // 行注释
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                // 块注释
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            b';' => {
+                let stmt = input[start..i].trim();
+                if !stmt.is_empty() {
+                    out.push(stmt.to_string());
+                }
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
 pub fn parse(input: &[u8]) -> Result<SqlStmt, String> {
     let (stmt, params) = parse_prepared(input)?;
     if params > 0 {
@@ -1124,12 +812,16 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
     })
 }
 
-/// ⭐ F76: 读 `(col [, col ...])` 列名列表 (表级约束用; 反引号已在 tokenizer 去).
+/// ⭐ F76: 读 `(col [, col ...])` 列名列表 (表级约束/索引列; 反引号已在 tokenizer 去).
+/// ⭐ compat: 吞可选 ASC/DESC 排序后缀 (CREATE INDEX ... (col DESC)).
 fn read_col_list(p: &mut P) -> Result<Vec<String>, String> {
     p.expect(&Tok::LParen, "(")?;
     let mut cols = Vec::new();
     loop {
         cols.push(p.ident()?);
+        // 排序后缀 (仅索引列场景)
+        p.try_kw("ASC");
+        p.try_kw("DESC");
         match p.next()? {
             Tok::Comma => continue,
             Tok::RParen => break,
@@ -1139,9 +831,54 @@ fn read_col_list(p: &mut P) -> Result<Vec<String>, String> {
     Ok(cols)
 }
 
-/// `CREATE TABLE t (col TYPE [PRIMARY KEY] [NOT NULL], ..., INDEX(col), ...)`
+/// `CREATE TABLE t (...) | CREATE INDEX [IF NOT EXISTS] name ON t (cols) | CREATE EXTENSION ... | ...`
 fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("CREATE")?;
+    // ⭐ compat: CREATE OR REPLACE FUNCTION — 吞掉 (v1 不做触发器/函数)
+    if p.try_kw("OR") {
+        p.kw("REPLACE")?;
+        p.kw("FUNCTION")?;
+        return Ok(SqlStmt::DdlStub);
+    }
+    if p.try_kw("INDEX") {
+        // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON t (col, ...) [WHERE ...]
+        p.try_kw("UNIQUE");
+        let if_not_exists = if p.try_kw("IF") {
+            p.kw("NOT")?;
+            p.kw("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let _ = p.ident()?; // 索引名 (吞)
+        p.kw("ON")?;
+        let table = p.table_ident()?;
+        let cols = read_col_list(p)?;
+        // 吞可选 WHERE 部分索引 (至语句结束)
+        if p.try_kw("WHERE") {
+            while !matches!(p.peek(), None) {
+                p.i += 1;
+            }
+        }
+        p.done()?;
+        return Ok(SqlStmt::CreateIndex { table, cols, if_not_exists });
+    }
+    if p.try_kw("EXTENSION") {
+        // CREATE EXTENSION [IF NOT EXISTS] "name" — 吞掉 (uuid-ossp 等)
+        let _ = p.try_kw("IF");
+        let _ = p.try_kw("NOT");
+        let _ = p.try_kw("EXISTS");
+        let _ = p.ident()?; // 扩展名 (含双引号已去)
+        p.done()?;
+        return Ok(SqlStmt::DdlStub);
+    }
+    if p.try_kw("TRIGGER") {
+        // CREATE TRIGGER name ... — 吞掉
+        return Ok(SqlStmt::DdlStub);
+    }
+    if p.try_kw("SEQUENCE") || p.try_kw("TYPE") || p.try_kw("DATABASE") {
+        return Ok(SqlStmt::DdlStub);
+    }
     p.kw("TABLE")?;
     // ⭐ IF NOT EXISTS: `CREATE TABLE IF NOT EXISTS t (...)` — 表已存在时静默跳过
     let if_not_exists = if p.try_kw("IF") {
@@ -1210,6 +947,19 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
             while !matches!(p.peek(), Some(Tok::Comma) | Some(Tok::RParen) | None) {
                 p.i += 1;
             }
+        } else if p.try_kw("CHECK") {
+            // ⭐ compat: 表级 CHECK (expr) — v1 吞 (不强制约束)
+            if p.peek() == Some(&Tok::LParen) {
+                p.next()?;
+                let mut depth = 1;
+                while depth > 0 {
+                    match p.next()? {
+                        Tok::LParen => depth += 1,
+                        Tok::RParen => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
         } else {
             let name = p.ident()?;
             let ty = parse_col_type(p)?;
@@ -1236,11 +986,65 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                 } else if p.try_kw("AUTO_INCREMENT") || p.try_kw("AUTOINCREMENT") {
                     // ⭐ F76: 吃 AUTO_INCREMENT (v1 不做服务端自增; ORM 提供显式 id)
                 } else if p.try_kw("DEFAULT") {
-                    // ⭐ F76: 吃 DEFAULT <字面量> (v1 不落默认值)
-                    let _ = p.value()?;
+                    // ⭐ compat: 吃 DEFAULT <字面量 | 函数调用> (NOW(), uuid_generate_v4(), '{}'::jsonb)
+                    // v1 不落默认值, 但必须能解析 PG 常见默认表达式
+                    match p.peek() {
+                        Some(Tok::Ident(_)) => {
+                            let _ = p.ident()?;
+                            if p.peek() == Some(&Tok::LParen) {
+                                // 函数调用: NOW() / uuid_generate_v4() — 吞括号及参数
+                                p.next()?;
+                                let mut depth = 1;
+                                while depth > 0 {
+                                    match p.next()? {
+                                        Tok::LParen => depth += 1,
+                                        Tok::RParen => depth -= 1,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            let _ = p.value()?;
+                        }
+                    }
+                    // `::jsonb` / `::text` 类型转换后缀 (tokenizer 把 `::` 合成单 Colon)
+                    if p.peek() == Some(&Tok::Colon) {
+                        p.next()?;
+                        let _ = p.ident()?;
+                    }
                 } else if p.try_kw("COMMENT") {
                     // ⭐ F76: 吃 COMMENT '…'
                     let _ = p.value()?;
+                } else if p.try_kw("REFERENCES") {
+                    // ⭐ compat: 列级外键 `REFERENCES t (c) [ON DELETE ...]` — v1 吞 (不强制外键)
+                    let _ = p.ident()?;
+                    if p.peek() == Some(&Tok::LParen) {
+                        let _ = read_col_list(p)?;
+                    }
+                    // 吞 ON DELETE/UPDATE CASCADE|SET NULL|RESTRICT ... 至下个属性/逗号/右括号
+                    while !matches!(
+                        p.peek(),
+                        Some(Tok::Comma) | Some(Tok::RParen) | None
+                    ) && !matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("PRIMARY")
+                        || s.eq_ignore_ascii_case("NOT") || s.eq_ignore_ascii_case("UNIQUE")
+                        || s.eq_ignore_ascii_case("DEFAULT") || s.eq_ignore_ascii_case("REFERENCES"))
+                    {
+                        p.i += 1;
+                    }
+                } else if p.try_kw("CHECK") {
+                    // ⭐ compat: 列级 CHECK (expr) — v1 吞 (不强制约束)
+                    if p.peek() == Some(&Tok::LParen) {
+                        p.next()?;
+                        let mut depth = 1;
+                        while depth > 0 {
+                            match p.next()? {
+                                Tok::LParen => depth += 1,
+                                Tok::RParen => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                    }
                 } else {
                     break;
                 }
@@ -1341,6 +1145,12 @@ fn parse_insert(p: &mut P) -> Result<SqlStmt, String> {
             p.next()?;
         } else {
             break;
+        }
+    }
+    // ⭐ compat: 吞 RETURNING ... (v1 不返回受影响行值)
+    if p.try_kw("RETURNING") {
+        while !matches!(p.peek(), None) {
+            p.i += 1;
         }
     }
     p.done()?;
@@ -1544,6 +1354,17 @@ fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             }
             _ => return Err("LIKE supports only prefix patterns ('abc%')".into()),
         }
+    } else if p.try_kw("IS") {
+        // ⭐ compat: `col IS [NOT] NULL` — desugar 为 col = NULL / col <> NULL
+        let not = p.try_kw("NOT");
+        p.kw("NULL")?;
+        let leaf = Pred::Leaf(Cond {
+            col,
+            op: if not { CmpOp::Ne } else { CmpOp::Eq },
+            val: SqlValue::Null,
+            set: vec![],
+        });
+        return Ok(leaf);
     } else {
         let op = match p.next()? {
             Tok::Eq => CmpOp::Eq,
@@ -1603,7 +1424,18 @@ fn parse_update(p: &mut P) -> Result<SqlStmt, String> {
     loop {
         let col = p.ident()?;
         p.expect(&Tok::Eq, "=")?;
-        sets.push((col, p.value()?));
+        // ⭐ compat: SET c = 列引用 (同表列) — 非字面量前导关键字时按 ColRef 处理
+        let val = if let Some(Tok::Ident(s)) = p.peek()
+            && !matches!(
+                s.to_ascii_uppercase().as_str(),
+                "NULL" | "TRUE" | "FALSE" | "NOW"
+            )
+        {
+            SqlValue::ColRef(p.ident()?)
+        } else {
+            p.value()?
+        };
+        sets.push((col, val));
         if p.peek() == Some(&Tok::Comma) {
             p.next()?;
         } else {
@@ -1611,6 +1443,12 @@ fn parse_update(p: &mut P) -> Result<SqlStmt, String> {
         }
     }
     let conds = parse_where(p)?;
+    // ⭐ compat: 吞 RETURNING ... (v1 不返回受影响行值)
+    if p.try_kw("RETURNING") {
+        while !matches!(p.peek(), None) {
+            p.i += 1;
+        }
+    }
     p.done()?;
     Ok(SqlStmt::Update { table, sets, conds })
 }
@@ -1651,7 +1489,7 @@ fn parse_col_type(p: &mut P) -> Result<ColType, String> {
         "BLOB" | "BYTES" | "BYTEA" => ColType::Bytes,
         "DATE" => ColType::Date,
         "TIME" => ColType::Time,
-        "TIMESTAMP" | "DATETIME" => ColType::Timestamp,
+        "TIMESTAMP" | "DATETIME" | "TIMESTAMPTZ" => ColType::Timestamp, // ⭐ compat: TIMESTAMPTZ 别名
         "JSON" | "JSONB" => ColType::Json,
         "UUID" => ColType::Uuid,
         other => return Err(format!("unknown type {other}")),
@@ -1674,20 +1512,52 @@ fn parse_col_type(p: &mut P) -> Result<ColType, String> {
             }
         }
     }
+    // ⭐ compat: 数组后缀 `TEXT[]` — v1 映射为标量类型 (语义: 存 JSON 序列化数组)
+    let is_array = p.try_kw("ARRAY")
+        || if matches!(p.peek(), Some(Tok::LBracket)) {
+            p.next()?;
+            p.expect(&Tok::RBracket, "]")?;
+            true
+        } else {
+            false
+        };
+    if is_array {
+        // 数组类型映射为 Str 列 (值为 JSON 数组文本); 保持类型信息在注释/元数据
+        return Ok(match ty {
+            ColType::I64 => ColType::I64,
+            _ => ColType::Str,
+        });
+    }
     Ok(ty)
 }
 
-/// ⭐ S1: `DROP TABLE t`
+/// ⭐ S1: `DROP TABLE [IF EXISTS] t`
 fn parse_drop(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("DROP")?;
+    if p.try_kw("TRIGGER") {
+        // ⭐ compat: DROP TRIGGER [IF EXISTS] name ON t — 吞掉
+        return Ok(SqlStmt::DdlStub);
+    }
+    if p.try_kw("INDEX") {
+        // ⭐ compat: DROP INDEX [IF EXISTS] name — 吞掉
+        return Ok(SqlStmt::DdlStub);
+    }
     p.kw("TABLE")?;
+    let _if_exists = p.try_kw("IF") && { p.try_kw("NOT"); p.try_kw("EXISTS"); true };
+    // 支持逗号分隔多表 DROP: 只取首表 (其余吞)
     let table = p.table_ident()?;
+    while p.try_kw("CASCADE") || p.try_kw("RESTRICT") {}
+    if matches!(p.peek(), Some(Tok::Comma)) {
+        while !matches!(p.peek(), None) {
+            p.i += 1;
+        }
+    }
     p.done()?;
     Ok(SqlStmt::DropTable { table })
 }
 
-/// ⭐ F79: `ALTER TABLE t ADD [COLUMN] name TYPE [NULL|NOT NULL] [DEFAULT v]`.
-/// v1 仅支持追加可空列 (NOT NULL 无法回填旧行 → 拒); DROP/MODIFY/RENAME 拒.
+/// ⭐ F79: `ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] name TYPE [NULL|NOT NULL] [DEFAULT v]`.
+/// v1 仅支持追加可空列; DROP/MODIFY/RENAME 拒.
 fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("ALTER")?;
     p.kw("TABLE")?;
@@ -1696,9 +1566,11 @@ fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
         return Err("only ALTER TABLE ADD COLUMN is supported (v1)".into());
     }
     p.try_kw("COLUMN"); // 可选
+    // ⭐ compat: ADD COLUMN IF NOT EXISTS
+    let if_not_exists = p.try_kw("IF") && { p.try_kw("NOT"); p.try_kw("EXISTS"); true };
     let name = p.ident()?;
     let ty = parse_col_type(p)?;
-    // 列属性: NULL/NOT NULL/DEFAULT(吞); NOT NULL 无法回填旧行 → 拒
+    // 列属性: NULL/NOT NULL/DEFAULT(吞)
     let mut nullable = true;
     loop {
         if p.try_kw("NOT") {
@@ -1707,18 +1579,36 @@ fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
         } else if p.try_kw("NULL") {
             nullable = true;
         } else if p.try_kw("DEFAULT") {
-            let _ = p.value()?; // v1 吞默认值 (旧行仍读 NULL)
+            // ⭐ compat: 支持 DEFAULT <字面量|函数调用|转换后缀>
+            match p.peek() {
+                Some(Tok::Ident(_)) => {
+                    let _ = p.ident()?;
+                    if p.peek() == Some(&Tok::LParen) {
+                        p.next()?;
+                        let mut depth = 1;
+                        while depth > 0 {
+                            match p.next()? {
+                                Tok::LParen => depth += 1,
+                                Tok::RParen => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let _ = p.value()?;
+                }
+            }
+            if p.peek() == Some(&Tok::Colon) {
+                p.next()?;
+                let _ = p.ident()?;
+            }
         } else {
             break;
         }
     }
-    if !nullable {
-        return Err(
-            "ADD COLUMN NOT NULL is not supported (v1); add a nullable column".into(),
-        );
-    }
     p.done()?;
-    Ok(SqlStmt::AlterTable { table, add: Column { name, ty, nullable } })
+    Ok(SqlStmt::AlterTable { table, add: Column { name, ty, nullable }, if_not_exists })
 }
 
 /// ⭐ F78: 聚合内标量表达式递归下降 — 加减 > 乘除 > 因子 (列/字面量/括号).
@@ -2076,6 +1966,9 @@ fn parse_join_from(
             SelectItem::Agg { .. } => {
                 Err("aggregate functions are not supported in JOIN queries".to_string())
             }
+            SelectItem::ScalarFn { .. } => {
+                Err("scalar functions are not supported in JOIN queries".to_string())
+            }
         })
         .collect::<Result<_, _>>()?;
     let conds = conds_raw.map(&|c: &Cond| JoinCond {
@@ -2167,6 +2060,23 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             let name = p.ident()?;
             // ⭐ G1: ident( → 聚合函数 COUNT/SUM/AVG/MIN/MAX
             if p.peek() == Some(&Tok::LParen) {
+                // ⭐ compat: 标量函数 (NOW()/CURRENT_TIMESTAMP) → ScalarFn (投影常量)
+                if matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
+                ) {
+                    p.next()?; // (
+                    let mut depth = 1;
+                    while depth > 0 {
+                        match p.next()? {
+                            Tok::LParen => depth += 1,
+                            Tok::RParen => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    items.push(SelectItem::ScalarFn { name: name.to_ascii_lowercase() });
+                    break;
+                }
                 let func = match name.to_ascii_uppercase().as_str() {
                     "COUNT" => AggFn::Count,
                     "SUM" => AggFn::Sum,
@@ -2239,6 +2149,7 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             .filter_map(|i| match i {
                 SelectItem::Col { name, .. } => Some(name.clone()),
                 SelectItem::Agg { .. } => None,
+                SelectItem::ScalarFn { .. } => None,
             })
             .collect();
         return Ok(SqlStmt::SystemQuery {
@@ -2290,6 +2201,7 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             .filter_map(|i| match i {
                 SelectItem::Col { name, .. } => Some(name.clone()),
                 SelectItem::Agg { .. } => None,
+                SelectItem::ScalarFn { .. } => None,
             })
             .collect();
     }
@@ -2390,185 +2302,4 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     }
     p.done_if(top)?;
     Ok(SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use storage::schema::ColType;
-
-    #[test]
-    fn create_roundtrip() {
-        let s = parse(b"CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, score DOUBLE, INDEX(name), INDEX(score))").unwrap();
-        let SqlStmt::CreateTable { table, schema, if_not_exists } = s else { panic!() };
-        assert_eq!(table, "users");
-        assert!(!if_not_exists);
-        assert_eq!(schema.columns.len(), 3);
-        assert_eq!(schema.pk_col, 0);
-        assert!(!schema.columns[0].nullable);
-        assert!(!schema.columns[1].nullable);
-        assert!(schema.columns[2].nullable);
-        assert_eq!(schema.columns[2].ty, ColType::F64);
-        assert_eq!(schema.indexes.len(), 2);
-        assert_eq!(schema.indexes[0].col, 1);
-        assert_eq!(schema.indexes[1].col, 2);
-    }
-
-    #[test]
-    fn create_if_not_exists() {
-        let s = parse(b"CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY)").unwrap();
-        let SqlStmt::CreateTable { table, if_not_exists, .. } = s else { panic!() };
-        assert_eq!(table, "users");
-        assert!(if_not_exists);
-
-        // 无 IF NOT EXISTS → false
-        let s = parse(b"CREATE TABLE users2 (id INT PRIMARY KEY)").unwrap();
-        let SqlStmt::CreateTable { if_not_exists, .. } = s else { panic!() };
-        assert!(!if_not_exists);
-    }
-
-    #[test]
-    fn create_errors() {
-        assert!(parse(b"CREATE TABLE t (a INT)").unwrap_err().contains("PRIMARY KEY"));
-        assert!(
-            parse(b"CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY)")
-                .unwrap_err()
-                .contains("multiple")
-        );
-        assert!(
-            parse(b"CREATE TABLE t (a INT PRIMARY KEY, INDEX(zzz))")
-                .unwrap_err()
-                .contains("unknown column")
-        );
-        assert!(parse(b"CREATE TABLE t (a WAT PRIMARY KEY)").unwrap_err().contains("unknown type"));
-    }
-
-    #[test]
-    fn insert_roundtrip() {
-        // 大小写不敏感 + 引号转义 + 负数/浮点/NULL
-        let s = parse(b"insert into t (id, name, score) values (-5, 'it''s ok', NULL)").unwrap();
-        let SqlStmt::Insert { table, cols, rows } = s else { panic!() };
-        assert_eq!(table, "t");
-        assert_eq!(cols, vec!["id", "name", "score"]);
-        assert_eq!(
-            rows,
-            vec![vec![
-                SqlValue::Int(-5),
-                SqlValue::Str(b"it's ok".to_vec()),
-                SqlValue::Null,
-            ]]
-        );
-        // 无列清单
-        let s = parse(b"INSERT INTO t VALUES (1, 2.5)").unwrap();
-        let SqlStmt::Insert { cols, rows, .. } = s else { panic!() };
-        assert!(cols.is_empty());
-        assert_eq!(rows, vec![vec![SqlValue::Int(1), SqlValue::Float(2.5)]]);
-        // ⭐ S1: 多行 VALUES
-        let s = parse(b"INSERT INTO t (a) VALUES (1), (2), (3)").unwrap();
-        let SqlStmt::Insert { rows, .. } = s else { panic!() };
-        assert_eq!(rows.len(), 3);
-        assert!(parse(b"INSERT INTO t VALUES (1), (2, 3)").unwrap_err().contains("inconsistent"));
-        // 列数不符
-        assert!(parse(b"INSERT INTO t (a) VALUES (1, 2)").is_err());
-    }
-
-    #[test]
-    fn select_roundtrip() {
-        let s = parse(b"SELECT * FROM t WHERE a = 1 AND b >= 2.5 AND c < 'x' LIMIT 10").unwrap();
-        let SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having } = s else { panic!() };
-        assert!(order.is_empty() && offset.is_none() && group_by.is_empty() && having.is_true());
-        assert_eq!(table, "t");
-        assert!(items.is_empty(), "* = 全列");
-        assert_eq!(limit, Some(10));
-        let cj = conds.as_conjuncts().unwrap();
-        assert_eq!(cj.len(), 3);
-        assert_eq!(cj[0], &Cond { col: "a".into(), op: CmpOp::Eq, val: SqlValue::Int(1), set: vec![] });
-        assert_eq!(cj[1].op, CmpOp::Ge);
-        assert_eq!(cj[2], &Cond { col: "c".into(), op: CmpOp::Lt, val: SqlValue::Str(b"x".to_vec()), set: vec![] });
-        // 无 WHERE / 无 LIMIT
-        let s = parse(b"SELECT * FROM t").unwrap();
-        let SqlStmt::Select { conds, limit, .. } = s else { panic!() };
-        assert!(conds.is_true());
-        assert_eq!(limit, None);
-    }
-
-    #[test]
-    fn select_errors() {
-        // ⭐ O1: 投影列
-        let s = parse(b"SELECT a, b FROM t WHERE a = 1").unwrap();
-        let SqlStmt::Select { items, .. } = s else { panic!() };
-        assert_eq!(items, vec![SelectItem::Col { name: "a".into(), alias: None }, SelectItem::Col { name: "b".into(), alias: None }]);
-        // ⭐ S2: 新算子/子句
-        let s = parse(b"SELECT COUNT(*) FROM t WHERE a IN (1, 2, 3)").unwrap();
-        let SqlStmt::Select { items, conds, .. } = s else { panic!() };
-        assert_eq!(items, vec![SelectItem::Agg { func: AggFn::Count, arg: None, distinct: false, alias: None }]);
-        let cj = conds.as_conjuncts().unwrap();
-        assert_eq!(cj[0].op, CmpOp::In);
-        assert_eq!(cj[0].set.len(), 3);
-        let s = parse(b"SELECT * FROM t WHERE a BETWEEN 1 AND 5 AND b != 'x'").unwrap();
-        let SqlStmt::Select { conds, .. } = s else { panic!() };
-        let cj = conds.as_conjuncts().unwrap();
-        assert_eq!(cj.len(), 3, "BETWEEN desugar 成 Ge+Le");
-        assert_eq!(cj[0].op, CmpOp::Ge);
-        assert_eq!(cj[1].op, CmpOp::Le);
-        assert_eq!(cj[2].op, CmpOp::Ne);
-        let s = parse(b"SELECT * FROM t WHERE c LIKE 'ab%' ORDER BY a DESC, b LIMIT 3 OFFSET 6").unwrap();
-        let SqlStmt::Select { conds, order, limit, offset, .. } = s else { panic!() };
-        let cj = conds.as_conjuncts().unwrap();
-        assert_eq!(cj.len(), 2, "LIKE 前缀 desugar 成 Ge+Lt");
-        assert_eq!(cj[0].val, SqlValue::Str(b"ab".to_vec()));
-        assert_eq!(cj[1].val, SqlValue::Str(b"ac".to_vec()));
-        assert_eq!(order, vec![("a".into(), true), ("b".into(), false)]);
-        assert_eq!((limit, offset), (Some(3), Some(6)));
-        assert!(parse(b"SELECT * FROM t WHERE c LIKE '%ab'").is_err(), "仅前缀模式");
-        assert!(parse(b"SELECT * FROM t WHERE a IN ()").is_err());
-        // ⭐ S1: DML 解析
-        let s = parse(b"DELETE FROM t WHERE a = 1").unwrap();
-        assert!(matches!(s, SqlStmt::Delete { .. }));
-        let s = parse(b"UPDATE t SET a = 1, b = 'x' WHERE c > 2").unwrap();
-        let SqlStmt::Update { sets, conds, .. } = s else { panic!() };
-        assert_eq!(sets.len(), 2);
-        assert_eq!(conds.as_conjuncts().unwrap().len(), 1);
-        assert_eq!(parse(b"DROP TABLE t").unwrap(), SqlStmt::DropTable { table: "t".into() });
-        assert!(parse(b"SELECT * FROM t WHERE a = NULL").unwrap_err().contains("NULL"));
-        assert!(parse(b"SELECT * FROM t WHERE a ! 1").is_err());
-        assert!(parse(b"SELECT * FROM t LIMIT x").is_err());
-        assert!(parse(b"SELECT * FROM t garbage").unwrap_err().contains("trailing"));
-        assert!(parse(b"SELECT * FROM t WHERE name = 'unterminated").is_err());
-    }
-
-    // ⭐ P1: 预处理占位符与绑定
-    #[test]
-    fn prepared_params() {
-        // ? 按序编号
-        let (s, n) = parse_prepared(b"INSERT INTO t (a, b) VALUES (?, ?)").unwrap();
-        assert_eq!(n, 2);
-        let SqlStmt::Insert { ref rows, .. } = s else { panic!() };
-        assert_eq!(rows[0], vec![SqlValue::Param(0), SqlValue::Param(1)]);
-        // 绑定 roundtrip
-        let bound = bind_params(&s, &[SqlValue::Int(7), SqlValue::Str(b"x".to_vec())]).unwrap();
-        let SqlStmt::Insert { rows, .. } = bound else { panic!() };
-        assert_eq!(rows[0], vec![SqlValue::Int(7), SqlValue::Str(b"x".to_vec())]);
-        // $n 显式编号 (乱序引用)
-        let (s, n) = parse_prepared(b"SELECT * FROM t WHERE a = $2 AND b = $1").unwrap();
-        assert_eq!(n, 2);
-        let bound = bind_params(&s, &[SqlValue::Int(10), SqlValue::Int(20)]).unwrap();
-        let SqlStmt::Select { conds, .. } = bound else { panic!() };
-        let cj = conds.as_conjuncts().unwrap();
-        assert_eq!(cj[0].val, SqlValue::Int(20), "$2 → params[1]");
-        assert_eq!(cj[1].val, SqlValue::Int(10));
-        // IN / UPDATE sets 占位
-        let (s, n) = parse_prepared(b"UPDATE t SET a = ? WHERE b IN (?, ?)").unwrap();
-        assert_eq!(n, 3);
-        let bound =
-            bind_params(&s, &[SqlValue::Int(1), SqlValue::Int(2), SqlValue::Int(3)]).unwrap();
-        let SqlStmt::Update { sets, conds, .. } = bound else { panic!() };
-        assert_eq!(sets[0].1, SqlValue::Int(1));
-        assert_eq!(conds.as_conjuncts().unwrap()[0].set, vec![SqlValue::Int(2), SqlValue::Int(3)]);
-        // 个数不符 / 混用 / simple query 拒绝 / LIMIT 位置拒绝
-        assert!(bind_params(&s, &[SqlValue::Int(1)]).unwrap_err().contains("missing"));
-        assert!(parse_prepared(b"SELECT * FROM t WHERE a = ? AND b = $1").is_err());
-        assert!(parse(b"SELECT * FROM t WHERE a = ?").unwrap_err().contains("prepared"));
-        assert!(parse_prepared(b"SELECT * FROM t LIMIT ?").is_err(), "LIMIT 占位不支持");
-    }
 }
