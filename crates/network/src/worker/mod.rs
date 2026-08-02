@@ -44,17 +44,18 @@ mod sql_dispatch;
 /// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
 mod sql_eval;
 pub(crate) use sql_agg::{
-    bind_scalar_expr, cmp_colvalue, eval_bound_expr, materialize_select_agg, render_select_agg,
-    sql_run_agg_select, AggSpec, BoundExpr,
+    bind_scalar_expr, cmp_colvalue, eval_bound_expr, eval_json_exists, materialize_select_agg,
+    render_select_agg, sql_run_agg_select, AggSpec, BoundExpr,
 };
 pub(crate) use sql_dispatch::{
     sql_dispatch_stmt, sql_join_drive, sql_join_kickoff, sql_plan_select, sql_run_dml,
     sql_unique_drive, sysq_render_catalog, SysQuerySpec,
 };
 pub(crate) use sql_eval::{
-    col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq, project_output_row,
-    render_sql_count, render_sql_rows, scalar_fn_const_row, sql_build_row, sql_cmp, sql_dml_op,
-    sql_err_bytes, sql_ok_bytes, sql_order_cmp, sql_pk_bytes, sql_rows_bytes, sql_to_col,
+    col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq, is_auto_pk,
+    project_output_row, render_sql_count, render_sql_rows, scalar_fn_const_row, sql_build_row,
+    sql_cmp, sql_dml_op, sql_err_bytes, sql_ok_bytes, sql_order_cmp, sql_pk_bytes,
+    sql_rows_bytes, sql_to_col, visible_cols, HIDDEN_ROWID,
 };
 /// ⭐ 拆分 (2026-08): SQL 值编码/解码工具 (日期/时间/UUID/Decimal).
 mod sql_encode;
@@ -4211,6 +4212,7 @@ fn finish_derived_join(
             .collect(),
         pk_col: 0,
         indexes: Vec::new(),
+        dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
     });
@@ -4302,6 +4304,7 @@ fn derived_render(
             .collect(),
         pk_col: 0,
         indexes: Vec::new(),
+        dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
     };

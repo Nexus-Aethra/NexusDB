@@ -109,13 +109,17 @@ pub struct TableSchema {
     /// ⭐ F79 (ALTER): 各版本的列数 (index=version-1 → 该版本写入时的列数).
     /// ADD COLUMN 只追加列 → 旧行 (版本较小) 按其版本列数解码, 超出列补 NULL.
     pub version_ncols: Vec<u16>,
+    /// ⭐ compat (DROP COLUMN): 已删除列的列号集合 (被删列仍占 columns 位置,
+    /// 行布局/版本机制不变 → 存量行零重写; 新行该列写 NULL). 索引 on 该列一并移除.
+    pub dropped: Vec<u16>,
 }
 
 /// 序列化格式版本 (与 schema.version 无关, 是编码布局版本).
 /// ⭐ F65: 1→2 索引项加 1B global 标志; decode 兼容 v1 (global=false).
 /// ⭐ F79: 2→3 尾部加 version_ncols; decode 兼容 v1/v2 (version_ncols=[当前列数]).
 /// ⭐ F81: 3→4 Decimal 列在类型字节后追加 precision+scale; decode 兼容 v1-3 (无 Decimal 列).
-const FMT_VER: u8 = 4;
+/// ⭐ compat: 4→5 尾部加 dropped 列号列表; decode 兼容 v1-4 (dropped=[]).
+const FMT_VER: u8 = 5;
 
 /// schema 反序列化错误.
 #[derive(Debug, PartialEq, Eq)]
@@ -185,6 +189,7 @@ impl TableSchema {
             pk_col,
             indexes,
             next_iid,
+            dropped: Vec::new(),
         })
     }
 
@@ -203,6 +208,26 @@ impl TableSchema {
             indexes: self.indexes.clone(),
             next_iid: self.next_iid,
             version_ncols,
+            dropped: self.dropped.clone(),
+        })
+    }
+
+    /// ⭐ compat (DROP COLUMN): 标记删除一列 — 该列保留在 columns (行布局不变,
+    /// 存量行零重写), 从可见列/索引移除; version 不变 (列数未变). 重复删/越界报错.
+    pub fn with_dropped_column(&self, col_idx: u16) -> Result<Self, SchemaError> {
+        if col_idx as usize >= self.columns.len() || self.dropped.contains(&col_idx) {
+            return Err(SchemaError::BadRef);
+        }
+        let mut dropped = self.dropped.clone();
+        dropped.push(col_idx);
+        Ok(Self {
+            version: self.version,
+            version_ncols: self.version_ncols.clone(),
+            columns: self.columns.clone(),
+            pk_col: self.pk_col,
+            indexes: self.indexes.iter().filter(|i| i.col != col_idx).cloned().collect(),
+            next_iid: self.next_iid,
+            dropped,
         })
     }
 
@@ -216,8 +241,13 @@ impl TableSchema {
     }
 
     /// 按列名查列下标.
+    /// ⭐ compat (DROP COLUMN): 列名 → 列号 (跳过已删列 → None, 显式引用报 unknown).
     pub fn col_by_name(&self, name: &str) -> Option<u16> {
-        self.columns.iter().position(|c| c.name == name).map(|i| i as u16)
+        self.columns
+            .iter()
+            .position(|c| c.name == name)
+            .map(|i| i as u16)
+            .filter(|&i| !self.dropped.contains(&i))
     }
 
     /// 序列化:
@@ -255,6 +285,11 @@ impl TableSchema {
         for &nc in &self.version_ncols {
             out.extend_from_slice(&nc.to_le_bytes());
         }
+        // ⭐ compat (FMT_VER 5): dropped 列号列表
+        out.push(self.dropped.len() as u8);
+        for &d in &self.dropped {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
         out
     }
 
@@ -262,7 +297,7 @@ impl TableSchema {
     pub fn decode(buf: &[u8]) -> Result<Self, SchemaError> {
         let mut r = Reader { buf, pos: 0 };
         let fmt = r.u8()?;
-        if fmt != FMT_VER && fmt != 1 && fmt != 2 && fmt != 3 {
+        if fmt != FMT_VER && fmt != 1 && fmt != 2 && fmt != 3 && fmt != 4 {
             return Err(SchemaError::BadFormat);
         }
         let version = r.u8()?;
@@ -313,7 +348,18 @@ impl TableSchema {
         } else {
             vec![columns.len() as u16]
         };
-        Ok(Self { version, columns, pk_col, indexes, next_iid, version_ncols })
+        // ⭐ compat (FMT_VER 5): dropped 列号列表; v1-4 无此段 → 空
+        let dropped = if fmt >= 5 {
+            let nd = r.u8()? as usize;
+            let mut d = Vec::with_capacity(nd);
+            for _ in 0..nd {
+                d.push(r.u16()?);
+            }
+            d
+        } else {
+            Vec::new()
+        };
+        Ok(Self { version, columns, pk_col, indexes, next_iid, version_ncols, dropped })
     }
 }
 

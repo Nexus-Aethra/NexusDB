@@ -136,6 +136,57 @@ mod tests {
             &items[0],
             SelectItem::Expr { expr: ScalarExpr::JsonGet { as_text: true, .. }, .. }
         ));
+        // JSONB 存在操作符 j ? 'a' — 操作符位置 ? (非占位符)
+        let s = parse(b"SELECT * FROM t WHERE j ? 'a'").unwrap();
+        let SqlStmt::Select { conds, .. } = s else { panic!("expected Select") };
+        assert!(matches!(
+            conds,
+            Pred::Leaf(Cond { op: CmpOp::JsonExists, val: SqlValue::Str(ref k), .. }) if k == b"a"
+        ));
+        // prepared: 操作符 ? 不占位 (0 param); 值位置 ? 仍占位 (1 param)
+        let (s, n) = parse_prepared(b"SELECT * FROM t WHERE j ? 'a'").unwrap();
+        assert!(matches!(s, SqlStmt::Select { .. }) && n == 0, "n={n}");
+        let (_, n) = parse_prepared(b"SELECT * FROM t WHERE id = ?").unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn compat_auto_rowid() {
+        // L1: 无 PK + 单列 UNIQUE → 提升该列为 pk (不重复建唯一索引)
+        let s = parse(b"CREATE TABLE t (a INT UNIQUE, b INT)").unwrap();
+        let SqlStmt::CreateTable { schema, .. } = s else { panic!("expected CreateTable") };
+        assert_eq!(schema.columns[schema.pk_col as usize].name, "a", "{schema:?}");
+        // 表级复合 UNIQUE(a,b) → v1 解析只取首列 (既有退化) → L1 提升 a
+        let s = parse(b"CREATE TABLE t (a INT, b INT, UNIQUE(a, b))").unwrap();
+        let SqlStmt::CreateTable { schema, .. } = s else { panic!("expected CreateTable") };
+        assert_eq!(schema.columns[schema.pk_col as usize].name, "a");
+        // L2: 无 PK 无唯一 → 注入
+        let s = parse(b"CREATE TABLE t (a INT, b TEXT)").unwrap();
+        let SqlStmt::CreateTable { schema, .. } = s else { panic!("expected CreateTable") };
+        assert_eq!(schema.columns[schema.pk_col as usize].name, "__rowid");
+        // 保留名冲突 → 拒绝
+        let e = parse(b"CREATE TABLE t (__rowid INT)").unwrap_err();
+        assert!(e.contains("reserved"), "{e}");
+    }
+
+    #[test]
+    fn compat_alter_drop_column() {
+        let s = parse(b"ALTER TABLE t DROP COLUMN extra").unwrap();
+        assert!(matches!(
+            s,
+            SqlStmt::AlterTable { drop: Some(ref c), .. } if c == "extra"
+        ));
+        let s = parse(b"ALTER TABLE t DROP extra").unwrap();
+        assert!(matches!(
+            s,
+            SqlStmt::AlterTable { drop: Some(ref c), .. } if c == "extra"
+        ));
+        // ADD 仍工作
+        let s = parse(b"ALTER TABLE t ADD COLUMN c INT").unwrap();
+        assert!(matches!(
+            s,
+            SqlStmt::AlterTable { add: Some(_), drop: None, .. }
+        ));
     }
 
     #[test]
@@ -156,7 +207,10 @@ mod tests {
 
     #[test]
     fn create_errors() {
-        assert!(parse(b"CREATE TABLE t (a INT)").unwrap_err().contains("PRIMARY KEY"));
+        // ⭐ compat: 无 PK 不再报错 — 自动注入隐藏 __rowid 为主键
+        let s = parse(b"CREATE TABLE t (a INT)").unwrap();
+        let SqlStmt::CreateTable { schema, .. } = s else { panic!("expected CreateTable") };
+        assert_eq!(schema.columns[schema.pk_col as usize].name, "__rowid");
         assert!(
             parse(b"CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY)")
                 .unwrap_err()

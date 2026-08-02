@@ -2551,8 +2551,13 @@ fn mysql_alter_table() {
     assert!(matches!(c.query("ALTER TABLE t ADD COLUMN name TEXT"), QueryResult::Err { .. }));
     // NOT NULL → 报错 (v1)
     assert!(matches!(c.query("ALTER TABLE t ADD COLUMN x INT NOT NULL"), QueryResult::Err { .. }));
-    // DROP COLUMN → 报错 (v1)
-    assert!(matches!(c.query("ALTER TABLE t DROP COLUMN name"), QueryResult::Err { .. }));
+    // ⭐ compat: DROP COLUMN — 标记删除 (SELECT * 隐藏, 显式引用报错, 存量行不受影响)
+    assert_eq!(c.query("ALTER TABLE t DROP COLUMN name"), QueryResult::Ok { affected: 0 });
+    assert!(matches!(c.query("SELECT name FROM t"), QueryResult::Err { .. }));
+    let r = c.query("SELECT * FROM t ORDER BY id");
+    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    assert_eq!(rows[0].len(), 3, "{rows:?}"); // id, age, email (name 已隐藏)
+    assert_eq!(c.query("SELECT id FROM t WHERE age = 30"), QueryResult::Rows(vec![vec![Some("3".into())]]));
 
     drop(c);
     server.shutdown().unwrap();

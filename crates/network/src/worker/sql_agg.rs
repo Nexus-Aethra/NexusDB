@@ -265,6 +265,26 @@ pub(crate) fn eval_json_get(base: &ColValue, key: &ColValue, as_text: bool) -> C
     }
 }
 
+/// ⭐ compat: JSONB 存在操作符 `j ? 'key'` — 顶层 object 是否含键 (数组/标量 → false).
+pub(crate) fn eval_json_exists(cv: &ColValue, key: &ColValue) -> bool {
+    let ColValue::Bytes(raw) = cv else {
+        return false;
+    };
+    let ColValue::Bytes(k) = key else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Ok(ks) = std::str::from_utf8(k) else {
+        return false;
+    };
+    match v {
+        serde_json::Value::Object(map) => map.contains_key(ks),
+        _ => false,
+    }
+}
+
 /// ⭐ F78: 逐行求值 — 任一操作数 NULL/非数值 → NULL; Div 除零 → NULL;
 /// 全整型且非 Div → I64 (溢出→NULL); 否则 F64.
 pub(crate) fn eval_bound_expr(e: &BoundExpr, row: &[ColValue]) -> ColValue {
@@ -543,7 +563,8 @@ pub(crate) fn eval_having_pred(
                 sql::CmpOp::Ge => ord.is_ge(),
                 sql::CmpOp::Lt => ord.is_lt(),
                 sql::CmpOp::Le => ord.is_le(),
-                sql::CmpOp::In => false, // HAVING 不支持 IN
+                sql::CmpOp::In => false,         // HAVING 不支持 IN
+                sql::CmpOp::JsonExists => false, // HAVING 不支持 JSONB '?'
             }
         }
         Pred::And(v) => v.iter().all(|p| eval_having_pred(row, p)),

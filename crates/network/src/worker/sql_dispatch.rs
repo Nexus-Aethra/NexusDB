@@ -591,6 +591,7 @@ pub(crate) fn sql_join_plan(ctx: &SqlJoinCtx) -> Result<Vec<Vec<u16>>, String> {
     }
     // 投影项
     if ctx.items.is_empty() {
+        // ⭐ JOIN 内部列定位 (ON/行重建) 需全列 proj; 隐藏/已删列在渲染输出段过滤
         for (ti, t) in ctx.tables.iter().enumerate() {
             let sc = t.schema.as_ref().expect("schema ready");
             for i in 0..sc.columns.len() as u16 {
@@ -752,6 +753,10 @@ pub(crate) fn sql_join_broadcast(
             if ti != idx {
                 continue;
             }
+            // ⭐ compat: JSONB '?' 无 shard 下推语义 → 纯残余过滤
+            if cond.op == CmpOp::JsonExists {
+                continue;
+            }
             let ty = schema.columns[cidx as usize].ty;
             let op = match cond.op {
                 CmpOp::Eq => shard_manager::PredOp::Eq,
@@ -761,6 +766,7 @@ pub(crate) fn sql_join_broadcast(
                 CmpOp::Lt => shard_manager::PredOp::Lt,
                 CmpOp::Le => shard_manager::PredOp::Le,
                 CmpOp::In => shard_manager::PredOp::In,
+                CmpOp::JsonExists => unreachable!("上续 continue"),
             };
             if cond.op == CmpOp::In {
                 let set: Vec<ColValue> =
@@ -1415,6 +1421,10 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
         for (t, jt) in ctx.tables.iter().enumerate() {
             let sc = jt.schema.as_ref().unwrap();
             for (i, col) in sc.columns.iter().enumerate() {
+                // ⭐ compat: SELECT * 排除隐藏 __rowid 与已删列 (内部定位仍用全列)
+                if sc.dropped.contains(&(i as u16)) || col.name == HIDDEN_ROWID {
+                    continue;
+                }
                 out_plan.push((format!("{}.{}", jt.alias, col.name), wide_pos(t, i as u16)));
             }
         }
@@ -1498,6 +1508,11 @@ pub(crate) fn join_cond_pass(cv: &ColValue, cond: &JoinCond) -> bool {
     if cond.op == CmpOp::In {
         return cond.set.iter().any(|v| sql_cmp(cv, v) == Some(Ordering::Equal));
     }
+    // ⭐ compat: JSONB '?' — 列含顶层键
+    if cond.op == CmpOp::JsonExists {
+        let key = sql_to_col(ColType::Str, &cond.val).unwrap_or(ColValue::Null);
+        return eval_json_exists(cv, &key);
+    }
     match sql_cmp(cv, &cond.val) {
         None => false,
         Some(o) => match cond.op {
@@ -1508,6 +1523,7 @@ pub(crate) fn join_cond_pass(cv: &ColValue, cond: &JoinCond) -> bool {
             CmpOp::Lt => o == Ordering::Less,
             CmpOp::Le => o != Ordering::Greater,
             CmpOp::In => unreachable!(),
+            CmpOp::JsonExists => unreachable!(),
         },
     }
 }
@@ -1559,6 +1575,7 @@ pub(crate) fn join_cmp_cols(a: &ColValue, op: CmpOp, b: &ColValue) -> bool {
         CmpOp::Lt => ord == Ordering::Less,
         CmpOp::Le => ord != Ordering::Greater,
         CmpOp::In => false,
+        CmpOp::JsonExists => false,
     }
 }
 
@@ -1905,6 +1922,7 @@ pub(crate) fn sysq_finish(
             .collect(),
         pk_col: 0,
         indexes: Vec::new(),
+        dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
     };
@@ -2685,7 +2703,8 @@ pub(crate) fn sql_run_dml(
                 return;
             }
             if proj.is_empty() {
-                proj = (0..schema.columns.len() as u16).collect();
+                // ⭐ compat: SELECT * — 排除隐藏 __rowid (自动主键表)
+                proj = visible_cols(&schema);
             }
             // ⭐ S2: ORDER BY 列名 → 列号
             let mut order_cols: Vec<(u16, bool)> = Vec::with_capacity(order.len());
@@ -3050,7 +3069,53 @@ pub(crate) fn sql_run_dml(
             conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
         }
         // ⭐ F79: ALTER TABLE ADD COLUMN — 基于旧 schema (参数) 合成新 schema 并广播 SetSchemaOp
-        SqlStmt::AlterTable { table, add, if_not_exists } => {
+        // ⭐ compat: ALTER TABLE DROP COLUMN — 标记删除 (列号/布局/版本不变, 存量零重写)
+        SqlStmt::AlterTable { table, add, drop, if_not_exists } => {
+            // ⭐ compat: DROP COLUMN
+            if let Some(drop_col) = drop {
+                let Some(col_idx) = schema.col_by_name(&drop_col) else {
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(conn.proto, &format!("unknown column '{drop_col}'")),
+                    );
+                    return;
+                };
+                let new_schema = match schema.with_dropped_column(col_idx) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        conn.resp_complete(seq, sql_err_bytes(conn.proto, "drop column failed"));
+                        return;
+                    }
+                };
+                let bytes = new_schema.encode();
+                let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+                conn.sql_ddl_agg.insert(
+                    seq,
+                    SqlDdlAgg {
+                        remaining: num_shards,
+                        error: None,
+                        key: (db.to_string(), table),
+                        schema: std::sync::Arc::new(new_schema),
+                        alter: true,
+                    },
+                );
+                for sid in 0..num_shards {
+                    let op = BatchOp::SetSchemaOp {
+                        db: db.clone(),
+                        table: table_arc.clone(),
+                        bytes: bytes.clone(),
+                    };
+                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                }
+                return;
+            }
+            let add = match add {
+                Some(a) => a,
+                None => {
+                    conn.resp_complete(seq, sql_err_bytes(conn.proto, "ALTER with no action"));
+                    return;
+                }
+            };
             // ⭐ compat: ADD COLUMN IF NOT EXISTS — 列已存在时静默跳过
             if if_not_exists && schema.col_by_name(&add.name).is_some() {
                 conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
@@ -3113,10 +3178,13 @@ pub(crate) fn sql_run_dml(
         | SqlStmt::SelectJoin { .. } => {
             unreachable!("工具命令在 sql_dispatch_stmt 处理")
         }
-        // ⭐ S3: DESCRIBE — schema 本地渲染 (Field/Type/Null/Key)
+        // ⭐ S3: DESCRIBE — schema 本地渲染 (Field/Type/Null/Key); 跳过已删列
         SqlStmt::Describe { .. } => {
             let mut rows: Vec<Vec<ColValue>> = Vec::new();
             for (i, col) in schema.columns.iter().enumerate() {
+                if schema.dropped.contains(&(i as u16)) {
+                    continue;
+                }
                 let ty = coltype_sql_name(col.ty);
                 let key = if i as u16 == schema.pk_col {
                     "PRI"
@@ -3172,6 +3240,10 @@ fn conds_to_scan_preds(schema: &TableSchema, conds: &Pred<Cond>) -> Vec<shard_ma
         if matches!(cond.val, SqlValue::Null) {
             continue;
         }
+        // ⭐ compat: JSONB '?' 无 shard 下推语义 → 纯残余过滤
+        if cond.op == CmpOp::JsonExists {
+            continue;
+        }
         let op = match cond.op {
             CmpOp::Eq => shard_manager::PredOp::Eq,
             CmpOp::Ne => shard_manager::PredOp::Ne,
@@ -3180,6 +3252,7 @@ fn conds_to_scan_preds(schema: &TableSchema, conds: &Pred<Cond>) -> Vec<shard_ma
             CmpOp::Lt => shard_manager::PredOp::Lt,
             CmpOp::Le => shard_manager::PredOp::Le,
             CmpOp::In => shard_manager::PredOp::In,
+            CmpOp::JsonExists => unreachable!("上续 continue"),
         };
         if cond.op == CmpOp::In {
             let mut set = Vec::with_capacity(cond.set.len());
@@ -3386,6 +3459,8 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                     }
                 }
                 CmpOp::Ne => {}
+                // ⭐ compat: JSONB '?' 无界/无剪枝, 不算命中 (纯残余过滤)
+                CmpOp::JsonExists => {}
             }
         }
         // ⭐ M3-3 (代价): 无界范围 (仅 lo 或仅 hi, 如 `score > 10`) → 索引扫半边表,

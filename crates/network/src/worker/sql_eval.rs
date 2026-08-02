@@ -71,28 +71,89 @@ pub(crate) fn scalar_fn_const_row(
     Ok((cref, row))
 }
 
+/// ⭐ compat (自动主键): 隐藏 `__rowid` 列名 (L2 注入; parse 层拒绝用户同名列).
+pub(crate) const HIDDEN_ROWID: &str = "__rowid";
+
+/// ⭐ compat (自动主键): 隐藏列生成 — 进程级 Atomic 递增.
+/// seed = 首次使用的当前时间微秒 (单调; 重启后从新时间戳续 → 与存量
+/// (旧时间戳) 不冲突, 免恢复; 时钟大幅回拨 + 重启 → 极小概率覆盖, v1 文档化).
+static AUTO_ROWID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub(crate) fn next_auto_rowid() -> i64 {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(1)
+    };
+    let mut cur = AUTO_ROWID.load(Acquire);
+    loop {
+        let base = if cur == 0 { now() } else { cur };
+        match AUTO_ROWID.compare_exchange(cur, base + 1, AcqRel, Acquire) {
+            Ok(_) => return base + 1,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// ⭐ compat: 该表是否自动主键表 (pk 列名为隐藏 __rowid).
+pub(crate) fn is_auto_pk(schema: &TableSchema) -> bool {
+    schema
+        .columns
+        .get(schema.pk_col as usize)
+        .map(|c| c.name == HIDDEN_ROWID)
+        .unwrap_or(false)
+}
+
+/// ⭐ compat: 可见列号 — `SELECT *` 全列展开时排除隐藏 __rowid 与已删列.
+pub(crate) fn visible_cols(schema: &TableSchema) -> Vec<u16> {
+    (0..schema.columns.len() as u16)
+        .filter(|&i| {
+            schema.columns[i as usize].name != HIDDEN_ROWID && !schema.dropped.contains(&i)
+        })
+        .collect()
+}
+
 /// INSERT 值列表 → 全列 ColValue (列清单缺省填 NULL; 类型转换).
+/// ⭐ compat (自动主键 + DROP COLUMN): 自动主键表用户不提供 __rowid; 已删列
+/// 不可写 (col_by_name 过滤); 无列清单时 VALUES 数 = 可见列数 (全列 − 隐藏/已删).
 pub(crate) fn sql_build_row(
     schema: &TableSchema,
     cols: &[String],
     vals: &[SqlValue],
 ) -> Result<Vec<ColValue>, String> {
     let n = schema.columns.len();
+    let auto_rowid = is_auto_pk(schema).then_some(schema.pk_col as usize);
+    let hidden = |i: usize| auto_rowid == Some(i) || schema.dropped.contains(&(i as u16));
     let mut out = vec![ColValue::Null; n];
     if cols.is_empty() {
-        if vals.len() != n {
-            return Err(format!("expected {n} values, got {}", vals.len()));
+        let visible = (0..n).filter(|&i| !hidden(i)).count();
+        if vals.len() != visible {
+            return Err(format!("expected {visible} values, got {}", vals.len()));
         }
-        for (i, v) in vals.iter().enumerate() {
-            out[i] = sql_to_col(schema.columns[i].ty, v)?;
+        let mut vi = 0;
+        for (i, c) in schema.columns.iter().enumerate() {
+            if hidden(i) {
+                continue;
+            }
+            out[i] = sql_to_col(c.ty, &vals[vi])?;
+            vi += 1;
         }
     } else {
         for (name, v) in cols.iter().zip(vals) {
+            if name.eq_ignore_ascii_case(HIDDEN_ROWID) {
+                return Err(format!("column '{HIDDEN_ROWID}' is reserved for auto rowid"));
+            }
             let i = schema
                 .col_by_name(name)
                 .ok_or_else(|| format!("unknown column '{name}'"))? as usize;
             out[i] = sql_to_col(schema.columns[i].ty, v)?;
         }
+    }
+    // 自动主键: 未提供 (或显式值) → 生成; 禁止用户覆盖 (保持隐藏语义)
+    if let Some(i) = auto_rowid {
+        out[i] = ColValue::I64(next_auto_rowid());
     }
     Ok(out)
 }
@@ -261,6 +322,10 @@ pub(crate) fn eval_cond_leaf(schema: &TableSchema, values: &[ColValue], c: &Cond
             CmpOp::Le => o != Ordering::Greater,
             CmpOp::Ne => o != Ordering::Equal, // ⭐ S2
             CmpOp::In => unreachable!(),
+            CmpOp::JsonExists => {
+                let key = sql_to_col(ColType::Str, &c.val).unwrap_or(ColValue::Null);
+                eval_json_exists(cv, &key)
+            }
         },
     }
 }

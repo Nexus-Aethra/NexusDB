@@ -1115,7 +1115,33 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
         columns[i].nullable = false;
         pk = Some(i as u16);
     }
-    let pk = pk.ok_or("PRIMARY KEY required")?;
+    // ⭐ compat (自动主键): 无 PRIMARY KEY 时降级 —
+    // L1: 恰一个单列 UNIQUE → 提升为 PK (零膨胀; 该列不重复建唯一索引);
+    // L2: 否则注入隐藏自增列 __rowid BIGINT NOT NULL 为 PK (8B, worker 进程级
+    // Atomic 递增, seed=启动时间戳 → 免恢复; SELECT * 对外隐藏该列).
+    let pk = match pk {
+        Some(p) => p,
+        None => {
+            if unique_names.len() == 1 && global_unique_names.is_empty() {
+                let u = unique_names.pop().unwrap();
+                columns
+                    .iter()
+                    .position(|c| c.name == u)
+                    .map(|i| i as u16)
+                    .ok_or_else(|| format!("UNIQUE on unknown column {u}"))?
+            } else {
+                if columns.iter().any(|c| c.name.eq_ignore_ascii_case("__rowid")) {
+                    return Err("column name '__rowid' is reserved for auto rowid".into());
+                }
+                columns.push(Column {
+                    name: "__rowid".to_string(),
+                    ty: ColType::I64,
+                    nullable: false,
+                });
+                (columns.len() - 1) as u16
+            }
+        }
+    };
     let col_pos = |n: &str, what: &str| -> Result<u16, String> {
         columns
             .iter()
@@ -1425,39 +1451,51 @@ fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
         });
         return Ok(leaf);
     } else {
-        let op = match p.next()? {
-            Tok::Eq => CmpOp::Eq,
-            Tok::Gt => CmpOp::Gt,
-            Tok::Ge => CmpOp::Ge,
-            Tok::Lt => CmpOp::Lt,
-            Tok::Le => CmpOp::Le,
-            Tok::Ne => CmpOp::Ne,
-            other => return Err(format!("expected comparison operator, got {other:?}")),
-        };
-        // ⭐ F71: col op (SELECT ...) — 标量子查询 (dispatch 前折叠为常量)
-        if p.peek_paren_select() {
-            let stmt = parse_paren_subselect(p)?;
-            return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::Subquery(stmt), set: vec![] }));
+        // ⭐ compat: `j ? 'key'` — 操作符位置 `?` → JSONB 存在 (值位置 `?` 仍为
+        // prepared 占位符, 由 p.value() 处理). v1: 键须字面量 (Str/Int), 纯残余过滤.
+        if p.peek() == Some(&Tok::Question) {
+            p.next()?;
+            let key = p.value()?;
+            if key == SqlValue::Null || matches!(key, SqlValue::ColRef(_) | SqlValue::Subquery(_))
+            {
+                return Err("JSONB '?' key must be a literal".into());
+            }
+            conds.push(Cond { col, op: CmpOp::JsonExists, val: key, set: vec![] });
+        } else {
+            let op = match p.next()? {
+                Tok::Eq => CmpOp::Eq,
+                Tok::Gt => CmpOp::Gt,
+                Tok::Ge => CmpOp::Ge,
+                Tok::Lt => CmpOp::Lt,
+                Tok::Le => CmpOp::Le,
+                Tok::Ne => CmpOp::Ne,
+                other => return Err(format!("expected comparison operator, got {other:?}")),
+            };
+            // ⭐ F71: col op (SELECT ...) — 标量子查询 (dispatch 前折叠为常量)
+            if p.peek_paren_select() {
+                let stmt = parse_paren_subselect(p)?;
+                return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::Subquery(stmt), set: vec![] }));
+            }
+            // ⭐ F74: col op ident (非 NULL) → ColRef (关联子查询相关列; decorrelate 前收集)
+            // ⭐ F80: 但排除字面量前导关键字 (NULL/TRUE/FALSE 及 DATE|TIME|TIMESTAMP|DATETIME '...'),
+            //   它们应落到 value() 解析为字面量而非列引用.
+            if let Some(Tok::Ident(s)) = p.peek()
+                && !matches!(
+                    s.to_ascii_uppercase().as_str(),
+                    "NULL" | "TRUE" | "FALSE" | "DATE" | "TIME" | "TIMESTAMP" | "DATETIME"
+                )
+            {
+                let rhs = p.ident()?;
+                return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::ColRef(rhs), set: vec![] }));
+            }
+            // ⭐ P0-1: 字面量算术折叠 (`a = 1+2` → `a = 3`)
+            let rv = p.value()?;
+            let val = fold_cond_arith(p, rv)?;
+            if val == SqlValue::Null {
+                return Err("NULL is not a valid comparison bound".into());
+            }
+            conds.push(Cond { col, op, val, set: vec![] });
         }
-        // ⭐ F74: col op ident (非 NULL) → ColRef (关联子查询相关列; decorrelate 前收集)
-        // ⭐ F80: 但排除字面量前导关键字 (NULL/TRUE/FALSE 及 DATE|TIME|TIMESTAMP|DATETIME '...'),
-        //   它们应落到 value() 解析为字面量而非列引用.
-        if let Some(Tok::Ident(s)) = p.peek()
-            && !matches!(
-                s.to_ascii_uppercase().as_str(),
-                "NULL" | "TRUE" | "FALSE" | "DATE" | "TIME" | "TIMESTAMP" | "DATETIME"
-            )
-        {
-            let rhs = p.ident()?;
-            return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::ColRef(rhs), set: vec![] }));
-        }
-        // ⭐ P0-1: 字面量算术折叠 (`a = 1+2` → `a = 3`)
-        let rv = p.value()?;
-        let val = fold_cond_arith(p, rv)?;
-        if val == SqlValue::Null {
-            return Err("NULL is not a valid comparison bound".into());
-        }
-        conds.push(Cond { col, op, val, set: vec![] });
     }
     // 单条 → Leaf; 多条 (BETWEEN/LIKE desugar) → And; 空 (LIKE '%') → 恒真
     Ok(match conds.len() {
@@ -1537,6 +1575,7 @@ fn const_cmp(l: SqlValue, op: CmpOp, r: SqlValue) -> Result<bool, String> {
         CmpOp::Lt => ord == Ordering::Less,
         CmpOp::Le => ord != Ordering::Greater,
         CmpOp::In => return Err("IN not valid in constant comparison".into()),
+        CmpOp::JsonExists => return Err("JSONB '?' not valid in constant comparison".into()),
     })
 }
 
@@ -1693,12 +1732,19 @@ fn parse_drop(p: &mut P) -> Result<SqlStmt, String> {
 
 /// ⭐ F79: `ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] name TYPE [NULL|NOT NULL] [DEFAULT v]`.
 /// v1 仅支持追加可空列; DROP/MODIFY/RENAME 拒.
+/// ⭐ compat: `ALTER TABLE t DROP [COLUMN] c` — 标记删除 (列号/布局不变, 存量零重写).
 fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("ALTER")?;
     p.kw("TABLE")?;
     let table = p.table_ident()?;
+    if p.try_kw("DROP") {
+        p.try_kw("COLUMN"); // 可选
+        let name = p.ident()?;
+        p.done()?;
+        return Ok(SqlStmt::AlterTable { table, add: None, drop: Some(name), if_not_exists: false });
+    }
     if !p.try_kw("ADD") {
-        return Err("only ALTER TABLE ADD COLUMN is supported (v1)".into());
+        return Err("only ALTER TABLE ADD COLUMN / DROP COLUMN is supported (v1)".into());
     }
     p.try_kw("COLUMN"); // 可选
     // ⭐ compat: ADD COLUMN IF NOT EXISTS
@@ -1750,7 +1796,12 @@ fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
         return Err("ADD COLUMN NOT NULL requires a DEFAULT (v1: cannot backfill existing rows)".into());
     }
     p.done()?;
-    Ok(SqlStmt::AlterTable { table, add: Column { name, ty, nullable }, if_not_exists })
+    Ok(SqlStmt::AlterTable {
+        table,
+        add: Some(Column { name, ty, nullable }),
+        drop: None,
+        if_not_exists,
+    })
 }
 
 /// ⭐ F78: 聚合内标量表达式递归下降 — 加减 > 乘除 > 因子 (列/字面量/括号).

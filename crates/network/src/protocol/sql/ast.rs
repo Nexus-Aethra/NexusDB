@@ -62,6 +62,8 @@ pub enum CmpOp {
     Ne,
     /// ⭐ S2: IN 集合 (值在 Cond::set; 索引列可提 [min,max] 界 + 残余精确).
     In,
+    /// ⭐ compat: JSONB 存在操作符 `j ? 'key'` (列含 JSON 顶层键; 纯残余过滤, 不下推).
+    JsonExists,
 }
 
 /// ⭐ G1 (F63): 聚合函数.
@@ -384,8 +386,9 @@ pub enum SqlStmt {
     CreateIndex { table: String, cols: Vec<String>, if_not_exists: bool },
     /// ⭐ compat: 纯 PG 专有 DDL 吞掉 (EXTENSION / FUNCTION / TRIGGER / SEQUENCE ...) — 无副作用.
     DdlStub,
-    /// ⭐ F79: ALTER TABLE t ADD COLUMN c TYPE (v1 仅追加可空列).
-    AlterTable { table: String, add: Column, if_not_exists: bool },
+    /// ⭐ F79: ALTER TABLE t ADD COLUMN c TYPE (v1 仅追加可空列);
+    /// ⭐ compat: DROP COLUMN c (标记删除, 物理保留).
+    AlterTable { table: String, add: Option<Column>, drop: Option<String>, if_not_exists: bool },
     /// ⭐ S3: USE db — 连接级切库 (worker 校验存在).
     Use { db: String },
     /// ⭐ S3: DESCRIBE t / DESC t — schema 渲染 (worker 本地).
