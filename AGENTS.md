@@ -81,6 +81,7 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 - 均在 protocol/sql.rs 解析层 + worker.rs 投影渲染 (out_names 三路: alias>label>列名); 零存储/调度改动
 - 剩余缺口 (P1/P2): DISTINCT / COUNT(DISTINCT) / SUM(表达式) / ALTER TABLE
 - **回归提速 (已配置)**: rust-lld 链接器 (.cargo/config.toml + .linker/ld.lld, 零安装) 使重链接 ~1s; cargo-nextest (并行+进度+超时, .config/nextest.toml) 全量 850 测试 57s
+- **❗测试栈 (已根治)**: 曾因 `ChunkBuf::new` 的 `Box::new([0u8; 1MiB])` 在栈上构造 1MB 临时数组, 深层 async 链爆 8MB 默认线程栈 → SIGABRT (list_ops_tests 复现). 已修复: 大缓冲全部堆分配 (`vec![0u8; CHUNK_SIZE]` / `page_pool::alloc_zeroed`), 默认栈即可, 无需 RUST_MIN_STACK
 - **❗跑测试必加 `TMPDIR=$PWD/target/nxtmp`**: 沙箱 /tmp 只读不稳定, e2e 写临时库到 /tmp 会导致并发下引擎初始化失败/页损坏→hang (非 io_uring/非代码 bug)
 
 ### 2026-07-31 会话十五总览 (F73/F74/F75, 细节见 CHANGELOG)

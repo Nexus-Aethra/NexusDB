@@ -50,7 +50,14 @@ const VPID_UNSET: u64 = u64::MAX;
 impl ChunkBuf {
     fn new() -> Self {
         Self {
-            data: Box::new([0u8; CHUNK_SIZE]),
+            // ⭐ 修复: `Box::new([0u8; CHUNK_SIZE])` 会在栈上构造 1MB 数组再 memcpy 到堆,
+            // 深层 async 调用链 (pager::submit → load_full_view → ChunkBuf::new) 内联叠加时
+            // 吃光默认 8MB 测试线程栈 → SIGABRT stack overflow (list_ops_tests 复现).
+            // `vec![0u8; CHUNK_SIZE]` 直接在堆上分配+清零, 栈上仅 Vec 头 (24B).
+            data: vec![0u8; CHUNK_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("exact CHUNK_SIZE"),
             vpids: [VPID_UNSET; PAGES_PER_CHUNK],
             page_count: 0,
         }

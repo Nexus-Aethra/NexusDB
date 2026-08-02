@@ -357,7 +357,7 @@ impl std::fmt::Debug for TableDirectory {
 /// 一个明确接口 (page_type = Leaf, 含 page header).
 #[allow(dead_code)]
 fn empty_leaf_with_vpid(vpid: Vpid) -> Box<[u8; PAGE_SIZE]> {
-    let mut page = Box::new([0u8; PAGE_SIZE]);
+    let mut page = crate::page_pool::alloc_zeroed();
     page_init_header(&mut page, PageType::Leaf);
     page_set_vpid(&mut page[..], vpid);
     page

@@ -4,10 +4,11 @@
 //! 模式: 用 `scheduler::SchedHandle + spawn_on + drive_until_idle + pollster::block_on`
 //! 在测试线程上跑协程, 直到 future 完成.
 //!
-//! **⭐ 栈大小 (T17)**: Storage 内联 async fn 返回 [u8; 16KB] page buffer,
-//! 多个 inline 后 poll frame 含多个 16KB 数组, 极易爆 8MB 默认线程栈.
-//! 跑测试前请设置 `RUST_MIN_STACK=67108864` (或 64MB+),
-//! 否则测试 thread 栈不够会 stack overflow.
+//! **⭐ 栈大小 (T17, 已根治 2026-08-02)**: 曾因 storage 内联 async fn 的 poll frame
+//! 含大数组 (尤其 `ChunkBuf::new` 的 `Box::new([0u8; 1MiB])` 会在栈上构造 1MB 临时数组),
+//! 深层 async 链叠加后爆 8MB 默认线程栈 → SIGABRT stack overflow (list_ops_tests 复现).
+//! 已修复: 大缓冲全部堆分配 (`vec![0u8; CHUNK_SIZE]` / `page_pool::alloc_zeroed`),
+//! 默认 8MB 线程栈即可, **不再需要 RUST_MIN_STACK**.
 //!
 //! **用法**:
 //! ```ignore
@@ -24,8 +25,7 @@
 
 /// 跑 async 测试在一个新的 scheduler 上.
 ///
-/// **前提**: 测试进程须以 `RUST_MIN_STACK=67108864` (64MB) 启动,
-/// 否则 storage 内联 async fn 状态机 + 多个 [u8; 16KB] 局部变量会爆栈.
+/// **前提**: 大缓冲已堆分配 (见模块注释), 默认 8MB 线程栈即可, 无需 RUST_MIN_STACK.
 ///
 /// 模式:
 /// 1. 新建 SchedHandle
