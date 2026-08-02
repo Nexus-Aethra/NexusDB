@@ -8,7 +8,7 @@
 //!
 //! 原则: 所有规则确定性、幂等 (对结果再应用不改变); 便于与执行结果一致性对比。
 
-use super::ast::{CmpOp, Cond, Pred};
+use super::ast::{sort_in_set, CmpOp, Cond, JoinCond, Pred, SqlValue};
 
 /// 归一化谓词树 — 展开单元素集合 / 消 NOT NOT / 德摩根 / 恒真恒假标记.
 /// 返回 (归一后的谓词, 是否恒假).
@@ -143,6 +143,106 @@ pub fn negate_cond(cond: &Cond) -> Option<Cond> {
     })
 }
 
+/// 叶子类型的最小协议 — 泛型 OR→IN 合并所需访问器.
+pub trait OrEqInLeaf {
+    fn op(&self) -> CmpOp;
+    fn val(&self) -> &SqlValue;
+    fn set(&self) -> &Vec<SqlValue>;
+    fn col_key(&self) -> &str;
+    fn build_in(col: &Self, set: Vec<SqlValue>) -> Self;
+}
+
+impl OrEqInLeaf for Cond {
+    fn op(&self) -> CmpOp {
+        self.op
+    }
+    fn val(&self) -> &SqlValue {
+        &self.val
+    }
+    fn set(&self) -> &Vec<SqlValue> {
+        &self.set
+    }
+    fn col_key(&self) -> &str {
+        &self.col
+    }
+    fn build_in(col: &Self, set: Vec<SqlValue>) -> Self {
+        Cond { col: col.col.clone(), op: CmpOp::In, val: SqlValue::Null, set }
+    }
+}
+
+impl OrEqInLeaf for JoinCond {
+    fn op(&self) -> CmpOp {
+        self.op
+    }
+    fn val(&self) -> &SqlValue {
+        &self.val
+    }
+    fn set(&self) -> &Vec<SqlValue> {
+        &self.set
+    }
+    fn col_key(&self) -> &str {
+        &self.col.col
+    }
+    fn build_in(col: &Self, set: Vec<SqlValue>) -> Self {
+        JoinCond { col: col.col.clone(), op: CmpOp::In, val: SqlValue::Null, set }
+    }
+}
+
+/// ⭐ M2c: 同列等值 OR → IN 合并.
+///
+/// `a=1 OR a=2 OR a=3` → `a IN (1,2,3)` (sort_in_set 排序去重).
+/// 让含 OR 的 AND 谓词 (如 `(a=1 OR a=2) AND b>15`) 重新进入 AND 下推路径:
+/// 单表 `sql_plan_select` 的索引计分 / JOIN `ScanFiltered` 广播均可利用.
+/// 保守: 仅当 OR 全分支为同列 Eq 叶子; 混合算子/跨列/嵌套 → 原样保留 (语义不变).
+pub fn or_eq_to_in<C>(pred: &Pred<C>) -> Pred<C>
+where
+    C: OrEqInLeaf + Clone,
+{
+    match pred {
+        Pred::Or(v) => {
+            let mut col: Option<&str> = None;
+            let mut vals: Vec<SqlValue> = Vec::with_capacity(v.len());
+            let mut ok = true;
+            for b in v {
+                match b {
+                    Pred::Leaf(c) if c.op() == CmpOp::Eq && c.set().is_empty() => match col {
+                        None => col = Some(c.col_key()),
+                        Some(ex) if ex != c.col_key() => {
+                            ok = false;
+                            break;
+                        }
+                        _ => {}
+                    },
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    if let Pred::Leaf(c) = b {
+                        vals.push(c.val().clone());
+                    }
+                }
+            }
+            // OR 单分支已被结构归一展开为 Leaf, 到这里必然 ≥2 分支 (且全 Eq 同列)
+            if ok {
+                if let Some(c0) = v.iter().find_map(|b| match b {
+                    Pred::Leaf(c) => Some(c),
+                    _ => None,
+                }) {
+                    let mut set = vals;
+                    sort_in_set(&mut set);
+                    return Pred::Leaf(C::build_in(c0, set));
+                }
+            }
+            pred.clone()
+        }
+        Pred::And(v) => Pred::And(v.iter().map(or_eq_to_in).collect()),
+        Pred::Not(b) => Pred::Not(Box::new(or_eq_to_in(b))),
+        Pred::Leaf(_) => pred.clone(),
+    }
+}
+
 /// ⭐ 对 `Pred<Cond>` 做完整归一 (含叶子反转): NOT 叶子 → 反转算子.
 /// 供 worker 物理规划在索引选择前调用。
 pub fn normalize_pred_cond(pred: &Pred<Cond>) -> (Pred<Cond>, bool) {
@@ -154,7 +254,14 @@ pub fn normalize_pred_cond(pred: &Pred<Cond>) -> (Pred<Cond>, bool) {
     // 第二遍: 处理 NOT 直接作用叶子 (结构归一后 NOT 只可能直接包叶子)
     let np2 = push_not_to_leaf(&np);
     // 第三遍: 再归一 (展开单元素/恒真恒假)
-    normalize_pred(&np2)
+    let (np3, is_false2) = normalize_pred(&np2);
+    if is_false2 {
+        return (np3, true);
+    }
+    // ⭐ M2c: 同列等值 OR → IN 合并 (含 OR 的 AND 谓词可重新进入下推路径)
+    let np4 = or_eq_to_in(&np3);
+    // 第四遍: In 叶子可能改变上层 And/Or 结构, 再归一一次 (幂等)
+    normalize_pred(&np4)
 }
 
 /// 递归把 `NOT(Leaf)` 反转, `NOT(复合)` 已由归一处理.
@@ -275,5 +382,79 @@ mod tests {
         let (np1, _) = normalize_pred_cond(&p);
         let (np2, _) = normalize_pred_cond(&np1);
         assert_eq!(np1, np2, "normalize must be idempotent");
+    }
+
+    // ===== ⭐ M2c: 同列等值 OR → IN 合并 =====
+
+    fn eq(col: &str, val: i64) -> Pred<Cond> {
+        Pred::Leaf(cond(col, CmpOp::Eq, val))
+    }
+
+    #[test]
+    fn or_eq_in_merges_and_dedups() {
+        let p = Pred::Or(vec![eq("a", 1), eq("a", 2), eq("a", 1)]);
+        let (np, _) = normalize_pred_cond(&p);
+        match np {
+            Pred::Leaf(c) => {
+                assert_eq!(c.op, CmpOp::In, "OR(Eq) → IN");
+                assert_eq!(c.set.len(), 2, "重复值去重: {c:?}");
+                assert_eq!(c.set[0], SqlValue::Int(1));
+                assert_eq!(c.set[1], SqlValue::Int(2));
+            }
+            other => panic!("expected In leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn or_eq_in_cross_col_keeps_or() {
+        let p = Pred::Or(vec![eq("a", 1), eq("b", 2)]);
+        let (np, _) = normalize_pred_cond(&p);
+        assert!(matches!(np, Pred::Or(_)), "跨列 OR 不合并: {np:?}");
+    }
+
+    #[test]
+    fn or_eq_in_mixed_op_keeps_or() {
+        let p = Pred::Or(vec![eq("a", 1), Pred::Leaf(cond("a", CmpOp::Gt, 5))]);
+        let (np, _) = normalize_pred_cond(&p);
+        assert!(matches!(np, Pred::Or(_)), "混合算子 OR 不合并: {np:?}");
+    }
+
+    #[test]
+    fn or_eq_in_inside_and_merges() {
+        // (a=1 OR a=2) AND b>15 → a IN (1,2) AND b>15
+        let p = Pred::And(vec![
+            Pred::Or(vec![eq("a", 1), eq("a", 2)]),
+            Pred::Leaf(cond("b", CmpOp::Gt, 15)),
+        ]);
+        let (np, _) = normalize_pred_cond(&p);
+        match np {
+            Pred::And(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(children
+                    .iter()
+                    .any(|c| matches!(c, Pred::Leaf(cc) if cc.op == CmpOp::In)));
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn or_eq_in_mixed_structure_keeps_or() {
+        // a=1 OR (a=2 AND b=3): AND 分支不能并入 IN
+        let p = Pred::Or(vec![
+            eq("a", 1),
+            Pred::And(vec![eq("a", 2), eq("b", 3)]),
+        ]);
+        let (np, _) = normalize_pred_cond(&p);
+        assert!(matches!(np, Pred::Or(_)), "嵌套 AND 分支不合并: {np:?}");
+    }
+
+    #[test]
+    fn or_eq_in_is_idempotent() {
+        let p = Pred::Or(vec![eq("a", 3), eq("a", 1)]);
+        let (np1, _) = normalize_pred_cond(&p);
+        let (np2, _) = normalize_pred_cond(&np1);
+        assert_eq!(np1, np2, "M2c 幂等");
+        assert!(matches!(np1, Pred::Leaf(c) if c.op == CmpOp::In));
     }
 }

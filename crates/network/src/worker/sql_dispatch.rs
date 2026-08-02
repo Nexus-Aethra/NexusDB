@@ -682,7 +682,10 @@ pub(crate) fn sql_join_broadcast(
         let schema = t.schema.as_ref().unwrap();
         let mut preds: Vec<shard_manager::ScanPred> = Vec::new();
         // ⭐ F69: 仅纯 AND 合取时下推 (含 OR/NOT → 空 preds 全扫, finish 递归残余保正确)
-        for cond in c.conds.as_conjuncts().unwrap_or_default() {
+        // ⭐ M2c: JOIN 叶子是 JoinCond, 做同列等值 OR→IN 合并 (a=1 OR a=2 → a IN (1,2)),
+        // 让含 OR 的 AND 谓词重新进入 AND 下推路径
+        let nconds = sql::or_eq_to_in::<sql::JoinCond>(&c.conds);
+        for cond in nconds.as_conjuncts().unwrap_or_default() {
             let Ok((ti, cidx)) = sql_join_resolve(c, &cond.col) else { continue };
             if ti != idx {
                 continue;
@@ -2934,6 +2937,50 @@ mod tests {
         let schema = test_schema();
         let plan = sql_plan_select(&schema, &c("id", CmpOp::Eq, SqlValue::Int(42))).unwrap();
         assert!(matches!(plan, SqlPlan::PkGet { .. }), "pk eq must be PkGet, got {plan:?}");
+    }
+
+    #[test]
+    fn or_eq_merges_to_in_index_plan() {
+        // ⭐ M2c: score=1 OR score=2 → 归一后 score IN (1,2) → 单索引扫描 [1,2] 闭界
+        // (取代 FullScan / IndexUnion 双分支, 走 M1 计分的单 Index 计划)
+        let schema = test_schema();
+        let p = Pred::Or(vec![
+            c("score", CmpOp::Eq, SqlValue::Int(1)),
+            c("score", CmpOp::Eq, SqlValue::Int(2)),
+        ]);
+        let (np, _) = sql::normalize_pred_cond(&p);
+        let plan = sql_plan_select(&schema, &np).unwrap();
+        match plan {
+            SqlPlan::Index { iid, lo, hi, .. } => {
+                assert_eq!(iid, 1, "score 是第二个索引 (iid 1)");
+                assert_eq!(lo, Some(ColValue::I64(1)));
+                assert_eq!(hi, Some(ColValue::I64(2)));
+            }
+            other => panic!("OR→IN 应走单 Index 扫描, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn or_eq_inside_and_still_plans_index() {
+        // ⭐ M2c: (score=1 OR score=2) AND name='x' → And(In, Eq) → 计分选 name 等值索引
+        let schema = test_schema();
+        let p = Pred::And(vec![
+            Pred::Or(vec![
+                c("score", CmpOp::Eq, SqlValue::Int(1)),
+                c("score", CmpOp::Eq, SqlValue::Int(2)),
+            ]),
+            c("name", CmpOp::Eq, SqlValue::Str(b"x".to_vec())),
+        ]);
+        let (np, _) = sql::normalize_pred_cond(&p);
+        let plan = sql_plan_select(&schema, &np).unwrap();
+        match plan {
+            SqlPlan::Index { iid, lo, hi, .. } => {
+                assert_eq!(iid, 0, "name 等值 +3 应胜出");
+                assert_eq!(lo, Some(ColValue::Bytes(b"x".to_vec())));
+                assert_eq!(hi, Some(ColValue::Bytes(b"x".to_vec())));
+            }
+            other => panic!("含 OR 的 AND 也应走索引, got {other:?}"),
+        }
     }
 
     #[test]

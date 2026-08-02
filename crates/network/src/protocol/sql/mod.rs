@@ -18,7 +18,7 @@ mod parser;
 pub use ast::*;
 pub use optimizer::{
     as_disjuncts, is_always_false, is_always_true, negate_cond, normalize_pred,
-    normalize_pred_cond,
+    normalize_pred_cond, or_eq_to_in, OrEqInLeaf,
 };
 pub use parser::{
     bind_params, parse, parse_prepared, split_sql_statements,
