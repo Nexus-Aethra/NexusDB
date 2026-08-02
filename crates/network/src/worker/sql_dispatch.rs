@@ -2776,6 +2776,11 @@ fn conds_to_scan_preds(schema: &TableSchema, conds: &Pred<Cond>) -> Vec<shard_ma
         if matches!(ty, ColType::Decimal { .. }) {
             continue;
         }
+        // ⭐ IS [NOT] NULL (desugar 为 =/<> NULL): shard 端有序编码比较不支持 NULL 语义
+        // → 留 worker 残余过滤 (eval 用 sql_cmp 专有分支).
+        if matches!(cond.val, SqlValue::Null) {
+            continue;
+        }
         let op = match cond.op {
             CmpOp::Eq => shard_manager::PredOp::Eq,
             CmpOp::Ne => shard_manager::PredOp::Ne,

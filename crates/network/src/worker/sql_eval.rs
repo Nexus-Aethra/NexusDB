@@ -242,6 +242,14 @@ pub(crate) fn coerce_cmp_lit(ty: ColType, sv: &SqlValue) -> Option<SqlValue> {
 /// ⭐ P1: 数值列 vs 文本 → 按文本数字解析比较 (PG 文本参数弱类型, 与 sql_to_col 一致).
 pub(crate) fn sql_cmp(cv: &ColValue, sv: &SqlValue) -> Option<std::cmp::Ordering> {
     match (cv, sv) {
+        // ⭐ IS [NOT] NULL (desugar 为 `col = NULL` / `col <> NULL`): NULL 列值 vs NULL
+        // 字面量 → Equal (Eq 匹配 / Ne 不匹配); 非 NULL 值 vs NULL → Greater (Eq false / Ne true).
+        // 标准 SQL 的 `x = NULL` 恒 unknown, 但此处只由 IS [NOT] NULL desugar 产生,
+        // 是专有语义 (需先于 `(Null, _)` 分支匹配).
+        (cv, SqlValue::Null) => Some(match cv {
+            ColValue::Null => std::cmp::Ordering::Equal,
+            _ => std::cmp::Ordering::Greater,
+        }),
         (ColValue::Null, _) => None,
         (ColValue::I64(a), SqlValue::Int(b)) => Some(a.cmp(b)),
         (ColValue::I64(a), SqlValue::Float(b)) => (*a as f64).partial_cmp(b),

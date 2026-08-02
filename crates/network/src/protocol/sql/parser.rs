@@ -1269,6 +1269,26 @@ fn parse_primary(p: &mut P) -> Result<Pred<Cond>, String> {
 /// ⭐ F69: 单个比较谓词 `col op val / IN / BETWEEN / LIKE`.
 /// BETWEEN/LIKE desugar 产物 (多条) 包为 `And(vec![Leaf,..])`; 单条 → `Leaf`.
 fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
+    // ⭐ P0-1: 常量比较短路 — `1=1`/`0=1`/`'a'<'b'` (无列引用) → 恒真 (空 AND) /
+    // 恒假 (空 OR). 恒假由 dispatch 短路返回空; 恒真由 normalize 消除.
+    if matches!(p.peek(), Some(Tok::Num(_)) | Some(Tok::Str(_))) {
+        let lhs = p.value()?;
+        let op = match p.next()? {
+            Tok::Eq => CmpOp::Eq,
+            Tok::Gt => CmpOp::Gt,
+            Tok::Ge => CmpOp::Ge,
+            Tok::Lt => CmpOp::Lt,
+            Tok::Le => CmpOp::Le,
+            Tok::Ne => CmpOp::Ne,
+            other => {
+                return Err(format!("expected comparison operator after constant, got {other:?}"))
+            }
+        };
+        let rv = p.value()?;
+        let rhs = fold_cond_arith(p, rv)?;
+        let truthy = const_cmp(lhs, op, rhs)?;
+        return Ok(if truthy { Pred::And(vec![]) } else { Pred::Or(vec![]) });
+    }
     let mut conds: Vec<Cond> = Vec::new();
     let col = p.ident()?;
     // ⭐ F71: col [NOT] IN (...) — NOT IN 包 Pred::Not; 子查询与字面量列表两路
@@ -1392,7 +1412,9 @@ fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             let rhs = p.ident()?;
             return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::ColRef(rhs), set: vec![] }));
         }
-        let val = p.value()?;
+        // ⭐ P0-1: 字面量算术折叠 (`a = 1+2` → `a = 3`)
+        let rv = p.value()?;
+        let val = fold_cond_arith(p, rv)?;
         if val == SqlValue::Null {
             return Err("NULL is not a valid comparison bound".into());
         }
@@ -1402,6 +1424,80 @@ fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
     Ok(match conds.len() {
         1 => Pred::Leaf(conds.pop().unwrap()),
         _ => Pred::And(conds.into_iter().map(Pred::Leaf).collect()),
+    })
+}
+
+/// ⭐ P0-1: 折叠 cond 右值的字面量算术 (`a = 1+2` → `a = 3`). 仅数值;
+/// 含列引用/字符串遇算术符报错 (v1).
+fn fold_cond_arith(p: &mut P, first: SqlValue) -> Result<SqlValue, String> {
+    let mut acc = first;
+    loop {
+        let op = match p.peek() {
+            Some(Tok::Plus) => ArithOp::Add,
+            Some(Tok::Minus) => ArithOp::Sub,
+            Some(Tok::Star) => ArithOp::Mul,
+            Some(Tok::Slash) => ArithOp::Div,
+            _ => break,
+        };
+        p.next()?;
+        let rhs = p.value()?;
+        acc = eval_const_bin(op, acc, rhs)?;
+    }
+    Ok(acc)
+}
+
+/// ⭐ P0-1: 常量二元算术求值 (Int/Float; 溢出/除零/非数值报错).
+fn eval_const_bin(op: ArithOp, l: SqlValue, r: SqlValue) -> Result<SqlValue, String> {
+    use SqlValue::{Float, Int};
+    match (l, r) {
+        (Int(a), Int(b)) => {
+            let v = match op {
+                ArithOp::Add => a.checked_add(b),
+                ArithOp::Sub => a.checked_sub(b),
+                ArithOp::Mul => a.checked_mul(b),
+                ArithOp::Div => a.checked_div(b),
+            };
+            v.map(Int)
+                .ok_or_else(|| "integer overflow/div-by-zero in constant expression".into())
+        }
+        (Float(a), Float(b)) => Ok(Float(match op {
+            ArithOp::Add => a + b,
+            ArithOp::Sub => a - b,
+            ArithOp::Mul => a * b,
+            ArithOp::Div => a / b,
+        })),
+        (Float(a), Int(b)) => eval_const_bin(op, Float(a), Float(b as f64)),
+        (Int(a), Float(b)) => eval_const_bin(op, Float(a as f64), Float(b)),
+        _ => Err("constant arithmetic requires numeric operands".into()),
+    }
+}
+
+/// ⭐ P0-1: 常量比较求值 (Int/Float/Str; 混合类型报错).
+fn const_cmp(l: SqlValue, op: CmpOp, r: SqlValue) -> Result<bool, String> {
+    use std::cmp::Ordering;
+    use SqlValue::{Float, Int, Str};
+    let ord = match (l, r) {
+        (Int(a), Int(b)) => a.cmp(&b),
+        (Float(a), Float(b)) => a
+            .partial_cmp(&b)
+            .ok_or_else(|| "constant comparison with NaN".to_string())?,
+        (Float(a), Int(b)) => a
+            .partial_cmp(&(b as f64))
+            .ok_or_else(|| "constant comparison with NaN".to_string())?,
+        (Int(a), Float(b)) => (a as f64)
+            .partial_cmp(&b)
+            .ok_or_else(|| "constant comparison with NaN".to_string())?,
+        (Str(a), Str(b)) => a.cmp(&b),
+        _ => return Err("constant comparison requires numeric/string operands".into()),
+    };
+    Ok(match op {
+        CmpOp::Eq => ord == Ordering::Equal,
+        CmpOp::Ne => ord != Ordering::Equal,
+        CmpOp::Gt => ord == Ordering::Greater,
+        CmpOp::Ge => ord != Ordering::Less,
+        CmpOp::Lt => ord == Ordering::Less,
+        CmpOp::Le => ord != Ordering::Greater,
+        CmpOp::In => return Err("IN not valid in constant comparison".into()),
     })
 }
 

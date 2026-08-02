@@ -76,7 +76,7 @@ Executor (已有 worker: 广播 shard + 完成点聚合)
 
 | # | 优化 | 说明 | 收益 |
 |---|------|------|------|
-| 1 | **常量折叠** | `WHERE a = 1+2` → `a = 3`；`WHERE 1=1` 消除 | 减少计算/谓词简化 |
+| 1 | **常量折叠** | `WHERE a = 1+2` → `a = 3`；`WHERE 1=1` 消除 | 减少计算/谓词简化 | ✅ 2026-08-02 |
 | 2 | **投影裁剪（列裁剪）** | `SELECT a FROM t` 只取列 a 的 shard 扫描 | 大幅减少 IO/传输（当前全行） |
 | 3 | **复合索引前缀匹配** | 索引 `(a,b)` 命中 `WHERE a=? AND b=?` 或仅 `WHERE a=?` | 当前只匹配单列索引 |
 | 4 | **多索引选择** | 候选多个索引，选覆盖谓词最多/界最紧者 | 替换贪婪首个索引 |
@@ -91,7 +91,7 @@ Executor (已有 worker: 广播 shard + 完成点聚合)
 | 8 | **排序消排（利用索引有序）** | `ORDER BY a` 走索引 `(a)` 天然有序 → 免 sort；配合 LIMIT | 大结果集排序成本 |
 | 9 | **排序后 limit 下推** | 有排序+limit：shard 各自取 top-k → 合并再 top-k（多路归并） | 避免全量排序 |
 | 10 | **谓词下推增强** | OR 分支各自下推；JOIN 内表过滤下推 | 减少中间行数 |
-| 11 | **IS NULL 走索引** | `WHERE a IS NULL` 利用索引（NexusDB 索引支持 null 标记则可行） | 专项查询 |
+| 11 | **IS NULL 走索引** | `WHERE a IS NULL` 利用索引（NexusDB 索引支持 null 标记则可行） | 专项查询 | ⚠️ 语义已支持 (desugar 全扫, 修复 sql_cmp NULL 比较); 走索引需存储层 NULL 标记 (未做) |
 
 ### P2 — 代价优化（CBO，需统计信息）
 
@@ -128,7 +128,7 @@ Executor (已有 worker: 广播 shard + 完成点聚合)
    top-(limit+offset), worker 归并后 early_cut; 残余过滤存在时 limit 不下推
    (过滤破坏 top-k 不变量), 仅免排序
 3. ✅ OR 展开: IndexUnion 计划节点 (两个 IndexScan 合并)
-4. ⏳ 谓词下推: OR 分支独立下推 + JOIN 内表过滤 (ScanFiltered 已有基础)
+4. ✅ 谓词下推: JOIN 内表过滤 (F68) + 同列等值 OR→IN 合并下推 (M2c) + 投影下推 (P0-2)
 ```
 
 交付：常见分页/排序查询走索引 (LIMIT/OFFSET + ORDER BY 索引列)。

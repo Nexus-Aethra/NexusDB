@@ -2486,6 +2486,32 @@ fn mysql_projection_pushdown() {
     drop(mgr);
 }
 
+/// ⭐ P0-1 + P1-11: 常量折叠 (常量比较短路 `1=1`/`1=0`, 右值算术 `id=1+2`)
+/// 与 IS NULL 语义 (desugar 为 col=NULL, 走全扫正确过滤; NULL 不入索引).
+#[test]
+fn mysql_const_fold_and_is_null() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)");
+    for (id, name, score) in [("1", "'a'", 10), ("2", "'b'", 5), ("3", "NULL", 20)] {
+        c.query(&format!("INSERT INTO t VALUES ({id}, {name}, {score})"));
+    }
+    // 常量比较短路: 1=1 恒真 → 全表 (pk 序); 1=0 恒假 → 空
+    assert_eq!(c.ids("SELECT id FROM t WHERE 1=1"), vec!["1", "2", "3"]);
+    assert_eq!(c.ids("SELECT id FROM t WHERE 1=0"), Vec::<String>::new());
+    assert_eq!(c.ids("SELECT id FROM t WHERE 2 > 1"), vec!["1", "2", "3"]);
+    // 右值算术折叠: id = 1+2 → id = 3; score > 2*3 → score > 6
+    assert_eq!(c.ids("SELECT id FROM t WHERE id = 1+2"), vec!["3"]);
+    assert_eq!(c.ids("SELECT id FROM t WHERE score > 2*3"), vec!["1", "3"]);
+    // IS NULL / IS NOT NULL (desugar → 全扫过滤; NULL 不入索引走不了索引扫描)
+    assert_eq!(c.ids("SELECT id FROM t WHERE name IS NULL"), vec!["3"]);
+    assert_eq!(c.ids("SELECT id FROM t WHERE name IS NOT NULL"), vec!["1", "2"]);
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ F81: DECIMAL 定点小数 — 建表→插入(字符串精确/字面量)→查回不丢精度→SUM→WHERE→ORDER.
 #[test]
 fn mysql_decimal() {
