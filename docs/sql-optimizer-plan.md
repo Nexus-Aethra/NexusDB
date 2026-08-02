@@ -98,7 +98,7 @@ Executor (已有 worker: 广播 shard + 完成点聚合)
 | # | 优化 | 说明 | 收益 |
 |---|------|------|------|
 | 12 | **基数估算** | 从 shard 采样/维护每索引键基数 | 支持代价比较 | ✅ (M3-1 行数 + M3-4 索引列 distinct + M3-5 列 min/max 直方图基础; 统计持久化 stats.bin M3-1b); 完整 SampledHistogram 分桶直方图留 M3-6 |
-| 13 | **连接顺序** | 小表驱动大表（NestedLoop 顺序） | JOIN 性能 | ✅ (M3-2: 双表 Inner 驱动交换, EstimateRows 选小表, 保列序) |
+| 13 | **连接顺序** | 小表驱动大表（NestedLoop 顺序） | JOIN 性能 | ✅ (M3-2: 双表 Inner 驱动交换, EstimateRows 选小表, 保列序; 方案 A: 行数合并一轮 + 小表阈值跳过统计, 开销收敛) |
 | 14 | **哈希/合并连接** | 大结果集连接不依赖嵌套循环 | 大规模 JOIN | ✅ 已覆盖: worker 内存 hash join (右建 hash 左探测) + key_set 下推; 跨 shard 重分布哈希单机架构不适用 |
 | 15 | **代价模型** | 行数/选择性 → 访问路径选择 | 优化器决策 | ✅ (M3-3: IN 大集合降权 + 无界范围降权 + M3-4 distinct 打破 Eq 平局; M3-5 min/max 区间占比接入需行数代价框架, 留 M3-6) |
 | 15 | **物化视图/结果缓存** | 热点查询缓存（对接 RESP 内存） | 读密集场景 |
@@ -137,12 +137,18 @@ Executor (已有 worker: 广播 shard + 完成点聚合)
 ### M3 — CBO 起步（统计 + 连接）
 
 ```
-1. 统计信息: shard 维护每索引近似基数 (SampledHistogram), 随快照持久化
-2. 代价模型: 行数估算 → 访问路径/连接顺序选择
-3. 连接顺序: NestedLoop 小表驱动
+1. ✅ 统计信息: shard 维护每索引近似基数, stats.bin 持久化 (M3-1/M3-1b)
+2. ✅ 代价模型: 行数估算 → 访问路径/连接顺序选择 (M3-3/M3-4/M3-5)
+3. ✅ 连接顺序: NestedLoop 小表驱动 (M3-2)
+4. ✅ 方案 A (2026-08-02, 开销收敛调优): 双表行数合并一轮广播 (group 0/1 区分表)
+   + 小表阈值 EST_SKIP_STATS_ROWS=1024 (两表行数均 ≤ → 跳过 distinct/ranges
+   直接决策) → 小表 JOIN 固定 1 轮; 有索引大表 3 轮 (行数+distinct+ranges 各
+   合并一轮); 无索引大表 1 轮 (候选空自动跳过).
+   观测: /metrics nexusdb_sql_join_est_rounds / _skipped.
+   轮数对比 (原实现 → 现实现): 无索引 2→1, 有索引小表 6→1, 有索引大表 6→3.
 ```
 
-交付：`EXPLAIN` 含估算行数；多表 JOIN 顺序优化。
+交付：`EXPLAIN` 含估算行数；多表 JOIN 顺序优化；统计开销收敛。
 
 ## 五、与现有代码的衔接
 

@@ -666,7 +666,10 @@ pub(crate) fn sql_join_kickoff(
                             && c.joins[0].on.iter().all(|o| matches!(o, sql::OnPred::Eq(..)))
                     };
                     if est_ok {
-                        let (db, table) = {
+                        // ⭐ 方案 A (调优): 两表行数合并一轮广播 (group 0=tables[0], 1=tables[1]),
+                        // 省 1 轮; 后续 distinct/ranges 仅在有候选索引列时收集, 且小表
+                        // (行数 ≤ EST_SKIP_STATS_ROWS) 直接跳过 → 双表小 JOIN 固定只 1 轮.
+                        let (db, t0, t1) = {
                             let c = conn.sql_join.get_mut(&seq).unwrap();
                             c.phase = JoinPhase::EstimateRows;
                             c.est_phase = 0;
@@ -679,14 +682,24 @@ pub(crate) fn sql_join_kickoff(
                                 std::collections::HashMap::new(),
                                 std::collections::HashMap::new(),
                             ];
-                            c.remaining = num_shards;
+                            c.remaining = 2 * num_shards;
                             c.gather_order = vec![0, 1]; // swapped 时改为 [1, 0]
-                            (c.db.clone(), c.tables[0].table.clone())
+                            (c.db.clone(), c.tables[0].table.clone(), c.tables[1].table.clone())
                         };
                         for sid in 0..num_shards {
-                            let op = BatchOp::EstimateRowCount { db: db.clone(), table: table.clone() };
-                            push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                            push_task_grouped(
+                                conn_id, seq, worker_id, 0, sid,
+                                BatchOp::EstimateRowCount { db: db.clone(), table: t0.clone() },
+                                shard_inboxes,
+                            );
+                            push_task_grouped(
+                                conn_id, seq, worker_id, 1, sid,
+                                BatchOp::EstimateRowCount { db: db.clone(), table: t1.clone() },
+                                shard_inboxes,
+                            );
                         }
+                        crate::metrics::SQL_JOIN_EST_ROUNDS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return;
                     }
                     {
@@ -975,11 +988,13 @@ pub(crate) fn sql_join_index_hint(
 }
 
 /// ⭐ F67 (JOIN): handle_resp 认领 — 按 phase 推进. 返回 true = 已处理此 seq.
+/// `group` 仅 EstimateRows 行数批使用 (0=tables[0], 1=tables[1]).
 pub(crate) fn sql_join_drive(
     conn: &mut ConnState,
     conn_id: u64,
     seq: u64,
     worker_id: u32,
+    group: u32,
     result: &BatchResult,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
@@ -1039,37 +1054,43 @@ pub(crate) fn sql_join_drive(
             }
             true
         }
-        // ⭐ M3-2/M3-4/M3-5: 收集统计 — est_phase 0/1 行数, 2/3 distinct, 4/5 ranges.
-        // 阶段序列固定推进 (跳过候选空阶段), 全齐 → 决策驱动表.
+        // ⭐ M3-2/M3-4/M3-5 + 方案 A (调优): 统计收集 — 批次 0=两表行数 (合并一轮,
+        // group 0=t0, 1=t1), 1=两表 distinct (合并一轮), 2=两表 ranges (合并一轮).
+        // 候选索引空表不入批; 行数批收齐后两表均 ≤ EST_SKIP_STATS_ROWS → 直接决策.
         JoinPhase::EstimateRows => {
             {
                 let c = conn.sql_join.get_mut(&seq).unwrap();
-                // 收当前阶段结果
+                // 收当前批次结果 (group 区分表 0/1)
+                let ti = group as usize;
                 match c.est_phase {
-                    0 | 1 => {
+                    0 => {
                         if let BatchResult::RowCount(n) = result {
-                            c.est_rows[c.est_phase as usize] += n;
+                            if ti < 2 {
+                                c.est_rows[ti] += n;
+                            }
                         }
                     }
-                    2 | 3 => {
+                    1 => {
                         if let BatchResult::DistinctCounts(ds) = result {
-                            let ti = (c.est_phase - 2) as usize;
-                            let cand = join_candidate_eq_iids(&c, ti);
-                            if let Some(map) = c.join_distinct.get_mut(ti) {
-                                for ((_, iid), d) in cand.iter().zip(ds.iter()) {
-                                    map.insert(*iid, *d);
+                            if ti < 2 {
+                                let cand = join_candidate_eq_iids(&c, ti);
+                                if let Some(map) = c.join_distinct.get_mut(ti) {
+                                    for ((_, iid), d) in cand.iter().zip(ds.iter()) {
+                                        map.insert(*iid, *d);
+                                    }
                                 }
                             }
                         }
                     }
                     _ => {
                         if let BatchResult::RangeBounds(rbs) = result {
-                            let ti = (c.est_phase - 4) as usize;
-                            let cand = join_candidate_eq_iids(&c, ti);
-                            if let Some(map) = c.join_ranges.get_mut(ti) {
-                                for ((_, iid), (lo, hi)) in cand.iter().zip(rbs.iter()) {
-                                    if let (Some(lo), Some(hi)) = (lo, hi) {
-                                        map.insert(*iid, (lo.clone(), hi.clone()));
+                            if ti < 2 {
+                                let cand = join_candidate_eq_iids(&c, ti);
+                                if let Some(map) = c.join_ranges.get_mut(ti) {
+                                    for ((_, iid), (lo, hi)) in cand.iter().zip(rbs.iter()) {
+                                        if let (Some(lo), Some(hi)) = (lo, hi) {
+                                            map.insert(*iid, (lo.clone(), hi.clone()));
+                                        }
                                     }
                                 }
                             }
@@ -1080,45 +1101,58 @@ pub(crate) fn sql_join_drive(
                 if c.remaining > 0 {
                     return true;
                 }
-                // 本阶段齐 → 推进 (跳过候选空的阶段)
+                // 本批收齐 → 推进 (跳过候选空批)
                 let mut phase = c.est_phase + 1;
-                loop {
-                    if phase >= 6 {
-                        break; // 全部收集齐 → 出块决策
+                if c.est_phase == 0
+                    && c.est_rows[0] <= EST_SKIP_STATS_ROWS
+                    && c.est_rows[1] <= EST_SKIP_STATS_ROWS
+                {
+                    // ⭐ 方案 A: 小表 JOIN — distinct/ranges 的索引选择收益可忽略,
+                    // 跳过统计直接按行数决策 (双表小 JOIN 固定只 1 轮广播).
+                    crate::metrics::SQL_JOIN_EST_SKIPPED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    phase = 3;
+                }
+                while phase < 3 {
+                    // 仅对有候选索引列的表广播 (候选空表跳过)
+                    let mut pushes: Vec<(u32, Vec<u32>)> = Vec::new();
+                    for t in 0..2 {
+                        let cand = join_candidate_eq_iids(&c, t);
+                        if !cand.is_empty() {
+                            pushes.push((t as u32, cand.iter().map(|&(_, iid)| iid).collect()));
+                        }
                     }
-                    let ti = match phase {
-                        1 | 3 | 5 => 1,
-                        _ => 0,
-                    };
-                    let cand = join_candidate_eq_iids(&c, ti);
-                    if cand.is_empty() {
+                    if pushes.is_empty() {
                         phase += 1;
                         continue;
                     }
-                    let iids: Vec<u32> = cand.iter().map(|&(_, iid)| iid).collect();
-                    let table = c.tables[ti].table.clone();
+                    c.est_phase = phase as u8;
+                    c.remaining = pushes.len() * num_shards;
                     let db = c.db.clone();
-                    c.est_phase = phase;
-                    c.remaining = num_shards;
-                    for sid in 0..num_shards {
-                        let op = match phase {
-                            2 | 3 => BatchOp::EstimateDistinct {
-                                db: db.clone(),
-                                table: table.clone(),
-                                iids: iids.clone(),
-                            },
-                            _ => BatchOp::EstimateRanges {
-                                db: db.clone(),
-                                table: table.clone(),
-                                iids: iids.clone(),
-                            },
-                        };
-                        push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                    for (t, iids) in pushes {
+                        let table = c.tables[t as usize].table.clone();
+                        for sid in 0..num_shards {
+                            let op = match phase {
+                                1 => BatchOp::EstimateDistinct {
+                                    db: db.clone(),
+                                    table: table.clone(),
+                                    iids: iids.clone(),
+                                },
+                                _ => BatchOp::EstimateRanges {
+                                    db: db.clone(),
+                                    table: table.clone(),
+                                    iids: iids.clone(),
+                                },
+                            };
+                            push_task_grouped(conn_id, seq, worker_id, t, sid, op, shard_inboxes);
+                        }
                     }
+                    crate::metrics::SQL_JOIN_EST_ROUNDS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return true;
                 }
             }
-            // 全部收集齐 → 决策驱动表 → Gather
+            // 全部收集齐 / 阈值跳过 → 决策驱动表 → Gather
             sql_join_est_decide(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
             true
         }

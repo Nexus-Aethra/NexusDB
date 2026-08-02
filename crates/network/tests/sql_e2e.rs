@@ -2074,7 +2074,10 @@ fn mysql_join_driver_swap() {
 }
 
 /// ⭐ M3-4 (基数估算): JOIN 表上多个等值索引候选 → EstimateRows 收集 distinct,
-/// index_hint 选选择性高的; 结果正确性 (distinct 收集路径走通).
+/// index_hint 选选择性高的.
+/// ⭐ 方案 A: 本测试小表 (≤ 阈值) 走"跳过统计"路径 — 验证 index_hint 退化
+/// (join_distinct 空 → 取首个 Eq) 下结果仍正确; 完整 distinct 收集路径由
+/// mysql_join_est_threshold 的大表场景覆盖.
 #[test]
 fn mysql_join_distinct_choice() {
     let (server, mgr) = start_sql_server(None);
@@ -2101,6 +2104,84 @@ fn mysql_join_distinct_choice() {
         c.query("SELECT u.name, t.id FROM u JOIN t ON u.id = t.id WHERE t.a = 0 AND t.b = 0"),
         QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]])
     );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 方案 A (调优): EstimateRows 开销收敛 — 小表 JOIN (两表行数 ≤ EST_SKIP_STATS_ROWS)
+/// 跳过 distinct/ranges 统计收集, 固定只 1 轮行数广播 (SQL_JOIN_EST_ROUNDS 增量=1,
+/// SQL_JOIN_EST_SKIPPED 增量=1); 大表 JOIN 走完整统计 (行数+distinct+ranges=3 轮,
+/// 不触发跳过). 结果正确性两条路径都保持.
+/// 注: 断言依赖 nextest heavy 组串行 (max-threads=1), 勿与其它 JOIN 测试并行跑本 binary.
+#[test]
+fn mysql_join_est_threshold() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    // ---- 小表场景: 两表 ≤ 阈值 → 跳过统计, 只 1 轮 ----
+    c.query("CREATE TABLE s (id INT PRIMARY KEY, a INT, b INT)");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT)");
+    c.query("CREATE INDEX sa ON s(a)");
+    c.query("CREATE INDEX sb ON s(b)");
+    for i in 0..100 {
+        c.query(&format!("INSERT INTO s VALUES ({i}, {}, {i})", i % 2));
+    }
+    for (id, name) in [("0", "zero"), ("1", "one")] {
+        c.query(&format!("INSERT INTO u VALUES ({id}, '{name}')"));
+    }
+    let r0 = network::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed);
+    let k0 = network::metrics::SQL_JOIN_EST_SKIPPED.load(Relaxed);
+    assert_eq!(
+        c.query("SELECT u.name, s.id FROM u JOIN s ON u.id = s.id WHERE s.a = 0 AND s.b = 0"),
+        QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]]),
+        "小表 JOIN 结果正确 (跳过统计 + key_set/index_hint 兜底)"
+    );
+    let r1 = network::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed);
+    let k1 = network::metrics::SQL_JOIN_EST_SKIPPED.load(Relaxed);
+    assert_eq!(r1 - r0, 1, "小表 JOIN 应只 1 轮 (行数合并, 统计跳过)");
+    assert_eq!(k1 - k0, 1, "小表 JOIN 应触发阈值跳过");
+
+    // ---- 大表场景: 一行 > 阈值 → 走完整统计 (行数+distinct+ranges) ----
+    // 注: 独立 CREATE INDEX 在 worker 被吞 (v1), 须用建表内联 INDEX(col).
+    c.query("CREATE TABLE big (id INT PRIMARY KEY, a INT, b INT, INDEX(a), INDEX(b))");
+    // 多行 VALUES 批量插入 (2000 行 > 阈值 1024)
+    let mut sql = String::from("INSERT INTO big VALUES ");
+    for i in 0..2000 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i}, {}, {i})", i % 50));
+    }
+    c.query(&sql);
+    assert_eq!(
+        c.query("SELECT u.name, big.id FROM u JOIN big ON u.id = big.id WHERE big.a = 0 AND big.b = 0"),
+        QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]]),
+        "大表 JOIN 走统计后结果仍正确"
+    );
+    let r2 = network::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed);
+    let k2 = network::metrics::SQL_JOIN_EST_SKIPPED.load(Relaxed);
+    assert_eq!(r2 - r1, 3, "大表 JOIN 应 3 轮 (行数+distinct+ranges)");
+    assert_eq!(k2 - k1, 0, "大表 JOIN 不应触发阈值跳过");
+
+    // ---- 无索引大表: 行数 > 阈值但无候选索引列 → distinct/ranges 自动跳过, 仍 1 轮 ----
+    c.query("CREATE TABLE big2 (id INT PRIMARY KEY, c INT)");
+    let mut sql = String::from("INSERT INTO big2 VALUES ");
+    for i in 0..1500 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i}, {i})"));
+    }
+    c.query(&sql);
+    assert_eq!(
+        c.query("SELECT u.name, big2.id FROM u JOIN big2 ON u.id = big2.id WHERE big2.c = 0"),
+        QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]]),
+        "无索引大表 JOIN 结果正确 (全扫 Gather)"
+    );
+    let r3 = network::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed);
+    assert_eq!(r3 - r2, 1, "无索引大表应 1 轮 (候选空, 统计批次自动跳过)");
 
     drop(c);
     server.shutdown().unwrap();

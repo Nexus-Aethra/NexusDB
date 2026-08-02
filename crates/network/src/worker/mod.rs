@@ -373,7 +373,9 @@ struct SqlJoinCtx {
     swapped: bool,
     /// ⭐ M3-2: gather 顺序 (表下标; 默认 [0,1,...], swapped 双表 [1,0]).
     gather_order: Vec<usize>,
-    /// ⭐ M3-2: EstimateRows 收集进度 (0/1=行数 t0/t1, 2/3=distinct t0/t1) 与行数和.
+    /// ⭐ M3-2/M3-4/M3-5 + 方案 A: EstimateRows 收集批次 — 0=两表行数 (合并一轮,
+    /// group 0/1 区分表), 1=两表 distinct (合并一轮), 2=两表 ranges (合并一轮).
+    /// 行数批收齐后两表均 ≤ EST_SKIP_STATS_ROWS → 跳过 1/2 直接决策.
     est_phase: u8,
     est_rows: [u64; 2],
     /// ⭐ M3-4: 每表索引列 distinct 基数 (ti → iid → distinct; 仅双表 Inner
@@ -388,6 +390,12 @@ const JOIN_MAX_ROWS: usize = 262_144;
 
 /// ⭐ F70 (JOIN): 键集合下推上限 (超阈退回全表扫; 海量点查劣于全扫).
 const JOIN_KEYSET_MAX: usize = 1024;
+
+/// ⭐ 方案 A (调优): EstimateRows 小表阈值 — 双表 Inner JOIN 两表行数均 ≤ 此值
+/// → 跳过 distinct/ranges 统计收集, 直接按行数决策驱动表 (小表 JOIN 固定只 1 轮
+/// 行数广播; 索引选择收益在极小表上可忽略). 调优面: 调大 → 更多表跳过统计 (省
+/// 广播轮次); 调小 → 更多表走统计 (索引选择更准).
+const EST_SKIP_STATS_ROWS: u64 = 1024;
 
 /// ⭐ 事务 v1 (F61): conn 层事务缓冲 — BEGIN..COMMIT 间写语句截流,
 /// shard/调度器零事务状态 (时间维度: 交互式间隙不占 shard;
@@ -2710,7 +2718,7 @@ fn handle_resp_shard_result(
         return;
     }
     // ⭐ F67 (JOIN): 两表 hash join 状态机推进 (schema 拉取 / 两轮 gather / 完成点)
-    if sql_join_drive(conn, conn_id, seq, worker_id, result, shard_inboxes, num_shards) {
+    if sql_join_drive(conn, conn_id, seq, worker_id, group, result, shard_inboxes, num_shards) {
         return;
     }
     // ⭐ X3: SQL 钩子 — schema 拉取续跑 (挂起语句在 schema 到达后继续规划)
@@ -5085,12 +5093,18 @@ fn handle_http_request(
                  nexusdb_sql_queries_total {}\n\
                  # TYPE nexusdb_kv_ops_total counter\n\
                  nexusdb_kv_ops_total {}\n\
+                 # TYPE nexusdb_sql_join_est_rounds counter\n\
+                 nexusdb_sql_join_est_rounds {}\n\
+                 # TYPE nexusdb_sql_join_est_skipped counter\n\
+                 nexusdb_sql_join_est_skipped {}\n\
                  # TYPE nexusdb_uptime_seconds gauge\n\
                  nexusdb_uptime_seconds {}\n",
                 crate::metrics::HTTP_REQUESTS.load(Relaxed),
                 crate::metrics::HTTP_ERRORS.load(Relaxed),
                 crate::metrics::SQL_QUERIES.load(Relaxed),
                 crate::metrics::KV_OPS.load(Relaxed),
+                crate::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed),
+                crate::metrics::SQL_JOIN_EST_SKIPPED.load(Relaxed),
                 crate::metrics::uptime_seconds(),
             );
             conn.resp_complete(seq, h::build_text_response(200, m.as_bytes(), ka));
