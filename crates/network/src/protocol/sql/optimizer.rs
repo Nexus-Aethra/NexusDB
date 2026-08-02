@@ -105,6 +105,24 @@ pub fn is_always_false<C>(pred: &Pred<C>) -> bool {
     matches!(pred, Pred::Or(v) if v.is_empty())
 }
 
+/// 取析取 (OR) 的叶分支集合. 仅当顶层是 OR 且每个分支都是单叶子时返回 Some,
+/// 否则 None. ⭐ M2: 供 OR → 索引并集展开.
+pub fn as_disjuncts<C>(pred: &Pred<C>) -> Option<Vec<&C>>
+where
+    C: Clone,
+{
+    let Pred::Or(branches) = pred else { return None };
+    let mut out = Vec::with_capacity(branches.len());
+    for b in branches {
+        match b {
+            Pred::Leaf(c) => out.push(c),
+            // 含 AND/NOT/嵌套 OR 的分支无法单一区间 → 保守不展开
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// 反转单个叶子条件 (等值/范围算子) — `NOT (a = 1)` → `a <> 1` 等.
 /// 对 IN / LIKE 等无法确定补集的算子返回 None (保守保留).
 pub fn negate_cond(cond: &Cond) -> Option<Cond> {

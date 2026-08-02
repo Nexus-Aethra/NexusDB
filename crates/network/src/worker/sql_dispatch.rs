@@ -2193,7 +2193,8 @@ pub(crate) fn sql_run_dml(
                     }
                 }
                 // ⭐ S2: 无可用索引的 DML (含无 WHERE 全删/全改) → 全表扫 phase1
-                Ok(SqlPlan::FullScan) => {
+                // ⭐ M2: OR 并集对 DML 同样回退全表扫 phase1
+                Ok(SqlPlan::FullScan) | Ok(SqlPlan::IndexUnion { .. }) => {
                     conn.sql_select_agg.insert(
                         seq,
                         SqlSelectAgg {
@@ -2386,6 +2387,51 @@ pub(crate) fn sql_run_dml(
                     pk,
                 };
                 push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
+            }
+            // ⭐ M2: OR → 索引并集 — 每个分支一个 IndexScan, 合并到同一聚合 (残余过滤兼底)
+            Ok(SqlPlan::IndexUnion { branches }) => {
+                // 每个分支广播 IndexScan; remaining = 分支数 × shard 数
+                let rem = branches.len() * num_shards;
+                conn.sql_select_agg.insert(
+                    seq,
+                    SqlSelectAgg {
+                        remaining: rem,
+                        error: None,
+                        rows: Vec::new(),
+                        schema: schema.clone(),
+                        conds: conds.clone(),
+                        limit,
+                        proj,
+                        cover: None,
+                        unique_early: false,
+                        done: false,
+                        dml: None,
+                        dml_target: None,
+                        order: order_cols,
+                        offset,
+                        count,
+                        agg_spec: None,
+                        out_names,
+                    },
+                );
+                let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+                for (ipos, lo, hi) in branches {
+                    let idx = &schema.indexes[ipos as usize];
+                    for sid in 0..num_shards {
+                        let op = BatchOp::IndexScan {
+                            db: db.clone(),
+                            table: table_arc.clone(),
+                            iid: idx.iid,
+                            lo: lo.clone(),
+                            hi: hi.clone(),
+                            limit: 0,
+                            with_rows: true,
+                        };
+                        push_task_grouped(
+                            conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes,
+                        );
+                    }
+                }
             }
             // ⭐ S2: 全表扫 — 广播 TableScan + 全条件残余过滤
             Ok(SqlPlan::FullScan) => {
@@ -2649,6 +2695,92 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
     }
     // ⭐ F69: 含 OR/NOT → 无单一区间, 回退全表扫 (正确性由完成点 eval_pred 兼底)
     let Some(conds) = pred.as_conjuncts() else {
+        // ⭐ M2: OR → 索引并集 — 顶层 OR 的各单叶分支若均命中间一索引列的
+        // 等值/范围算子, 分别 IndexScan 后 worker 合并去重 (避免全表扫).
+        if let Some(branches) = sql::as_disjuncts(pred) {
+            let mut ok = true;
+            let mut branch_idx: Option<usize> = None;
+            let mut bounds: Vec<(Option<ColValue>, Option<ColValue>)> =
+                Vec::with_capacity(branches.len());
+            for c in &branches {
+                if !matches!(c.op, CmpOp::Eq | CmpOp::Ge | CmpOp::Le | CmpOp::Gt | CmpOp::Lt | CmpOp::In) {
+                    ok = false;
+                    break;
+                }
+                if schema.col_by_name(&c.col).is_none() {
+                    ok = false;
+                    break;
+                }
+                let col_idx = schema.col_by_name(&c.col).unwrap();
+                // 仅支持索引列
+                let Some(ipos) = schema.indexes.iter().position(|i| i.col == col_idx) else {
+                    ok = false;
+                    break;
+                };
+                // 所有分支必须落在同一索引列 (并集可合并)
+                if let Some(prev) = branch_idx {
+                    if prev != ipos {
+                        ok = false;
+                        break;
+                    }
+                } else {
+                    branch_idx = Some(ipos);
+                }
+                let col = &schema.columns[col_idx as usize];
+                let mut lo: Option<ColValue> = None;
+                let mut hi: Option<ColValue> = None;
+                match c.op {
+                    CmpOp::Eq => {
+                        let cv = sql_to_col(col.ty, &c.val)?;
+                        lo = Some(cv.clone());
+                        hi = Some(cv);
+                    }
+                    CmpOp::Ge | CmpOp::Gt => {
+                        let cv = sql_to_col(col.ty, &c.val)?;
+                        lo = Some(cv);
+                    }
+                    CmpOp::Le | CmpOp::Lt => {
+                        let cv = sql_to_col(col.ty, &c.val)?;
+                        hi = Some(cv);
+                    }
+                    CmpOp::In => {
+                        let mut min: Option<ColValue> = None;
+                        let mut max: Option<ColValue> = None;
+                        for v in &c.set {
+                            let cv = sql_to_col(col.ty, v)?;
+                            let enc = storage::sql_rows::index_val_bytes(col.ty, &cv)
+                                .ok_or("bad IN value")?;
+                            let replace_min = min
+                                .as_ref()
+                                .and_then(|m| storage::sql_rows::index_val_bytes(col.ty, m))
+                                .is_none_or(|me| enc < me);
+                            if replace_min {
+                                min = Some(cv.clone());
+                            }
+                            let replace_max = max
+                                .as_ref()
+                                .and_then(|m| storage::sql_rows::index_val_bytes(col.ty, m))
+                                .is_none_or(|me| enc > me);
+                            if replace_max {
+                                max = Some(cv.clone());
+                            }
+                        }
+                        lo = min;
+                        hi = max;
+                    }
+                    _ => unreachable!(),
+                }
+                bounds.push((lo, hi));
+            }
+            if ok && branch_idx.is_some() {
+                let ipos = branch_idx.unwrap();
+                let branches: Vec<(u16, Option<ColValue>, Option<ColValue>)> = bounds
+                    .into_iter()
+                    .map(|(lo, hi)| (ipos as u16, lo, hi))
+                    .collect();
+                return Ok(SqlPlan::IndexUnion { branches });
+            }
+        }
         return Ok(SqlPlan::FullScan);
     };
     // 1. pk 等值点查
@@ -2885,5 +3017,65 @@ mod tests {
         ]);
         let (_, is_false) = sql::normalize_pred_cond(&raw);
         assert!(is_false, "AND 含恒假项必须标记恒假");
+    }
+
+    #[test]
+    fn or_same_index_uses_index_union() {
+        let schema = test_schema();
+        // tag = 'a' OR tag = 'b' → IndexUnion (两个等值分支)
+        let p = Pred::Or(vec![
+            c("name", CmpOp::Eq, SqlValue::Str(b"a".to_vec())),
+            c("name", CmpOp::Eq, SqlValue::Str(b"b".to_vec())),
+        ]);
+        let plan = sql_plan_select(&schema, &p).unwrap();
+        match plan {
+            SqlPlan::IndexUnion { branches } => {
+                assert_eq!(branches.len(), 2, "两个等值分支");
+                // 每个分支是同一索引列 (name, 索引 ipos 0)
+                assert_eq!(branches[0].0, 0);
+                assert_eq!(branches[1].0, 0);
+            }
+            other => panic!("expected IndexUnion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn or_cross_index_falls_back_full_scan() {
+        let schema = test_schema();
+        // name = 'a' OR score = 5 → 跨索引列 → FullScan (不能并集)
+        let p = Pred::Or(vec![
+            c("name", CmpOp::Eq, SqlValue::Str(b"a".to_vec())),
+            c("score", CmpOp::Eq, SqlValue::Int(5)),
+        ]);
+        let plan = sql_plan_select(&schema, &p).unwrap();
+        assert!(matches!(plan, SqlPlan::FullScan), "跨索引列 OR 应 FullScan, got {plan:?}");
+    }
+
+    #[test]
+    fn or_with_and_branch_falls_back_full_scan() {
+        let schema = test_schema();
+        // (name='a') OR (name='b' AND score=1) → 含 AND 分支 → FullScan
+        let p = Pred::Or(vec![
+            c("name", CmpOp::Eq, SqlValue::Str(b"a".to_vec())),
+            Pred::And(vec![
+                c("name", CmpOp::Eq, SqlValue::Str(b"b".to_vec())),
+                c("score", CmpOp::Eq, SqlValue::Int(1)),
+            ]),
+        ]);
+        let plan = sql_plan_select(&schema, &p).unwrap();
+        assert!(matches!(plan, SqlPlan::FullScan), "含 AND 分支应 FullScan, got {plan:?}");
+    }
+
+    #[test]
+    fn or_on_non_index_col_falls_back_full_scan() {
+        let schema = test_schema();
+        // score 有索引, 但用未索引的... schema 只有 name/score 索引. 测试 id 上的 OR (pk 非索引)
+        let p = Pred::Or(vec![
+            c("id", CmpOp::Eq, SqlValue::Int(1)),
+            c("id", CmpOp::Eq, SqlValue::Int(2)),
+        ]);
+        // id 是 pk, 非独立索引列 → 无索引 → FullScan (pk 点查只支持单值)
+        let plan = sql_plan_select(&schema, &p).unwrap();
+        assert!(matches!(plan, SqlPlan::FullScan), "pk 上的 OR 应 FullScan, got {plan:?}");
     }
 }

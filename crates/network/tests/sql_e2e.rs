@@ -1947,7 +1947,10 @@ fn mysql_or_predicates() {
         c.query(&format!("INSERT INTO t VALUES ({}, {a}, {b})", i + 1));
     }
 
-    // OR (索引列 a 上 OR → 全表扫回退, 结果正确)
+    // ⭐ M2: 索引列 a 上的 OR → IndexUnion (分别 IndexScan + 合并去重)
+    // 数据 (id,a,b)=(1,1,10)(2,2,20)(3,3,30)(4,1,99) → a∈{1,2} 命中 id=1,2,4
+    assert_eq!(c.ids("SELECT id FROM t WHERE a = 1 OR a = 2 ORDER BY id"), vec!["1", "2", "4"]);
+    // OR (跨列 a=1 OR b=30 → 全表扫回退, 结果正确)
     assert_eq!(c.ids("SELECT id FROM t WHERE a = 1 OR b = 30 ORDER BY id"), vec!["1", "3", "4"]);
     // 混合 (a=1 OR a=2) AND b>15
     assert_eq!(c.ids("SELECT id FROM t WHERE (a = 1 OR a = 2) AND b > 15 ORDER BY id"), vec!["2", "4"]);

@@ -526,6 +526,12 @@ enum SqlPlan {
     },
     /// ⭐ S2: 无可用索引 → 广播全表扫 + 全条件残余过滤.
     FullScan,
+    /// ⭐ M2 (2026-08): OR → 索引并集 — 多个同索引列等值/范围分支,
+    /// 分别 IndexScan 后 worker 合并去重 (避免全表扫).
+    IndexUnion {
+        /// (索引列名, 分支界)
+        branches: Vec<(u16, Option<ColValue>, Option<ColValue>)>,
+    },
 }
 
 /// ⭐ W1 (索引路由缓存): SQL worker 级共享缓存 — schema + 索引路由.
