@@ -2408,6 +2408,10 @@ pub(crate) fn sql_run_dml(
                     drop_key: None,
                 },
             );
+            // ⭐ DIAG: worker 端 push 计数 (临时, 定位批量 INSERT 丢行)
+            if ops.len() >= 5000 {
+                eprintln!("[W-DIAG] INSERT {} ops pushed to shards", ops.len());
+            }
             // ⭐ F65: 含全局唯一列且单行 autocommit → 走占坑编排
             let has_gu = schema.indexes.iter().any(|i| i.unique && i.global);
             if has_gu {

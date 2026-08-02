@@ -116,6 +116,75 @@ fn complete_flush_error_requeues() {
     });
 }
 
+/// ⭐ 回归 (2026-08-02, 冷启动丢 32 行 P0): 过时快照不入 chunk_list.
+///
+/// 核心属性: 当 complete_flush 完成时, 若 write_queue 中同 key 仍有 pending
+/// 快照 (更新版本), 则过时快照不入 chunk_list, 避免遮蔽读路径.
+#[test]
+fn stale_snapshot_not_inserted_into_chunk_list() {
+    run_async(async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pager = setup_pager(&tmp);
+
+        // 1. 写足够多的页触发多个 chunk swap + 周期刷盘
+        let mut all_vpids = Vec::new();
+        for _ in 0..256 {
+            let page = Box::new([0xABu8; PAGE_SIZE]);
+            let vpid = pager.create(page).await.unwrap();
+            all_vpids.push(vpid);
+        }
+
+        // 2. 触发周期刷盘: 快照当前驻留 chunk → pending
+        let flushed = pager.maybe_periodic_flush().await.unwrap();
+        assert!(flushed, "periodic flush should trigger after 256 writes");
+
+        // 3. take_flush_batches: pending → in_flight (模拟协程取走快照)
+        let batches = pager.take_flush_batches();
+        assert!(!batches.is_empty(), "should have flush batches");
+        let inflight_keys: Vec<storage::PageKey> = batches
+            .iter()
+            .flat_map(|b| b.items.iter().map(|(k, _)| *k))
+            .collect();
+        assert!(pager.has_inflight());
+
+        // 4. 继续写页: 填充活跃 chunk 直到它满并 swap → 新快照入 pending
+        //    这模拟了 "协程写盘期间 shard 继续处理写入" 的场景
+        for _ in 0..128 {
+            let page = Box::new([0xCDu8; PAGE_SIZE]);
+            let vpid = pager.create(page).await.unwrap();
+            all_vpids.push(vpid);
+        }
+
+        // 5. 模拟协程完成: 用旧快照的结果调 complete_flush
+        //    修复后: 同 key 有 pending 新快照时不入 chunk_list
+        for &key in &inflight_keys {
+            pager.complete_flush(key, Ok(())).unwrap();
+        }
+        assert!(!pager.has_inflight());
+
+        // 6. 验证: 所有 vpid 仍可读 (包括 swap 后新写的)
+        for (i, &vpid) in all_vpids.iter().enumerate() {
+            pager.read(vpid).await.unwrap_or_else(|e| {
+                panic!("vpid {vpid} (idx {i}) read failed after stale flush: {e}")
+            });
+        }
+
+        // 7. 完成剩余 pending 的落盘 → chunk_list 正确刷新
+        let batches2 = pager.take_flush_batches();
+        for batch in &batches2 {
+            for &(k, _) in &batch.items {
+                pager.complete_flush(k, Ok(())).unwrap();
+            }
+        }
+        // 再次验证所有 vpid
+        for (i, &vpid) in all_vpids.iter().enumerate() {
+            pager.read(vpid).await.unwrap_or_else(|e| {
+                panic!("vpid {vpid} (idx {i}) read failed after full flush: {e}")
+            });
+        }
+    });
+}
+
 #[test]
 fn backpressure_degrades_to_sync_write() {
     run_async(async move {

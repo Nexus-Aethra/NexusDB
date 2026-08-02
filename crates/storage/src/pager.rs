@@ -213,6 +213,19 @@ fn parse_page_vpid(chunk_bytes: &[u8], i: usize) -> Option<u64> {
     ))
 }
 
+/// ⭐ 统计 chunk 数据中有效页数 (magic == "LCBP").
+/// 用于 complete_flush 插入 chunk_list 时比较新旧版本完整性.
+fn count_valid_pages(chunk_bytes: &[u8]) -> u32 {
+    let mut count = 0u32;
+    for i in 0..PAGES_PER_CHUNK {
+        let off = i * PAGE_SIZE;
+        if off + 4 <= chunk_bytes.len() && &chunk_bytes[off..off + 4] == b"LCBP" {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// ⭐ 异步落盘: in-flight + pending 总数上限 (背压阈值).
 /// 超出后 chunk 满 swap 退化为同步落盘, 写入降速到磁盘速度.
 const MAX_INFLIGHT_CHUNKS: usize = 8;
@@ -446,6 +459,20 @@ impl Pager {
             io::Error::new(io::ErrorKind::NotFound, format!("vpid {} not mapped", vpid))
         })?;
 
+        // ⭐ DIAG: 检测非 META vpid 指向 META_PID (bad page type 根因定位)
+        if crate::chunk_writer::diag_enabled()
+            && vpid != crate::meta_page::META_VPID
+            && pid.file_id() == 0
+            && pid.chunk_idx() == 0
+            && pid.page_idx() == 0
+        {
+            eprintln!(
+                "[DIAG-META-PID] vpid={vpid} maps to META_PID (0,0,0)! \
+                 backtrace:\n{:?}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+
         let key = PageKey {
             file_id: pid.file_id(),
             chunk_idx: pid.chunk_idx(),
@@ -457,6 +484,21 @@ impl Pager {
             let mut out = page_pool::alloc();
             let off = page_idx as usize * PAGE_SIZE;
             out.copy_from_slice(&chunk_bytes[off..off + PAGE_SIZE]);
+            // ⭐ DIAG: 检测从 nowchunks 读到坏页 (bad page type 根因)
+            if crate::chunk_writer::diag_enabled()
+                && vpid != crate::meta_page::META_VPID
+                && (out[0..4] != [0x4C, 0x43, 0x42, 0x50] || (out[4] != 2 && out[4] != 3))
+            {
+                eprintln!(
+                    "[DIAG-BADPAGE-NOWCHUNKS] vpid={vpid} pid=({},{},{}) \
+                     magic={:02X?} page_type={} hdr_vpid={} key={key:?} \
+                     chunk_page_count={}",
+                    pid.file_id(), pid.chunk_idx(), pid.page_idx(),
+                    &out[0..4], out[4],
+                    u64::from_le_bytes(out[0x18..0x20].try_into().unwrap_or_default()),
+                    self.nowchunks.chunk_page_count(key)
+                );
+            }
             return Ok(out);
         }
         // 3. WriteQueue 检索: pending 或 completed 中的 chunk 对读路径可见
@@ -487,6 +529,13 @@ impl Pager {
                 .expect("just checked contains")
         } else {
             // miss: 同步读盘
+            // ⭐ DIAG: 从磁盘读页 (最后手段) — 对最近写入的页是异常的
+            if crate::chunk_writer::diag_enabled() {
+                eprintln!(
+                    "[DIAG-DISK-READ] vpid={vpid} key={key:?} page_idx={page_idx} \
+                     — page not in nowchunks/write_queue/in_flight/chunk_list, reading from disk"
+                );
+            }
             let bytes = self.load_chunk_from_disk(key).await?;
             self.chunk_list.insert(key.into(), bytes);
             self.chunk_list.peek(&key.into()).expect("just inserted")
@@ -681,10 +730,28 @@ impl Pager {
     /// 本次 swap **退化为同步落盘** —— 磁盘到上限时写入自然降速到磁盘速度,
     /// 避免写时队列无限膨胀, 且无等待+收割死锁风险.
     pub async fn swap_full_chunk_to_write_queue(&mut self, key: PageKey) -> io::Result<()> {
+        // ⭐ DIAG: swap 前校验 chunk(0,0) 各页数据
+        if crate::chunk_writer::diag_enabled() && key.file_id == 0 && key.chunk_idx == 0 {
+            if let Some(chunk) = self.nowchunks.peek_chunk(key) {
+                for pidx in [0usize, 1, 30, 60, 63] {
+                    let off = pidx * PAGE_SIZE;
+                    eprintln!(
+                        "[DIAG-SWAP-CHECK] page_idx={pidx} magic={:02X?} type={}",
+                        &chunk[off..off+4], chunk[off+4]
+                    );
+                }
+            }
+        }
         let Some(chunk_box) = self.nowchunks.take_chunk_box(key) else {
             return Ok(());
         };
         let chunk_vec = chunk_box.to_vec();
+
+        // ⭐ 修复 (2026-08-02, bad page type 根因): swap 后立即作废 chunk_list
+        // 中同 key 的旧快照 (maybe_periodic_flush 产生的中间快照, 如 4/14/59 页).
+        // 否则 swap 数据还在 flush 管道中时, 读路径会命中 chunk_list 中的
+        // 旧快照 (缺少后续写入的页) → 全零页 → bad page type.
+        self.chunk_list.invalidate(&key.into());
 
         if self.write_queue.pending_keys().len() + self.in_flight.len()
             >= MAX_INFLIGHT_CHUNKS
@@ -768,7 +835,32 @@ impl Pager {
         match result {
             Ok(()) => {
                 let bytes = Rc::try_unwrap(rc).unwrap_or_else(|rc| (*rc).clone());
-                self.chunk_list.insert_from_write_queue(key, bytes);
+                // ⭐ 修复 (2026-08-02): 若同 key 有更新版本在 pending 或 in_flight 中,
+                // 说明本次落盘的快照已过时. 不插入 chunk_list, 避免旧快照遮蔽
+                // 读路径 (nowchunks miss → pending miss → chunk_list 命中旧数据).
+                // 场景: periodic_flush 快照 A(1页) 先写盘完成, 但 swap 的 B(64页)
+                // 已被 take_flush_batches 取走到 in_flight; 此时 pending 为空但
+                // in_flight 有 B, 必须也跳过 A 的插入.
+                if self.write_queue.peek_chunk_pending(key).is_some()
+                    || self.in_flight.contains_key(&key)
+                {
+                    // 过时快照: 丢弃 (不写 chunk_list)
+                } else {
+                    // ⭐ 修复 (2026-08-02, bad page type 根因):
+                    // 插入前比较有效页数——仅当新数据的有效页数 >= chunk_list
+                    // 中已有版本时才替换. 防止 maybe_periodic_flush 产生的
+                    // 中间快照 (4/14/59 页) 覆盖 swap 的完整快照 (64 页).
+                    let new_valid = count_valid_pages(&bytes);
+                    let should_insert = if let Some(existing) = self.chunk_list.peek(&key.into()) {
+                        let old_valid = count_valid_pages(&existing);
+                        new_valid >= old_valid
+                    } else {
+                        true
+                    };
+                    if should_insert {
+                        self.chunk_list.insert_from_write_queue(key, bytes);
+                    }
+                }
                 // 本批全部确认落盘且无待提交快照 → meta 可安全异步刷
                 if self.in_flight.is_empty() && self.write_queue.pending_keys().is_empty() {
                     self.meta_flush_due = true;
@@ -1204,16 +1296,19 @@ impl Pager {
     }
 
     /// ⭐ 自动持久化: 周期/计数检查.
-    /// 如果 writes >= 256 或 elapsed >= 10s, 执行 dirty flush + meta flush.
+    /// 如果 writes >= 256 或 elapsed >= 10s, 触发 WAL seal.
     /// 返回 true 表示触发了 flush.
+    ///
+    /// ⭐ 修复 (2026-08-02, bad page type 根因): 不再将驻留 chunk 快照
+    /// 入 write_queue. 原设计意图是周期刷盘保证持久性, 但:
+    /// - 读路径优先命中 nowchunks, 快照对读毫无价值
+    /// - 快照经 flush 管道后插入 chunk_list, 会与 swap 的完整数据
+    ///   产生时序竞态 → 旧快照遮蔽新数据 → 全零页 → bad page type
+    /// - 持久性由 WAL (periodic/strict) + swap (满 chunk) + 显式 flush
+    ///   (shutdown) 三重保证, 无需 periodic 快照
     pub async fn maybe_periodic_flush(&mut self) -> io::Result<bool> {
         const FLUSH_WRITE_THRESHOLD: u64 = 256;
         const FLUSH_PERIOD_SECS: u64 = 10;
-
-        // ⭐ 背压守卫: 落盘队列已满时推迟 (磁盘已饱和, 再入队只会膨胀).
-        if self.flush_backlog() >= MAX_INFLIGHT_CHUNKS {
-            return Ok(false);
-        }
 
         let should_flush = self.write_count_since_flush >= FLUSH_WRITE_THRESHOLD
             || self.last_flush_time.elapsed().as_secs() >= FLUSH_PERIOD_SECS;
@@ -1222,22 +1317,7 @@ impl Pager {
             return Ok(false);
         }
 
-        // ⭐ 纯 COW + 数组化 (2026-07-26): 驻留即待刷.
-        // 未满 active chunk **快照入队不 take** (chunk 留在原地继续增量写);
-        // 满 chunk 已在满时自动 swap, 这里只剩 active chunk (通常 ≤ 2 个).
-        // 重复快照未变化 chunk 的开销 (~1MB/10s) 已记录为设计取舍 (plan A3).
-        // meta 由 complete_flush 在 backlog 排空后统一刷 (data→meta 不变).
-        let resident: Vec<PageKey> = self.nowchunks.resident_keys();
-        for key in resident {
-            if let Some(chunk_data) = self.nowchunks.peek_chunk(key) {
-                let chunk_vec = chunk_data.to_vec();
-                // 旧 pending 快照作废 (本快照 ⊇ 旧快照)
-                self.write_queue.remove_pending(key);
-                self.write_queue
-                    .enqueue(crate::chunk_writer::WriteHandle::new(key, chunk_vec));
-            }
-        }
-
+        // 仅重置计数器 + 触发 WAL seal, 不再快照驻留 chunk
         self.write_count_since_flush = 0;
         self.last_flush_time = std::time::Instant::now();
         Ok(true)

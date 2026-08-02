@@ -360,6 +360,55 @@ impl StorageEngine {
                 }
             }
         }
+        // ⭐ DIAG: 全操作回查 — 索引更新后确认行仍可达 (NLOG_DIAG=1)
+        if crate::chunk_writer::diag_enabled() {
+            match self.get_physical(db, table, &rk).await {
+                Ok(Some(_)) => {}
+                Ok(None) => eprintln!(
+                    "[DIAG-ROWPUT-LOST] pk={pk:?} lost after row_put (index updates done)! db={db} table={table}"
+                ),
+                Err(e) => eprintln!(
+                    "[DIAG-ROWPUT-ERR] pk={pk:?} verify error: {e} db={db} table={table}"
+                ),
+            }
+            // ⭐ DIAG canary: per-shard 追踪最近 64 个 pk, 每次插入后全部回查
+            {
+                thread_local! {
+                    static RECENT_PKS: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>> =
+                        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+                    static SHARD_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+                }
+                let n = SHARD_N.with(|c| { let v = c.get(); c.set(v + 1); v });
+                // 每 200 次插入做一次全量回查 (避免太慢)
+                if n > 0 && n % 500 == 0 {
+                    let pks: Vec<Vec<u8>> = RECENT_PKS.with(|r| r.borrow().iter().cloned().collect());
+                    let mut lost = 0;
+                    for prev_pk in &pks {
+                        let rk = ks::encode_string(prev_pk);
+                        match self.get_physical(db, table, &rk).await {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                lost += 1;
+                                if lost <= 3 {
+                                    eprintln!(
+                                        "[DIAG-CANARY-LOST] pk={prev_pk:?} lost at shard-insert #{n}! db={db} table={table}"
+                                    );
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    if lost > 0 {
+                        eprintln!("[DIAG-CANARY-SUMMARY] {lost}/{} keys lost at shard-insert #{n} db={db} table={table}", pks.len());
+                    }
+                }
+                RECENT_PKS.with(|r| {
+                    let mut r = r.borrow_mut();
+                    r.push_back(pk.to_vec());
+                    if r.len() > 4000 { r.pop_front(); }
+                });
+            }
+        }
         Ok(())
     }
 

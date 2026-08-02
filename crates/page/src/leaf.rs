@@ -271,44 +271,24 @@ pub fn leaf_insert(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), Page
         idx.segments.len()
     );
 
-    // 2. pre_split: 如果目标段已满, 先分裂
-    if idx.segments[cur_seg_idx].item_count >= MAX_PER_CHECKPOINT {
-        dprintln!(
-            leaf,
-            "[LEAF_INSERT] pre_split triggered: seg_idx={} item_count={} key={:?}",
-            cur_seg_idx,
-            idx.segments[cur_seg_idx].item_count,
-            std::str::from_utf8(key).unwrap_or("?")
-        );
-        dprintln!(
-            leaf,
-            "[LEAF_INSERT]   idx.segments.len BEFORE pre_split = {}",
-            idx.segments.len()
-        );
-        let pre_result = pre_split_segment(page, &mut idx, cur_seg_idx, ItemKind::Leaf);
-        dprintln!(leaf, "[LEAF_INSERT] pre_split result: {:?}", pre_result);
-        dprintln!(
-            leaf,
-            "[LEAF_INSERT]   idx.segments.len AFTER pre_split = {}",
-            idx.segments.len()
-        );
-        pre_result?;
-        dprintln!(
-            leaf,
-            "[LEAF_INSERT] pre_split done. segments.len={}, segments={:?}",
-            idx.segments.len(),
-            idx.segments
-                .iter()
-                .map(|s| (s.item_count, s.first_item_off))
-                .collect::<Vec<_>>()
-        );
-        // 重新定位段
+    // 2. ⭐ 空间预检 + pre_split (2026-08-02 修复):
+    //    先估算空间需求, 不足则直接 PageFull (页数据未修改, checkpoint 一致).
+    //    充足才执行 pre_split_segment + 插入.
+    let need_pre_split = idx.segments[cur_seg_idx].item_count >= MAX_PER_CHECKPOINT;
+    {
+        // 估算新 item 大小: key + value + 编码开销 (shared/varint/头)
+        let est_item = key.len() + value.len() + 20;
+        // pre_split 会多一个段 = 多一个 checkpoint entry (4B)
+        let cp_growth = if need_pre_split { crate::checkpoint::CHECKPOINT_SIZE } else { 0 };
+        let cp_size = crate::checkpoint::checkpoint_area_size(idx.segments.len()) + cp_growth;
+        let free_off = page_free_off(page) as usize;
+        if free_off + est_item + cp_size + PAGE_FOOTER_SIZE > PAGE_SIZE {
+            return Err(PageError::PageFull);
+        }
+    }
+    if need_pre_split {
+        pre_split_segment(page, &mut idx, cur_seg_idx, ItemKind::Leaf)?;
         cur_seg_idx = idx.locate_segment(key);
-        dprintln!(
-            leaf,
-            "[LEAF_INSERT] after pre_split: cur_seg_idx={}",
-            cur_seg_idx
-        );
     }
 
     // 3. 段内顺序扫描找到 prev_ptr (指向 <key 的最后一个 item)
@@ -830,8 +810,6 @@ fn try_bulk_leaf_split(
     // 如果只有 1 个段, 强制在段内创建段边界
     if idx.segments.len() < 2 {
         let seg = &idx.segments[0];
-        // 需要至少 4 items (哨兵 + 3 真实 keys) 才能分出两侧各至少 1 key
-        // (因为 mid = item_count/2 >= 2, front=2 含哨兵+1key, back=剩余)
         if seg.item_count < 4 {
             return None;
         }
@@ -862,10 +840,46 @@ fn try_bulk_leaf_split(
     let split_off = idx.segments[best_seg].first_item_off as usize;
     let split_key = idx.segments[best_seg].first_full_key.clone();
 
-    // 计算 key counts
+    // 计算 key counts (从 PageIndex 段边界直接求和)
     let left_total_items: u16 = idx.segments[..best_seg].iter().map(|s| s.item_count).sum();
     let left_key_count = left_total_items - 1; // 减去哨兵
     let right_key_count: u16 = idx.segments[best_seg..].iter().map(|s| s.item_count).sum();
+
+    // ⭐ DIAG: 校验 PageIndex item_count 与实际 item 数是否一致
+    if std::env::var("NLOG_DIAG").is_ok_and(|v| v == "1") {
+        let mut actual_count = 0u16;
+        let mut off = PAGE_HEADER_SIZE;
+        let mut prev_key: Vec<u8> = Vec::new();
+        while off < free {
+            match decode_item(left, off, ItemKind::Leaf) {
+                Ok((item, n)) => {
+                    let _full = item.full_key(&prev_key);
+                    prev_key = _full;
+                    actual_count += 1;
+                    off += n;
+                }
+                Err(_) => break,
+            }
+        }
+        let idx_total: u16 = idx.segments.iter().map(|s| s.item_count).sum();
+        if actual_count != idx_total {
+            eprintln!(
+                "[DIAG-IDX-MISMATCH] actual_items={actual_count} idx_items={idx_total} \
+                 key_count={} free={free} segments={} best_seg={best_seg} \
+                 left_keys={left_key_count} right_keys={right_key_count}",
+                page_key_count(left),
+                idx.segments.len()
+            );
+            // dump 每个 segment 的 item_count
+            for (si, seg) in idx.segments.iter().enumerate() {
+                eprintln!(
+                    "  seg[{si}] item_count={} first_off={} first_key={:?}",
+                    seg.item_count, seg.first_item_off,
+                    String::from_utf8_lossy(&seg.first_full_key[..seg.first_full_key.len().min(20)])
+                );
+            }
+        }
+    }
 
     // 安全检查
     if left_key_count == 0 || right_key_count == 0 {
@@ -880,9 +894,32 @@ fn try_bulk_leaf_split(
     let write_start = PAGE_HEADER_SIZE + sent_n;
 
     // === BULK MEMCPY: 一次 copy 完成分裂 ===
-    let src_len = free - split_off;
-    right[write_start..write_start + src_len].copy_from_slice(&left[split_off..free]);
-    let right_free = write_start + src_len;
+    // ⭐ 修复 (2026-08-02, 冷启动丢 32 行 P0): 分裂点的首 item 可能与左页
+    // 末尾 item 存在前缀压缩 (shared > 0). 直接 memcpy 到右页后, 前缀引用
+    // 变为哨兵 (empty key) 而非原始前驱 → key 解压错误 → 后续 item 解码
+    // 偏移 → 静默丢 key. 修复: 首 item 用 split_key 重编码 (shared=0),
+    // 其余 item 保持原始 memcpy (它们的前缀引用首 item, key 不变).
+    let (first_item, first_n) = decode_item(left, split_off, ItemKind::Leaf).ok()?;
+    // ⭐ DIAG: 检查首 item 是否有前缀压缩 (shared > 0 = 确认 bug 场景)
+    if first_item.shared_prefix_len > 0 {
+        eprintln!(
+            "[DIAG-SPLIT-FIX] split_key={split_key:?} first_item shared={} unshared={} — re-encoding with shared=0",
+            first_item.shared_prefix_len, first_item.key_unshared_len
+        );
+    }
+    let mut first_buf = [0u8; PAGE_SIZE];
+    let first_encoded_n =
+        encode_leaf_item(&mut first_buf, &[], &split_key, first_item.value).ok()?;
+    right[write_start..write_start + first_encoded_n]
+        .copy_from_slice(&first_buf[..first_encoded_n]);
+    // 复制剩余 items (首 item 之后)
+    let rest_src = split_off + first_n;
+    let rest_len = free - rest_src;
+    let rest_dst = write_start + first_encoded_n;
+    if rest_len > 0 {
+        right[rest_dst..rest_dst + rest_len].copy_from_slice(&left[rest_src..free]);
+    }
+    let right_free = rest_dst + rest_len;
 
     // === 重建 right cp array ===
     write_checkpoint_header(

@@ -2311,6 +2311,10 @@ fn drive_async_flush(
     rt: &scheduler::SchedHandle,
     flush_done: &FlushDoneSlot,
 ) {
+    // ⭐ DIAG: NLOG_NO_FLUSH=1 禁用异步落盘 (定位数据丢失根因)
+    if std::env::var("NLOG_NO_FLUSH").is_ok_and(|v| v == "1") {
+        return;
+    }
     let round_start = std::time::Instant::now();
     {
         let mut e_borrow = engine.borrow_mut();

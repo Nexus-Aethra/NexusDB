@@ -26,6 +26,13 @@ use crate::types::{
     PidLocation, pid_to_offset,
 };
 
+/// ⭐ DIAG: NLOG_DIAG=1 启用写入错位/加载追踪探针.
+pub(crate) fn diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NLOG_DIAG").is_ok_and(|v| v == "1"))
+}
+
 // =====================================================================
 // NowChunks: 写缓冲 (LSM 风格)
 // =====================================================================
@@ -111,6 +118,14 @@ impl ChunkBuf {
         use page::PageType;
         debug_assert!((page_idx as usize) < PAGES_PER_CHUNK);
         let off = page_idx as usize * PAGE_SIZE;
+        // ⭐ DIAG: 检测 MetaPage 数据写入非 page_idx 0 (写入错位)
+        if diag_enabled() && data[4] == PageType::Meta as u8 && page_idx != 0 {
+            eprintln!(
+                "[DIAG-CORRUPT] MetaPage data (type=1) written to page_idx={page_idx} vpid={vpid}!\n\
+                 backtrace:\n{:?}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         // 完整 memcpy caller 字节 (含完整 [0..0x28] header)
         self.data[off..off + PAGE_SIZE].copy_from_slice(data);
         // ⭐ 仅当 page_type != Internal 时, 自动覆盖 vpid 字段.
@@ -214,6 +229,20 @@ impl NowChunks {
         vpid: u64,
         data: &[u8; PAGE_SIZE],
     ) {
+        // ⭐ DIAG: 检测非 MetaPage 写入 chunk(0,0) page_idx=0 (覆写 MetaPage)
+        if diag_enabled()
+            && key.file_id == 0
+            && key.chunk_idx == 0
+            && page_idx == 0
+            && data[4] != 1  // page_type != Meta
+        {
+            eprintln!(
+                "[DIAG-META-OVERWRITE] vpid={vpid} writing type={} to chunk(0,0) page_idx=0!\n\
+                 backtrace:\n{:?}",
+                data[4],
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         self.file_mut_or_insert(key.file_id)
             .slot_mut_or_insert(key.chunk_idx)
             .write_page_with_header(page_idx, vpid, data);
@@ -230,6 +259,14 @@ impl NowChunks {
     /// ⭐ flush/swap 路径: take 走整个 chunk (驻留移出, 不回插).
     /// 返回的 Box 含 chunk 完整 1MB 视图 (所有已写 page 的最新数据).
     pub fn take_chunk_box(&mut self, key: PageKey) -> Option<Box<[u8; CHUNK_SIZE]>> {
+        // ⭐ DIAG: 追踪 chunk 从 nowchunks 移出 (bad page type 根因定位)
+        if diag_enabled() && key.file_id == 0 && key.chunk_idx == 0 {
+            eprintln!(
+                "[DIAG-TAKE-CHUNK] key={key:?} page_count={}\nbacktrace:\n{:?}",
+                self.file(key.file_id).and_then(|f| f.slot(key.chunk_idx)).map(|c| c.page_count).unwrap_or(0),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         self.files
             .iter_mut()
             .find(|f| f.file_id == key.file_id)
@@ -345,6 +382,24 @@ impl NowChunks {
                 buf.vpids[i] = vpid;
                 buf.page_count += 1;
             }
+        }
+        // ⭐ DIAG: 追踪 chunk 加载 (定位写入错位根因)
+        if diag_enabled() {
+            let existing = self.file(key.file_id)
+                .and_then(|f| f.slot(key.chunk_idx))
+                .map(|c| c.page_count);
+            // 特别检查 chunk(0,0) page_idx=0 是否为 MetaPage
+            let p0_type = if key.file_id == 0 && key.chunk_idx == 0 {
+                format!("loaded_p0_type={}", buf.data[4])
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[DIAG-LOAD] load_full_view key={key:?} new_page_count={} existing_page_count={existing:?} {p0_type}\n\
+                 backtrace:\n{:?}",
+                buf.page_count,
+                std::backtrace::Backtrace::force_capture()
+            );
         }
         let file = self.file_mut_or_insert(key.file_id);
         let idx = key.chunk_idx as usize;

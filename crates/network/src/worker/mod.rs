@@ -3028,6 +3028,13 @@ fn handle_resp_shard_result(
         }
         agg.remaining -= 1;
         if agg.remaining == 0 {
+            // ⭐ DIAG: DmlAgg 完成计数 (临时, 定位批量 INSERT 丢行)
+            if agg.affected > 5000 {
+                eprintln!(
+                    "[R-DIAG] DmlAgg done: affected={} remaining_was=0 (after {} replies)",
+                    agg.affected, agg.affected
+                );
+            }
             let agg = conn.sql_dml_agg.remove(&seq).expect("just checked");
             conn.mysql_binary.remove(&seq);
             let bytes = match agg.error {
