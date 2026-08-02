@@ -397,7 +397,7 @@ pub async fn table_put(
     table_root_vpid: Vpid,
     key: &[u8],
     value: &[u8],
-) -> Result<Option<Vpid>, RegistryError> {
+) -> Result<(Option<Vpid>, bool), RegistryError> {
     use crate::btree::{btree_insert, travel_to_leaf_ro};
     use crate::overflow;
     use page::{leaf_get_with, leaf_update};
@@ -461,7 +461,9 @@ pub async fn table_put(
     if let Some(Some(old)) = old_desc {
         overflow::free_overflow(pager, &old).await?;
     }
-    Ok(new_root)
+    // ⭐ M3-1: 返回 (new_root, existed) — existed 供 engine 维护每表近似行数
+    // (旧值窥视 old_desc 已存在, 零额外 IO).
+    Ok((new_root, old_desc.is_some()))
 }
 
 /// 读 key 对应的 value. 返回 None 表示 key 不存在.
@@ -692,7 +694,7 @@ pub async fn table_put_many(
                 if overflow::is_indirect(stored) {
                     overflow::free_overflow(pager, stored).await?;
                 }
-                if let Some(new_root) = table_put(pager, cur_root, key, value).await? {
+                if let (Some(new_root), _) = table_put(pager, cur_root, key, value).await? {
                     cur_root = new_root;
                     root_changed = true;
                 }

@@ -151,6 +151,10 @@ pub struct StorageEngine {
     pub bloom_skip_count: u64,
     /// ⭐ WAL (F60): per-shard 预写日志 (None = Off 档 / 重放期间).
     wal: Option<crate::wal::WalWriter>,
+    /// ⭐ M3-1 (CBO 统计): 每 (db, table) 近似行数 (内存增量维护).
+    /// put 新 key +1 (覆盖不加, 由 registry::table_put 返回 existed), delete -1;
+    /// put_many 近似 +N (覆盖会高估). 重启后从 0 重算 (持久化 M3-1b 待做).
+    row_counts: std::collections::HashMap<(String, String), u64>,
 }
 
 /// ⭐ Q1: schema 镜像槽别名 (None = 已确认无 schema 的纯 KV 表).
@@ -342,6 +346,7 @@ impl StorageEngine {
             index_blooms: std::collections::HashMap::new(),
             bloom_skip_count: 0,
             wal: None, // 重放期间保持 None (append 自动跳过)
+            row_counts: std::collections::HashMap::new(),
         };
         // ⭐ U3: 从 data 行重建复合结构计数 (修复 crash 中 meta count 漂移).
         engine.rebuild_composite_counts().await.map_err(|e| {
@@ -707,8 +712,16 @@ impl StorageEngine {
             .await?
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
 
-        let new_root =
+        let (new_root, existed) =
             crate::registry::table_put(&mut self.pager, table_vpid, pkey, value).await?;
+
+        // ⭐ M3-1: 新 key → 近似行数 +1 (覆盖不加)
+        if !existed {
+            *self
+                .row_counts
+                .entry((db.to_string(), table.to_string()))
+                .or_insert(0) += 1;
+        }
 
         // ⭐ WAL (F60): 成功路径记录结果态 (重放幂等)
         if let Some(w) = self.wal.as_mut() {
@@ -810,6 +823,12 @@ impl StorageEngine {
             .await?
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let existed = crate::registry::table_delete(&mut self.pager, table_vpid, pkey).await?;
+        // ⭐ M3-1: 删除成功 → 近似行数 -1 (saturating 防下溢)
+        if existed {
+            if let Some(c) = self.row_counts.get_mut(&(db.to_string(), table.to_string())) {
+                *c = c.saturating_sub(1);
+            }
+        }
         // ⭐ WAL (F60): 存在才记 (不存在的 delete 重放无意义)
         if existed && let Some(w) = self.wal.as_mut() {
             w.append_del(db, table, pkey);
@@ -874,6 +893,12 @@ impl StorageEngine {
         let new_root =
             crate::registry::table_put_many(&mut self.pager, table_vpid, &encoded).await?;
 
+        // ⭐ M3-1: 批量写近似 +N (覆盖会高估; 近似基数对驱动选择足够)
+        *self
+            .row_counts
+            .entry((db.to_string(), table.to_string()))
+            .or_insert(0) += pairs.len() as u64;
+
         if let Some(new_root) = new_root {
             let db_handle = self.registry.open_db(db)?;
             db_handle
@@ -896,6 +921,13 @@ impl StorageEngine {
     ) -> Result<bool, RegistryError> {
         let ek = crate::keyspace::encode_string(key);
         self.delete_physical(db, table, &ek).await
+    }
+
+    /// ⭐ M3-1: 近似行数估计 (CBO 连接顺序/访问路径用; None = 无记录, 视为未知/小表).
+    pub fn estimate_row_count(&self, db: &str, table: &str) -> Option<u64> {
+        self.row_counts
+            .get(&(db.to_string(), table.to_string()))
+            .copied()
     }
 
     /// 暴露内部 DbRegistry (高级用法: 测试 / 调试).
