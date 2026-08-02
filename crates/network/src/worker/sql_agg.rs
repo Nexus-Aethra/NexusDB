@@ -153,6 +153,8 @@ pub(crate) fn sql_run_agg_select(
             count: false,
             agg_spec: Some(spec),
             out_names: Vec::new(),
+            down_proj: Vec::new(),
+            plain_rows: Vec::new(),
         },
     );
     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -628,44 +630,78 @@ pub(crate) fn materialize_select_agg(
         return Err(e);
     }
     // 全局序: (索引值, pk); 残余过滤全条件 (下推界是超集, 过滤幂等)
-    let mut rows = std::mem::take(&mut agg.rows);
-    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    // ⭐ M2b: sorted=true 时行序已按 (val,pk) 索引序排列 (= ORDER BY 序),
-    // 残余过滤不破坏相对顺序 → 过滤后取前 limit+offset 即可早停.
-    // (未消排的排序必须全量收集后再 sql_order_cmp, 禁用 early_cut.)
-    let early_cut: Option<usize> = if agg.count
-        || (!agg.order.is_empty() && !agg.sorted)
-        || agg.agg_spec.is_some()
-    {
-        None
-    } else {
-        agg.limit.map(|l| (l + agg.offset) as usize)
-    };
+    // ⭐ P0-2: 投影下推路径 — shard 只回 down_proj 列 (无 (val,pk) 排序键,
+    // 仅简单 SELECT 启用: order 空/无聚合/无 COUNT). 行展开回全列 (未下推列 = NULL,
+    // down_proj 契约已含过滤/排序/投影所需列) 后走既有过滤/投影逻辑.
     let mut out_rows: Vec<Vec<ColValue>> = Vec::new();
-    for (val, pk, rb) in &rows {
-        let decoded = if let Some((idx_col, pk_col)) = agg.cover {
-            let n = agg.schema.columns.len();
-            let iv = col_from_ordered_bytes(agg.schema.columns[idx_col as usize].ty, val);
-            let pv = col_from_ordered_bytes(agg.schema.columns[pk_col as usize].ty, pk);
-            match (iv, pv) {
-                (Some(iv), Some(pv)) => {
-                    let mut values = vec![ColValue::Null; n];
-                    values[idx_col as usize] = iv;
-                    values[pk_col as usize] = pv;
-                    Ok(values)
+    if !agg.down_proj.is_empty() {
+        let n = agg.schema.columns.len();
+        let plain = std::mem::take(&mut agg.plain_rows);
+        // 展开全部行为全列 (未下推列 = NULL; down_proj 契约已含过滤/排序/投影所需列)
+        let mut full: Vec<Vec<ColValue>> = plain
+            .iter()
+            .map(|row| {
+                let mut values = vec![ColValue::Null; n];
+                for (k, &ci) in agg.down_proj.iter().enumerate() {
+                    values[ci as usize] = row.get(k).cloned().unwrap_or(ColValue::Null);
                 }
-                _ => Err("bad covered index entry".to_string()),
+                values
+            })
+            .collect();
+        // ⭐ P0-2: 按 pk 排序 — 与 TableScan 全局 (val,pk) 序一致 (无 ORDER 默认 pk 序;
+        // LIMIT 无 ORDER 语义 = 全局 pk 序前 N). pk 列由 row_cols 契约保证已下推.
+        full.sort_by(|a, b| sql_order_cmp(a, b, &[(agg.schema.pk_col, false)]));
+        // 简单 SELECT (order 空) → early_cut 即 limit+offset
+        let early_cut: Option<usize> = agg.limit.map(|l| (l + agg.offset) as usize);
+        for values in &full {
+            if eval_pred(&agg.schema, values, &agg.conds) {
+                out_rows.push(values.clone());
+                if let Some(cut) = early_cut
+                    && out_rows.len() >= cut
+                {
+                    break;
+                }
             }
+        }
+    } else {
+        let mut rows = std::mem::take(&mut agg.rows);
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        // ⭐ M2b: sorted=true 时行序已按 (val,pk) 索引序排列 (= ORDER BY 序),
+        // 残余过滤不破坏相对顺序 → 过滤后取前 limit+offset 即可早停.
+        // (未消排的排序必须全量收集后再 sql_order_cmp, 禁用 early_cut.)
+        let early_cut: Option<usize> = if agg.count
+            || (!agg.order.is_empty() && !agg.sorted)
+            || agg.agg_spec.is_some()
+        {
+            None
         } else {
-            storage::row::decode_row(&agg.schema, rb).map_err(|e| e.to_string())
+            agg.limit.map(|l| (l + agg.offset) as usize)
         };
-        let values = decoded?;
-        if eval_pred(&agg.schema, &values, &agg.conds) {
-            out_rows.push(values);
-            if let Some(cut) = early_cut
-                && out_rows.len() >= cut
-            {
-                break;
+        for (val, pk, rb) in &rows {
+            let decoded = if let Some((idx_col, pk_col)) = agg.cover {
+                let n = agg.schema.columns.len();
+                let iv = col_from_ordered_bytes(agg.schema.columns[idx_col as usize].ty, val);
+                let pv = col_from_ordered_bytes(agg.schema.columns[pk_col as usize].ty, pk);
+                match (iv, pv) {
+                    (Some(iv), Some(pv)) => {
+                        let mut values = vec![ColValue::Null; n];
+                        values[idx_col as usize] = iv;
+                        values[pk_col as usize] = pv;
+                        Ok(values)
+                    }
+                    _ => Err("bad covered index entry".to_string()),
+                }
+            } else {
+                storage::row::decode_row(&agg.schema, rb).map_err(|e| e.to_string())
+            };
+            let values = decoded?;
+            if eval_pred(&agg.schema, &values, &agg.conds) {
+                out_rows.push(values);
+                if let Some(cut) = early_cut
+                    && out_rows.len() >= cut
+                {
+                    break;
+                }
             }
         }
     }

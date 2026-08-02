@@ -2178,6 +2178,8 @@ pub(crate) fn sql_run_dml(
                             count: false,
                             agg_spec: None,
                             out_names: Vec::new(),
+                            down_proj: Vec::new(),
+                            plain_rows: Vec::new(),
                         },
                     );
                     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -2220,6 +2222,8 @@ pub(crate) fn sql_run_dml(
                             count: false,
                             agg_spec: None,
                             out_names: Vec::new(),
+                            down_proj: Vec::new(),
+                            plain_rows: Vec::new(),
                         },
                     );
                     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -2419,6 +2423,8 @@ pub(crate) fn sql_run_dml(
                         count,
                         agg_spec: None,
                         out_names,
+                        down_proj: Vec::new(),
+                        plain_rows: Vec::new(),
                     },
                 );
                 let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -2448,8 +2454,40 @@ pub(crate) fn sql_run_dml(
                     && order_cols.len() == 1
                     && !order_cols[0].1
                     && order_cols[0].0 == schema.pk_col;
+                // ⭐ P0-2: 投影下推 — 仅简单 SELECT (无排序/聚合/COUNT/DML/覆盖索引).
+                // 下推列集 = SELECT 投影 ∪ WHERE 列 (去重保序); 真子集时启用,
+                // shard 端 (ScanFiltered) 只回这些列, worker 端展开回全列过滤/渲染.
+                let order_empty = order_cols.is_empty();
+                let mut row_cols: Vec<u16> = Vec::new();
+                if !count && order_empty {
+                    for &c in &proj {
+                        if !row_cols.contains(&c) {
+                            row_cols.push(c);
+                        }
+                    }
+                    for l in conds.leaves() {
+                        if let Some(ci) = schema.col_by_name(&l.col) {
+                            if !row_cols.contains(&ci) {
+                                row_cols.push(ci);
+                            }
+                        }
+                    }
+                    // ⭐ P0-2: pk 列始终下推 — worker 端需按 pk 排序保持与 TableScan
+                    // 全局 (val,pk) 序一致 (无 ORDER 默认 pk 序; LIMIT 无 ORDER = pk 序前 N).
+                    if !row_cols.contains(&schema.pk_col) {
+                        row_cols.push(schema.pk_col);
+                    }
+                }
+                let downable = !count && order_empty && row_cols.len() < schema.columns.len();
+                // 下推 preds: 仅纯 AND 合取可转 ScanPred (值转换失败跳过该谓词)
+                let down_preds = if downable {
+                    conds_to_scan_preds(&schema, &conds)
+                } else {
+                    Vec::new()
+                };
                 // limit 下推: 无条件 (零残余过滤, shard 端取行即命中)
                 // 且 (无排序 或 排序已按 pk 消排); 下推额含 offset.
+                // (投影下推路径 downable 时 order 必空, 条件退化为 is_true)
                 let shard_limit = if conds.is_true() && !count && (order_cols.is_empty() || pk_sorted)
                 {
                     limit.map(|l| l + offset).unwrap_or(0)
@@ -2477,14 +2515,28 @@ pub(crate) fn sql_run_dml(
                         count,
                         agg_spec: None,
                         out_names,
+                        down_proj: if downable { row_cols.clone() } else { Vec::new() },
+                        plain_rows: Vec::new(),
                     },
                 );
                 let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
                 for sid in 0..num_shards {
-                    let op = BatchOp::TableScan {
-                        db: db.clone(),
-                        table: table_arc.clone(),
-                        limit: shard_limit,
+                    let op = if downable {
+                        BatchOp::ScanFiltered {
+                            db: db.clone(),
+                            table: table_arc.clone(),
+                            preds: down_preds.clone(),
+                            proj: row_cols.clone(),
+                            index_hint: None,
+                            key_set_hint: None,
+                            limit: shard_limit,
+                        }
+                    } else {
+                        BatchOp::TableScan {
+                            db: db.clone(),
+                            table: table_arc.clone(),
+                            limit: shard_limit,
+                        }
                     };
                     push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
                 }
@@ -2583,6 +2635,8 @@ pub(crate) fn sql_run_dml(
                         count,
                         agg_spec: None,
                         out_names,
+                        down_proj: Vec::new(),
+                        plain_rows: Vec::new(),
                     },
                 );
                 let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
@@ -2709,6 +2763,60 @@ pub(crate) fn sql_run_dml(
 ///
 /// ⭐ 优化器增强 (2026-08, M1): 从"首个命中索引"升级为"计分最优索引":
 /// 等值命中 +3 / 范围 +2 / IN +1, 得分最高者胜; 平局取靠前 (确定性)。
+/// ⭐ P0-2: 单表 Cond → ScanPred 下推 (仅纯 AND 合取; 值转换失败跳过该谓词).
+/// shard 端 ScanFiltered 的 preds 是 AND 语义, 谓词下推只影响过滤位置 (正确性仍
+/// 由 worker 端 finish 残余过滤兜底).
+fn conds_to_scan_preds(schema: &TableSchema, conds: &Pred<Cond>) -> Vec<shard_manager::ScanPred> {
+    let mut preds = Vec::new();
+    for cond in conds.as_conjuncts().unwrap_or_default() {
+        let Some(cidx) = schema.col_by_name(&cond.col) else { continue };
+        let ty = schema.columns[cidx as usize].ty;
+        // ⭐ DECIMAL 不下推: shard 端按 ordered-bytes 比较, 与 worker 端 Decimal 定标
+        // 语义 (字面量转同 scale) 不一致 → 留在 worker 残余过滤 (正确性由 finish 兜底).
+        if matches!(ty, ColType::Decimal { .. }) {
+            continue;
+        }
+        let op = match cond.op {
+            CmpOp::Eq => shard_manager::PredOp::Eq,
+            CmpOp::Ne => shard_manager::PredOp::Ne,
+            CmpOp::Gt => shard_manager::PredOp::Gt,
+            CmpOp::Ge => shard_manager::PredOp::Ge,
+            CmpOp::Lt => shard_manager::PredOp::Lt,
+            CmpOp::Le => shard_manager::PredOp::Le,
+            CmpOp::In => shard_manager::PredOp::In,
+        };
+        if cond.op == CmpOp::In {
+            let mut set = Vec::with_capacity(cond.set.len());
+            let mut all_ok = true;
+            for v in &cond.set {
+                match sql_to_col(ty, v) {
+                    Ok(cv) => set.push(cv),
+                    Err(_) => {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if all_ok && !set.is_empty() {
+                preds.push(shard_manager::ScanPred {
+                    col: cidx,
+                    op,
+                    val: ColValue::Null,
+                    set,
+                });
+            }
+        } else if let Ok(val) = sql_to_col(ty, &cond.val) {
+            preds.push(shard_manager::ScanPred {
+                col: cidx,
+                op,
+                val,
+                set: Vec::new(),
+            });
+        }
+    }
+    preds
+}
+
 pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result<SqlPlan, String> {
     // 先校验所有叶子列名 (不论结构)
     for c in pred.leaves() {

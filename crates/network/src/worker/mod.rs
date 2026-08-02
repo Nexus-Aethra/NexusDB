@@ -317,6 +317,11 @@ struct SqlSelectAgg {
     count: bool,
     /// ⭐ F76: 投影输出列名 (与 proj 同序; None = 用 schema 列名, 空 vec = 全 None).
     out_names: Vec<Option<String>>,
+    /// ⭐ P0-2: 投影下推 — 非空 = shard 只回这些列 (行内列序 = 下标).
+    /// 仅简单 SELECT (无 ORDER/聚合/COUNT/DML/覆盖索引) 的 FullScan 启用.
+    down_proj: Vec<u16>,
+    /// ⭐ P0-2: 投影下推收行 (与 down_proj 同序; 仅 down_proj 非空时使用).
+    plain_rows: Vec<Vec<ColValue>>,
 }
 
 /// ⭐ S1: 两阶段 DML 的动作 (phase2 每 pk 一发).
@@ -2838,6 +2843,10 @@ fn handle_resp_shard_result(
             if !agg.done {
                 match result {
                     BatchResult::Rows(rows) => agg.rows.extend(rows.iter().cloned()),
+                    // ⭐ P0-2: 投影下推路径 — shard 回 row_cols 列, 收进 plain_rows
+                    BatchResult::ProjRows(rows) if !agg.down_proj.is_empty() => {
+                        agg.plain_rows.extend(rows.iter().cloned());
+                    }
                     BatchResult::Error(e) => agg.error = Some(e.clone()),
                     _ => agg.error = Some("unexpected reply".into()),
                 }

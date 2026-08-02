@@ -2445,6 +2445,47 @@ fn mysql_types() {
     drop(mgr);
 }
 
+/// ⭐ P0-2: 投影下推 — 简单 SELECT (无 ORDER/聚合/COUNT) 的 FullScan 广播改 ScanFiltered,
+/// shard 只回 proj ∪ WHERE 列 (row_cols), worker 展开回全列过滤/渲染; 结果与全行路径一致.
+#[test]
+fn mysql_projection_pushdown() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)");
+    for (id, name, score) in [("1", "a", 10), ("2", "b", 5), ("3", "c", 20)] {
+        c.query(&format!("INSERT INTO t VALUES ({id}, '{name}', {score})"));
+    }
+    // 无 WHERE 简单投影 (下推, shard 只回 id,name 列)
+    assert_eq!(
+        c.query("SELECT id, name FROM t"),
+        QueryResult::Rows(vec![
+            vec![Some("1".into()), Some("a".into())],
+            vec![Some("2".into()), Some("b".into())],
+            vec![Some("3".into()), Some("c".into())],
+        ])
+    );
+    // WHERE 列追加进下推列集 (row_cols = [id, score])
+    assert_eq!(c.ids("SELECT id FROM t WHERE score > 5"), vec!["1", "3"]);
+    // OR→IN 合并 (M2c) + 投影下推: name IN ('a','b') 作为 shard preds
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE name = 'a' OR name = 'b'"),
+        vec!["1", "2"]
+    );
+    // limit 下推 (无 WHERE → shard_limit = limit+offset)
+    assert_eq!(c.ids("SELECT name FROM t LIMIT 2"), vec!["a", "b"]);
+    // 全列 SELECT * → row_cols == 全列, 不下推, 结果一致
+    match c.query("SELECT * FROM t WHERE score > 5") {
+        QueryResult::Rows(rows) => assert_eq!(rows.len(), 2),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // 有排序 → 不走投影下推路径, 结果仍一致
+    assert_eq!(c.ids("SELECT id FROM t ORDER BY score"), vec!["2", "1", "3"]);
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ F81: DECIMAL 定点小数 — 建表→插入(字符串精确/字面量)→查回不丢精度→SUM→WHERE→ORDER.
 #[test]
 fn mysql_decimal() {
