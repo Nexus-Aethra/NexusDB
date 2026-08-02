@@ -373,9 +373,12 @@ struct SqlJoinCtx {
     swapped: bool,
     /// ⭐ M3-2: gather 顺序 (表下标; 默认 [0,1,...], swapped 双表 [1,0]).
     gather_order: Vec<usize>,
-    /// ⭐ M3-2: EstimateRows 收集进度 (0=等 tables[0], 1=等 tables[1]) 与行数和.
+    /// ⭐ M3-2: EstimateRows 收集进度 (0/1=行数 t0/t1, 2/3=distinct t0/t1) 与行数和.
     est_phase: u8,
     est_rows: [u64; 2],
+    /// ⭐ M3-4: 每表索引列 distinct 基数 (ti → iid → distinct; 仅双表 Inner
+    /// EstimateRows 路径收集; 无数据 = 空 map, index_hint 退化为取第一个 Eq).
+    join_distinct: Vec<std::collections::HashMap<u32, u64>>,
 }
 
 /// ⭐ F67 (JOIN): 单侧 gather 行数上限 (止 worker OOM; 超限报错).
@@ -3436,6 +3439,8 @@ fn handle_resp_shard_result(
         BatchResult::TxnApplied(_) => codec.encode_error("unexpected txn reply"),
         // ⭐ M3-2: 行数估计只出现在 worker 内部 (JOIN 驱动选择), 门面拦截
         BatchResult::RowCount(_) => codec.encode_error("unexpected rowcount reply"),
+        // ⭐ M3-4: distinct 估计只出现在 worker 内部 (JOIN 索引选择)
+        BatchResult::DistinctCounts(_) => codec.encode_error("unexpected distinct reply"),
         // ⭐ F65: 占坑结果只出现在 SQL 门面 (sql_unique_drive 已拦截)
         BatchResult::ReserveOk | BatchResult::ReserveConflict { .. } => {
             codec.encode_error("unexpected unique reply")
@@ -3622,6 +3627,7 @@ fn batch_result_to_response(result: &BatchResult) -> Response {
         BatchResult::Catalog(_) => Response::PutOk, // catalog 不走 Binary
         BatchResult::ProjRows(_) => Response::PutOk, // JOIN 不走 Binary
         BatchResult::RowCount(_) => Response::PutOk, // M3-2 行数估计不走 Binary
+        BatchResult::DistinctCounts(_) => Response::PutOk, // M3-4 distinct 不走 Binary
         BatchResult::GetValue(None) => Response::Get(None),
         BatchResult::GetValue(Some(stored)) => {
             let (_tag, payload) = decode_value(stored);
@@ -4230,6 +4236,7 @@ fn finish_derived_join(
         gather_order: Vec::new(),
         est_phase: 0,
         est_rows: [0, 0],
+        join_distinct: Vec::new(),
     };
     conn.sql_join.insert(seq, ctx);
     sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);

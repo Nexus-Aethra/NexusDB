@@ -443,6 +443,7 @@ pub(crate) fn sql_dispatch_stmt(
                 gather_order: Vec::new(),
                 est_phase: 0,
                 est_rows: [0, 0],
+                join_distinct: Vec::new(),
             };
             conn.sql_join.insert(seq, ctx);
             sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
@@ -669,6 +670,10 @@ pub(crate) fn sql_join_kickoff(
                             c.phase = JoinPhase::EstimateRows;
                             c.est_phase = 0;
                             c.est_rows = [0, 0];
+                            c.join_distinct = vec![
+                                std::collections::HashMap::new(),
+                                std::collections::HashMap::new(),
+                            ];
                             c.remaining = num_shards;
                             c.gather_order = vec![0, 1]; // swapped 时改为 [1, 0]
                             (c.db.clone(), c.tables[0].table.clone())
@@ -772,6 +777,52 @@ pub(crate) fn sql_join_broadcast(
 /// - 息含单个 OnPred::Eq (多列组合键 v1 跳过)
 /// - Eq 一侧属 idx 表且该列有普通二级索引, 另一侧属前序表 ti<idx
 /// - 前序键集合去重后 <= JOIN_KEYSET_MAX (超阈退回全表扫)
+/// ⭐ M3-4: 表 idx 的候选 Eq 索引列 (conds 中该表等值谓词列 → (列号, iid), 去重).
+fn join_candidate_eq_iids(ctx: &SqlJoinCtx, idx: usize) -> Vec<(u16, u32)> {
+    let Some(schema) = ctx.tables[idx].schema.as_ref() else { return Vec::new() };
+    let mut out: Vec<(u16, u32)> = Vec::new();
+    for cond in ctx.conds.as_conjuncts().unwrap_or_default() {
+        if cond.op != CmpOp::Eq {
+            continue;
+        }
+        let Ok((ti, cidx)) = sql_join_resolve(ctx, &cond.col) else { continue };
+        if ti != idx {
+            continue;
+        }
+        if let Some(iid) = schema.indexes.iter().find(|i| i.col == cidx).map(|i| i.iid) {
+            if !out.iter().any(|&(c, _)| c == cidx) {
+                out.push((cidx, iid));
+            }
+        }
+    }
+    out
+}
+
+/// ⭐ M3-2: EstimateRows 收集完成 → 决策驱动表 (右表更小 → swapped) → 启动 Gather.
+fn sql_join_est_decide(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+) {
+    let gather_idx = {
+        let c = conn.sql_join.get_mut(&seq).unwrap();
+        let s = c.est_rows[1] < c.est_rows[0];
+        c.swapped = s;
+        c.gather_order = if s { vec![1, 0] } else { vec![0, 1] };
+        c.gather_order[0]
+    };
+    {
+        let c = conn.sql_join.get_mut(&seq).unwrap();
+        c.phase = JoinPhase::Gather(gather_idx);
+        c.remaining = num_shards;
+        c.tables[gather_idx].rows.clear();
+    }
+    sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, gather_idx);
+}
+
 pub(crate) fn sql_join_keyset_hint(ctx: &SqlJoinCtx, idx: usize) -> Option<shard_manager::KeySetHint> {
     // ⭐ M3-2: swapped 双表 — 仅被驱动表 tables[0] 用 key_set (来源 joins[0] + tables[1]),
     // 驱动表 tables[1] 保持全量 (idx=1 → None). 普通多表 — idx==0 全量, idx>=1 用 joins[idx-1].
@@ -838,6 +889,8 @@ pub(crate) fn sql_join_index_hint(
 ) -> Option<shard_manager::IndexHint> {
     // 列号 → iid (仅取非全局普通二级索引即可)
     let iid_of = |col: u16| schema.indexes.iter().find(|i| i.col == col).map(|i| i.iid);
+    // ⭐ M3-4: 多个 Eq 候选 → 选 distinct 最高 (选择性最大; 无 distinct 数据同分 → 取首个)
+    let mut best_eq: Option<(u64, shard_manager::IndexHint)> = None;
     let mut best: Option<shard_manager::IndexHint> = None;
     for cond in ctx.conds.as_conjuncts().unwrap_or_default() {
         let Ok((ti, cidx)) = sql_join_resolve(ctx, &cond.col) else { continue };
@@ -849,12 +902,18 @@ pub(crate) fn sql_join_index_hint(
         let Ok(v) = sql_to_col(ty, &cond.val) else { continue };
         match cond.op {
             CmpOp::Eq => {
-                // Eq 最优: 直接定界返回
-                return Some(shard_manager::IndexHint {
-                    iid,
-                    lo: Some(v.clone()),
-                    hi: Some(v),
-                });
+                let d = ctx
+                    .join_distinct
+                    .get(idx)
+                    .and_then(|m| m.get(&iid))
+                    .copied()
+                    .unwrap_or(u64::MAX / 2);
+                if best_eq.is_none() || d > best_eq.as_ref().unwrap().0 {
+                    best_eq = Some((
+                        d,
+                        shard_manager::IndexHint { iid, lo: Some(v.clone()), hi: Some(v) },
+                    ));
+                }
             }
             CmpOp::Gt | CmpOp::Ge if best.is_none() => {
                 best = Some(shard_manager::IndexHint { iid, lo: Some(v), hi: None });
@@ -865,7 +924,7 @@ pub(crate) fn sql_join_index_hint(
             _ => {}
         }
     }
-    best
+    best_eq.map(|(_, h)| h).or(best)
 }
 
 /// ⭐ F67 (JOIN): handle_resp 认领 — 按 phase 推进. 返回 true = 已处理此 seq.
@@ -933,54 +992,78 @@ pub(crate) fn sql_join_drive(
             }
             true
         }
-        // ⭐ M3-2: 收集行数 (双表 Inner 驱动选择)
+        // ⭐ M3-2/M3-4: 收集行数 (est_phase 0/1) → 候选索引列 distinct (est_phase 2/3)
         JoinPhase::EstimateRows => {
-            let n = match result {
-                BatchResult::RowCount(n) => *n,
-                _ => 0,
-            };
-            let (next_ti, done) = {
-                let c = conn.sql_join.get_mut(&seq).unwrap();
-                c.est_rows[c.est_phase as usize] += n;
+            let c = conn.sql_join.get_mut(&seq).unwrap();
+            if c.est_phase < 2 {
+                // 阶段 1: 行数收集 (0=tables[0], 1=tables[1])
+                if let BatchResult::RowCount(n) = result {
+                    c.est_rows[c.est_phase as usize] += n;
+                }
                 c.remaining = c.remaining.saturating_sub(1);
                 if c.remaining > 0 {
-                    (None, false)
-                } else if c.est_phase == 0 {
+                    return true;
+                }
+                if c.est_phase == 0 {
+                    // 开始收 tables[1] 行数
                     c.est_phase = 1;
                     c.remaining = num_shards;
-                    (Some(1), false)
-                } else {
-                    (None, true)
+                    let (db, table) = (c.db.clone(), c.tables[1].table.clone());
+                    for sid in 0..num_shards {
+                        let op = BatchOp::EstimateRowCount { db: db.clone(), table: table.clone() };
+                        push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                    }
+                    return true;
                 }
-            };
-            if let Some(ti) = next_ti {
-                let (db, table) = {
-                    let c = conn.sql_join.get(&seq).unwrap();
-                    (c.db.clone(), c.tables[ti].table.clone())
-                };
+                // 行数齐 → 阶段 2: tables[0] 候选 Eq 索引列 distinct
+                let (db, cand) = (c.db.clone(), join_candidate_eq_iids(&c, 0));
+                if cand.is_empty() {
+                    sql_join_est_decide(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
+                    return true;
+                }
+                c.est_phase = 2;
+                c.remaining = num_shards;
+                let iids: Vec<u32> = cand.iter().map(|&(_, iid)| iid).collect();
+                let table = c.tables[0].table.clone();
                 for sid in 0..num_shards {
-                    let op = BatchOp::EstimateRowCount { db: db.clone(), table: table.clone() };
+                    let op = BatchOp::EstimateDistinct { db: db.clone(), table: table.clone(), iids: iids.clone() };
                     push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
                 }
                 return true;
             }
-            if done {
-                // 决策: 右表更小 → swapped (先 Gather 右表全量, 左表 key_set 点查)
-                let gather_idx = {
-                    let c = conn.sql_join.get_mut(&seq).unwrap();
-                    let s = c.est_rows[1] < c.est_rows[0];
-                    c.swapped = s;
-                    c.gather_order = if s { vec![1, 0] } else { vec![0, 1] };
-                    c.gather_order[0]
-                };
-                {
-                    let c = conn.sql_join.get_mut(&seq).unwrap();
-                    c.phase = JoinPhase::Gather(gather_idx);
-                    c.remaining = num_shards;
-                    c.tables[gather_idx].rows.clear();
+            // 阶段 2: distinct 收集 (est_phase 2/3)
+            if let BatchResult::DistinctCounts(ds) = result {
+                let ti = (c.est_phase - 2) as usize;
+                let cand = join_candidate_eq_iids(&c, ti);
+                if let Some(map) = c.join_distinct.get_mut(ti) {
+                    for ((_, iid), d) in cand.iter().zip(ds.iter()) {
+                        map.insert(*iid, *d);
+                    }
                 }
-                sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, gather_idx);
             }
+            c.remaining = c.remaining.saturating_sub(1);
+            if c.remaining > 0 {
+                return true;
+            }
+            if c.est_phase == 2 {
+                // 开始收 tables[1] distinct
+                c.est_phase = 3;
+                c.remaining = num_shards;
+                let (db, cand) = (c.db.clone(), join_candidate_eq_iids(&c, 1));
+                if cand.is_empty() {
+                    sql_join_est_decide(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
+                    return true;
+                }
+                let iids: Vec<u32> = cand.iter().map(|&(_, iid)| iid).collect();
+                let table = c.tables[1].table.clone();
+                for sid in 0..num_shards {
+                    let op = BatchOp::EstimateDistinct { db: db.clone(), table: table.clone(), iids: iids.clone() };
+                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                }
+                return true;
+            }
+            // 全部收集齐 → 决策驱动表 → Gather
+            sql_join_est_decide(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
             true
         }
         JoinPhase::Gather(idx) => {

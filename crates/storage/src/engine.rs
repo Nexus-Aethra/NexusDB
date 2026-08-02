@@ -155,6 +155,9 @@ pub struct StorageEngine {
     /// put 新 key +1 (覆盖不加, 由 registry::table_put 返回 existed), delete -1;
     /// put_many 近似 +N (覆盖会高估). 重启后从 0 重算 (持久化 M3-1b 待做).
     row_counts: std::collections::HashMap<(String, String), u64>,
+    /// ⭐ M3-4 (CBO): 每索引列近似 distinct 基数 (索引值写入时 bloom miss = 新值 → +1;
+    /// bloom 假阳性 → 低估, 近似可接受). 内存增量, 重启后从 0 重算.
+    pub(crate) distinct_counts: std::collections::HashMap<(String, String, u32), u64>,
 }
 
 /// ⭐ Q1: schema 镜像槽别名 (None = 已确认无 schema 的纯 KV 表).
@@ -347,6 +350,7 @@ impl StorageEngine {
             bloom_skip_count: 0,
             wal: None, // 重放期间保持 None (append 自动跳过)
             row_counts: std::collections::HashMap::new(),
+            distinct_counts: std::collections::HashMap::new(),
         };
         // ⭐ U3: 从 data 行重建复合结构计数 (修复 crash 中 meta count 漂移).
         engine.rebuild_composite_counts().await.map_err(|e| {
@@ -927,6 +931,13 @@ impl StorageEngine {
     pub fn estimate_row_count(&self, db: &str, table: &str) -> Option<u64> {
         self.row_counts
             .get(&(db.to_string(), table.to_string()))
+            .copied()
+    }
+
+    /// ⭐ M3-4: 索引列近似 distinct 基数 (CBO 选择度; None = 无记录, 视为未知).
+    pub fn estimate_distinct(&self, db: &str, table: &str, iid: u32) -> Option<u64> {
+        self.distinct_counts
+            .get(&(db.to_string(), table.to_string(), iid))
             .copied()
     }
 

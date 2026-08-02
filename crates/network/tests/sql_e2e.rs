@@ -2073,6 +2073,40 @@ fn mysql_join_driver_swap() {
     drop(mgr);
 }
 
+/// ⭐ M3-4 (基数估算): JOIN 表上多个等值索引候选 → EstimateRows 收集 distinct,
+/// index_hint 选选择性高的; 结果正确性 (distinct 收集路径走通).
+#[test]
+fn mysql_join_distinct_choice() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT)");
+    c.query("CREATE INDEX ta ON t(a)");
+    c.query("CREATE INDEX tb ON t(b)");
+    // t: 20 行, a 只有 2 个 distinct (id%2), b 每行唯一 (高 distinct)
+    for i in 0..20 {
+        c.query(&format!("INSERT INTO t VALUES ({i}, {}, {i})", i % 2));
+    }
+    for (id, name) in [("0", "zero"), ("1", "one"), ("2", "two")] {
+        c.query(&format!("INSERT INTO u VALUES ({id}, '{name}')"));
+    }
+    // u 3 行 << t 20 行 → 驱动 u; t 的 WHERE 双 Eq 候选 (ta: a distinct=2, tb: b distinct=20)
+    // → index_hint 应选 tb (选择性高); 结果: t.id=2 (a=0, b=2) 匹配 u.id=2
+    assert_eq!(
+        c.query("SELECT u.name, t.id FROM u JOIN t ON u.id = t.id WHERE t.a = 0 AND t.b = 2"),
+        QueryResult::Rows(vec![vec![Some("two".into()), Some("2".into())]])
+    );
+    // 另一候选组合: a=0 AND b=0 → t.id=0 (u.id=0)
+    assert_eq!(
+        c.query("SELECT u.name, t.id FROM u JOIN t ON u.id = t.id WHERE t.a = 0 AND t.b = 0"),
+        QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]])
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 fn mysql_or_join_having() {
     let (server, mgr) = start_sql_server(None);
     let mut c = MyConn::handshake_login(&server, "");

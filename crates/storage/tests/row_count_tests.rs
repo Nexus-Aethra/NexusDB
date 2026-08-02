@@ -4,11 +4,29 @@
 //!
 //! 用途: 为 M3-2 连接顺序 (NestedLoop 小表驱动) 与 M3-3 代价模型提供行数基.
 
+use storage::row::ColValue;
+use storage::schema::{ColType, Column, TableSchema};
 use storage::{IoBackend, IoBackendConfig, OpenOptions, StorageEngine};
 
 mod common;
 
 use common::run_async;
+
+/// (id I64 pk, name Str idx0, score F64 nullable)
+fn demo_schema() -> TableSchema {
+    TableSchema::new(
+        vec![
+            Column { name: "id".into(), ty: ColType::I64, nullable: false },
+            Column { name: "name".into(), ty: ColType::Str, nullable: false },
+            Column { name: "score".into(), ty: ColType::F64, nullable: true },
+        ],
+        0,
+        &[1], // iid 0 = name
+        &[],
+        &[],
+    )
+    .unwrap()
+}
 
 // =====================================================================
 // 测试 helper
@@ -91,5 +109,49 @@ fn row_count_put_many_and_isolation() {
         // 单 key 追加 → 6
         e.table_put("app", "t", b"k9", b"v9").await.unwrap();
         assert_eq!(e.estimate_row_count("app", "t"), Some(6));
+    });
+}
+
+/// ⭐ M3-4: 索引列近似 distinct 基数 — 插入不同值 +1, 重复/覆盖不变.
+#[test]
+fn distinct_counts_via_index_write() {
+    run_async(async move {
+        let (_tmp, opts) = setup();
+        let mut e = StorageEngine::open(opts).await.expect("open ok");
+        e.create_db("db1").await.expect("create db");
+        e.create_table("db1", "t1").await.expect("create table");
+        e.set_schema("db1", "t1", &demo_schema()).await.expect("set schema");
+
+        // 无记录 → None (未知)
+        assert_eq!(e.estimate_distinct("db1", "t1", 0), None);
+
+        // 6 行, name 3 个不同值 (i % 3) → distinct = 3
+        for i in 0..6i64 {
+            let row = vec![
+                ColValue::I64(i),
+                ColValue::Bytes(format!("u{}", i % 3).into_bytes()),
+                ColValue::Null,
+            ];
+            e.row_put("db1", "t1", &i.to_be_bytes(), &row).await.unwrap();
+        }
+        assert_eq!(e.estimate_distinct("db1", "t1", 0), Some(3));
+
+        // 覆盖写同索引值 (old==new) → 索引行不动, distinct 不变
+        let row = vec![
+            ColValue::I64(0),
+            ColValue::Bytes(b"u0".to_vec()),
+            ColValue::Null,
+        ];
+        e.row_put("db1", "t1", &0i64.to_be_bytes(), &row).await.unwrap();
+        assert_eq!(e.estimate_distinct("db1", "t1", 0), Some(3));
+
+        // 新值 → 4
+        let row = vec![
+            ColValue::I64(6),
+            ColValue::Bytes(b"u9".to_vec()),
+            ColValue::Null,
+        ];
+        e.row_put("db1", "t1", &6i64.to_be_bytes(), &row).await.unwrap();
+        assert_eq!(e.estimate_distinct("db1", "t1", 0), Some(4));
     });
 }

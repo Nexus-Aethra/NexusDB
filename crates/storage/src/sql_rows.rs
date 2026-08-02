@@ -329,7 +329,17 @@ impl StorageEngine {
                 self.put_physical(db, table, &ks::encode_index_entry(idx.iid, &nv, pk), &[])
                     .await?;
                 // ⭐ Y1: 喂 bloom (只增; 删/换值不摘除 → 只累积假阳性)
-                self.bloom_entry(db, table, idx.iid).insert(&nv);
+                let (db_s, tbl_s) = (db.to_string(), table.to_string());
+                let b = self.bloom_entry(db, table, idx.iid);
+                // ⭐ M3-4: 近似 distinct — bloom miss = 确定新值 → +1 (假阳性低估, 近似)
+                let is_new = !b.may_contain(&nv);
+                b.insert(&nv);
+                if is_new {
+                    *self
+                        .distinct_counts
+                        .entry((db_s, tbl_s, idx.iid))
+                        .or_insert(0) += 1;
+                }
             }
         }
         Ok(())

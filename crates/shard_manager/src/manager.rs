@@ -1617,6 +1617,14 @@ fn exec_task_op(
                 e.estimate_row_count(db, table).unwrap_or(0),
             )
         }
+        // ⭐ M3-4 (CBO): 索引列 distinct (worker 已算好 iid; 未统计=0)
+        crate::request::BatchOp::EstimateDistinct { ref db, ref table, ref iids } => {
+            crate::request::BatchResult::DistinctCounts(
+                iids.iter()
+                    .map(|iid| e.estimate_distinct(db, table, *iid).unwrap_or(0))
+                    .collect(),
+            )
+        }
         // ⭐ Phase H: Hash ops (单 key 单 shard, 无需聚合)
         crate::request::BatchOp::HSet { ref db, ref table, ref key, ref pairs } => {
             match block_on_io(e.hash_set(db, table, key, pairs)) {
@@ -2683,6 +2691,14 @@ fn shard_thread_main(
                                 // ⭐ M3-2: 行数估计 (只读, 表不存在=0)
                                 BatchOp::EstimateRowCount { db, table } => {
                                     BatchResult::RowCount(e.estimate_row_count(&db, &table).unwrap_or(0))
+                                }
+                                // ⭐ M3-4: distinct 估计 (只读)
+                                BatchOp::EstimateDistinct { db, table, iids } => {
+                                    BatchResult::DistinctCounts(
+                                        iids.iter()
+                                            .map(|iid| e.estimate_distinct(&db, &table, *iid).unwrap_or(0))
+                                            .collect(),
+                                    )
                                 }
                                 // ⭐ F65: 占坑 op (管理面兼容; 热路径走 ShardTask → exec_task_op)
                                 op @ (BatchOp::ReserveUnique { .. }

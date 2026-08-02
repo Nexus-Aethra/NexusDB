@@ -191,6 +191,9 @@ pub enum BatchOp {
     SetRange { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, offset: u32, data: Vec<u8> },
     /// ⭐ M3-2 (CBO): 估算表近似行数 (内存增量统计, 未统计=0). 返回 RowCount.
     EstimateRowCount { db: std::sync::Arc<str>, table: std::sync::Arc<str> },
+    /// ⭐ M3-4 (CBO): 索引列近似 distinct 基数 (worker 已算好 iid 列表; 免 shard 查 schema).
+    /// 返回 DistinctCounts (与 iids 同序).
+    EstimateDistinct { db: std::sync::Arc<str>, table: std::sync::Arc<str>, iids: Vec<u32> },
     // ---- ⭐ Phase H: Hash (全部单 key 路由, 一个 hash 的所有 field 同 shard) ----
     /// HSET 多 field: 返回新增 field 数 (Integer). value 带 tag.
     HSet { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, pairs: Vec<(Vec<u8>, Vec<u8>)> },
@@ -446,6 +449,8 @@ impl BatchOp {
             ScanFiltered { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ M3-2: 行数估计广播 op, 不走路由 (空 key)
             EstimateRowCount { db, table } => (db.as_ref(), table.as_ref(), &[]),
+            // ⭐ M3-4: distinct 估计广播 op, 不走路由
+            EstimateDistinct { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ 事务批: 取第一个 op 的 locator (组内同 shard, 仅兼容用;
             // ensure_table 在 shard 端逐 op 处理)
             TxnApply { ops, .. } => ops.first().map(|o| o.locator()).unwrap_or(("", "", &[])),
@@ -538,6 +543,8 @@ impl BatchOp {
             ScanFiltered { .. } => None,
             // ⭐ M3-2: 行数估计无 key (不参与 RESP 冒号选表)
             EstimateRowCount { .. } => None,
+            // ⭐ M3-4: distinct 估计无 key
+            EstimateDistinct { .. } => None,
             // ⭐ X2: schema op 无 key
             SetSchemaOp { .. } | GetSchemaOp { .. } => None,
             TxnApply { .. } => None,
@@ -605,6 +612,8 @@ pub enum BatchResult {
     ProjRows(Vec<Vec<storage::row::ColValue>>),
     /// ⭐ M3-2 (CBO): 表近似行数估计 (EstimateRowCount 响应).
     RowCount(u64),
+    /// ⭐ M3-4 (CBO): 索引列 distinct 计数 (EstimateDistinct 响应, 与 cols 同序).
+    DistinctCounts(Vec<u64>),
     Error(String),
 }
 
