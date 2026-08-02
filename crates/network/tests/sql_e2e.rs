@@ -2023,6 +2023,56 @@ fn mysql_or_predicates() {
 
 /// JOIN WHERE 带 OR (下推回退, worker 残余递归) + HAVING 带 OR.
 #[test]
+/// ⭐ M3-2 (连接顺序): 双表 Inner join 驱动交换 — 右表 (候选驱动) 远小于左表时,
+/// EstimateRows 收集行数 → 选小表驱动 (先 Gather 右表, 左表 key_set 点查);
+/// 结果与不交换一致, SELECT * 列序保持.
+#[test]
+fn mysql_join_driver_swap() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE big (id INT PRIMARY KEY, v INT)");
+    c.query("CREATE TABLE small (id INT PRIMARY KEY, name TEXT)");
+    for i in 0..100 {
+        c.query(&format!("INSERT INTO big VALUES ({i}, {i})"));
+    }
+    for (id, name) in [("0", "zero"), ("1", "one"), ("5", "five")] {
+        c.query(&format!("INSERT INTO small VALUES ({id}, '{name}')"));
+    }
+    // small (3) << big (100) → 驱动交换 (先 Gather small, big key_set 点查)
+    assert_eq!(
+        c.query("SELECT b.id, s.name FROM big b JOIN small s ON b.id = s.id ORDER BY b.id"),
+        QueryResult::Rows(vec![
+            vec![Some("0".into()), Some("zero".into())],
+            vec![Some("1".into()), Some("one".into())],
+            vec![Some("5".into()), Some("five".into())],
+        ])
+    );
+    // SELECT * 列序 = big 列 + small 列 (驱动交换不影响输出列序)
+    match c.query("SELECT * FROM big b JOIN small s ON b.id = s.id") {
+        QueryResult::Rows(rows) => {
+            assert_eq!(rows.len(), 3);
+            // 每行前 2 列是 big (id, v), 后 2 列是 small (id, name)
+            for row in &rows {
+                assert_eq!(row.len(), 4, "big 2 列 + small 2 列: {row:?}");
+            }
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // 反向驱动 (右表更大) 不交换, 结果仍一致
+    assert_eq!(
+        c.query("SELECT s.name, b.id FROM small s JOIN big b ON s.id = b.id ORDER BY s.id"),
+        QueryResult::Rows(vec![
+            vec![Some("zero".into()), Some("0".into())],
+            vec![Some("one".into()), Some("1".into())],
+            vec![Some("five".into()), Some("5".into())],
+        ])
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 fn mysql_or_join_having() {
     let (server, mgr) = start_sql_server(None);
     let mut c = MyConn::handshake_login(&server, "");

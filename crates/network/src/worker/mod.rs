@@ -338,6 +338,8 @@ enum JoinPhase {
     FetchSchema(usize),
     /// 广播 gather tables[idx] (ScanFiltered).
     Gather(usize),
+    /// ⭐ M3-2: 收集表行数 (双表 Inner 驱动选择; ctx.est_phase 0=tables[0], 1=tables[1]).
+    EstimateRows,
 }
 
 /// ⭐ F68 (JOIN): 参与 JOIN 的单表运行态.
@@ -366,6 +368,14 @@ struct SqlJoinCtx {
     offset: Option<u32>,
     phase: JoinPhase,
     remaining: usize,
+    /// ⭐ M3-2 (连接顺序): 双表 Inner 驱动交换 — 先 Gather 小表 (全量), 大表 key_set 点查.
+    /// 输出列序仍按 tables 顺序 (col_offset 固定), 仅广播/gather 顺序交换.
+    swapped: bool,
+    /// ⭐ M3-2: gather 顺序 (表下标; 默认 [0,1,...], swapped 双表 [1,0]).
+    gather_order: Vec<usize>,
+    /// ⭐ M3-2: EstimateRows 收集进度 (0=等 tables[0], 1=等 tables[1]) 与行数和.
+    est_phase: u8,
+    est_rows: [u64; 2],
 }
 
 /// ⭐ F67 (JOIN): 单侧 gather 行数上限 (止 worker OOM; 超限报错).
@@ -3424,6 +3434,8 @@ fn handle_resp_shard_result(
     let bytes = match result {
         // ⭐ 事务 v1: TxnApplied 只出现在 SQL 门面 (上方 sql_txn_agg 已拦截)
         BatchResult::TxnApplied(_) => codec.encode_error("unexpected txn reply"),
+        // ⭐ M3-2: 行数估计只出现在 worker 内部 (JOIN 驱动选择), 门面拦截
+        BatchResult::RowCount(_) => codec.encode_error("unexpected rowcount reply"),
         // ⭐ F65: 占坑结果只出现在 SQL 门面 (sql_unique_drive 已拦截)
         BatchResult::ReserveOk | BatchResult::ReserveConflict { .. } => {
             codec.encode_error("unexpected unique reply")
@@ -3609,6 +3621,7 @@ fn batch_result_to_response(result: &BatchResult) -> Response {
         BatchResult::ReserveOk | BatchResult::ReserveConflict { .. } => Response::PutOk, // 占坑不走 Binary
         BatchResult::Catalog(_) => Response::PutOk, // catalog 不走 Binary
         BatchResult::ProjRows(_) => Response::PutOk, // JOIN 不走 Binary
+        BatchResult::RowCount(_) => Response::PutOk, // M3-2 行数估计不走 Binary
         BatchResult::GetValue(None) => Response::Get(None),
         BatchResult::GetValue(Some(stored)) => {
             let (_tag, payload) = decode_value(stored);
@@ -4213,6 +4226,10 @@ fn finish_derived_join(
         offset,
         phase: JoinPhase::Gather(0),
         remaining: 0,
+        swapped: false,
+        gather_order: Vec::new(),
+        est_phase: 0,
+        est_rows: [0, 0],
     };
     conn.sql_join.insert(seq, ctx);
     sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);

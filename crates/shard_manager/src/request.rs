@@ -189,6 +189,8 @@ pub enum BatchOp {
     /// ⭐ SETRANGE: 从 offset 覆盖写 data (零扩展), 结果存 TAG_RAW,
     /// 返回新长度 (Integer).
     SetRange { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, offset: u32, data: Vec<u8> },
+    /// ⭐ M3-2 (CBO): 估算表近似行数 (内存增量统计, 未统计=0). 返回 RowCount.
+    EstimateRowCount { db: std::sync::Arc<str>, table: std::sync::Arc<str> },
     // ---- ⭐ Phase H: Hash (全部单 key 路由, 一个 hash 的所有 field 同 shard) ----
     /// HSET 多 field: 返回新增 field 数 (Integer). value 带 tag.
     HSet { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, pairs: Vec<(Vec<u8>, Vec<u8>)> },
@@ -442,6 +444,8 @@ impl BatchOp {
             }
             // ⭐ F67 (JOIN): 广播 op, 不走 locator 路由 (兵底空 key)
             ScanFiltered { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
+            // ⭐ M3-2: 行数估计广播 op, 不走路由 (空 key)
+            EstimateRowCount { db, table } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ 事务批: 取第一个 op 的 locator (组内同 shard, 仅兼容用;
             // ensure_table 在 shard 端逐 op 处理)
             TxnApply { ops, .. } => ops.first().map(|o| o.locator()).unwrap_or(("", "", &[])),
@@ -532,6 +536,8 @@ impl BatchOp {
             RowPut { .. } | RowGet { .. } | RowDelete { .. } | RowUpdate { .. }
             | IndexScan { .. } | DropTableOp { .. } | TableScan { .. } => None,
             ScanFiltered { .. } => None,
+            // ⭐ M3-2: 行数估计无 key (不参与 RESP 冒号选表)
+            EstimateRowCount { .. } => None,
             // ⭐ X2: schema op 无 key
             SetSchemaOp { .. } | GetSchemaOp { .. } => None,
             TxnApply { .. } => None,
@@ -597,6 +603,8 @@ pub enum BatchResult {
     Catalog(Vec<(String, Vec<u8>)>),
     /// ⭐ F67 (JOIN): ScanFiltered 结果 — 只含投影列值的行 (省带宽, worker 免 decode).
     ProjRows(Vec<Vec<storage::row::ColValue>>),
+    /// ⭐ M3-2 (CBO): 表近似行数估计 (EstimateRowCount 响应).
+    RowCount(u64),
     Error(String),
 }
 

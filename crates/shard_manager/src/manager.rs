@@ -1611,6 +1611,12 @@ fn exec_task_op(
         crate::request::BatchOp::SetRange { ref db, ref table, ref key, offset, ref data } => {
             exec_setrange(e, db, table, key, offset, data)
         }
+        // ⭐ M3-2 (CBO): 表近似行数 (内存增量统计; 未统计=0)
+        crate::request::BatchOp::EstimateRowCount { ref db, ref table } => {
+            crate::request::BatchResult::RowCount(
+                e.estimate_row_count(db, table).unwrap_or(0),
+            )
+        }
         // ⭐ Phase H: Hash ops (单 key 单 shard, 无需聚合)
         crate::request::BatchOp::HSet { ref db, ref table, ref key, ref pairs } => {
             match block_on_io(e.hash_set(db, table, key, pairs)) {
@@ -2674,6 +2680,10 @@ fn shard_thread_main(
                             let r = match op {
                                 // ⭐ 事务批 (管理面 Batch 兼容臂; 热路径走 ShardTask)
                                 BatchOp::TxnApply { ops, read_set } => exec_txn_apply(e, ops, read_set),
+                                // ⭐ M3-2: 行数估计 (只读, 表不存在=0)
+                                BatchOp::EstimateRowCount { db, table } => {
+                                    BatchResult::RowCount(e.estimate_row_count(&db, &table).unwrap_or(0))
+                                }
                                 // ⭐ F65: 占坑 op (管理面兼容; 热路径走 ShardTask → exec_task_op)
                                 op @ (BatchOp::ReserveUnique { .. }
                                 | BatchOp::StealUnique { .. }

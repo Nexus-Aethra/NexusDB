@@ -439,6 +439,10 @@ pub(crate) fn sql_dispatch_stmt(
                 offset,
                 phase: JoinPhase::Gather(0),
                 remaining: 0,
+                swapped: false,
+                gather_order: Vec::new(),
+                est_phase: 0,
+                est_rows: [0, 0],
             };
             conn.sql_join.insert(seq, ctx);
             sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
@@ -650,6 +654,31 @@ pub(crate) fn sql_join_kickoff(
             };
             match start {
                 Some(idx) => {
+                    // ⭐ M3-2 (连接顺序): 双表 Inner + 纯等值 ON + 无预填 → 先 EstimateRows
+                    // 收集两表行数, 选小表驱动 (swapped 时先 Gather 右表, 左表 key_set 点查).
+                    let est_ok = {
+                        let c = conn.sql_join.get(&seq).unwrap();
+                        c.tables.len() == 2
+                            && c.tables.iter().all(|t| !t.prefilled)
+                            && matches!(c.joins[0].kind, JoinKind::Inner)
+                            && c.joins[0].on.iter().all(|o| matches!(o, sql::OnPred::Eq(..)))
+                    };
+                    if est_ok {
+                        let (db, table) = {
+                            let c = conn.sql_join.get_mut(&seq).unwrap();
+                            c.phase = JoinPhase::EstimateRows;
+                            c.est_phase = 0;
+                            c.est_rows = [0, 0];
+                            c.remaining = num_shards;
+                            c.gather_order = vec![0, 1]; // swapped 时改为 [1, 0]
+                            (c.db.clone(), c.tables[0].table.clone())
+                        };
+                        for sid in 0..num_shards {
+                            let op = BatchOp::EstimateRowCount { db: db.clone(), table: table.clone() };
+                            push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                        }
+                        return;
+                    }
                     {
                         let c = conn.sql_join.get_mut(&seq).unwrap();
                         c.phase = JoinPhase::Gather(idx);
@@ -744,10 +773,19 @@ pub(crate) fn sql_join_broadcast(
 /// - Eq 一侧属 idx 表且该列有普通二级索引, 另一侧属前序表 ti<idx
 /// - 前序键集合去重后 <= JOIN_KEYSET_MAX (超阈退回全表扫)
 pub(crate) fn sql_join_keyset_hint(ctx: &SqlJoinCtx, idx: usize) -> Option<shard_manager::KeySetHint> {
-    if idx == 0 {
-        return None;
-    }
-    let jc = &ctx.joins[idx - 1];
+    // ⭐ M3-2: swapped 双表 — 仅被驱动表 tables[0] 用 key_set (来源 joins[0] + tables[1]),
+    // 驱动表 tables[1] 保持全量 (idx=1 → None). 普通多表 — idx==0 全量, idx>=1 用 joins[idx-1].
+    let (jc, prev_gt_ok) = if ctx.swapped {
+        if idx != 0 {
+            return None;
+        }
+        (&ctx.joins[0], true)
+    } else {
+        if idx == 0 {
+            return None;
+        }
+        (&ctx.joins[idx - 1], false)
+    };
     if !matches!(jc.kind, JoinKind::Inner | JoinKind::Left) {
         return None;
     }
@@ -761,10 +799,10 @@ pub(crate) fn sql_join_keyset_hint(ctx: &SqlJoinCtx, idx: usize) -> Option<shard
     // resolve 两侧 → (表下标, 列号)
     let (lt, li) = sql_join_resolve_on(ctx, l, idx).ok()?;
     let (rt, ri) = sql_join_resolve_on(ctx, r, idx).ok()?;
-    // 分辨新表侧 (idx) 与前序表侧 (ti<idx)
-    let (new_col, prev_ti, prev_col) = if lt == idx && rt < idx {
+    // 分辨新表侧 (idx) 与已 gather 侧 (普通多表 = 前序 ti<idx; swapped 双表 = tables[1])
+    let (new_col, prev_ti, prev_col) = if lt == idx && (prev_gt_ok || rt < idx) {
         (li, rt, ri)
-    } else if rt == idx && lt < idx {
+    } else if rt == idx && (prev_gt_ok || lt < idx) {
         (ri, lt, li)
     } else {
         return None;
@@ -895,6 +933,56 @@ pub(crate) fn sql_join_drive(
             }
             true
         }
+        // ⭐ M3-2: 收集行数 (双表 Inner 驱动选择)
+        JoinPhase::EstimateRows => {
+            let n = match result {
+                BatchResult::RowCount(n) => *n,
+                _ => 0,
+            };
+            let (next_ti, done) = {
+                let c = conn.sql_join.get_mut(&seq).unwrap();
+                c.est_rows[c.est_phase as usize] += n;
+                c.remaining = c.remaining.saturating_sub(1);
+                if c.remaining > 0 {
+                    (None, false)
+                } else if c.est_phase == 0 {
+                    c.est_phase = 1;
+                    c.remaining = num_shards;
+                    (Some(1), false)
+                } else {
+                    (None, true)
+                }
+            };
+            if let Some(ti) = next_ti {
+                let (db, table) = {
+                    let c = conn.sql_join.get(&seq).unwrap();
+                    (c.db.clone(), c.tables[ti].table.clone())
+                };
+                for sid in 0..num_shards {
+                    let op = BatchOp::EstimateRowCount { db: db.clone(), table: table.clone() };
+                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                }
+                return true;
+            }
+            if done {
+                // 决策: 右表更小 → swapped (先 Gather 右表全量, 左表 key_set 点查)
+                let gather_idx = {
+                    let c = conn.sql_join.get_mut(&seq).unwrap();
+                    let s = c.est_rows[1] < c.est_rows[0];
+                    c.swapped = s;
+                    c.gather_order = if s { vec![1, 0] } else { vec![0, 1] };
+                    c.gather_order[0]
+                };
+                {
+                    let c = conn.sql_join.get_mut(&seq).unwrap();
+                    c.phase = JoinPhase::Gather(gather_idx);
+                    c.remaining = num_shards;
+                    c.tables[gather_idx].rows.clear();
+                }
+                sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, gather_idx);
+            }
+            true
+        }
         JoinPhase::Gather(idx) => {
             let rows = match result {
                 BatchResult::ProjRows(r) => r.clone(),
@@ -918,15 +1006,26 @@ pub(crate) fn sql_join_drive(
             }
             if done {
                 let ntables = conn.sql_join.get(&seq).unwrap().tables.len();
-                if idx + 1 < ntables {
+                // ⭐ M3-2: 按 gather_order 推进 (默认空 = 数组序 idx+1)
+                let (next_idx, is_last) = {
+                    let c = conn.sql_join.get(&seq).unwrap();
+                    let go = &c.gather_order;
+                    if go.is_empty() {
+                        (if idx + 1 < ntables { Some(idx + 1) } else { None }, idx + 1 >= ntables)
+                    } else {
+                        let pos = go.iter().position(|&x| x == idx).unwrap();
+                        (go.get(pos + 1).copied(), pos + 1 >= go.len())
+                    }
+                };
+                if let Some(ni) = next_idx {
                     {
                         let c = conn.sql_join.get_mut(&seq).unwrap();
-                        c.phase = JoinPhase::Gather(idx + 1);
+                        c.phase = JoinPhase::Gather(ni);
                         c.remaining = num_shards;
-                        c.tables[idx + 1].rows.clear();
+                        c.tables[ni].rows.clear();
                     }
-                    sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, idx + 1);
-                } else {
+                    sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, ni);
+                } else if is_last {
                     sql_join_finish(conn, seq);
                 }
             }
@@ -952,8 +1051,61 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
     let wide_pos = |t: usize, cidx: u16| -> usize { col_offset[t] + pos_in(t, cidx) };
 
     // acc = 表 0 行 (宽度 = col_offset[1]); 逐 join 折叠
-    let mut acc: Vec<Vec<ColValue>> = ctx.tables[0].rows.clone();
-    for (ji, jc) in ctx.joins.iter().enumerate() {
+    let mut acc: Vec<Vec<ColValue>>;
+    if ctx.swapped {
+        // ⭐ M3-2 (连接顺序): 双表 Inner 驱动交换 — 驱动=tables[1] (先 Gather),
+        // 被驱动=tables[0] (key_set 点查). 输出行 = [tables[0] 列][tables[1] 列]
+        // (col_offset 固定, 保 SELECT * 列序与通用路径一致).
+        acc = {
+            let jc = &ctx.joins[0];
+            let (d_rows, p_rows) = (&ctx.tables[1].rows, &ctx.tables[0].rows);
+            // ON 等值键: (tables[1] proj 位, tables[0] proj 位)
+            let mut eq_keys: Vec<(usize, usize)> = Vec::new();
+            for on in &jc.on {
+                if let sql::OnPred::Eq(l, r) = on {
+                    let (lt, li) = sql_join_resolve_on(&ctx, l, 1).unwrap();
+                    let (rt, ri) = sql_join_resolve_on(&ctx, r, 1).unwrap();
+                    if lt == 1 {
+                        eq_keys.push((pos_in(1, li), pos_in(0, ri)));
+                    } else if rt == 1 {
+                        eq_keys.push((pos_in(1, ri), pos_in(0, li)));
+                    }
+                }
+            }
+            // 被驱动 (tables[0]) 按 join 键建 hash
+            let mut hash: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+            for (ri, row) in p_rows.iter().enumerate() {
+                if let Some(k) = join_key_multi(row, eq_keys.iter().map(|&(_, p0)| p0)) {
+                    hash.entry(k).or_default().push(ri);
+                }
+            }
+            let mut out: Vec<Vec<ColValue>> = Vec::new();
+            for d_row in d_rows {
+                if let Some(k) = join_key_multi(d_row, eq_keys.iter().map(|&(p1, _)| p1))
+                    && let Some(cands) = hash.get(&k)
+                {
+                    for &ri in cands {
+                        let mut w = Vec::with_capacity(col_offset[2]);
+                        w.extend_from_slice(&p_rows[ri]); // tables[0] 列
+                        w.extend_from_slice(d_row);       // tables[1] 列
+                        out.push(w);
+                    }
+                }
+                // Inner: 无匹配丢弃
+            }
+            out
+        };
+        if acc.len() > JOIN_MAX_ROWS {
+            conn.resp_complete(
+                seq,
+                sql_err_bytes(conn.proto, "JOIN result too large (row cap exceeded)"),
+            );
+            return;
+        }
+    } else {
+        // 原左深迭代 hash join (tables[0] 驱动, tables[1..] key_set/全量)
+        acc = ctx.tables[0].rows.clone();
+        for (ji, jc) in ctx.joins.iter().enumerate() {
         let rt = ji + 1;
         let acc_w = col_offset[rt];
         let right_pw = ctx.tables[rt].proj.len();
@@ -1052,6 +1204,7 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
             return;
         }
         acc = new_acc;
+        }
     }
 
     // 残余 WHERE (全 conds 递归; null 扩展位由 NULL→false 天然过滤, 保外连接标准语义)

@@ -214,6 +214,7 @@ fn main() {
                                     | BatchResult::OptMember(_)
                                     | BatchResult::IntList(_)
                                     | BatchResult::Rows(_)
+                                    | BatchResult::RowCount(_)
                                     | BatchResult::MultiPutOk => {
                                         match op_type {
                                             0 => { total_put.fetch_add(1, Ordering::Relaxed); }
