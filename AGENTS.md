@@ -80,7 +80,8 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 - **ORM 对接 P0** (以 SQLAlchemy 实机探测驱动, 0/17→13/17): 列别名 AS / 单表限定列 `表.列` / `db.table` (含反引号) / `LIMIT offset,count`; 额外解 create_all 阻断 (DESCRIBE不存在表→MySQL 1146; 表级 PRIMARY KEY/UNIQUE/KEY/FOREIGN KEY/CONSTRAINT + 吃 AUTO_INCREMENT/DEFAULT)
 - 均在 protocol/sql.rs 解析层 + worker.rs 投影渲染 (out_names 三路: alias>label>列名); 零存储/调度改动
 - 剩余缺口 (P1/P2): DISTINCT / COUNT(DISTINCT) / SUM(表达式) / ALTER TABLE
-- **回归提速 (已配置)**: rust-lld 链接器 (.cargo/config.toml + .linker/ld.lld, 零安装) 使重链接 ~1s; cargo-nextest (并行+进度+超时, .config/nextest.toml) 全量 850 测试 57s
+- **回归提速 (已配置)**: rust-lld 链接器 (.cargo/config.toml + .linker/ld.lld, 零安装) 使重链接 ~1s; cargo-nextest (并行+进度+超时, .config/nextest.toml) 全量 896 测试 ~40s
+  - ⚠️ `.config/` 与 `.cargo/` 均被 gitignore (本地配置). nextest.toml 的 heavy 组必须 `max-threads=1`: e2e 各起多 shard StorageEngine, 全量并行时引擎并发初始化耗尽有界资源 → 2PC 协调器 hang (two_pc_e2e 360s 超时复现; 串行后连续全量 896 passed 零超时)
 - **❗测试栈 (已根治)**: 曾因 `ChunkBuf::new` 的 `Box::new([0u8; 1MiB])` 在栈上构造 1MB 临时数组, 深层 async 链爆 8MB 默认线程栈 → SIGABRT (list_ops_tests 复现). 已修复: 大缓冲全部堆分配 (`vec![0u8; CHUNK_SIZE]` / `page_pool::alloc_zeroed`), 默认栈即可, 无需 RUST_MIN_STACK
 - **❗跑测试必加 `TMPDIR=$PWD/target/nxtmp`**: 沙箱 /tmp 只读不稳定, e2e 写临时库到 /tmp 会导致并发下引擎初始化失败/页损坏→hang (非 io_uring/非代码 bug)
 
