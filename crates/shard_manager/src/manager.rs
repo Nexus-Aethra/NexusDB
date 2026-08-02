@@ -1625,6 +1625,18 @@ fn exec_task_op(
                     .collect(),
             )
         }
+        // ⭐ M3-5 (CBO): 索引列 (min, max) 有序字节 (未统计 = (None, None))
+        crate::request::BatchOp::EstimateRanges { ref db, ref table, ref iids } => {
+            crate::request::BatchResult::RangeBounds(
+                iids.iter()
+                    .map(|iid| {
+                        e.estimate_range(db, table, *iid)
+                            .map(|(lo, hi)| (Some(lo), Some(hi)))
+                            .unwrap_or((None, None))
+                    })
+                    .collect(),
+            )
+        }
         // ⭐ Phase H: Hash ops (单 key 单 shard, 无需聚合)
         crate::request::BatchOp::HSet { ref db, ref table, ref key, ref pairs } => {
             match block_on_io(e.hash_set(db, table, key, pairs)) {
@@ -2697,6 +2709,18 @@ fn shard_thread_main(
                                     BatchResult::DistinctCounts(
                                         iids.iter()
                                             .map(|iid| e.estimate_distinct(&db, &table, *iid).unwrap_or(0))
+                                            .collect(),
+                                    )
+                                }
+                                // ⭐ M3-5: min/max 估计 (只读)
+                                BatchOp::EstimateRanges { db, table, iids } => {
+                                    BatchResult::RangeBounds(
+                                        iids.iter()
+                                            .map(|iid| {
+                                                e.estimate_range(&db, &table, *iid)
+                                                    .map(|(lo, hi)| (Some(lo), Some(hi)))
+                                                    .unwrap_or((None, None))
+                                            })
                                             .collect(),
                                     )
                                 }

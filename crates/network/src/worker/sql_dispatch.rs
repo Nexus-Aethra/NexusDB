@@ -444,6 +444,7 @@ pub(crate) fn sql_dispatch_stmt(
                 est_phase: 0,
                 est_rows: [0, 0],
                 join_distinct: Vec::new(),
+                join_ranges: Vec::new(),
             };
             conn.sql_join.insert(seq, ctx);
             sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
@@ -674,6 +675,10 @@ pub(crate) fn sql_join_kickoff(
                                 std::collections::HashMap::new(),
                                 std::collections::HashMap::new(),
                             ];
+                            c.join_ranges = vec![
+                                std::collections::HashMap::new(),
+                                std::collections::HashMap::new(),
+                            ];
                             c.remaining = num_shards;
                             c.gather_order = vec![0, 1]; // swapped 时改为 [1, 0]
                             (c.db.clone(), c.tables[0].table.clone())
@@ -777,6 +782,40 @@ pub(crate) fn sql_join_broadcast(
 /// - 息含单个 OnPred::Eq (多列组合键 v1 跳过)
 /// - Eq 一侧属 idx 表且该列有普通二级索引, 另一侧属前序表 ti<idx
 /// - 前序键集合去重后 <= JOIN_KEYSET_MAX (超阈退回全表扫)
+/// ⭐ M3-5: 单边范围谓词的扫描占比估计 (0..1, 越小越窄越好; 无 min/max 或非数值 → 1.0).
+/// Gt/Ge: (max - v)/(max - min); Lt/Le: (v - min)/(max - min).
+fn range_ratio(
+    ctx: &SqlJoinCtx,
+    idx: usize,
+    iid: u32,
+    v: &ColValue,
+    ty: ColType,
+    is_gt: bool,
+) -> f64 {
+    let Some((lo_b, hi_b)) = ctx.join_ranges.get(idx).and_then(|m| m.get(&iid)) else {
+        return 1.0;
+    };
+    let (Some(lo), Some(hi)) = (col_from_ordered_bytes(ty, lo_b), col_from_ordered_bytes(ty, hi_b))
+    else {
+        return 1.0;
+    };
+    let num = |c: &ColValue| -> Option<f64> {
+        match c {
+            ColValue::I64(n) => Some(*n as f64),
+            ColValue::F64(n) => Some(*n),
+            _ => None,
+        }
+    };
+    let (Some(l), Some(h), Some(x)) = (num(&lo), num(&hi), num(v)) else {
+        return 1.0;
+    };
+    if h <= l {
+        return 1.0;
+    }
+    let r = if is_gt { (h - x) / (h - l) } else { (x - l) / (h - l) };
+    r.clamp(0.0, 1.0)
+}
+
 /// ⭐ M3-4: 表 idx 的候选 Eq 索引列 (conds 中该表等值谓词列 → (列号, iid), 去重).
 fn join_candidate_eq_iids(ctx: &SqlJoinCtx, idx: usize) -> Vec<(u16, u32)> {
     let Some(schema) = ctx.tables[idx].schema.as_ref() else { return Vec::new() };
@@ -891,7 +930,8 @@ pub(crate) fn sql_join_index_hint(
     let iid_of = |col: u16| schema.indexes.iter().find(|i| i.col == col).map(|i| i.iid);
     // ⭐ M3-4: 多个 Eq 候选 → 选 distinct 最高 (选择性最大; 无 distinct 数据同分 → 取首个)
     let mut best_eq: Option<(u64, shard_manager::IndexHint)> = None;
-    let mut best: Option<shard_manager::IndexHint> = None;
+    // ⭐ M3-5: 多个范围候选 → 选 min/max 区间占比最小 (最窄)
+    let mut best_range: Option<(f64, shard_manager::IndexHint)> = None;
     for cond in ctx.conds.as_conjuncts().unwrap_or_default() {
         let Ok((ti, cidx)) = sql_join_resolve(ctx, &cond.col) else { continue };
         if ti != idx {
@@ -915,16 +955,23 @@ pub(crate) fn sql_join_index_hint(
                     ));
                 }
             }
-            CmpOp::Gt | CmpOp::Ge if best.is_none() => {
-                best = Some(shard_manager::IndexHint { iid, lo: Some(v), hi: None });
+            // ⭐ M3-5: 范围候选用列 min/max 区间占比选最窄 (越小扫描行越少; 无统计 → 1.0)
+            CmpOp::Gt | CmpOp::Ge => {
+                let ratio = range_ratio(ctx, idx, iid, &v, ty, true);
+                if best_range.is_none() || ratio < best_range.as_ref().unwrap().0 {
+                    best_range = Some((ratio, shard_manager::IndexHint { iid, lo: Some(v), hi: None }));
+                }
             }
-            CmpOp::Lt | CmpOp::Le if best.is_none() => {
-                best = Some(shard_manager::IndexHint { iid, lo: None, hi: Some(v) });
+            CmpOp::Lt | CmpOp::Le => {
+                let ratio = range_ratio(ctx, idx, iid, &v, ty, false);
+                if best_range.is_none() || ratio < best_range.as_ref().unwrap().0 {
+                    best_range = Some((ratio, shard_manager::IndexHint { iid, lo: None, hi: Some(v) }));
+                }
             }
             _ => {}
         }
     }
-    best_eq.map(|(_, h)| h).or(best)
+    best_eq.map(|(_, h)| h).or(best_range.map(|(_, h)| h))
 }
 
 /// ⭐ F67 (JOIN): handle_resp 认领 — 按 phase 推进. 返回 true = 已处理此 seq.
@@ -992,75 +1039,84 @@ pub(crate) fn sql_join_drive(
             }
             true
         }
-        // ⭐ M3-2/M3-4: 收集行数 (est_phase 0/1) → 候选索引列 distinct (est_phase 2/3)
+        // ⭐ M3-2/M3-4/M3-5: 收集统计 — est_phase 0/1 行数, 2/3 distinct, 4/5 ranges.
+        // 阶段序列固定推进 (跳过候选空阶段), 全齐 → 决策驱动表.
         JoinPhase::EstimateRows => {
-            let c = conn.sql_join.get_mut(&seq).unwrap();
-            if c.est_phase < 2 {
-                // 阶段 1: 行数收集 (0=tables[0], 1=tables[1])
-                if let BatchResult::RowCount(n) = result {
-                    c.est_rows[c.est_phase as usize] += n;
+            {
+                let c = conn.sql_join.get_mut(&seq).unwrap();
+                // 收当前阶段结果
+                match c.est_phase {
+                    0 | 1 => {
+                        if let BatchResult::RowCount(n) = result {
+                            c.est_rows[c.est_phase as usize] += n;
+                        }
+                    }
+                    2 | 3 => {
+                        if let BatchResult::DistinctCounts(ds) = result {
+                            let ti = (c.est_phase - 2) as usize;
+                            let cand = join_candidate_eq_iids(&c, ti);
+                            if let Some(map) = c.join_distinct.get_mut(ti) {
+                                for ((_, iid), d) in cand.iter().zip(ds.iter()) {
+                                    map.insert(*iid, *d);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if let BatchResult::RangeBounds(rbs) = result {
+                            let ti = (c.est_phase - 4) as usize;
+                            let cand = join_candidate_eq_iids(&c, ti);
+                            if let Some(map) = c.join_ranges.get_mut(ti) {
+                                for ((_, iid), (lo, hi)) in cand.iter().zip(rbs.iter()) {
+                                    if let (Some(lo), Some(hi)) = (lo, hi) {
+                                        map.insert(*iid, (lo.clone(), hi.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 c.remaining = c.remaining.saturating_sub(1);
                 if c.remaining > 0 {
                     return true;
                 }
-                if c.est_phase == 0 {
-                    // 开始收 tables[1] 行数
-                    c.est_phase = 1;
+                // 本阶段齐 → 推进 (跳过候选空的阶段)
+                let mut phase = c.est_phase + 1;
+                loop {
+                    if phase >= 6 {
+                        break; // 全部收集齐 → 出块决策
+                    }
+                    let ti = match phase {
+                        1 | 3 | 5 => 1,
+                        _ => 0,
+                    };
+                    let cand = join_candidate_eq_iids(&c, ti);
+                    if cand.is_empty() {
+                        phase += 1;
+                        continue;
+                    }
+                    let iids: Vec<u32> = cand.iter().map(|&(_, iid)| iid).collect();
+                    let table = c.tables[ti].table.clone();
+                    let db = c.db.clone();
+                    c.est_phase = phase;
                     c.remaining = num_shards;
-                    let (db, table) = (c.db.clone(), c.tables[1].table.clone());
                     for sid in 0..num_shards {
-                        let op = BatchOp::EstimateRowCount { db: db.clone(), table: table.clone() };
+                        let op = match phase {
+                            2 | 3 => BatchOp::EstimateDistinct {
+                                db: db.clone(),
+                                table: table.clone(),
+                                iids: iids.clone(),
+                            },
+                            _ => BatchOp::EstimateRanges {
+                                db: db.clone(),
+                                table: table.clone(),
+                                iids: iids.clone(),
+                            },
+                        };
                         push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
                     }
                     return true;
                 }
-                // 行数齐 → 阶段 2: tables[0] 候选 Eq 索引列 distinct
-                let (db, cand) = (c.db.clone(), join_candidate_eq_iids(&c, 0));
-                if cand.is_empty() {
-                    sql_join_est_decide(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
-                    return true;
-                }
-                c.est_phase = 2;
-                c.remaining = num_shards;
-                let iids: Vec<u32> = cand.iter().map(|&(_, iid)| iid).collect();
-                let table = c.tables[0].table.clone();
-                for sid in 0..num_shards {
-                    let op = BatchOp::EstimateDistinct { db: db.clone(), table: table.clone(), iids: iids.clone() };
-                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
-                }
-                return true;
-            }
-            // 阶段 2: distinct 收集 (est_phase 2/3)
-            if let BatchResult::DistinctCounts(ds) = result {
-                let ti = (c.est_phase - 2) as usize;
-                let cand = join_candidate_eq_iids(&c, ti);
-                if let Some(map) = c.join_distinct.get_mut(ti) {
-                    for ((_, iid), d) in cand.iter().zip(ds.iter()) {
-                        map.insert(*iid, *d);
-                    }
-                }
-            }
-            c.remaining = c.remaining.saturating_sub(1);
-            if c.remaining > 0 {
-                return true;
-            }
-            if c.est_phase == 2 {
-                // 开始收 tables[1] distinct
-                c.est_phase = 3;
-                c.remaining = num_shards;
-                let (db, cand) = (c.db.clone(), join_candidate_eq_iids(&c, 1));
-                if cand.is_empty() {
-                    sql_join_est_decide(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
-                    return true;
-                }
-                let iids: Vec<u32> = cand.iter().map(|&(_, iid)| iid).collect();
-                let table = c.tables[1].table.clone();
-                for sid in 0..num_shards {
-                    let op = BatchOp::EstimateDistinct { db: db.clone(), table: table.clone(), iids: iids.clone() };
-                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
-                }
-                return true;
             }
             // 全部收集齐 → 决策驱动表 → Gather
             sql_join_est_decide(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);

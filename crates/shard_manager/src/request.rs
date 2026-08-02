@@ -194,6 +194,9 @@ pub enum BatchOp {
     /// ⭐ M3-4 (CBO): 索引列近似 distinct 基数 (worker 已算好 iid 列表; 免 shard 查 schema).
     /// 返回 DistinctCounts (与 iids 同序).
     EstimateDistinct { db: std::sync::Arc<str>, table: std::sync::Arc<str>, iids: Vec<u32> },
+    /// ⭐ M3-5 (CBO): 索引列 (min, max) 有序字节 (范围选择度; 未统计 = (None, None)).
+    /// 返回 RangeBounds (与 iids 同序).
+    EstimateRanges { db: std::sync::Arc<str>, table: std::sync::Arc<str>, iids: Vec<u32> },
     // ---- ⭐ Phase H: Hash (全部单 key 路由, 一个 hash 的所有 field 同 shard) ----
     /// HSET 多 field: 返回新增 field 数 (Integer). value 带 tag.
     HSet { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, pairs: Vec<(Vec<u8>, Vec<u8>)> },
@@ -451,6 +454,8 @@ impl BatchOp {
             EstimateRowCount { db, table } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ M3-4: distinct 估计广播 op, 不走路由
             EstimateDistinct { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
+            // ⭐ M3-5: min/max 估计广播 op, 不走路由
+            EstimateRanges { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ 事务批: 取第一个 op 的 locator (组内同 shard, 仅兼容用;
             // ensure_table 在 shard 端逐 op 处理)
             TxnApply { ops, .. } => ops.first().map(|o| o.locator()).unwrap_or(("", "", &[])),
@@ -545,6 +550,8 @@ impl BatchOp {
             EstimateRowCount { .. } => None,
             // ⭐ M3-4: distinct 估计无 key
             EstimateDistinct { .. } => None,
+            // ⭐ M3-5: min/max 估计无 key
+            EstimateRanges { .. } => None,
             // ⭐ X2: schema op 无 key
             SetSchemaOp { .. } | GetSchemaOp { .. } => None,
             TxnApply { .. } => None,
@@ -614,6 +621,8 @@ pub enum BatchResult {
     RowCount(u64),
     /// ⭐ M3-4 (CBO): 索引列 distinct 计数 (EstimateDistinct 响应, 与 cols 同序).
     DistinctCounts(Vec<u64>),
+    /// ⭐ M3-5 (CBO): 索引列 (min, max) 有序字节 (EstimateRanges 响应, 与 iids 同序).
+    RangeBounds(Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>),
     Error(String),
 }
 

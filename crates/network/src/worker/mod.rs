@@ -379,6 +379,8 @@ struct SqlJoinCtx {
     /// ⭐ M3-4: 每表索引列 distinct 基数 (ti → iid → distinct; 仅双表 Inner
     /// EstimateRows 路径收集; 无数据 = 空 map, index_hint 退化为取第一个 Eq).
     join_distinct: Vec<std::collections::HashMap<u32, u64>>,
+    /// ⭐ M3-5: 每表索引列 (min, max) 有序字节 (ti → iid → (min,max); 范围候选占比).
+    join_ranges: Vec<std::collections::HashMap<u32, (Vec<u8>, Vec<u8>)>>,
 }
 
 /// ⭐ F67 (JOIN): 单侧 gather 行数上限 (止 worker OOM; 超限报错).
@@ -3441,6 +3443,8 @@ fn handle_resp_shard_result(
         BatchResult::RowCount(_) => codec.encode_error("unexpected rowcount reply"),
         // ⭐ M3-4: distinct 估计只出现在 worker 内部 (JOIN 索引选择)
         BatchResult::DistinctCounts(_) => codec.encode_error("unexpected distinct reply"),
+        // ⭐ M3-5: min/max 估计只出现在 worker 内部 (JOIN 范围选择)
+        BatchResult::RangeBounds(_) => codec.encode_error("unexpected range reply"),
         // ⭐ F65: 占坑结果只出现在 SQL 门面 (sql_unique_drive 已拦截)
         BatchResult::ReserveOk | BatchResult::ReserveConflict { .. } => {
             codec.encode_error("unexpected unique reply")
@@ -3628,6 +3632,7 @@ fn batch_result_to_response(result: &BatchResult) -> Response {
         BatchResult::ProjRows(_) => Response::PutOk, // JOIN 不走 Binary
         BatchResult::RowCount(_) => Response::PutOk, // M3-2 行数估计不走 Binary
         BatchResult::DistinctCounts(_) => Response::PutOk, // M3-4 distinct 不走 Binary
+        BatchResult::RangeBounds(_) => Response::PutOk, // M3-5 min/max 不走 Binary
         BatchResult::GetValue(None) => Response::Get(None),
         BatchResult::GetValue(Some(stored)) => {
             let (_tag, payload) = decode_value(stored);
@@ -4237,6 +4242,7 @@ fn finish_derived_join(
         est_phase: 0,
         est_rows: [0, 0],
         join_distinct: Vec::new(),
+        join_ranges: Vec::new(),
     };
     conn.sql_join.insert(seq, ctx);
     sql_join_kickoff(conn, conn_id, seq, worker_id, shard_inboxes, num_shards);
