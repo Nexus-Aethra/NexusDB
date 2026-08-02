@@ -38,6 +38,13 @@ pub(crate) fn sql_run_agg_select(
                     out_ty: schema.columns[i as usize].ty,
                 });
             }
+            sql::SelectItem::Expr { .. } => {
+                return fail(
+                    conn,
+                    "expression projections are not supported in aggregate queries (v1)"
+                        .to_string(),
+                );
+            }
             sql::SelectItem::Agg { func, arg, distinct, alias } => {
                 // ⭐ F78: 绑定表达式 (裸列退化) → (BoundExpr, 推导类型); COUNT(*) arg=None
                 let bound: Option<(BoundExpr, ColType)> = match arg {
@@ -153,6 +160,7 @@ pub(crate) fn sql_run_agg_select(
             count: false,
             agg_spec: Some(spec),
             out_names: Vec::new(),
+            expr_proj: Vec::new(),
             down_proj: Vec::new(),
             plain_rows: Vec::new(),
         },
@@ -205,6 +213,56 @@ pub(crate) enum BoundExpr {
     Col(u16),
     Lit(ColValue),
     Bin { op: sql::ArithOp, l: Box<BoundExpr>, r: Box<BoundExpr> },
+    /// ⭐ compat: JSONB 取字段 (-> 保留文本 / ->> 输出文本; v1 均 Str 承载).
+    JsonGet { base: Box<BoundExpr>, key: Box<BoundExpr>, as_text: bool },
+}
+
+/// ⭐ compat: JSONB 取字段求值 — base 为 JSON 文本 (Bytes), key 为字段名;
+/// 取到 → ->> 输出字符串 / -> 输出 JSON 原文 (均 Bytes); 无此键 → NULL.
+pub(crate) fn eval_json_get(base: &ColValue, key: &ColValue, as_text: bool) -> ColValue {
+    let ColValue::Bytes(raw) = base else {
+        return ColValue::Null;
+    };
+    let ColValue::Bytes(k) = key else {
+        return ColValue::Null;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) else {
+        return ColValue::Null;
+    };
+    let field = match v {
+        serde_json::Value::Object(map) => {
+            let Ok(ks) = std::str::from_utf8(k) else {
+                return ColValue::Null;
+            };
+            map.get(ks).cloned()
+        }
+        serde_json::Value::Array(arr) => {
+            // 数值键 → 数组下标
+            let Ok(ks) = std::str::from_utf8(k) else {
+                return ColValue::Null;
+            };
+            let Ok(idx) = ks.trim().parse::<usize>() else {
+                return ColValue::Null;
+            };
+            arr.get(idx).cloned()
+        }
+        _ => None,
+    };
+    match field {
+        Some(serde_json::Value::Null) | None => ColValue::Null,
+        Some(f) => {
+            if as_text {
+                // ->>: 字符串去引号, 其余 JSON 原文
+                match f {
+                    serde_json::Value::String(s) => ColValue::Bytes(s.into_bytes()),
+                    other => ColValue::Bytes(other.to_string().into_bytes()),
+                }
+            } else {
+                // ->: 保持 JSON 原文 (字符串带引号)
+                ColValue::Bytes(f.to_string().into_bytes())
+            }
+        }
+    }
 }
 
 /// ⭐ F78: 逐行求值 — 任一操作数 NULL/非数值 → NULL; Div 除零 → NULL;
@@ -213,6 +271,11 @@ pub(crate) fn eval_bound_expr(e: &BoundExpr, row: &[ColValue]) -> ColValue {
     match e {
         BoundExpr::Col(i) => row.get(*i as usize).cloned().unwrap_or(ColValue::Null),
         BoundExpr::Lit(v) => v.clone(),
+        BoundExpr::JsonGet { base, key, as_text } => {
+            let bv = eval_bound_expr(base, row);
+            let kv = eval_bound_expr(key, row);
+            eval_json_get(&bv, &kv, *as_text)
+        }
         BoundExpr::Bin { op, l, r } => {
             let lv = eval_bound_expr(l, row);
             let rv = eval_bound_expr(r, row);
@@ -284,6 +347,15 @@ pub(crate) fn bind_scalar_expr(
                 ColType::I64
             };
             Ok((BoundExpr::Bin { op: *op, l: Box::new(lb), r: Box::new(rb) }, out_ty))
+        }
+        sql::ScalarExpr::JsonGet { base, key, as_text } => {
+            let (bb, _) = bind_scalar_expr(schema, base)?;
+            let (kb, _) = bind_scalar_expr(schema, key)?;
+            // v1: 输出按 Str 承载 (-> 保留 JSON 原文 / ->> 文本)
+            Ok((
+                BoundExpr::JsonGet { base: Box::new(bb), key: Box::new(kb), as_text: *as_text },
+                ColType::Str,
+            ))
         }
     }
 }
@@ -726,25 +798,47 @@ pub(crate) fn materialize_select_agg(
         Some(l) => (start + l as usize).min(out_rows.len()),
         None => out_rows.len(),
     };
-    // 投影到输出列 (与 render_sql_rows 同义); ⭐ F76: out_names 有则用作列名 (AS 别名)
-    let cols: Vec<(String, ColType)> = agg
-        .proj
-        .iter()
-        .enumerate()
-        .map(|(k, &i)| {
-            let c = &agg.schema.columns[i as usize];
-            let name = agg
-                .out_names
-                .get(k)
-                .and_then(|o| o.clone())
-                .unwrap_or_else(|| c.name.clone());
-            (name, c.ty)
-        })
-        .collect();
-    let proj_rows: Vec<Vec<ColValue>> = out_rows[start..end]
-        .iter()
-        .map(|r| agg.proj.iter().map(|&i| r[i as usize].clone()).collect())
-        .collect();
+    // 投影到输出列 (与 render_sql_rows 同义); ⭐ F76: out_names 有则用作列名 (AS 别名).
+    // ⭐ compat: 含表达式投影 (JSONB 求值) → 逐行构建输出.
+    let (cols, proj_rows): (Vec<(String, ColType)>, Vec<Vec<ColValue>>) =
+        if agg.expr_proj.iter().any(|o| o.is_some()) {
+            let mut cols: Vec<(String, ColType)> = Vec::new();
+            let mut rows: Vec<Vec<ColValue>> = Vec::new();
+            for r in &out_rows[start..end] {
+                let (c, v) = project_output_row(
+                    &agg.schema,
+                    &agg.proj,
+                    &agg.expr_proj,
+                    &agg.out_names,
+                    r,
+                );
+                if cols.is_empty() {
+                    cols = c;
+                }
+                rows.push(v);
+            }
+            (cols, rows)
+        } else {
+            let cols: Vec<(String, ColType)> = agg
+                .proj
+                .iter()
+                .enumerate()
+                .map(|(k, &i)| {
+                    let c = &agg.schema.columns[i as usize];
+                    let name = agg
+                        .out_names
+                        .get(k)
+                        .and_then(|o| o.clone())
+                        .unwrap_or_else(|| c.name.clone());
+                    (name, c.ty)
+                })
+                .collect();
+            let proj_rows: Vec<Vec<ColValue>> = out_rows[start..end]
+                .iter()
+                .map(|r| agg.proj.iter().map(|&i| r[i as usize].clone()).collect())
+                .collect();
+            (cols, proj_rows)
+        };
     Ok((cols, proj_rows))
 }
 

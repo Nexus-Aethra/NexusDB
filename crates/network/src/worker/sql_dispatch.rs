@@ -254,6 +254,16 @@ pub(crate) fn sql_dispatch_stmt(
                 ),
             );
         }
+        // ⭐ compat: SELECT NOW() — 无 FROM 标量函数投影 (常量单行)
+        SqlStmt::ScalarSelect { items } => {
+            let bin = conn.mysql_binary.remove(&seq);
+            match scalar_fn_const_row(&items) {
+                Ok((cref, row)) => {
+                    conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cref, &[row]))
+                }
+                Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
+            }
+        }
         // ⭐ F66: `SELECT @@var` 系统变量 — 回合理值单行 (SQLAlchemy 初始化)
         SqlStmt::SystemVarStub { vars } => {
             let bin = conn.mysql_binary.remove(&seq);
@@ -2244,6 +2254,16 @@ pub(crate) fn strip_pred_qual(pred: &mut Pred<Cond>, table: &str) {
     }
 }
 
+/// ⭐ compat: 表达式投影 base 列号 (JSONB 表达式根列; v1: 递归取 JsonGet 底层
+/// 列引用; Lit 等无列场景回退列 0 — 渲染时求值仍可取到值).
+fn bound_base_col(e: &BoundExpr) -> u16 {
+    match e {
+        BoundExpr::Col(i) => *i,
+        BoundExpr::JsonGet { base, .. } => bound_base_col(base),
+        BoundExpr::Lit(_) | BoundExpr::Bin { .. } => 0,
+    }
+}
+
 /// ⭐ F76: 单表 Select/Delete/Update 内所有列引用剥表名限定符 (JOIN 走 QualCol 不经此).
 pub(crate) fn strip_qual_in_stmt(stmt: &mut SqlStmt) {
     match stmt {
@@ -2258,6 +2278,10 @@ pub(crate) fn strip_qual_in_stmt(stmt: &mut SqlStmt) {
                     }
                     sql::SelectItem::Agg { .. } => {}
                     sql::SelectItem::ScalarFn { .. } => {}
+                    // ⭐ compat: 表达式投影内部列引用剥表限定前缀
+                    sql::SelectItem::Expr { expr, .. } => {
+                        expr.for_each_col_mut(&mut |c| strip_col_qual(c, &t));
+                    }
                 }
             }
             strip_pred_qual(conds, &t);
@@ -2300,6 +2324,8 @@ pub(crate) fn sql_run_dml(
     let mut stmt = stmt;
     strip_qual_in_stmt(&mut stmt);
     match stmt {
+        // ⭐ compat: 无 FROM 标量函数投影在 sql_dispatch_stmt 已处理
+        SqlStmt::ScalarSelect { .. } => unreachable!("ScalarSelect 在 sql_dispatch_stmt 处理"),
         SqlStmt::Insert { table, cols, rows } => {
             // ⭐ S1: 多行 VALUES — 逐行 RowPut, DmlAgg 计数 (批内非原子, 文档记录)
             let mut ops: Vec<BatchOp> = Vec::with_capacity(rows.len());
@@ -2421,6 +2447,13 @@ pub(crate) fn sql_run_dml(
                             return;
                         };
                         if i == schema.pk_col {
+                            // ⭐ compat: SET pk = pk (RHS 同列引用) — 同值 no-op, 跳过
+                            // (PG 允许同值更新; 真实改 pk 值仍拒绝)
+                            if let SqlValue::ColRef(r) = v
+                                && r.eq_ignore_ascii_case(name)
+                            {
+                                continue;
+                            }
                             conn.resp_complete(
                                 seq,
                                 sql_err_bytes(conn.proto, "cannot UPDATE PRIMARY KEY column"),
@@ -2454,6 +2487,11 @@ pub(crate) fn sql_run_dml(
                             return;
                         }
                         out.push((i, cv));
+                    }
+                    // ⭐ compat: 全部 set 为 pk 同值 (SET pk = pk) → no-op, 直接回 OK
+                    if out.is_empty() {
+                        conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+                        return;
                     }
                     (table, conds, SqlDmlAction::Update(out))
                 }
@@ -2504,6 +2542,7 @@ pub(crate) fn sql_run_dml(
                             count: false,
                             agg_spec: None,
                             out_names: Vec::new(),
+                            expr_proj: Vec::new(),
                             down_proj: Vec::new(),
                             plain_rows: Vec::new(),
                         },
@@ -2548,6 +2587,7 @@ pub(crate) fn sql_run_dml(
                             count: false,
                             agg_spec: None,
                             out_names: Vec::new(),
+                            expr_proj: Vec::new(),
                             down_proj: Vec::new(),
                             plain_rows: Vec::new(),
                         },
@@ -2603,42 +2643,50 @@ pub(crate) fn sql_run_dml(
                 );
                 return;
             }
-            let cols: Vec<String> = items
-                .iter()
-                .filter_map(|i| match i {
-                    sql::SelectItem::Col { name, .. } => Some(name.clone()),
-                    sql::SelectItem::Agg { .. } => None, // 仅 COUNT(*) 特例可达
-                    sql::SelectItem::ScalarFn { .. } => None, // 由常量特判处理
-                })
-                .collect();
-            // ⭐ F76: 输出列名 (alias 优先) — 与 proj 同序; 空 items (SELECT *) → 全 None
-            let out_names: Vec<Option<String>> = items
-                .iter()
-                .filter_map(|i| match i {
-                    sql::SelectItem::Col { alias, .. } => Some(alias.clone()),
-                    sql::SelectItem::Agg { .. } => None,
-                    sql::SelectItem::ScalarFn { name } => Some(Some(name.clone())),
-                })
-                .collect();
-            // ⭐ O1: 投影列名 → 列号 (空/COUNT = 全列)
-            let proj: Vec<u16> = if cols.is_empty() {
-                (0..schema.columns.len() as u16).collect()
-            } else {
-                let mut p = Vec::with_capacity(cols.len());
-                for c in &cols {
-                    match schema.col_by_name(c) {
-                        Some(i) => p.push(i),
-                        None => {
-                            conn.resp_complete(
-                                seq,
-                                sql_err_bytes(conn.proto, &format!("unknown column '{c}'")),
-                            );
-                            return;
+            // ⭐ O1 + compat: 投影项解析 — 同步构建 (proj 列号, 输出名, 表达式投影).
+            // Col → 直出列; Expr (JSONB j->'a') → base 列号进 proj + 绑定表达式
+            // (渲染时逐行求值); 空 items (SELECT *) → 全列. 列序 = items 序.
+            let mut proj: Vec<u16> = Vec::new();
+            let mut out_names: Vec<Option<String>> = Vec::new();
+            let mut expr_proj: Vec<Option<BoundExpr>> = Vec::new();
+            let mut proj_err: Option<String> = None;
+            for it in &items {
+                match it {
+                    sql::SelectItem::Col { name, alias } => {
+                        match schema.col_by_name(name) {
+                            Some(i) => proj.push(i),
+                            None => {
+                                proj_err = Some(format!("unknown column '{name}'"));
+                                break;
+                            }
                         }
+                        out_names.push(alias.clone());
+                        expr_proj.push(None);
                     }
+                    sql::SelectItem::Expr { expr, alias } => {
+                        let bound = match bind_scalar_expr(&schema, expr) {
+                            Ok((b, _)) => b,
+                            Err(e) => {
+                                proj_err = Some(e);
+                                break;
+                            }
+                        };
+                        proj.push(bound_base_col(&bound));
+                        out_names.push(alias.clone());
+                        expr_proj.push(Some(bound));
+                    }
+                    // ⭐ G1: COUNT(*) 特例 (items 仅 Agg → proj 空走全列);
+                    // ScalarFn 纯常量走 ScalarSelect, 与列混合时忽略 (v1 边界)
+                    _ => {}
                 }
-                p
-            };
+            }
+            if let Some(msg) = proj_err {
+                conn.resp_complete(seq, sql_err_bytes(conn.proto, &msg));
+                return;
+            }
+            if proj.is_empty() {
+                proj = (0..schema.columns.len() as u16).collect();
+            }
             // ⭐ S2: ORDER BY 列名 → 列号
             let mut order_cols: Vec<(u16, bool)> = Vec::with_capacity(order.len());
             for (name, desc) in &order {
@@ -2657,6 +2705,17 @@ pub(crate) fn sql_run_dml(
             match sql_plan_select(&schema, &conds) {
             Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
             Ok(SqlPlan::PkGet { pk }) => {
+                // ⭐ compat: 表达式投影 (JSONB) 不走点查单行路径 (v1 边界)
+                if expr_proj.iter().any(|o| o.is_some()) {
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(
+                            conn.proto,
+                            "expression projections with point lookup are not supported (v1)",
+                        ),
+                    );
+                    return;
+                }
                 // ⭐ 事务 v1 (F61): RYOW — pk 点查命中本事务 write_set 时
                 // 直接回缓冲内容 (INSERT 见新行 / DELETE 见空; UPDATE 直通
                 // 读已提交版本 — v1 文档化)
@@ -2749,6 +2808,7 @@ pub(crate) fn sql_run_dml(
                         count,
                         agg_spec: None,
                         out_names,
+                        expr_proj,
                         down_proj: Vec::new(),
                         plain_rows: Vec::new(),
                     },
@@ -2841,6 +2901,7 @@ pub(crate) fn sql_run_dml(
                         count,
                         agg_spec: None,
                         out_names,
+                        expr_proj,
                         down_proj: if downable { row_cols.clone() } else { Vec::new() },
                         plain_rows: Vec::new(),
                     },
@@ -2961,6 +3022,7 @@ pub(crate) fn sql_run_dml(
                         count,
                         agg_spec: None,
                         out_names,
+                        expr_proj,
                         down_proj: Vec::new(),
                         plain_rows: Vec::new(),
                     },

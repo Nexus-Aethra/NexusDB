@@ -3,6 +3,74 @@
 
 use super::*;
 
+/// ⭐ compat: 表达式投影输出行 — 按 (proj 列号, expr_proj 表达式) 构建单行
+/// 输出 (列定义 + 值). Some(expr) → 求值 (JSONB 取字段, 输出 Str);
+/// None → 直接输出 proj 列. 供 materialize_select_agg / RYOW 单行共用.
+#[allow(clippy::type_complexity)]
+pub(crate) fn project_output_row(
+    schema: &TableSchema,
+    proj: &[u16],
+    expr_proj: &[Option<BoundExpr>],
+    out_names: &[Option<String>],
+    row: &[ColValue],
+) -> (Vec<(String, ColType)>, Vec<ColValue>) {
+    let mut cols: Vec<(String, ColType)> = Vec::with_capacity(proj.len());
+    let mut vals: Vec<ColValue> = Vec::with_capacity(proj.len());
+    for (k, &i) in proj.iter().enumerate() {
+        let c = &schema.columns[i as usize];
+        match expr_proj.get(k).and_then(|o| o.as_ref()) {
+            Some(e) => {
+                cols.push((
+                    out_names
+                        .get(k)
+                        .and_then(|o| o.clone())
+                        .unwrap_or_else(|| c.name.clone()),
+                    ColType::Str,
+                ));
+                vals.push(eval_bound_expr(e, row));
+            }
+            None => {
+                cols.push((
+                    out_names
+                        .get(k)
+                        .and_then(|o| o.clone())
+                        .unwrap_or_else(|| c.name.clone()),
+                    c.ty,
+                ));
+                vals.push(row.get(i as usize).cloned().unwrap_or(ColValue::Null));
+            }
+        }
+    }
+    (cols, vals)
+}
+
+/// ⭐ compat: 无 FROM 标量函数投影常量单行 (SELECT NOW() 等).
+/// 返回 (列定义, 常量行); 未知函数报错.
+pub(crate) fn scalar_fn_const_row(
+    items: &[sql::SelectItem],
+) -> Result<(Vec<(&'static str, ColType)>, Vec<ColValue>), String> {
+    let mut cref: Vec<(&str, ColType)> = Vec::with_capacity(items.len());
+    let mut row: Vec<ColValue> = Vec::with_capacity(items.len());
+    for it in items {
+        if let sql::SelectItem::ScalarFn { name } = it {
+            match name.to_ascii_uppercase().as_str() {
+                "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" => {
+                    cref.push(("now", ColType::Timestamp));
+                    // Timestamp 以 i64 微秒承载
+                    row.push(ColValue::I64(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_micros() as i64)
+                            .unwrap_or(0),
+                    ));
+                }
+                other => return Err(format!("unknown scalar function '{other}'")),
+            }
+        }
+    }
+    Ok((cref, row))
+}
+
 /// INSERT 值列表 → 全列 ColValue (列清单缺省填 NULL; 类型转换).
 pub(crate) fn sql_build_row(
     schema: &TableSchema,

@@ -39,6 +39,9 @@ enum Tok {
     RBracket,
     /// ⭐ compat: `::` 类型转换后缀 (`'{}'::jsonb`).
     Colon,
+    /// ⭐ compat: JSONB 操作符 `->` (取字段) / `->>` (取文本).
+    Arrow,
+    ArrowText,
 }
 
 fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
@@ -147,6 +150,31 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             b'$' => {
+                // ⭐ compat: dollar-quote ($$...$$ / $tag$...$tag$) — CREATE FUNCTION
+                // 体等 PG 专有 DDL. 与 $n 参数区分: dollar-quote 的 tag 后紧跟 `$`
+                // ($$ 或 字母/数字/下划线+$), 而 $n 的数字后不跟 `$`.
+                let mut k = i + 1;
+                while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
+                    k += 1;
+                }
+                if k < b.len() && b[k] == b'$' {
+                    let tag = &b[i..=k];
+                    let mut scan = k + 1;
+                    let mut end = None;
+                    while scan < b.len() {
+                        if b[scan..].starts_with(tag) {
+                            end = Some(scan);
+                            break;
+                        }
+                        scan += 1;
+                    }
+                    let Some(end) = end else {
+                        return Err("unterminated dollar-quoted string".into());
+                    };
+                    toks.push(Tok::Str(b[i..end + tag.len()].to_vec()));
+                    i = end + tag.len();
+                    continue;
+                }
                 // ⭐ P1: $n (1-based)
                 let start = i + 1;
                 let mut j = start;
@@ -197,6 +225,17 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             b'-' => {
+                // ⭐ compat: JSONB 操作符 -> / ->> (优先于减号)
+                if b.get(i + 1) == Some(&b'>') {
+                    if b.get(i + 2) == Some(&b'>') {
+                        toks.push(Tok::ArrowText);
+                        i += 3;
+                    } else {
+                        toks.push(Tok::Arrow);
+                        i += 2;
+                    }
+                    continue;
+                }
                 // ⭐ F78: 二元减号 vs 负数字面量 — 前一 token 是值结尾 (ident/num/str/`)`)
                 // 则为二元减; 否则为负数前缀 (保留旧行为: WHERE x = -1).
                 let prev_is_value = matches!(
@@ -2072,6 +2111,9 @@ fn parse_join_from(
             SelectItem::ScalarFn { .. } => {
                 Err("scalar functions are not supported in JOIN queries".to_string())
             }
+            SelectItem::Expr { .. } => {
+                Err("expression projections are not supported in JOIN queries (v1)".to_string())
+            }
         })
         .collect::<Result<_, _>>()?;
     let conds = conds_raw.map(&|c: &Cond| JoinCond {
@@ -2215,6 +2257,25 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 p.expect(&Tok::RParen, ")")?;
                 let alias = parse_col_alias(p);
                 items.push(SelectItem::Agg { func, arg, distinct, alias });
+            } else if matches!(p.peek(), Some(Tok::Arrow | Tok::ArrowText)) {
+                // ⭐ compat: JSONB 操作符 j->'a' / j->>'a' (v1: 列 + 字面量键, 可链式)
+                let mut expr = ScalarExpr::Col(name);
+                loop {
+                    let as_text = match p.peek() {
+                        Some(Tok::Arrow) => false,
+                        Some(Tok::ArrowText) => true,
+                        _ => break,
+                    };
+                    p.next()?;
+                    let key = p.value()?;
+                    expr = ScalarExpr::JsonGet {
+                        base: Box::new(expr),
+                        key: Box::new(ScalarExpr::Lit(key)),
+                        as_text,
+                    };
+                }
+                let alias = parse_col_alias(p);
+                items.push(SelectItem::Expr { expr, alias });
             } else {
                 let alias = parse_col_alias(p);
                 items.push(SelectItem::Col { name, alias });
@@ -2224,6 +2285,13 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             } else {
                 break;
             }
+        }
+    }
+    if !matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FROM")) {
+        // ⭐ compat: 无 FROM 的标量函数投影 (SELECT NOW()/CURRENT_TIMESTAMP) — 常量单行
+        if items.iter().all(|i| matches!(i, SelectItem::ScalarFn { .. })) && !items.is_empty() {
+            p.done()?;
+            return Ok(SqlStmt::ScalarSelect { items });
         }
     }
     p.kw("FROM")?;
@@ -2253,6 +2321,7 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 SelectItem::Col { name, .. } => Some(name.clone()),
                 SelectItem::Agg { .. } => None,
                 SelectItem::ScalarFn { .. } => None,
+                SelectItem::Expr { .. } => None,
             })
             .collect();
         return Ok(SqlStmt::SystemQuery {
@@ -2305,6 +2374,7 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 SelectItem::Col { name, .. } => Some(name.clone()),
                 SelectItem::Agg { .. } => None,
                 SelectItem::ScalarFn { .. } => None,
+                SelectItem::Expr { .. } => None,
             })
             .collect();
     }

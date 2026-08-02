@@ -99,6 +99,46 @@ mod tests {
     }
 
     #[test]
+    fn compat_scalar_select_and_dollar_quote() {
+        // 无 FROM 标量函数投影
+        let s = parse(b"SELECT NOW()").unwrap();
+        assert!(matches!(s, SqlStmt::ScalarSelect { .. }), "{s:?}");
+        // dollar-quote 函数体 (CREATE OR REPLACE FUNCTION)
+        let s = parse(
+            b"CREATE OR REPLACE FUNCTION f() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+        assert!(matches!(s, SqlStmt::DdlStub), "{s:?}");
+        // $n 参数占位符不受 dollar-quote 影响 (prepared 路径)
+        let (s, n) = parse_prepared(b"SELECT id FROM t WHERE id = $1").unwrap();
+        assert!(matches!(s, SqlStmt::Select { .. }) && n == 1, "{s:?}");
+    }
+
+    #[test]
+    fn compat_jsonb_projection() {
+        // SELECT j->'a' / j->>'a' 投影表达式
+        let s = parse(b"SELECT j->'a' FROM t").unwrap();
+        let SqlStmt::Select { items, .. } = s else { panic!("expected Select") };
+        assert!(matches!(
+            &items[0],
+            SelectItem::Expr { expr: ScalarExpr::JsonGet { as_text: false, .. }, .. }
+        ));
+        let s = parse(b"SELECT j->>'a' FROM t").unwrap();
+        let SqlStmt::Select { items, .. } = s else { panic!("expected Select") };
+        assert!(matches!(
+            &items[0],
+            SelectItem::Expr { expr: ScalarExpr::JsonGet { as_text: true, .. }, .. }
+        ));
+        // 链式 j->'a'->>'b'
+        let s = parse(b"SELECT j->'a'->>'b' FROM t").unwrap();
+        let SqlStmt::Select { items, .. } = s else { panic!("expected Select") };
+        assert!(matches!(
+            &items[0],
+            SelectItem::Expr { expr: ScalarExpr::JsonGet { as_text: true, .. }, .. }
+        ));
+    }
+
+    #[test]
     fn compat_split_sql_statements() {
         let parts = split_sql_statements(
             "CREATE TABLE t (a INT); SELECT ';' AS x; -- 注释; 分号\nSELECT 2;",

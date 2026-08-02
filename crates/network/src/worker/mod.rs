@@ -43,15 +43,18 @@ mod sql_agg;
 mod sql_dispatch;
 /// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
 mod sql_eval;
-pub(crate) use sql_agg::{materialize_select_agg, render_select_agg, sql_run_agg_select, AggSpec, cmp_colvalue};
+pub(crate) use sql_agg::{
+    bind_scalar_expr, cmp_colvalue, eval_bound_expr, materialize_select_agg, render_select_agg,
+    sql_run_agg_select, AggSpec, BoundExpr,
+};
 pub(crate) use sql_dispatch::{
     sql_dispatch_stmt, sql_join_drive, sql_join_kickoff, sql_plan_select, sql_run_dml,
     sql_unique_drive, sysq_render_catalog, SysQuerySpec,
 };
 pub(crate) use sql_eval::{
-    col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq, render_sql_count,
-    render_sql_rows, sql_build_row, sql_cmp, sql_dml_op, sql_err_bytes, sql_ok_bytes,
-    sql_order_cmp, sql_pk_bytes, sql_rows_bytes, sql_to_col,
+    col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq, project_output_row,
+    render_sql_count, render_sql_rows, scalar_fn_const_row, sql_build_row, sql_cmp, sql_dml_op,
+    sql_err_bytes, sql_ok_bytes, sql_order_cmp, sql_pk_bytes, sql_rows_bytes, sql_to_col,
 };
 /// ⭐ 拆分 (2026-08): SQL 值编码/解码工具 (日期/时间/UUID/Decimal).
 mod sql_encode;
@@ -317,6 +320,9 @@ struct SqlSelectAgg {
     count: bool,
     /// ⭐ F76: 投影输出列名 (与 proj 同序; None = 用 schema 列名, 空 vec = 全 None).
     out_names: Vec<Option<String>>,
+    /// ⭐ compat: 表达式投影 — 与 proj 同长; Some(bound) = 该输出列为表达式求值
+    /// (JSONB 取字段; base 列号已含于 proj), None = 直接输出 proj 列.
+    expr_proj: Vec<Option<BoundExpr>>,
     /// ⭐ P0-2: 投影下推 — 非空 = shard 只回这些列 (行内列序 = 下标).
     /// 仅简单 SELECT (无 ORDER/聚合/COUNT/DML/覆盖索引) 的 FullScan 启用.
     down_proj: Vec<u16>,
@@ -4336,27 +4342,10 @@ fn derived_render(
     }
     // ⭐ compat: 标量函数投影 (SELECT NOW()/version()) — 常量单行
     if items.iter().all(|i| matches!(i, sql::SelectItem::ScalarFn { .. })) && !items.is_empty() {
-        let mut cref: Vec<(&str, ColType)> = Vec::with_capacity(items.len());
-        let mut row: Vec<ColValue> = Vec::with_capacity(items.len());
-        for it in items {
-            if let sql::SelectItem::ScalarFn { name } = it {
-                match name.to_ascii_uppercase().as_str() {
-                    "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" => {
-                        cref.push(("now", ColType::Timestamp));
-                        // Timestamp 以 i64 微秒承载
-                        row.push(ColValue::I64(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_micros() as i64)
-                                .unwrap_or(0),
-                        ));
-                    }
-                    other => {
-                        return sql_err_bytes(proto, &format!("unknown scalar function '{other}'"))
-                    }
-                }
-            }
-        }
+        let (cref, row) = match scalar_fn_const_row(items) {
+            Ok(v) => v,
+            Err(e) => return sql_err_bytes(proto, &e),
+        };
         return sql_rows_bytes(proto, binary, &cref, &[row]);
     }
     // 投影: items 空 = 全列
@@ -4373,6 +4362,9 @@ fn derived_render(
             },
             sql::SelectItem::Agg { .. } => unreachable!("孤 COUNT(*) 已在上方特判"),
             sql::SelectItem::ScalarFn { .. } => unreachable!("标量函数已在上方常量特判"),
+            sql::SelectItem::Expr { .. } => {
+                return sql_err_bytes(proto, "expression projections in derived tables are not supported (v1)")
+            }
         }
     }
     let cref: Vec<(&str, ColType)> = idxs.iter().map(|&i| (cols[i].0.as_str(), cols[i].1)).collect();

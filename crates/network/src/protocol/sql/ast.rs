@@ -96,6 +96,8 @@ pub enum SelectItem {
     Agg { func: AggFn, arg: Option<ScalarExpr>, distinct: bool, alias: Option<String> },
     /// ⭐ compat: 标量函数投影 (NOW()/version()) — worker 渲染常量.
     ScalarFn { name: String },
+    /// ⭐ compat: 表达式投影 (JSONB 取字段 j->'a' / j->>'a', v1 仅列+常量键).
+    Expr { expr: ScalarExpr, alias: Option<String> },
 }
 
 /// ⭐ F78: 算术运算符.
@@ -118,12 +120,15 @@ impl ArithOp {
     }
 }
 
-/// ⭐ F78: 聚合内标量表达式 (列引用 / 字面量 / 二元算术).
+/// ⭐ F78: 聚合内标量表达式 (列引用 / 字面量 / 二元算术 / JSONB 取字段).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarExpr {
     Col(String),
     Lit(SqlValue),
     Bin { op: ArithOp, l: Box<ScalarExpr>, r: Box<ScalarExpr> },
+    /// ⭐ compat: JSONB 取字段 `base->key` (as_text=false) / `base->>key` (as_text=true).
+    /// 仅支持 base=列 + key=字符串字面量 (v1).
+    JsonGet { base: Box<ScalarExpr>, key: Box<ScalarExpr>, as_text: bool },
 }
 
 impl ScalarExpr {
@@ -138,6 +143,9 @@ impl ScalarExpr {
                 _ => "?".to_string(),
             },
             ScalarExpr::Bin { op, l, r } => format!("{} {} {}", l.render(), op.sym(), r.render()),
+            ScalarExpr::JsonGet { base, key, as_text } => {
+                format!("{} {} {}", base.render(), if *as_text { "->>" } else { "->" }, key.render())
+            }
         }
     }
     /// 是否单一裸列引用 (COUNT(DISTINCT col) / 单列聚合退化判定).
@@ -156,6 +164,10 @@ impl ScalarExpr {
                 l.for_each_col(f);
                 r.for_each_col(f);
             }
+            ScalarExpr::JsonGet { base, key, .. } => {
+                base.for_each_col(f);
+                key.for_each_col(f);
+            }
         }
     }
     /// 就地改写所有列名 (供 strip_qual 剥表限定前缀).
@@ -167,12 +179,16 @@ impl ScalarExpr {
                 l.for_each_col_mut(f);
                 r.for_each_col_mut(f);
             }
+            ScalarExpr::JsonGet { base, key, .. } => {
+                base.for_each_col_mut(f);
+                key.for_each_col_mut(f);
+            }
         }
     }
 }
 
 impl SelectItem {
-    /// ⭐ F76: 输出列名 — alias 优先, 否则列名 / 聚合 label.
+    /// ⭐ F76: 输出列名 — alias 优先, 否则列名 / 聚合 label / 表达式原文.
     pub fn out_name(&self) -> String {
         match self {
             SelectItem::ScalarFn { name } => name.clone(),
@@ -189,6 +205,7 @@ impl SelectItem {
                     format!("{fname}({inner})")
                 }
             }),
+            SelectItem::Expr { expr, alias } => alias.clone().unwrap_or_else(|| expr.render()),
         }
     }
 }
@@ -379,6 +396,8 @@ pub enum SqlStmt {
     VersionStub,
     /// ⭐ S5: `SELECT DATABASE()` — 单行当前库名 (mysql cli USE 后探测).
     DatabaseStub,
+    /// ⭐ compat: 无 FROM 的标量函数投影 (`SELECT NOW()`) — worker 渲染常量单行.
+    ScalarSelect { items: Vec<SelectItem> },
     /// ⭐ F66: 系统表查询 (information_schema.* / pg_catalog.*) — 虚拟表,
     /// worker 从活元数据合成结果集. cols 空 = `*`.
     SystemQuery {

@@ -24,17 +24,17 @@
 | 9 | `CREATE INDEX [IF NOT EXISTS]`（含部分 WHERE） | 无此语句 | 新增 `CREATE INDEX` 解析（吞/建索引） |
 | 10 | `ALTER TABLE ADD COLUMN IF NOT EXISTS` | unknown type NOT | ALTER 支持 IF NOT EXISTS + DEFAULT |
 | 11 | `DROP TABLE IF EXISTS` | trailing tokens | DROP 支持 IF EXISTS |
-| 12 | `CREATE OR REPLACE FUNCTION` / `CREATE TRIGGER` / `DROP TRIGGER` | multi-stmt / 不支持 | 吞掉这些 PG 专有 DDL（v1 不做触发器） |
+| 12 | `CREATE OR REPLACE FUNCTION` / `CREATE TRIGGER` / `DROP TRIGGER` | multi-stmt / 不支持 | ✅ (2026-08-02): tokenizer 支持 dollar-quote `$$...$$`/`$tag$...$tag$` → 函数体吞掉为 DdlStub |
 
 ### P1 — 运行时查询依赖（story-loom repo 层常用）
 
 | # | 缺陷 | 方案 |
 |---|------|------|
-| 13 | `UPDATE ... SET c = c2`（列引用） | UPDATE 赋值右侧支持列引用 |
+| 13 | `UPDATE ... SET c = c2`（列引用） | 部分 ✅ (2026-08-02): `SET pk = pk` 同值放行 (no-op 跳过); 真实列引用 c=c2 需行级求值 (v1 留) |
 | 14 | `WHERE x IS NOT NULL` / `IS NULL` | 谓词支持 IS [NOT] NULL |
-| 15 | `SELECT NOW()` | 内置函数 NOW()→当前时间 |
+| 15 | `SELECT NOW()` | ✅ (2026-08-02): `SqlStmt::ScalarSelect` — 无 FROM 标量函数投影常量单行 |
 | 16 | `RETURNING` | INSERT/UPDATE/DELETE 吞 RETURNING 子句 |
-| 17 | JSONB 操作符 `->` `->>` `?` | tokenizer + 求值（`->` 取字段） |
+| 17 | JSONB 操作符 `->` `->>` `?` | 部分 ✅ (2026-08-02): `->`/`->>` 表达式投影 (tokenizer + ScalarExpr::JsonGet + 逐行求值, serde_json); `?` 与 MySQL `?` 占位符歧义, v1 留 |
 
 ### P2 — 完整性 / 未来
 
