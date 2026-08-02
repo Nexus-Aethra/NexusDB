@@ -97,7 +97,7 @@ Executor (已有 worker: 广播 shard + 完成点聚合)
 
 | # | 优化 | 说明 | 收益 |
 |---|------|------|------|
-| 12 | **基数估算** | 从 shard 采样/维护每索引键基数 | 支持代价比较 | ✅ 基础 (M3-1: 每表近似行数增量, engine 内存 + EstimateRowCount 协议); SampledHistogram 直方图留 M3-4 |
+| 12 | **基数估算** | 从 shard 采样/维护每索引键基数 | 支持代价比较 | ✅ (M3-1 行数 + M3-4 索引列 distinct: bloom miss 判新值增量维护, EstimateDistinct 协议, JOIN 索引选择用 distinct 打破 Eq 平局); SampledHistogram 直方图留 M3-5 |
 | 13 | **连接顺序** | 小表驱动大表（NestedLoop 顺序） | JOIN 性能 | ✅ (M3-2: 双表 Inner 驱动交换, EstimateRows 选小表, 保列序) |
 | 14 | **哈希/合并连接** | 大结果集连接不依赖嵌套循环 | 大规模 JOIN | ⏳ |
 | 15 | **代价模型** | 行数/选择性 → 访问路径选择 | 优化器决策 | ✅ 基础 (M3-3: IN 大集合降权 + 无界范围降权) |
