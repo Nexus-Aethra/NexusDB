@@ -349,7 +349,8 @@ pub struct JoinCond {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlStmt {
     /// CREATE TABLE: schema 已构建完成 (含 pk / 索引 iid 分配).
-    CreateTable { table: String, schema: TableSchema },
+    /// `if_not_exists=true` → 表已存在时静默跳过 (不报错).
+    CreateTable { table: String, schema: TableSchema, if_not_exists: bool },
     /// INSERT: cols 为空 = 全列序; ⭐ S1: rows 支持多行 VALUES.
     Insert { table: String, cols: Vec<String>, rows: Vec<Vec<SqlValue>> },
     /// SELECT: items 空 = `*` 全列 (⭐ O1 投影; ⭐ G1/F63 列+聚合混合).
@@ -1142,6 +1143,14 @@ fn read_col_list(p: &mut P) -> Result<Vec<String>, String> {
 fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("CREATE")?;
     p.kw("TABLE")?;
+    // ⭐ IF NOT EXISTS: `CREATE TABLE IF NOT EXISTS t (...)` — 表已存在时静默跳过
+    let if_not_exists = if p.try_kw("IF") {
+        p.kw("NOT")?;
+        p.kw("EXISTS")?;
+        true
+    } else {
+        false
+    };
     let table = p.table_ident()?;
     p.expect(&Tok::LParen, "(")?;
 
@@ -1285,7 +1294,7 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
     }
     let schema = TableSchema::new(columns, pk, &index_cols, &unique_cols, &global_unique_cols)
         .map_err(|e| e.to_string())?;
-    Ok(SqlStmt::CreateTable { table, schema })
+    Ok(SqlStmt::CreateTable { table, schema, if_not_exists })
 }
 
 /// `INSERT INTO t [(c1,...)] VALUES (v1,...)`
@@ -2391,8 +2400,9 @@ mod tests {
     #[test]
     fn create_roundtrip() {
         let s = parse(b"CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, score DOUBLE, INDEX(name), INDEX(score))").unwrap();
-        let SqlStmt::CreateTable { table, schema } = s else { panic!() };
+        let SqlStmt::CreateTable { table, schema, if_not_exists } = s else { panic!() };
         assert_eq!(table, "users");
+        assert!(!if_not_exists);
         assert_eq!(schema.columns.len(), 3);
         assert_eq!(schema.pk_col, 0);
         assert!(!schema.columns[0].nullable);
@@ -2402,6 +2412,19 @@ mod tests {
         assert_eq!(schema.indexes.len(), 2);
         assert_eq!(schema.indexes[0].col, 1);
         assert_eq!(schema.indexes[1].col, 2);
+    }
+
+    #[test]
+    fn create_if_not_exists() {
+        let s = parse(b"CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY)").unwrap();
+        let SqlStmt::CreateTable { table, if_not_exists, .. } = s else { panic!() };
+        assert_eq!(table, "users");
+        assert!(if_not_exists);
+
+        // 无 IF NOT EXISTS → false
+        let s = parse(b"CREATE TABLE users2 (id INT PRIMARY KEY)").unwrap();
+        let SqlStmt::CreateTable { if_not_exists, .. } = s else { panic!() };
+        assert!(!if_not_exists);
     }
 
     #[test]

@@ -4834,7 +4834,15 @@ fn sql_dispatch_stmt(
                 );
             }
         }
-        SqlStmt::CreateTable { table, schema } => {
+        SqlStmt::CreateTable { table, schema, if_not_exists } => {
+            // ⭐ IF NOT EXISTS: 表已存在 → 静默跳过 (直接 OK, 不广播)
+            if if_not_exists {
+                let key = (db.to_string(), table.clone());
+                if conn.sql_cache.borrow().schemas.contains_key(&key) {
+                    conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+                    return;
+                }
+            }
             let bytes = schema.encode();
             let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
             conn.sql_ddl_agg.insert(
