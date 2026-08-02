@@ -1,0 +1,35 @@
+# NexusDB 容器配置 — stdfs 变体 (兼容 Docker 默认 seccomp, 禁用 io_uring)
+# 用途: 挂载覆盖 /etc/nexusdb/nexusdb.toml
+#   -v $PWD/deploy/nexusdb.stdfs.toml:/etc/nexusdb/nexusdb.toml
+# io_uring 被 Docker seccomp 拦截时使用 (Operation not permitted 的解法)
+
+[server]
+listen_addr = "0.0.0.0:5433"     # Binary 内部协议 (压测/工具)
+redis_addr  = "0.0.0.0:6379"     # RESP (Redis 兼容); 空 = 禁用
+sql_addr    = "0.0.0.0:5434"     # MySQL wire
+pg_addr     = "0.0.0.0:5435"     # PostgreSQL wire
+http_addr   = "0.0.0.0:6778"     # HTTP REST + /metrics
+
+sql_password   = ""              # SQL 双门面登录密码 (空 = 免密)
+redis_password = ""              # RESP AUTH 密码
+http_token     = ""              # REST Bearer token
+http_cors_origin = ""
+
+tls_cert = ""
+tls_key  = ""
+
+sql_worker_count = 2
+max_key_bytes = 1024
+max_value_bytes = 1048576
+
+[storage]
+block_root = "/data"
+num_shards = 6
+io_backend = "stdfs"             # ⭐ 关键: 改用标准文件 IO, 兼容任何内核/seccomp
+default_db = "default"
+default_table = "default"
+
+[log]
+level = "info"
+stderr = true
+dir = ""
