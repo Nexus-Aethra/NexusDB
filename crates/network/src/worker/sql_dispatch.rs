@@ -2916,6 +2916,9 @@ pub(crate) fn sql_run_dml(
 ///
 /// ⭐ 优化器增强 (2026-08, M1): 从"首个命中索引"升级为"计分最优索引":
 /// 等值命中 +3 / 范围 +2 / IN +1, 得分最高者胜; 平局取靠前 (确定性)。
+/// ⭐ M3-3 (代价): IN 集合大小阈值 — 超过则选择性过低, 不走索引 (全扫 + 残余).
+const IN_INDEX_MAX_SET: usize = 32;
+
 /// ⭐ P0-2: 单表 Cond → ScanPred 下推 (仅纯 AND 合取; 值转换失败跳过该谓词).
 /// shard 端 ScanFiltered 的 preds 是 AND 语义, 谓词下推只影响过滤位置 (正确性仍
 /// 由 worker 端 finish 残余过滤兜底).
@@ -3114,6 +3117,11 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                 // ⭐ S2: IN → [min, max] 闭界超集 (保序编码字节比较取极值),
                 // 残余过滤精确; Ne 无剪枝价值, 不算命中
                 CmpOp::In => {
+                    // ⭐ M3-3 (代价): IN 界 = [min,max] 超集, 集合 ≥ IN_INDEX_MAX_SET 时
+                    // 扫描接近全表且残余仍要全量 eval → 不选索引 (回退全扫 + 残余).
+                    if c.set.len() >= IN_INDEX_MAX_SET {
+                        continue;
+                    }
                     score += 1;
                     hits.push(c);
                     if lo.is_none() && hi.is_none() {
@@ -3144,6 +3152,11 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                 }
                 CmpOp::Ne => {}
             }
+        }
+        // ⭐ M3-3 (代价): 无界范围 (仅 lo 或仅 hi, 如 `score > 10`) → 索引扫半边表,
+        // 选择性低 → 计分 -1 (有界范围 BETWEEN 保持原分).
+        if score > 0 && (lo.is_some() != hi.is_some()) {
+            score = score.saturating_sub(1);
         }
         // 只有得分 > 0 才算候选; 平局保留首个 (ipos 更小者优先, 确定性)
         if score > 0 && best.as_ref().map_or(true, |(bs, bpos, _)| score > *bs || (score == *bs && ipos < *bpos)) {
@@ -3196,6 +3209,37 @@ mod tests {
 
     fn andc(preds: Vec<Pred<Cond>>) -> Pred<Cond> {
         Pred::And(preds)
+    }
+
+    #[test]
+    fn large_in_falls_back_to_fullscan() {
+        // ⭐ M3-3: score IN (1..=100) 集合 ≥ 32 → 选择性过低, 不选 score 索引 (全扫 + 残余)
+        let schema = test_schema();
+        let p = Pred::Leaf(Cond {
+            col: "score".into(),
+            op: CmpOp::In,
+            val: SqlValue::Null,
+            set: (1..=100).map(|i| SqlValue::Int(i)).collect(),
+        });
+        let (np, _) = sql::normalize_pred_cond(&p);
+        let plan = sql_plan_select(&schema, &np).unwrap();
+        assert!(matches!(plan, SqlPlan::FullScan), "大 IN 应回退全扫: {plan:?}");
+    }
+
+    #[test]
+    fn unbounded_range_loses_to_eq_index() {
+        // ⭐ M3-3: 无界范围 (score > 10, 仅 lo) 降权 +1; name 等值 +3 胜出 (选 name 索引)
+        let schema = test_schema();
+        let p = Pred::And(vec![
+            c("name", CmpOp::Eq, SqlValue::Str(b"x".to_vec())),
+            c("score", CmpOp::Gt, SqlValue::Int(10)),
+        ]);
+        let (np, _) = sql::normalize_pred_cond(&p);
+        let plan = sql_plan_select(&schema, &np).unwrap();
+        assert!(
+            matches!(plan, SqlPlan::Index { iid: 0, .. }),
+            "name 等值 +3 应胜出 (score 单边范围降权): {plan:?}"
+        );
     }
 
     #[test]
