@@ -308,7 +308,14 @@ impl StorageEngine {
         self.check_unique(db, table, &schema, pk, values, &old_ivals).await?;
 
         // row 行
-        self.put_physical(db, table, &rk, &new_bytes).await?;
+        // ⭐ M3-1: SQL 用户行 → 行数 +1 (覆盖不加; 索引条目写不计行数)
+        let existed = self.put_physical(db, table, &rk, &new_bytes).await?;
+        if !existed {
+            *self
+                .row_counts
+                .entry((db.to_string(), table.to_string()))
+                .or_insert(0) += 1;
+        }
 
         // 索引行: 逐 IndexDef 对比新旧值, 只动变化的
         for idx in schema.indexes.clone() {
@@ -337,8 +344,19 @@ impl StorageEngine {
                 if is_new {
                     *self
                         .distinct_counts
-                        .entry((db_s, tbl_s, idx.iid))
+                        .entry((db_s.clone(), tbl_s.clone(), idx.iid))
                         .or_insert(0) += 1;
+                }
+                // ⭐ M3-5: 索引列 min/max (有序字节比较 = 值序; 覆盖写同值不破坏)
+                let e = self
+                    .range_counts
+                    .entry((db_s, tbl_s, idx.iid))
+                    .or_insert_with(|| (nv.to_vec(), nv.to_vec()));
+                if nv.as_slice() < e.0.as_slice() {
+                    e.0 = nv.to_vec();
+                }
+                if nv.as_slice() > e.1.as_slice() {
+                    e.1 = nv.to_vec();
                 }
             }
         }
@@ -432,7 +450,7 @@ impl StorageEngine {
         self.ensure_table(db, table).await?;
         let key = ks::unique_slot_key(iid, enc_val);
         let val = Self::unique_slot_val(1, txn_id, pk);
-        self.put_physical(db, table, &key, &val).await
+        self.put_physical(db, table, &key, &val).await.map(|_| ())
     }
 
     /// ⭐ F65: PENDING→COMMITTED (写行成功后; 仅 txn+pk 匹配才转, 防误转).

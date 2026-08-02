@@ -152,12 +152,16 @@ pub struct StorageEngine {
     /// ⭐ WAL (F60): per-shard 预写日志 (None = Off 档 / 重放期间).
     wal: Option<crate::wal::WalWriter>,
     /// ⭐ M3-1 (CBO 统计): 每 (db, table) 近似行数 (内存增量维护).
-    /// put 新 key +1 (覆盖不加, 由 registry::table_put 返回 existed), delete -1;
-    /// put_many 近似 +N (覆盖会高估). 重启后从 0 重算 (持久化 M3-1b 待做).
-    row_counts: std::collections::HashMap<(String, String), u64>,
+    /// put 新 key +1 (覆盖不加, 由 put_physical 返回 existed), delete -1;
+    /// put_many 近似 +N (覆盖会高估). 重启后从 0 重算 (持久化 M3-1b).
+    pub(crate) row_counts: std::collections::HashMap<(String, String), u64>,
     /// ⭐ M3-4 (CBO): 每索引列近似 distinct 基数 (索引值写入时 bloom miss = 新值 → +1;
     /// bloom 假阳性 → 低估, 近似可接受). 内存增量, 重启后从 0 重算.
     pub(crate) distinct_counts: std::collections::HashMap<(String, String, u32), u64>,
+    /// ⭐ M3-5 (CBO): 每索引列 (min, max) 有序字节 (值序比较; 范围选择度/直方图基础).
+    pub(crate) range_counts: std::collections::HashMap<(String, String, u32), (Vec<u8>, Vec<u8>)>,
+    /// ⭐ M3-1b: CBO 统计持久化文件 (block_dir/stats.bin; 崩溃不保证, 近似统计可接受).
+    stats_path: std::path::PathBuf,
 }
 
 /// ⭐ Q1: schema 镜像槽别名 (None = 已确认无 schema 的纯 KV 表).
@@ -290,6 +294,8 @@ impl StorageEngine {
         // Pager 实际写 .block 时, 走 key.file_id + 1 命名
         // recover 推断 last_file_id 后, 新写入从 next_file_id 开始
         // 简化: 我们总是用 next_file_id 推断的 block_path
+        // ⭐ M3-1b: 统计持久化路径 (block_dir/stats.bin; 须在 pager move block_dir_for_io 前算好)
+        let stats_path = block_dir_for_io.join("stats.bin");
         let active_file_id = recovered.pid_alloc.current().0;
         let block_path = block_dir_for_io.join(format!("{:06}.block", active_file_id + 1));
         // 如果推断的 block 不存在 (e.g., new db), 用第一个
@@ -351,7 +357,11 @@ impl StorageEngine {
             wal: None, // 重放期间保持 None (append 自动跳过)
             row_counts: std::collections::HashMap::new(),
             distinct_counts: std::collections::HashMap::new(),
+            range_counts: std::collections::HashMap::new(),
+            stats_path,
         };
+        // ⭐ M3-1b: 加载持久化统计 (缺失/损坏 → 空统计, 无碍)
+        engine.load_stats();
         // ⭐ U3: 从 data 行重建复合结构计数 (修复 crash 中 meta count 漂移).
         engine.rebuild_composite_counts().await.map_err(|e| {
             StorageError::Io(std::io::Error::other(format!("rebuild_composite_counts: {e}")))
@@ -427,7 +437,10 @@ impl StorageEngine {
 
     /// 显式 flush: nowchunks → .block (pwrite + fsync) → chunk_list → meta flush.
     pub async fn flush(&mut self) -> io::Result<()> {
-        self.pager.flush().await
+        self.pager.flush().await?;
+        // ⭐ M3-1b: 统计随 flush 持久化 (重启后保留近似统计)
+        self.save_stats();
+        Ok(())
     }
 
     /// 隐式 flush 后 drop. **不**保证 fsync (调用方应先调 flush).
@@ -438,6 +451,8 @@ impl StorageEngine {
         // 两步内部都保证 "chunk data 全部写完才刷 meta".
         self.pager.flush().await?;
         self.pager.drive_write_queue().await?;
+        // ⭐ M3-1b: 统计落盘 (close 直调 pager.flush 绕过 engine.flush, 需显式 save)
+        self.save_stats();
         // ⭐ WAL (F60): 正常关闭 = 全量已落盘, 全部段可删 (重启免重放)
         if let Some(mut w) = self.wal.take() {
             w.purge_all();
@@ -694,7 +709,16 @@ impl StorageEngine {
             self.purge_composite_if_any(db, table, key).await?;
         }
         let ek = crate::keyspace::encode_string(key);
-        self.put_physical(db, table, &ek, value).await
+        // ⭐ M3-1: 用户行写入 → 行数 +1 (覆盖不加; existed 由 put_physical 返回,
+        // 复合类型/索引条目写不走此处不计行数)
+        let existed = self.put_physical(db, table, &ek, value).await?;
+        if !existed {
+            *self
+                .row_counts
+                .entry((db.to_string(), table.to_string()))
+                .or_insert(0) += 1;
+        }
+        Ok(())
     }
 
     // =================================================================
@@ -703,13 +727,14 @@ impl StorageEngine {
     // =================================================================
 
     /// 按物理 key 写入 (含 root split 的 TableDirectory 回写, 与 table_put 同逻辑).
+    /// 返回 existed (key 是否已存在), 供**用户行入口** (table_put / row_put 主行) 维护行数.
     pub(crate) async fn put_physical(
         &mut self,
         db: &str,
         table: &str,
         pkey: &[u8],
         value: &[u8],
-    ) -> Result<(), RegistryError> {
+    ) -> Result<bool, RegistryError> {
         let db_handle = self.registry.open_db(db)?;
         let table_vpid = db_handle
             .open_table(&mut self.pager, table)
@@ -718,14 +743,6 @@ impl StorageEngine {
 
         let (new_root, existed) =
             crate::registry::table_put(&mut self.pager, table_vpid, pkey, value).await?;
-
-        // ⭐ M3-1: 新 key → 近似行数 +1 (覆盖不加)
-        if !existed {
-            *self
-                .row_counts
-                .entry((db.to_string(), table.to_string()))
-                .or_insert(0) += 1;
-        }
 
         // ⭐ WAL (F60): 成功路径记录结果态 (重放幂等)
         if let Some(w) = self.wal.as_mut() {
@@ -743,7 +760,7 @@ impl StorageEngine {
             let db_handle = self.registry.open_db(db)?;
             db_handle.update_table_root(table, new_root);
         }
-        Ok(())
+        Ok(existed)
     }
 
     /// 按物理 key 读 (溢出链自动展开).
@@ -941,6 +958,94 @@ impl StorageEngine {
             .copied()
     }
 
+    /// ⭐ M3-5: 索引列 (min, max) 有序字节 (值序比较; 范围选择度/直方图基础; None = 无记录).
+    pub fn estimate_range(&self, db: &str, table: &str, iid: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.range_counts
+            .get(&(db.to_string(), table.to_string(), iid))
+            .cloned()
+    }
+
+    /// ⭐ M3-1b: 持久化 CBO 统计 (row + distinct + range) 到 stats.bin (best-effort).
+    fn save_stats(&self) {
+        use std::io::Write;
+        let Ok(mut f) = std::fs::File::create(&self.stats_path) else { return };
+        let _ = f.write_all(b"NXTST1");
+        // row_counts
+        let _ = f.write_all(&(self.row_counts.len() as u32).to_le_bytes());
+        for ((db, table), n) in &self.row_counts {
+            let _ = f.write_all(&(db.len() as u16).to_le_bytes());
+            let _ = f.write_all(db.as_bytes());
+            let _ = f.write_all(&(table.len() as u16).to_le_bytes());
+            let _ = f.write_all(table.as_bytes());
+            let _ = f.write_all(&n.to_le_bytes());
+        }
+        // distinct_counts
+        let _ = f.write_all(&(self.distinct_counts.len() as u32).to_le_bytes());
+        for ((db, table, iid), n) in &self.distinct_counts {
+            let _ = f.write_all(&(db.len() as u16).to_le_bytes());
+            let _ = f.write_all(db.as_bytes());
+            let _ = f.write_all(&(table.len() as u16).to_le_bytes());
+            let _ = f.write_all(table.as_bytes());
+            let _ = f.write_all(&iid.to_le_bytes());
+            let _ = f.write_all(&n.to_le_bytes());
+        }
+        // range_counts (min/max)
+        let _ = f.write_all(&(self.range_counts.len() as u32).to_le_bytes());
+        for ((db, table, iid), (lo, hi)) in &self.range_counts {
+            let _ = f.write_all(&(db.len() as u16).to_le_bytes());
+            let _ = f.write_all(db.as_bytes());
+            let _ = f.write_all(&(table.len() as u16).to_le_bytes());
+            let _ = f.write_all(table.as_bytes());
+            let _ = f.write_all(&iid.to_le_bytes());
+            let _ = f.write_all(&(lo.len() as u16).to_le_bytes());
+            let _ = f.write_all(lo);
+            let _ = f.write_all(&(hi.len() as u16).to_le_bytes());
+            let _ = f.write_all(hi);
+        }
+    }
+
+    /// ⭐ M3-1b: 加载 stats.bin (open 时; 缺失/损坏 → 空统计, 无碍).
+    fn load_stats(&mut self) {
+        use std::io::Read;
+        let Ok(mut f) = std::fs::File::open(&self.stats_path) else { return };
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_err() || buf.len() < 6 || &buf[..6] != b"NXTST1" {
+            return;
+        }
+        let mut p = 6usize;
+        // row_counts
+        let Some(n) = st_u32(&buf, &mut p) else { return };
+        for _ in 0..n {
+            let (Some(db), Some(table), Some(c)) =
+                (st_str(&buf, &mut p), st_str(&buf, &mut p), st_u64(&buf, &mut p))
+            else { return };
+            self.row_counts.insert((db, table), c);
+        }
+        // distinct_counts
+        let Some(n) = st_u32(&buf, &mut p) else { return };
+        for _ in 0..n {
+            let (Some(db), Some(table), Some(iid), Some(c)) = (
+                st_str(&buf, &mut p),
+                st_str(&buf, &mut p),
+                st_u32(&buf, &mut p),
+                st_u64(&buf, &mut p),
+            ) else { return };
+            self.distinct_counts.insert((db, table, iid), c);
+        }
+        // range_counts
+        let Some(n) = st_u32(&buf, &mut p) else { return };
+        for _ in 0..n {
+            let (Some(db), Some(table), Some(iid), Some(lo), Some(hi)) = (
+                st_str(&buf, &mut p),
+                st_str(&buf, &mut p),
+                st_u32(&buf, &mut p),
+                st_bytes(&buf, &mut p),
+                st_bytes(&buf, &mut p),
+            ) else { return };
+            self.range_counts.insert((db, table, iid), (lo, hi));
+        }
+    }
+
     /// 暴露内部 DbRegistry (高级用法: 测试 / 调试).
     pub fn registry_mut(&mut self) -> &mut DbRegistry {
         &mut self.registry
@@ -1017,6 +1122,51 @@ impl Drop for StorageEngine {
 // =====================================================================
 // MetaPage 初始化: 写空 MetaPage 到 chunk 0 page 0 (T9 集成)
 // =====================================================================
+
+// ===== ⭐ M3-1b: stats.bin 解码辅助 =====
+fn st_u16(b: &[u8], p: &mut usize) -> Option<u16> {
+    if *p + 2 > b.len() {
+        return None;
+    }
+    let v = u16::from_le_bytes([b[*p], b[*p + 1]]);
+    *p += 2;
+    Some(v)
+}
+fn st_u32(b: &[u8], p: &mut usize) -> Option<u32> {
+    if *p + 4 > b.len() {
+        return None;
+    }
+    let v = u32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+    *p += 4;
+    Some(v)
+}
+fn st_u64(b: &[u8], p: &mut usize) -> Option<u64> {
+    if *p + 8 > b.len() {
+        return None;
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[*p..*p + 8]);
+    *p += 8;
+    Some(u64::from_le_bytes(a))
+}
+fn st_str(b: &[u8], p: &mut usize) -> Option<String> {
+    let n = st_u16(b, p)? as usize;
+    if *p + n > b.len() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&b[*p..*p + n]).to_string();
+    *p += n;
+    Some(s)
+}
+fn st_bytes(b: &[u8], p: &mut usize) -> Option<Vec<u8>> {
+    let n = st_u16(b, p)? as usize;
+    if *p + n > b.len() {
+        return None;
+    }
+    let v = b[*p..*p + n].to_vec();
+    *p += n;
+    Some(v)
+}
 
 /// 写一个空的 MetaPage 到 block_dir/000001.block 的 chunk 0 page 0 (offset 0),
 /// 并在 MetaCache 中登记 vpid 0 → META_PID.

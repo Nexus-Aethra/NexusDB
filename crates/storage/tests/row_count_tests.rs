@@ -153,5 +153,53 @@ fn distinct_counts_via_index_write() {
         ];
         e.row_put("db1", "t1", &6i64.to_be_bytes(), &row).await.unwrap();
         assert_eq!(e.estimate_distinct("db1", "t1", 0), Some(4));
+
+        // ⭐ M3-5: 索引列 min/max (有序字节, lo < hi)
+        let (lo, hi) = e.estimate_range("db1", "t1", 0).expect("range stats");
+        assert!(lo.as_slice() < hi.as_slice(), "min < max: {lo:?} < {hi:?}");
+    });
+}
+
+/// ⭐ M3-1b: 统计持久化 — flush/close 写 stats.bin, 重新 open 后保留 (行数/distinct/min-max).
+#[test]
+fn stats_persist_across_reopen() {
+    run_async(async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = OpenOptions {
+            block_root: tmp.path().to_path_buf().clone(),
+            block_dir: Some(tmp.path().to_path_buf()), // compat: block_dir 直接用
+            db_name: Some("default".to_string()),
+            shard_id: 0,
+            create_if_missing: true,
+            chunk_cache_size: 4,
+            io_backend: IoBackend::StdFs,
+            io_config: IoBackendConfig::default(),
+            wal_mode: Default::default(),
+        };
+        {
+            let mut e = StorageEngine::open(opts.clone()).await.expect("open ok");
+            e.create_db("app").await.expect("create db");
+            e.create_table("app", "t").await.expect("create table");
+            e.set_schema("app", "t", &demo_schema()).await.expect("set schema");
+            for i in 0..3i64 {
+                let row = vec![
+                    ColValue::I64(i),
+                    ColValue::Bytes(format!("u{}", i % 2).into_bytes()),
+                    ColValue::Null,
+                ];
+                e.row_put("app", "t", &i.to_be_bytes(), &row).await.unwrap();
+            }
+            assert_eq!(e.estimate_row_count("app", "t"), Some(3));
+            assert_eq!(e.estimate_distinct("app", "t", 0), Some(2));
+            assert!(e.estimate_range("app", "t", 0).is_some());
+            // 显式 close: flush (save_stats) + purge WAL → reopen 免重放
+            e.close().await.expect("close ok");
+        }
+        // 重新 open 同路径 → 统计保留
+        let mut e2 = StorageEngine::open(opts).await.expect("reopen ok");
+        assert_eq!(e2.estimate_row_count("app", "t"), Some(3), "行数持久化");
+        assert_eq!(e2.estimate_distinct("app", "t", 0), Some(2), "distinct 持久化");
+        let (lo, hi) = e2.estimate_range("app", "t", 0).expect("range 持久化");
+        assert!(lo.as_slice() < hi.as_slice());
     });
 }

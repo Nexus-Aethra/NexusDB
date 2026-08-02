@@ -582,6 +582,7 @@ impl StorageEngine {
         v.extend_from_slice(&tail.to_le_bytes());
         self.put_physical(db, table, &ks::encode_type_meta(key), &v)
             .await
+            .map(|_| ())
     }
 
     /// LPUSH(left=true)/RPUSH: 逐个 push, 返回新长度.
