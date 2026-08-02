@@ -1572,6 +1572,7 @@ fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
     let ty = parse_col_type(p)?;
     // 列属性: NULL/NOT NULL/DEFAULT(吞)
     let mut nullable = true;
+    let mut has_default = false;
     loop {
         if p.try_kw("NOT") {
             p.kw("NULL")?;
@@ -1580,6 +1581,7 @@ fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
             nullable = true;
         } else if p.try_kw("DEFAULT") {
             // ⭐ compat: 支持 DEFAULT <字面量|函数调用|转换后缀>
+            has_default = true;
             match p.peek() {
                 Some(Tok::Ident(_)) => {
                     let _ = p.ident()?;
@@ -1606,6 +1608,11 @@ fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
         } else {
             break;
         }
+    }
+    // ⭐ compat: NOT NULL 且无 DEFAULT → 旧行无法回填, 保持 v1 拒绝;
+    //   有 DEFAULT (如迁移的 NOT NULL DEFAULT false) → 接受 (由 worker 回填默认).
+    if !nullable && !has_default {
+        return Err("ADD COLUMN NOT NULL requires a DEFAULT (v1: cannot backfill existing rows)".into());
     }
     p.done()?;
     Ok(SqlStmt::AlterTable { table, add: Column { name, ty, nullable }, if_not_exists })

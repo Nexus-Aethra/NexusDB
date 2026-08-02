@@ -2230,7 +2230,24 @@ pub(crate) fn sql_run_dml(
                 }
             }
         }
-        SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having } => {
+        SqlStmt::Select { table, items, mut conds, limit, order, offset, group_by, having } => {
+            // ⭐ 优化器 M1 (2026-08): 谓词归一 (NOT 下推/恒真恒假短路) 后再规划
+            let (ncond, cond_false) = sql::normalize_pred_cond(&conds);
+            conds = ncond;
+            if cond_false {
+                // 恒假谓词 → 直接返回空结果 (短路广播)
+                let bin = conn.mysql_binary.remove(&seq);
+                conn.resp_complete(
+                    seq,
+                    sql_rows_bytes(
+                        conn.proto,
+                        bin,
+                        &[("", storage::schema::ColType::I64)],
+                        &[],
+                    ),
+                );
+                return;
+            }
             // ⭐ G1/G2 (F63): 投影分型 — 纯列 / COUNT(*) 特例 (旧路径) /
             // 广义聚合 (分桶完成点)
             let has_agg = items.iter().any(|i| matches!(i, sql::SelectItem::Agg { .. }));
@@ -2617,8 +2634,12 @@ pub(crate) fn sql_run_dml(
 }
 
 /// SELECT 访问路径选择 (worker 过滤器核心):
-/// 1. pk 等值 → PkGet; 2. 首个命中条件的索引 → Index (界下推);
-/// 3. 无可用索引 → 报错 (v1 不做全表扫).
+/// 1. pk 等值 → PkGet;
+/// 2. 多索引计分选择 (等值 > 范围 > IN, 界最紧者胜) → Index (界下推);
+/// 3. 无可用索引 → FullScan (残余过滤兜底).
+///
+/// ⭐ 优化器增强 (2026-08, M1): 从"首个命中索引"升级为"计分最优索引":
+/// 等值命中 +3 / 范围 +2 / IN +1, 得分最高者胜; 平局取靠前 (确定性)。
 pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result<SqlPlan, String> {
     // 先校验所有叶子列名 (不论结构)
     for c in pred.leaves() {
@@ -2636,29 +2657,35 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
         let cv = sql_to_col(pk_col.ty, &c.val)?;
         return Ok(SqlPlan::PkGet { pk: sql_pk_bytes(pk_col.ty, &cv)? });
     }
-    // 2. 首个有条件命中的索引 (界下推; 开界值多包含由残余过滤兜底)
-    for idx in &schema.indexes {
+    // 2. 多索引计分选择
+    let mut best: Option<(u32, usize, u32)> = None; // (score, idx_pos, iid)
+    let mut best_bounds: (Option<ColValue>, Option<ColValue>) = (None, None);
+    for (ipos, idx) in schema.indexes.iter().enumerate() {
         let col = &schema.columns[idx.col as usize];
         let mut lo: Option<ColValue> = None;
         let mut hi: Option<ColValue> = None;
-        let mut hit = false;
+        let mut score: u32 = 0;
+        let mut hits: Vec<&Cond> = Vec::new();
         for c in conds.iter().filter(|c| c.col == col.name) {
             let cv_of = |v: &SqlValue| sql_to_col(col.ty, v);
             match c.op {
                 CmpOp::Eq => {
-                    hit = true;
+                    score += 3;
+                    hits.push(c);
                     let cv = cv_of(&c.val)?;
                     lo = Some(cv.clone());
                     hi = Some(cv);
                 }
                 CmpOp::Gt | CmpOp::Ge => {
-                    hit = true;
+                    score += 2;
+                    hits.push(c);
                     if lo.is_none() {
                         lo = Some(cv_of(&c.val)?);
                     }
                 }
                 CmpOp::Lt | CmpOp::Le => {
-                    hit = true;
+                    score += 2;
+                    hits.push(c);
                     if hi.is_none() {
                         hi = Some(cv_of(&c.val)?);
                     }
@@ -2666,7 +2693,8 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                 // ⭐ S2: IN → [min, max] 闭界超集 (保序编码字节比较取极值),
                 // 残余过滤精确; Ne 无剪枝价值, 不算命中
                 CmpOp::In => {
-                    hit = true;
+                    score += 1;
+                    hits.push(c);
                     if lo.is_none() && hi.is_none() {
                         let mut min: Option<ColValue> = None;
                         let mut max: Option<ColValue> = None;
@@ -2696,22 +2724,166 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                 CmpOp::Ne => {}
             }
         }
-        if hit {
-            // limit 可下推 ⟺ 全部条件都在本索引列且均为闭界算子
-            // (Eq/Ge/Le 的闭界下推与过滤语义一致, 不会截掉本应命中的行)
-            let limit_push = conds
-                .iter()
-                .all(|c| c.col == col.name && matches!(c.op, CmpOp::Eq | CmpOp::Ge | CmpOp::Le));
-            // ⭐ W2: 等值 (lo == hi) 时算路由缓存键 (与引擎索引值编码同源)
-            let eq_enc = match (&lo, &hi) {
-                (Some(l), Some(h)) if l == h => {
-                    storage::sql_rows::index_val_bytes(col.ty, l)
-                }
-                _ => None,
-            };
-            return Ok(SqlPlan::Index { iid: idx.iid, lo, hi, limit_push, eq_enc });
+        // 只有得分 > 0 才算候选; 平局保留首个 (ipos 更小者优先, 确定性)
+        if score > 0 && best.as_ref().map_or(true, |(bs, bpos, _)| score > *bs || (score == *bs && ipos < *bpos)) {
+            best = Some((score, ipos, idx.iid));
+            best_bounds = (lo, hi);
         }
+    }
+    if let Some((_, ipos, iid)) = best {
+        let idx = &schema.indexes[ipos];
+        let col = &schema.columns[idx.col as usize];
+        let (lo, hi) = best_bounds;
+        // limit 可下推 ⟺ 全部条件都在本索引列且均为闭界算子
+        // (Eq/Ge/Le 的闭界下推与过滤语义一致, 不会截掉本应命中的行)
+        let limit_push = conds
+            .iter()
+            .all(|c| c.col == col.name && matches!(c.op, CmpOp::Eq | CmpOp::Ge | CmpOp::Le));
+        // ⭐ W2: 等值 (lo == hi) 时算路由缓存键 (与引擎索引值编码同源)
+        let eq_enc = match (&lo, &hi) {
+            (Some(l), Some(h)) if l == h => storage::sql_rows::index_val_bytes(col.ty, l),
+            _ => None,
+        };
+        return Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc });
     }
     // ⭐ S2: 无可用索引 → 全表扫 + 残余过滤 (v1 的报错路径退役)
     Ok(SqlPlan::FullScan)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::schema::{ColType, Column};
+
+    fn test_schema() -> TableSchema {
+        TableSchema::new(
+            vec![
+                Column { name: "id".into(), ty: ColType::I64, nullable: false },
+                Column { name: "name".into(), ty: ColType::Str, nullable: true },
+                Column { name: "score".into(), ty: ColType::I64, nullable: true },
+            ],
+            0,
+            &[1, 2],
+            &[],
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn c(col: &str, op: CmpOp, val: SqlValue) -> Pred<Cond> {
+        Pred::Leaf(Cond { col: col.into(), op, val, set: vec![] })
+    }
+
+    fn andc(preds: Vec<Pred<Cond>>) -> Pred<Cond> {
+        Pred::And(preds)
+    }
+
+    #[test]
+    fn pk_eq_uses_point_get() {
+        let schema = test_schema();
+        let plan = sql_plan_select(&schema, &c("id", CmpOp::Eq, SqlValue::Int(42))).unwrap();
+        assert!(matches!(plan, SqlPlan::PkGet { .. }), "pk eq must be PkGet, got {plan:?}");
+    }
+
+    #[test]
+    fn single_index_hit() {
+        let schema = test_schema();
+        let plan = sql_plan_select(
+            &schema,
+            &c("name", CmpOp::Eq, SqlValue::Str(b"alice".to_vec())),
+        )
+        .unwrap();
+        match plan {
+            SqlPlan::Index { iid, lo, hi, .. } => {
+                assert_eq!(iid, 0, "name 是第一个索引 (iid 0)");
+                assert_eq!(lo, Some(ColValue::Bytes(b"alice".to_vec())));
+                assert_eq!(hi, Some(ColValue::Bytes(b"alice".to_vec())));
+            }
+            other => panic!("expected Index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_index_chooses_best() {
+        let schema = test_schema();
+        // name 等值 (+3) vs score 范围 (+2) → 选 name 索引
+        let p = andc(vec![
+            c("name", CmpOp::Eq, SqlValue::Str(b"alice".to_vec())),
+            c("score", CmpOp::Gt, SqlValue::Int(10)),
+        ]);
+        let plan = sql_plan_select(&schema, &p).unwrap();
+        match plan {
+            SqlPlan::Index { iid, .. } => assert_eq!(iid, 0, "等值索引应优先于范围索引"),
+            other => panic!("expected Index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_index_selected_when_no_eq() {
+        let schema = test_schema();
+        let p = andc(vec![
+            c("score", CmpOp::Ge, SqlValue::Int(10)),
+            c("score", CmpOp::Le, SqlValue::Int(20)),
+        ]);
+        let plan = sql_plan_select(&schema, &p).unwrap();
+        match plan {
+            SqlPlan::Index { iid, lo, hi, .. } => {
+                assert_eq!(iid, 1, "score 范围应选 score 索引");
+                assert_eq!(lo, Some(ColValue::I64(10)));
+                assert_eq!(hi, Some(ColValue::I64(20)));
+            }
+            other => panic!("expected Index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eq_on_two_indexes_prefers_first() {
+        let schema = test_schema();
+        // 两个等值, 平局取靠前 (iid 0) — 确定性
+        let p = andc(vec![
+            c("name", CmpOp::Eq, SqlValue::Str(b"x".to_vec())),
+            c("score", CmpOp::Eq, SqlValue::Int(5)),
+        ]);
+        let plan = sql_plan_select(&schema, &p).unwrap();
+        match plan {
+            SqlPlan::Index { iid, .. } => assert_eq!(iid, 0, "平局应取靠前索引 (确定性)"),
+            other => panic!("expected Index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_matching_index_falls_back_full_scan() {
+        let schema = test_schema();
+        let plan = sql_plan_select(&schema, &c("id", CmpOp::Gt, SqlValue::Int(0))).unwrap();
+        assert!(matches!(plan, SqlPlan::FullScan), "无索引命中应 FullScan, got {plan:?}");
+    }
+
+    #[test]
+    fn unknown_column_errors() {
+        let schema = test_schema();
+        assert!(sql_plan_select(&schema, &c("nope", CmpOp::Eq, SqlValue::Int(1))).is_err());
+    }
+
+    #[test]
+    fn normalize_not_eq_for_index_plan() {
+        let schema = test_schema();
+        let raw = Pred::Not(Box::new(c("name", CmpOp::Eq, SqlValue::Str(b"alice".to_vec()))));
+        let (np, is_false) = sql::normalize_pred_cond(&raw);
+        assert!(!is_false);
+        match np {
+            Pred::Leaf(ref cc) => assert_eq!(cc.op, CmpOp::Ne),
+            other => panic!("expected leaf Ne, got {other:?}"),
+        }
+        let plan = sql_plan_select(&schema, &np).unwrap();
+        assert!(matches!(plan, SqlPlan::FullScan), "Ne 无界, got {plan:?}");
+    }
+
+    #[test]
+    fn always_false_predicate_short_circuits() {
+        let raw = Pred::And(vec![
+            c("id", CmpOp::Eq, SqlValue::Int(1)),
+            Pred::Or(vec![]),
+        ]);
+        let (_, is_false) = sql::normalize_pred_cond(&raw);
+        assert!(is_false, "AND 含恒假项必须标记恒假");
+    }
 }

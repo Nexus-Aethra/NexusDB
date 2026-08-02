@@ -12,9 +12,13 @@
 //! 新增 `sql_planner.rs` 层, 在 parse 与执行之间做 AST → 物理计划转换。
 
 mod ast;
+mod optimizer;
 mod parser;
 
 pub use ast::*;
+pub use optimizer::{
+    is_always_false, is_always_true, negate_cond, normalize_pred, normalize_pred_cond,
+};
 pub use parser::{
     bind_params, parse, parse_prepared, split_sql_statements,
 };

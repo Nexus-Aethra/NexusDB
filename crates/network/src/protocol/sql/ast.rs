@@ -1,4 +1,4 @@
-use storage::schema::{ColType, Column, TableSchema};
+use storage::schema::{Column, TableSchema};
 
 /// SQL 字面量 (类型转换在 worker 按 schema 列类型做).
 #[derive(Debug, Clone, PartialEq)]

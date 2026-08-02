@@ -37,6 +37,22 @@ use storage::schema::{ColType, TableSchema};
 /// ⭐ 拆分 (2026-08): SQL 纯工具函数 (不依赖 ConnState 状态).
 mod sql_util;
 use sql_util::*;
+/// ⭐ 拆分 (2026-08): SQL 聚合执行 (GROUP BY/聚合函数/HAVING).
+mod sql_agg;
+/// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
+mod sql_dispatch;
+/// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
+mod sql_eval;
+pub(crate) use sql_agg::{materialize_select_agg, render_select_agg, sql_run_agg_select, AggSpec, cmp_colvalue};
+pub(crate) use sql_dispatch::{
+    sql_dispatch_stmt, sql_join_drive, sql_join_kickoff, sql_plan_select, sql_run_dml,
+    sql_unique_drive, sysq_render_catalog, SysQuerySpec,
+};
+pub(crate) use sql_eval::{
+    col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq, render_sql_count,
+    render_sql_rows, sql_build_row, sql_cmp, sql_dml_op, sql_err_bytes, sql_ok_bytes,
+    sql_order_cmp, sql_pk_bytes, sql_rows_bytes, sql_to_col,
+};
 /// ⭐ 拆分 (2026-08): SQL 值编码/解码工具 (日期/时间/UUID/Decimal).
 mod sql_encode;
 use sql_encode::*;
@@ -44,24 +60,6 @@ use sql_encode::*;
 pub(crate) use sql_encode::{
     datetime_parts, render_date, render_decimal, render_time, render_timestamp, render_uuid,
     time_parts,
-};
-/// ⭐ 拆分 (2026-08): SQL 聚合执行 (GROUP BY/聚合函数/HAVING).
-mod sql_agg;
-pub(crate) use sql_agg::{
-    cmp_colvalue, materialize_select_agg, render_select_agg, sql_run_agg_select, AggSpec,
-};
-/// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
-mod sql_eval;
-pub(crate) use sql_eval::{
-    col_from_ordered_bytes, collect_dml_pks, eval_cond_leaf, eval_pred, eval_pred_sysq,
-    render_sql_count, render_sql_rows, sql_build_row, sql_cmp, sql_dml_op, sql_err_bytes,
-    sql_ok_bytes, sql_order_cmp, sql_pk_bytes, sql_rows_bytes, sql_to_col,
-};
-/// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
-mod sql_dispatch;
-pub(crate) use sql_dispatch::{
-    sql_dispatch_stmt, sql_join_drive, sql_join_kickoff, sql_plan_select, sql_run_dml,
-    sql_unique_drive, sysq_render_catalog, SysQuerySpec,
 };
 
 /// 特殊 epoll token: reply bus eventfd.
@@ -513,6 +511,7 @@ enum DerivedCtx {
 type MatResult = Result<(Vec<(String, ColType)>, Vec<Vec<ColValue>>), String>;
 
 /// SELECT 访问路径 (worker 过滤器选择).
+#[derive(Debug)]
 enum SqlPlan {
     /// WHERE pk = v → 单 shard 点查.
     PkGet { pk: Vec<u8> },
@@ -4761,23 +4760,17 @@ fn process_pg_input(
                                     db_view, shard_inboxes, num_shards, stmt,
                                 ),
                             }
-                        } else {
-                            // multi-statement: 逐条 dispatch (各得独立 seq)
-                            for stmt_text in &parts {
-                                let s = conn.next_seq;
-                                conn.next_seq += 1;
-                                let cur_db = conn.current_db.clone();
-                                match sql::parse(stmt_text.as_bytes()) {
-                                    Err(e) => conn.resp_complete(
-                                        s,
-                                        sql_err_bytes(ProtocolKind::Pg, &e),
-                                    ),
-                                    Ok(stmt) => sql_dispatch_stmt(
-                                        conn, conn_id, s, worker_id, &cur_db, default_db,
-                                        db_view, shard_inboxes, num_shards, stmt,
-                                    ),
-                                }
-                            }
+                        } else if parts.len() > 1 {
+                            // ⚠️ multi-statement 暂不支持: DML 走异步 shard 广播,
+                            // 逐条 dispatch 会响应乱序/残留。story-loom 迁移的多语句
+                            // Exec 需"顺序执行 + 响应聚合器"专项 (2026-08 记录)。
+                            conn.resp_complete(
+                                seq,
+                                sql_err_bytes(
+                                    ProtocolKind::Pg,
+                                    "multi-statement queries are not yet supported (DML 异步广播限制)",
+                                ),
+                            );
                         }
                     }
                     b'X' => {

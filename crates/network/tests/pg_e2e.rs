@@ -338,7 +338,7 @@ fn pg_full_flow() {
     assert_eq!(cols, vec!["Field", "Type", "Null", "Key"]);
     assert_eq!(rows.len(), 3);
     assert_eq!(c.query(";"), PgResult::Complete("EMPTY".into()));
-    // 多语句拒绝
+    // ⭐ compat (2026-08): multi-statement 暂拒绝 (DML 异步广播响应乱序, 专项后续)
     let PgResult::Err(_, msg) = c.query("SELECT 1; SELECT 2") else { panic!() };
     assert!(msg.contains("multi-statement"));
 
@@ -744,3 +744,7 @@ fn pg_group_by_aggregates() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+
+
+
