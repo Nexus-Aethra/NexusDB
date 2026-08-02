@@ -148,6 +148,7 @@ pub(crate) fn sql_run_agg_select(
             dml: None,
             dml_target: None,
             order: Vec::new(), // 排序在 agg_spec.order (输出列域)
+            sorted: false,
             offset: offset.unwrap_or(0),
             count: false,
             agg_spec: Some(spec),
@@ -629,7 +630,12 @@ pub(crate) fn materialize_select_agg(
     // 全局序: (索引值, pk); 残余过滤全条件 (下推界是超集, 过滤幂等)
     let mut rows = std::mem::take(&mut agg.rows);
     rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    let early_cut: Option<usize> = if agg.count || !agg.order.is_empty() || agg.agg_spec.is_some()
+    // ⭐ M2b: sorted=true 时行序已按 (val,pk) 索引序排列 (= ORDER BY 序),
+    // 残余过滤不破坏相对顺序 → 过滤后取前 limit+offset 即可早停.
+    // (未消排的排序必须全量收集后再 sql_order_cmp, 禁用 early_cut.)
+    let early_cut: Option<usize> = if agg.count
+        || (!agg.order.is_empty() && !agg.sorted)
+        || agg.agg_spec.is_some()
     {
         None
     } else {
@@ -674,7 +680,9 @@ pub(crate) fn materialize_select_agg(
             vec![vec![ColValue::I64(out_rows.len() as i64)]],
         ));
     }
-    if !agg.order.is_empty() {
+    // ⭐ M2b: 排序消排 — sorted=true 时 out_rows 已按索引序 (= ORDER BY 序),
+    // 残余过滤不破坏相对顺序 → 免 sql_order_cmp 全量排序.
+    if !agg.order.is_empty() && !agg.sorted {
         out_rows.sort_by(|a, b| sql_order_cmp(a, b, &agg.order));
     }
     let start = (agg.offset as usize).min(out_rows.len());

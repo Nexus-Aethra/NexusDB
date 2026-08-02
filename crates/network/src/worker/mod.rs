@@ -308,6 +308,9 @@ struct SqlSelectAgg {
     dml_target: Option<(std::sync::Arc<str>, String)>,
     /// ⭐ S2: ORDER BY (列号, desc); 非空时 shard limit 不下推 (需全量排序).
     order: Vec<(u16, bool)>,
+    /// ⭐ M2b (2026-08): 排序消排 — ORDER BY 单列 ASC 且 == 索引列 →
+    /// 索引序即排序序, worker 端免 sql_order_cmp 全量排序; 配合 top-k 下推.
+    sorted: bool,
     /// ⭐ S2: OFFSET (排序后跳过).
     offset: u32,
     /// ⭐ S2: COUNT(*) — 输出单行计数 (免投影; limit/offset 不影响计数).

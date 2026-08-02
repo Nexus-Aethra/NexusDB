@@ -602,6 +602,49 @@ fn mysql_select_extended() {
         c.ids("SELECT id FROM nums ORDER BY val ASC LIMIT 3 OFFSET 5"),
         vec!["5", "6", "7"]
     );
+    // ⭐ M2b: 排序消排 + top-k 下推 —
+    // ORDER BY 索引列 ASC → 每 shard 取 top-(limit+offset), worker 归并免全量排序.
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 10 ORDER BY val ASC LIMIT 3"),
+        vec!["10", "11", "12"],
+        "索引序即排序序, 3 shard 各 top-3 归并后全局 top-3"
+    );
+    // 带 OFFSET: 每 shard 取 5, 归并后跳过 2 取 3
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 10 ORDER BY val ASC LIMIT 3 OFFSET 2"),
+        vec!["12", "13", "14"],
+        "排序消排 + offset 下推"
+    );
+    // 无 limit 的消排: 免 worker 全量排序但不下推 limit
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 15 ORDER BY val ASC"),
+        vec!["15", "16", "17", "18", "19"],
+        "无 LIMIT 排序消排"
+    );
+    // DESC 不消排 (索引升序): 回退全量排序, 结果仍正确
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 17 ORDER BY val DESC"),
+        vec!["19", "18", "17"],
+        "DESC 保持 sql_order_cmp 全量排序"
+    );
+    // 排序消排 + 残余过滤: 界下推后仍须 worker 过滤 (note 无索引)
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 10 AND note = 'n2' ORDER BY val ASC"),
+        vec!["12", "17"],
+        "残余过滤不破坏索引序 (val%5==2 → 12,17)"
+    );
+    // 排序消排 + 残余过滤 + LIMIT: early_cut 只计过滤通过的行
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 10 AND note = 'n2' ORDER BY val ASC LIMIT 1"),
+        vec!["12"],
+        "残余过滤下 top-1 仍正确"
+    );
+    // pk 排序消排 (FullScan 天然按 pk 序) + top-k 下推
+    assert_eq!(
+        c.ids("SELECT id FROM nums ORDER BY id ASC LIMIT 4"),
+        vec!["0", "1", "2", "3"],
+        "FullScan pk 序 = ORDER BY pk"
+    );
     // 多列排序: grp asc, val desc
     assert_eq!(
         c.ids("SELECT id FROM nums ORDER BY grp ASC, val DESC LIMIT 2"),

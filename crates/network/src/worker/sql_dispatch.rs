@@ -2170,6 +2170,7 @@ pub(crate) fn sql_run_dml(
                             dml: Some(action),
                             dml_target: Some((db.clone(), table.clone())),
                             order: Vec::new(),
+                            sorted: false,
                             offset: 0,
                             count: false,
                             agg_spec: None,
@@ -2211,6 +2212,7 @@ pub(crate) fn sql_run_dml(
                             dml: Some(action),
                             dml_target: Some((db.clone(), table.clone())),
                             order: Vec::new(),
+                            sorted: false,
                             offset: 0,
                             count: false,
                             agg_spec: None,
@@ -2408,6 +2410,8 @@ pub(crate) fn sql_run_dml(
                         dml: None,
                         dml_target: None,
                         order: order_cols,
+                        // 并集无序 (跨分支跨 shard) → 不能消排, worker 端照常排序
+                        sorted: false,
                         offset,
                         count,
                         agg_spec: None,
@@ -2435,8 +2439,16 @@ pub(crate) fn sql_run_dml(
             }
             // ⭐ S2: 全表扫 — 广播 TableScan + 全条件残余过滤
             Ok(SqlPlan::FullScan) => {
-                // limit 下推仅当无条件且无排序 (下推额含 offset)
-                let shard_limit = if conds.is_true() && order_cols.is_empty() && !count {
+                // ⭐ M2b: 排序消排 — TableScan 天然按 pk 升序返回 (BTree 遍历),
+                // ORDER BY pk ASC 时免 worker 端全量排序 (sorted = 消排成功).
+                let pk_sorted = !count
+                    && order_cols.len() == 1
+                    && !order_cols[0].1
+                    && order_cols[0].0 == schema.pk_col;
+                // limit 下推: 无条件 (零残余过滤, shard 端取行即命中)
+                // 且 (无排序 或 排序已按 pk 消排); 下推额含 offset.
+                let shard_limit = if conds.is_true() && !count && (order_cols.is_empty() || pk_sorted)
+                {
                     limit.map(|l| l + offset).unwrap_or(0)
                 } else {
                     0
@@ -2457,6 +2469,7 @@ pub(crate) fn sql_run_dml(
                         dml: None,
                         dml_target: None,
                         order: order_cols,
+                        sorted: pk_sorted,
                         offset,
                         count,
                         agg_spec: None,
@@ -2474,13 +2487,6 @@ pub(crate) fn sql_run_dml(
                 }
             }
             Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc }) => {
-                // limit 下推: 仅当条件可被闭界完全表达且无排序
-                // (否则残余过滤/全量排序会漏行; 下推额含 offset)
-                let shard_limit = if limit_push && order_cols.is_empty() && !count {
-                    limit.map(|l| l + offset).unwrap_or(0)
-                } else {
-                    0
-                };
                 // ⭐ O1: 覆盖判定 — 投影∪条件∪排序列 ⊆ {索引列, pk 列} → 免回表
                 let idx_col = schema
                     .indexes
@@ -2488,6 +2494,19 @@ pub(crate) fn sql_run_dml(
                     .find(|i| i.iid == iid)
                     .map(|i| i.col)
                     .expect("plan 产出的 iid 必在 schema");
+                // ⭐ M2b: 排序消排 — ORDER BY 单列 ASC 且 == 索引列 → 索引序
+                // (val,pk 升序) 即排序序, worker 端免 sql_order_cmp 全量排序.
+                let sorted = !count
+                    && order_cols.len() == 1
+                    && !order_cols[0].1
+                    && order_cols[0].0 == idx_col;
+                // limit 下推: 仅当条件可被闭界完全表达 (零残余过滤, 下推行必命中)
+                // 且 (无排序 或 排序已消排); 下推额含 offset.
+                let shard_limit = if limit_push && !count && (order_cols.is_empty() || sorted) {
+                    limit.map(|l| l + offset).unwrap_or(0)
+                } else {
+                    0
+                };
                 let pk_col = schema.pk_col;
                 let in_cover = |c: u16| c == idx_col || c == pk_col;
                 let cover = (count || proj.iter().all(|&c| in_cover(c)))
@@ -2556,6 +2575,7 @@ pub(crate) fn sql_run_dml(
                         dml: None,
                         dml_target: None,
                         order: order_cols,
+                        sorted,
                         offset,
                         count,
                         agg_spec: None,

@@ -120,13 +120,18 @@ Executor (已有 worker: 广播 shard + 完成点聚合)
 ### M2 — 排序/limit/OR（物理增强）
 
 ```
-1. 排序消排: ORDER BY 列 = 索引列 → 免 sort, 计划标记 Sorted
-2. 排序后 limit 下推: shard top-k + 完成点多路归并
-3. OR 展开: IndexUnion 计划节点 (两个 IndexScan 合并)
-4. 谓词下推: OR 分支独立下推 + JOIN 内表过滤
+1. ✅ 排序消排: ORDER BY 单列 ASC == 索引列 → 免 sort (SqlSelectAgg.sorted)
+   · Index 计划: 索引序 (val,pk) 升序 = 排序序 → worker 端免 sql_order_cmp
+   · FullScan 计划: TableScan 天然按 pk 序 → ORDER BY pk ASC 亦消排
+   · DESC / 多列 / IndexUnion (跨分支无序) 不消排 → 回退全量排序 (正确性红线)
+2. ✅ 排序后 limit 下推: sorted 且零残余过滤 (limit_push) → 每 shard 取
+   top-(limit+offset), worker 归并后 early_cut; 残余过滤存在时 limit 不下推
+   (过滤破坏 top-k 不变量), 仅免排序
+3. ✅ OR 展开: IndexUnion 计划节点 (两个 IndexScan 合并)
+4. ⏳ 谓词下推: OR 分支独立下推 + JOIN 内表过滤 (ScanFiltered 已有基础)
 ```
 
-交付：常见分页/排序查询走索引。
+交付：常见分页/排序查询走索引 (LIMIT/OFFSET + ORDER BY 索引列)。
 
 ### M3 — CBO 起步（统计 + 连接）
 
