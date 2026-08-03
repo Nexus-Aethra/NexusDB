@@ -44,6 +44,7 @@
 
 pub mod coordinator;
 pub mod error;
+pub mod exec_cmds;
 pub mod inbox;
 pub mod latency_probe;
 pub mod manager;
