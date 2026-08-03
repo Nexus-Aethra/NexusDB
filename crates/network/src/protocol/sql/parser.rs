@@ -679,14 +679,6 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
         }
         return Ok((SqlStmt::SetStub, 0));
     }
-    // ⭐ 渐进式替换 (2026-08): sqlparser-rs 前端. 默认关闭自动接管 — 映射层尚不
-    // 覆盖 DISTINCT/函数表达式/JOIN 等全部 SELECT 特性, 部分接管会破坏行为.
-    // 接入开关: 设 NEXUS_SQLPARSER_BRIDGE=1 开启 (生产默认走手写).
-    if std::env::var("NEXUS_SQLPARSER_BRIDGE").as_deref() == Ok("1")
-        && let Some(bridge) = crate::protocol::sql::sqlparser_bridge::parse_select(input)?
-    {
-        return Ok(bridge);
-    }
     let toks = tokenize(text)?;
     let mut p = P { toks, i: 0, next_param: 0, saw_question: false, saw_dollar: false };
     let stmt = match p.peek() {
