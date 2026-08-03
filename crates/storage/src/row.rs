@@ -30,6 +30,10 @@ pub enum ColValue {
     Decimal(i128, u8),
 }
 
+/// ⭐ PG 兼容 (FMT_VER 6): ColDefault::Lit 需要 Eq (schema 比较/测试).
+/// f64 语义上 NaN 破坏 Eq 定律, 但仅作 trait bound 满足 (无 HashMap key 用途).
+impl Eq for ColValue {}
+
 /// row 编解码错误.
 #[derive(Debug, PartialEq)]
 pub enum RowError {
@@ -244,15 +248,15 @@ mod tests {
     fn schema() -> TableSchema {
         TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
-                Column { name: "name".into(), ty: ColType::Str, nullable: false },
-                Column { name: "score".into(), ty: ColType::F64, nullable: true },
-                Column { name: "blob".into(), ty: ColType::Bytes, nullable: true },
-                Column { name: "note".into(), ty: ColType::Str, nullable: true },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
+                Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
+                Column { name: "blob".into(), ty: ColType::Bytes, nullable: true, default: None },
+                Column { name: "note".into(), ty: ColType::Str, nullable: true, default: None },
             ],
             0,
             &[1, 2],
-            &[], &[])
+            &[], &[], &[])
         .unwrap()
     }
 
@@ -366,11 +370,11 @@ mod tests {
         // 旧 schema: 3 列 (id I64 pk, name Str, age I64)
         let old = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
-                Column { name: "name".into(), ty: ColType::Str, nullable: false },
-                Column { name: "age".into(), ty: ColType::I64, nullable: true },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
+                Column { name: "age".into(), ty: ColType::I64, nullable: true, default: None },
             ],
-            0, &[], &[], &[],
+            0, &[], &[], &[], &[],
         )
         .unwrap();
         assert_eq!(old.version, 1);
@@ -379,7 +383,7 @@ mod tests {
 
         // ADD COLUMN email Str (nullable) → version 2, 4 列
         let new = old
-            .with_added_column(Column { name: "email".into(), ty: ColType::Str, nullable: true })
+            .with_added_column(Column { name: "email".into(), ty: ColType::Str, nullable: true, default: None })
             .unwrap();
         assert_eq!(new.version, 2);
         assert_eq!(new.version_ncols, vec![3, 4]);
@@ -420,18 +424,18 @@ mod tests {
     fn f80_new_types_roundtrip() {
         let s = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
-                Column { name: "active".into(), ty: ColType::Bool, nullable: false },
-                Column { name: "d".into(), ty: ColType::Date, nullable: true },
-                Column { name: "t".into(), ty: ColType::Time, nullable: true },
-                Column { name: "ts".into(), ty: ColType::Timestamp, nullable: true },
-                Column { name: "meta".into(), ty: ColType::Json, nullable: true },
-                Column { name: "uid".into(), ty: ColType::Uuid, nullable: true },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column { name: "active".into(), ty: ColType::Bool, nullable: false, default: None },
+                Column { name: "d".into(), ty: ColType::Date, nullable: true, default: None },
+                Column { name: "t".into(), ty: ColType::Time, nullable: true, default: None },
+                Column { name: "ts".into(), ty: ColType::Timestamp, nullable: true, default: None },
+                Column { name: "meta".into(), ty: ColType::Json, nullable: true, default: None },
+                Column { name: "uid".into(), ty: ColType::Uuid, nullable: true, default: None },
             ],
             0,
             &[],
             &[],
-            &[],
+            &[], &[],
         )
         .unwrap();
         let vals = vec![
@@ -470,27 +474,30 @@ mod tests {
     fn f81_decimal_roundtrip() {
         let s = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
                 Column {
                     name: "amt".into(),
                     ty: ColType::Decimal { precision: 18, scale: 2 },
                     nullable: false,
+                    default: None,
                 },
                 Column {
                     name: "note".into(),
                     ty: ColType::Str,
                     nullable: true,
+                    default: None,
                 },
                 Column {
                     name: "big".into(),
                     ty: ColType::Decimal { precision: 38, scale: 4 },
                     nullable: true,
+                    default: None,
                 },
             ],
             0,
             &[],
             &[],
-            &[],
+            &[], &[],
         )
         .unwrap();
         let vals = vec![

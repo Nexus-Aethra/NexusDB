@@ -846,6 +846,22 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
                 offset: *offset,
             }
         }
+        // ⭐ PG 兼容: SELECT EXISTS — 内层 (SystemQuery) 递归绑定 $n
+        SqlStmt::ExistsStub { inner } => SqlStmt::ExistsStub {
+            inner: Box::new(bind_params(inner, params)?),
+        },
+        // ⭐ F66: 系统表查询 — WHERE 条件支持 $n (migrator 探测)
+        SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset } => {
+            SqlStmt::SystemQuery {
+                catalog: catalog.clone(),
+                table: table.clone(),
+                cols: cols.clone(),
+                conds: bind_conds(conds)?,
+                order: order.clone(),
+                limit: *limit,
+                offset: *offset,
+            }
+        }
         // 无参数位的语句原样克隆
         other => other.clone(),
     })
@@ -868,6 +884,65 @@ fn read_col_list(p: &mut P) -> Result<Vec<String>, String> {
         }
     }
     Ok(cols)
+}
+
+/// ⭐ PG 兼容: 解析列 DEFAULT 表达式 → ColDefault (v1: 字面量 / NOW /
+/// uuid_generate_v4; 未知函数/表达式 → None, 吞掉不落默认). 含 `::type` 后缀.
+fn parse_col_default(
+    p: &mut P,
+    ty: ColType,
+) -> Result<Option<storage::schema::ColDefault>, String> {
+    use storage::schema::ColDefault;
+    // 函数调用 / 裸标识 (true/false/null/未加引号文本)
+    if let Some(Tok::Ident(_)) = p.peek() {
+        let name = p.ident()?.to_ascii_lowercase();
+        if p.peek() == Some(&Tok::LParen) {
+            // 函数: NOW() / uuid_generate_v4() — 吞括号及参数
+            p.next()?;
+            let mut depth = 1;
+            while depth > 0 {
+                match p.next()? {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => depth -= 1,
+                    _ => {}
+                }
+            }
+            let d = match name.as_str() {
+                "now" | "current_timestamp" | "current_date" | "current_time" => {
+                    Some(ColDefault::Now)
+                }
+                "uuid_generate_v4" => Some(ColDefault::UuidGenV4),
+                _ => None, // 未知函数 → 吞掉不落默认
+            };
+            // ::type 后缀
+            if p.peek() == Some(&Tok::Colon) {
+                p.next()?;
+                let _ = p.ident()?;
+            }
+            return Ok(d);
+        }
+        // 裸标识 (PG 允许 DEFAULT true / 'text')
+        let val = match name.as_str() {
+            "true" => crate::protocol::sql::SqlValue::Int(1),
+            "false" => crate::protocol::sql::SqlValue::Int(0),
+            "null" => crate::protocol::sql::SqlValue::Null,
+            _ => crate::protocol::sql::SqlValue::Str(name.into_bytes()),
+        };
+        let cv = crate::worker::sql_to_col(ty, &val)?;
+        if p.peek() == Some(&Tok::Colon) {
+            p.next()?;
+            let _ = p.ident()?;
+        }
+        return Ok(Some(ColDefault::Lit(cv)));
+    }
+    // 字面量 (含 '{}'::jsonb 等)
+    let val = p.value()?;
+    if p.peek() == Some(&Tok::Colon) {
+        p.next()?;
+        let _ = p.ident()?;
+    }
+    let cv = crate::worker::sql_to_col(ty, &val)?;
+    Ok(Some(ColDefault::Lit(cv)))
 }
 
 /// `CREATE TABLE t (...) | CREATE INDEX [IF NOT EXISTS] name ON t (cols) | CREATE EXTENSION ... | ...`
@@ -915,7 +990,13 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
         // CREATE TRIGGER name ... — 吞掉
         return Ok(SqlStmt::DdlStub);
     }
-    if p.try_kw("SEQUENCE") || p.try_kw("TYPE") || p.try_kw("DATABASE") {
+    if p.try_kw("DATABASE") {
+        // ⭐ PG 兼容: CREATE DATABASE name — 真实建库 (worker 走 shard 2PC)
+        let name = p.ident()?;
+        p.done()?;
+        return Ok(SqlStmt::CreateDb { name });
+    }
+    if p.try_kw("SEQUENCE") || p.try_kw("TYPE") {
         return Ok(SqlStmt::DdlStub);
     }
     p.kw("TABLE")?;
@@ -936,6 +1017,7 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
     let mut index_names: Vec<String> = Vec::new();
     let mut unique_names: Vec<String> = Vec::new(); // ⭐ O3
     let mut global_unique_names: Vec<String> = Vec::new(); // ⭐ F65
+    let mut composite_unique_names: Vec<Vec<String>> = Vec::new(); // ⭐ PG 兼容 (FMT_VER 7)
     loop {
         if p.try_kw("INDEX") {
             p.expect(&Tok::LParen, "(")?;
@@ -962,8 +1044,11 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                 let _ = p.ident()?;
             }
             let cols = read_col_list(p)?;
-            if let Some(c) = cols.into_iter().next() {
-                unique_names.push(c);
+            if cols.len() == 1 {
+                unique_names.push(cols[0].clone());
+            } else {
+                // ⭐ PG 兼容 (FMT_VER 7): 复合 UNIQUE → 整组保留 (schema 拼 key 唯一)
+                composite_unique_names.push(cols);
             }
         } else if p.try_kw("KEY") {
             if p.peek() != Some(&Tok::LParen) {
@@ -1004,6 +1089,7 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
             let ty = parse_col_type(p)?;
             let mut nullable = true;
             let mut is_pk = false;
+            let mut default: Option<storage::schema::ColDefault> = None;
             loop {
                 if p.try_kw("PRIMARY") {
                     p.kw("KEY")?;
@@ -1025,33 +1111,8 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                 } else if p.try_kw("AUTO_INCREMENT") || p.try_kw("AUTOINCREMENT") {
                     // ⭐ F76: 吃 AUTO_INCREMENT (v1 不做服务端自增; ORM 提供显式 id)
                 } else if p.try_kw("DEFAULT") {
-                    // ⭐ compat: 吃 DEFAULT <字面量 | 函数调用> (NOW(), uuid_generate_v4(), '{}'::jsonb)
-                    // v1 不落默认值, 但必须能解析 PG 常见默认表达式
-                    match p.peek() {
-                        Some(Tok::Ident(_)) => {
-                            let _ = p.ident()?;
-                            if p.peek() == Some(&Tok::LParen) {
-                                // 函数调用: NOW() / uuid_generate_v4() — 吞括号及参数
-                                p.next()?;
-                                let mut depth = 1;
-                                while depth > 0 {
-                                    match p.next()? {
-                                        Tok::LParen => depth += 1,
-                                        Tok::RParen => depth -= 1,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            let _ = p.value()?;
-                        }
-                    }
-                    // `::jsonb` / `::text` 类型转换后缀 (tokenizer 把 `::` 合成单 Colon)
-                    if p.peek() == Some(&Tok::Colon) {
-                        p.next()?;
-                        let _ = p.ident()?;
-                    }
+                    // ⭐ PG 兼容: 捕获 DEFAULT 表达式 → Column.default
+                    default = parse_col_default(p, ty)?;
                 } else if p.try_kw("COMMENT") {
                     // ⭐ F76: 吃 COMMENT '…'
                     let _ = p.value()?;
@@ -1094,7 +1155,7 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                 }
                 pk = Some(columns.len() as u16);
             }
-            columns.push(Column { name, ty, nullable });
+            columns.push(Column { name, ty, nullable, default });
         }
         match p.next()? {
             Tok::Comma => continue,
@@ -1137,6 +1198,7 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                     name: "__rowid".to_string(),
                     ty: ColType::I64,
                     nullable: false,
+                    default: None,
                 });
                 (columns.len() - 1) as u16
             }
@@ -1161,8 +1223,23 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
     for n in &global_unique_names {
         global_unique_cols.push(col_pos(n, "GLOBAL UNIQUE")?);
     }
-    let schema = TableSchema::new(columns, pk, &index_cols, &unique_cols, &global_unique_cols)
-        .map_err(|e| e.to_string())?;
+    let mut composite_unique_cols: Vec<Vec<u16>> = Vec::with_capacity(composite_unique_names.len());
+    for g in &composite_unique_names {
+        let mut cols = Vec::with_capacity(g.len());
+        for n in g {
+            cols.push(col_pos(n, "UNIQUE")?);
+        }
+        composite_unique_cols.push(cols);
+    }
+    let schema = TableSchema::new(
+        columns,
+        pk,
+        &index_cols,
+        &unique_cols,
+        &global_unique_cols,
+        &composite_unique_cols,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(SqlStmt::CreateTable { table, schema, if_not_exists })
 }
 
@@ -1751,9 +1828,9 @@ fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
     let if_not_exists = p.try_kw("IF") && { p.try_kw("NOT"); p.try_kw("EXISTS"); true };
     let name = p.ident()?;
     let ty = parse_col_type(p)?;
-    // 列属性: NULL/NOT NULL/DEFAULT(吞)
+    // 列属性: NULL/NOT NULL/DEFAULT
     let mut nullable = true;
-    let mut has_default = false;
+    let mut default: Option<storage::schema::ColDefault> = None;
     loop {
         if p.try_kw("NOT") {
             p.kw("NULL")?;
@@ -1761,44 +1838,21 @@ fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
         } else if p.try_kw("NULL") {
             nullable = true;
         } else if p.try_kw("DEFAULT") {
-            // ⭐ compat: 支持 DEFAULT <字面量|函数调用|转换后缀>
-            has_default = true;
-            match p.peek() {
-                Some(Tok::Ident(_)) => {
-                    let _ = p.ident()?;
-                    if p.peek() == Some(&Tok::LParen) {
-                        p.next()?;
-                        let mut depth = 1;
-                        while depth > 0 {
-                            match p.next()? {
-                                Tok::LParen => depth += 1,
-                                Tok::RParen => depth -= 1,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    let _ = p.value()?;
-                }
-            }
-            if p.peek() == Some(&Tok::Colon) {
-                p.next()?;
-                let _ = p.ident()?;
-            }
+            // ⭐ PG 兼容: 捕获 DEFAULT 表达式 (由 worker 对新行求值回填)
+            default = parse_col_default(p, ty)?;
         } else {
             break;
         }
     }
     // ⭐ compat: NOT NULL 且无 DEFAULT → 旧行无法回填, 保持 v1 拒绝;
     //   有 DEFAULT (如迁移的 NOT NULL DEFAULT false) → 接受 (由 worker 回填默认).
-    if !nullable && !has_default {
+    if !nullable && default.is_none() {
         return Err("ADD COLUMN NOT NULL requires a DEFAULT (v1: cannot backfill existing rows)".into());
     }
     p.done()?;
     Ok(SqlStmt::AlterTable {
         table,
-        add: Some(Column { name, ty, nullable }),
+        add: Some(Column { name, ty, nullable, default }),
         drop: None,
         if_not_exists,
     })
@@ -2251,9 +2305,17 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
         p.expect(&Tok::RParen, ")")?;
         p.done()?;
         return Ok(SqlStmt::DatabaseStub);
+    } else if matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FROM")) {
+        // ⭐ PG 兼容: 空投影 `SELECT FROM t` — 等价 SELECT * FROM t (migrator 探表)
     } else {
         loop {
             let name = p.ident()?;
+            // ⭐ PG 兼容: SELECT EXISTS (SELECT ...) — 标量布尔探测 (migrator 建库/探表)
+            if name.eq_ignore_ascii_case("EXISTS") && p.peek_paren_select() {
+                let inner = parse_paren_subselect(p)?;
+                p.done()?;
+                return Ok(SqlStmt::ExistsStub { inner });
+            }
             // ⭐ G1: ident( → 聚合函数 COUNT/SUM/AVG/MIN/MAX
             if p.peek() == Some(&Tok::LParen) {
                 // ⭐ compat: 标量函数 (NOW()/CURRENT_TIMESTAMP) → ScalarFn (投影常量)
@@ -2355,6 +2417,23 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
         return parse_derived(p, items, top);
     }
     let table = p.ident()?;
+    // ⭐ PG 兼容: 裸名 pg_* 系统表 → 映射 pg_catalog.X (PG search_path 默认含 pg_catalog)
+    let table = if !table.contains('.')
+        && matches!(
+            table.to_ascii_lowercase().as_str(),
+            "pg_database"
+                | "pg_namespace"
+                | "pg_class"
+                | "pg_attribute"
+                | "pg_tables"
+                | "pg_indexes"
+                | "pg_views"
+                | "pg_settings"
+        ) {
+        format!("pg_catalog.{table}")
+    } else {
+        table
+    };
     // ⭐ F66: 系统表拦截 — `information_schema.X` / `pg_catalog.X` (大小写不敏)
     // 走虚拟表合成路径; 尾部只解 WHERE/ORDER/LIMIT/OFFSET (不支持 GROUP/HAVING)
     if let Some((cat, tbl)) = split_system_table(&table) {

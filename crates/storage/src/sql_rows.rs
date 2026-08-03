@@ -156,6 +156,31 @@ pub fn index_val_bytes(ty: ColType, v: &ColValue) -> Option<Vec<u8>> {
     }
 }
 
+/// ⭐ PG 兼容 (FMT_VER 7): 索引 key 编码 — 多列索引拼接各列编码
+/// (长度前缀防碰撞: `[u16 len][enc]...`). 单列索引保持 `index_val_bytes`
+/// 原编码 (兼容存量索引行/bloom 键). 任一列为 NULL → None (不入索引).
+pub fn index_vals_bytes(
+    schema: &TableSchema,
+    idx: &crate::schema::IndexDef,
+    values: &[ColValue],
+) -> Option<Vec<u8>> {
+    if idx.cols.len() == 1 {
+        let c = idx.cols[0] as usize;
+        return index_val_bytes(schema.columns[c].ty, &values[c]);
+    }
+    // ⭐ 复合 key: `[IVAL_COMPOSITE][nseg][u16 len][enc]...` — 型别字节让
+    // split_index_val 正确切分 (长度前缀防碰撞, 型别字节防误判单值).
+    let mut out = Vec::with_capacity(16);
+    out.push(crate::keyspace::IVAL_COMPOSITE);
+    out.push(idx.cols.len() as u8);
+    for &c in &idx.cols {
+        let enc = index_val_bytes(schema.columns[c as usize].ty, &values[c as usize])?;
+        out.extend_from_slice(&(enc.len() as u16).to_le_bytes());
+        out.extend_from_slice(&enc);
+    }
+    Some(out)
+}
+
 impl StorageEngine {
     // =================================================================
     // ⭐ Q1: schema 持久化 + 常驻镜像
@@ -213,8 +238,7 @@ impl StorageEngine {
         old_ivals: &Option<Vec<(u32, Option<Vec<u8>>)>>,
     ) -> Result<(), RegistryError> {
         for idx in schema.indexes.iter().filter(|i| i.unique) {
-            let ty = schema.columns[idx.col as usize].ty;
-            let Some(nv) = index_val_bytes(ty, &values[idx.col as usize]) else {
+            let Some(nv) = index_vals_bytes(schema, idx, &values) else {
                 continue;
             };
             // 值未变 (同 pk 覆盖) 不必探测
@@ -241,10 +265,17 @@ impl StorageEngine {
             })
             .await?;
             if dup {
-                return Err(se(format!(
-                    "duplicate key on unique column '{}'",
-                    schema.columns[idx.col as usize].name
-                )));
+                // ⭐ PG 兼容: 复合唯一 → 列组名
+                let colnames = if idx.cols.len() == 1 {
+                    schema.columns[idx.cols[0] as usize].name.clone()
+                } else {
+                    idx.cols
+                        .iter()
+                        .map(|&c| schema.columns[c as usize].name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                return Err(se(format!("duplicate key on unique columns ({colnames})")));
             }
         }
         Ok(())
@@ -319,8 +350,7 @@ impl StorageEngine {
 
         // 索引行: 逐 IndexDef 对比新旧值, 只动变化的
         for idx in schema.indexes.clone() {
-            let ty = schema.columns[idx.col as usize].ty;
-            let new_iv = index_val_bytes(ty, &values[idx.col as usize]);
+            let new_iv = index_vals_bytes(&schema, &idx, &values);
             let old_iv = old_ivals
                 .as_ref()
                 .and_then(|m| m.iter().find(|(iid, _)| *iid == idx.iid))
@@ -852,7 +882,7 @@ impl StorageEngine {
             .indexes
             .iter()
             .find(|i| i.iid == iid)
-            .copied()
+            .cloned()
             .ok_or_else(|| se(format!("index {iid} not found")))?;
         let ty = schema.columns[idx.col as usize].ty;
         let enc_bound = |b: Option<&ColValue>| -> Result<Option<Vec<u8>>, RegistryError> {
@@ -909,9 +939,26 @@ fn index_vals_of(
         .indexes
         .iter()
         .map(|idx| {
-            let ty = schema.columns[idx.col as usize].ty;
-            let v = row::read_col(schema, row_bytes, idx.col).map_err(se)?;
-            Ok((idx.iid, index_val_bytes(ty, &v)))
+            // ⭐ PG 兼容 (FMT_VER 7): 复合索引 → 拼接各列编码 (长度前缀)
+            if idx.cols.len() == 1 {
+                let c = idx.cols[0];
+                let v = row::read_col(schema, row_bytes, c).map_err(se)?;
+                return Ok((idx.iid, index_val_bytes(schema.columns[c as usize].ty, &v)));
+            }
+            let mut out = Vec::with_capacity(16);
+            out.push(crate::keyspace::IVAL_COMPOSITE);
+            out.push(idx.cols.len() as u8);
+            let mut any_null = false;
+            for &c in &idx.cols {
+                let v = row::read_col(schema, row_bytes, c).map_err(se)?;
+                let Some(e) = index_val_bytes(schema.columns[c as usize].ty, &v) else {
+                    any_null = true;
+                    break;
+                };
+                out.extend_from_slice(&(e.len() as u16).to_le_bytes());
+                out.extend_from_slice(&e);
+            }
+            Ok((idx.iid, if any_null { None } else { Some(out) }))
         })
         .collect()
 }

@@ -609,6 +609,8 @@ pub struct SqlSharedRoutes {
     route_pruned: std::sync::atomic::AtomicU64,
     /// 观测: 等值查询零任务短路的次数 (候选空, 直接回空结果).
     route_bypassed: std::sync::atomic::AtomicU64,
+    /// ⭐ PG 兼容: 集群控制面 (建库 2PC). worker 启动后由 main 注入.
+    cluster_ctl: std::sync::RwLock<Option<std::sync::Arc<shard_manager::ShardManager>>>,
 }
 
 impl Default for SqlSharedRoutes {
@@ -619,7 +621,20 @@ impl Default for SqlSharedRoutes {
             ddl_epoch: std::sync::atomic::AtomicU64::new(0),
             route_pruned: std::sync::atomic::AtomicU64::new(0),
             route_bypassed: std::sync::atomic::AtomicU64::new(0),
+            cluster_ctl: std::sync::RwLock::new(None),
         }
+    }
+}
+
+impl SqlSharedRoutes {
+    /// ⭐ PG 兼容: 注入集群控制面 (建库 2PC). 未注入时 CREATE DATABASE 报错.
+    pub fn set_cluster_ctl(&self, mgr: std::sync::Arc<shard_manager::ShardManager>) {
+        *self.cluster_ctl.write().expect("cluster_ctl lock") = Some(mgr);
+    }
+
+    /// 取集群控制面 (None = 未注入, 测试/无管理面场景).
+    pub fn cluster_ctl(&self) -> Option<std::sync::Arc<shard_manager::ShardManager>> {
+        self.cluster_ctl.read().expect("cluster_ctl lock").clone()
     }
 }
 
@@ -3884,8 +3899,7 @@ fn feed_route_bloom(
     }
     let BatchOp::RowPut { values, .. } = op else { return };
     for idx in schema.indexes.iter() {
-        let ty = schema.columns[idx.col as usize].ty;
-        if let Some(enc) = storage::sql_rows::index_val_bytes(ty, &values[idx.col as usize]) {
+        if let Some(enc) = storage::sql_rows::index_vals_bytes(&schema, idx, &values) {
             let entry = sh
                 .routes
                 .read()
@@ -4215,7 +4229,12 @@ fn finish_derived_join(
         version: 1,
         columns: cols
             .iter()
-            .map(|(n, t)| storage::schema::Column { name: n.clone(), ty: *t, nullable: true })
+            .map(|(n, t)| storage::schema::Column {
+                name: n.clone(),
+                ty: *t,
+                nullable: true,
+                default: None,
+            })
             .collect(),
         pk_col: 0,
         indexes: Vec::new(),
@@ -4307,7 +4326,12 @@ fn derived_render(
         version: 1,
         columns: cols
             .iter()
-            .map(|(n, t)| storage::schema::Column { name: n.clone(), ty: *t, nullable: true })
+            .map(|(n, t)| storage::schema::Column {
+                name: n.clone(),
+                ty: *t,
+                nullable: true,
+                default: None,
+            })
             .collect(),
         pk_col: 0,
         indexes: Vec::new(),
@@ -4703,12 +4727,18 @@ fn process_pg_input(
                 match pg::parse_startup(payload) {
                     Ok((_user, database)) => {
                         // database 参数 → 切库 (不存在直接拒绝断连)
+                        // ⭐ PG 兼容: "postgres" admin 库别名 → 映射 default 库 (migrator 探测用)
                         if let Some(dbn) = database
                             && !dbn.is_empty()
                             && dbn != default_db.as_ref()
                         {
-                            if db_view.id_of(&dbn).is_some() {
-                                conn.current_db = std::sync::Arc::from(dbn.as_str());
+                            let resolved = if dbn == "postgres" {
+                                default_db.clone()
+                            } else {
+                                std::sync::Arc::from(dbn.as_str())
+                            };
+                            if &*resolved == default_db.as_ref() || db_view.id_of(&resolved).is_some() {
+                                conn.current_db = resolved;
                             } else {
                                 conn.send_bytes(&pg::build_error(
                                     "3D000",

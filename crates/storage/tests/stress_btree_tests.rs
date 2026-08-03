@@ -10,14 +10,14 @@ use common::run_async;
 fn demo_schema() -> TableSchema {
     TableSchema::new(
         vec![
-            Column { name: "id".into(), ty: ColType::I64, nullable: false },
-            Column { name: "name".into(), ty: ColType::Str, nullable: false },
-            Column { name: "score".into(), ty: ColType::F64, nullable: true },
+            Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+            Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
+            Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
         ],
         0,
         &[1, 2],
         &[],
-        &[],
+        &[], &[],
     )
     .unwrap()
 }

@@ -81,15 +81,76 @@ pub struct Column {
     pub name: String,
     pub ty: ColType,
     pub nullable: bool,
+    /// ⭐ PG 兼容: 列默认值 (DEFAULT 表达式; v1: 字面量 / NOW / uuid_generate_v4).
+    pub default: Option<ColDefault>,
 }
 
-/// 二级索引定义 (单列索引; iid 表内唯一, 由 schema 内 next_iid 单调分配).
+use crate::row::ColValue;
+
+/// ⭐ PG 兼容 (FMT_VER 6): 列 DEFAULT 表达式.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColDefault {
+    /// 字面量 — 已按列类型编码 (parser 构造时用列类型转换).
+    Lit(ColValue),
+    /// NOW() / CURRENT_TIMESTAMP — 当前时间戳 (i64 微秒).
+    Now,
+    /// uuid_generate_v4() — 随机 UUID (16B).
+    UuidGenV4,
+}
+
+/// ColDefault::Lit 编码 (值标签 + payload; 仅 DEFAULT 常用类型).
+fn encode_colvalue(v: &ColValue, out: &mut Vec<u8>) {
+    match v {
+        ColValue::Null => out.push(0),
+        ColValue::I64(x) => {
+            out.push(1);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        ColValue::F64(x) => {
+            out.push(2);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        ColValue::Bytes(b) => {
+            out.push(3);
+            out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        ColValue::Decimal(x, sc) => {
+            out.push(4);
+            out.push(*sc);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+}
+
+fn decode_colvalue(r: &mut Reader) -> Result<ColValue, SchemaError> {
+    Ok(match r.u8()? {
+        0 => ColValue::Null,
+        1 => ColValue::I64(r.i64()?),
+        2 => ColValue::F64(r.f64()?),
+        3 => {
+            let len = r.u16()? as usize;
+            ColValue::Bytes(r.bytes(len)?.to_vec())
+        }
+        4 => {
+            let sc = r.u8()?;
+            ColValue::Decimal(r.i128()?, sc)
+        }
+        _ => return Err(SchemaError::BadFormat),
+    })
+}
+
+/// 二级索引定义 (iid 表内唯一, 由 schema 内 next_iid 单调分配).
 /// ⭐ O3: `unique` = 唯一索引 (写入强制唯一 + 等值查询可早停).
 /// ⭐ F65: `global` = 跨 shard 全局唯一 (email-shard 占坑; 仅 unique 时有意义).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// ⭐ PG 兼容 (FMT_VER 7): `cols` = 复合索引列集 (单列 = [col]).
+/// `col` 保留 = cols[0] (兼容既有单列引用/诊断).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {
     pub iid: u32,
     pub col: u16,
+    /// ⭐ PG 兼容: 索引列集 (复合唯一索引 >1 列; 单列 = vec![col]).
+    pub cols: Vec<u16>,
     pub unique: bool,
     pub global: bool,
 }
@@ -119,7 +180,9 @@ pub struct TableSchema {
 /// ⭐ F79: 2→3 尾部加 version_ncols; decode 兼容 v1/v2 (version_ncols=[当前列数]).
 /// ⭐ F81: 3→4 Decimal 列在类型字节后追加 precision+scale; decode 兼容 v1-3 (无 Decimal 列).
 /// ⭐ compat: 4→5 尾部加 dropped 列号列表; decode 兼容 v1-4 (dropped=[]).
-const FMT_VER: u8 = 5;
+/// ⭐ PG 兼容: 5→6 每列追加 default 段; decode 兼容 v1-5 (default=None).
+/// ⭐ PG 兼容: 6→7 索引项追加 cols 列集; decode 兼容 v1-6 (cols=[col]).
+const FMT_VER: u8 = 7;
 
 /// schema 反序列化错误.
 #[derive(Debug, PartialEq, Eq)]
@@ -154,33 +217,57 @@ impl TableSchema {
         index_cols: &[u16],
         unique_cols: &[u16],
         global_unique_cols: &[u16],
+        composite_unique_cols: &[Vec<u16>],
     ) -> Result<Self, SchemaError> {
         if pk_col as usize >= columns.len() {
             return Err(SchemaError::BadRef);
         }
         let mut next_iid = 0u32;
-        let mut indexes: Vec<IndexDef> =
-            Vec::with_capacity(index_cols.len() + unique_cols.len() + global_unique_cols.len());
-        // (列集, unique, global)
-        for (cols, unique, global) in [
-            (index_cols, false, false),
-            (unique_cols, true, false),
-            (global_unique_cols, true, true),
-        ] {
-            for &col in cols {
-                if col as usize >= columns.len() {
-                    return Err(SchemaError::BadRef);
-                }
-                if col == pk_col && global {
-                    // pk 已天然全局唯一 (存储 key), 无需占坑
-                    return Err(SchemaError::BadRef);
-                }
-                if indexes.iter().any(|i| i.col == col) {
-                    continue; // 同列重复声明: 首个生效
-                }
-                indexes.push(IndexDef { iid: next_iid, col, unique, global });
-                next_iid += 1;
+        let mut indexes: Vec<IndexDef> = Vec::with_capacity(
+            index_cols.len() + unique_cols.len() + global_unique_cols.len() + composite_unique_cols.len(),
+        );
+        let mut seen_cols = std::collections::HashSet::new();
+        // (列集, unique, global); 单列索引逐列登记, 复合唯一整组登记
+        let mut push_index = |indexes: &mut Vec<IndexDef>, cols: Vec<u16>, unique: bool, global: bool| -> Result<(), SchemaError> {
+            let col = cols[0];
+            if col as usize >= columns.len() {
+                return Err(SchemaError::BadRef);
             }
+            if col == pk_col && global {
+                // pk 已天然全局唯一 (存储 key), 无需占坑
+                return Err(SchemaError::BadRef);
+            }
+            if cols.iter().any(|&c| c as usize >= columns.len()) {
+                return Err(SchemaError::BadRef);
+            }
+            // 去重: 单列索引按列判重; 复合整组判重 (与既有单列键不同 → 保留)
+            let dup = if cols.len() == 1 {
+                seen_cols.contains(&col)
+            } else {
+                indexes.iter().any(|i| i.cols == cols)
+            };
+            if dup {
+                return Ok(());
+            }
+            indexes.push(IndexDef { iid: next_iid, col, cols, unique, global });
+            next_iid += 1;
+            seen_cols.insert(col);
+            Ok(())
+        };
+        for &col in index_cols {
+            push_index(&mut indexes, vec![col], false, false)?;
+        }
+        for &col in unique_cols {
+            push_index(&mut indexes, vec![col], true, false)?;
+        }
+        for &col in global_unique_cols {
+            push_index(&mut indexes, vec![col], true, true)?;
+        }
+        for group in composite_unique_cols {
+            if group.len() < 2 {
+                return Err(SchemaError::BadRef);
+            }
+            push_index(&mut indexes, group.clone(), true, false)?;
         }
         Ok(Self {
             version: 1,
@@ -271,11 +358,26 @@ impl TableSchema {
                 out.push(scale);
             }
             out.push(c.nullable as u8);
+            // ⭐ PG 兼容 (FMT_VER 6): 列默认值 (0=无; 1=Lit; 2=Now; 3=UuidGenV4)
+            match &c.default {
+                None => out.push(0),
+                Some(ColDefault::Lit(v)) => {
+                    out.push(1);
+                    encode_colvalue(v, &mut out);
+                }
+                Some(ColDefault::Now) => out.push(2),
+                Some(ColDefault::UuidGenV4) => out.push(3),
+            }
         }
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
         for i in &self.indexes {
             out.extend_from_slice(&i.iid.to_le_bytes());
             out.extend_from_slice(&i.col.to_le_bytes());
+            // ⭐ PG 兼容 (FMT_VER 7): 索引列集 (单列 = len1)
+            out.extend_from_slice(&(i.cols.len() as u16).to_le_bytes());
+            for &c in &i.cols {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
             out.push(i.unique as u8); // ⭐ O3
             out.push(i.global as u8); // ⭐ F65 (FMT_VER 2)
         }
@@ -297,7 +399,7 @@ impl TableSchema {
     pub fn decode(buf: &[u8]) -> Result<Self, SchemaError> {
         let mut r = Reader { buf, pos: 0 };
         let fmt = r.u8()?;
-        if fmt != FMT_VER && fmt != 1 && fmt != 2 && fmt != 3 && fmt != 4 {
+        if fmt != FMT_VER && fmt != 1 && fmt != 2 && fmt != 3 && fmt != 4 && fmt != 5 && fmt != 6 {
             return Err(SchemaError::BadFormat);
         }
         let version = r.u8()?;
@@ -319,19 +421,45 @@ impl TableSchema {
                 ColType::from_byte(tb).ok_or(SchemaError::BadFormat)?
             };
             let nullable = r.u8()? != 0;
-            columns.push(Column { name, ty, nullable });
+            // ⭐ PG 兼容 (FMT_VER 6): 列默认值; v1-5 无此段 → None
+            let default = if fmt >= 6 {
+                match r.u8()? {
+                    0 => None,
+                    1 => Some(ColDefault::Lit(decode_colvalue(&mut r)?)),
+                    2 => Some(ColDefault::Now),
+                    3 => Some(ColDefault::UuidGenV4),
+                    _ => return Err(SchemaError::BadFormat),
+                }
+            } else {
+                None
+            };
+            columns.push(Column { name, ty, nullable, default });
         }
         let n_idx = r.u16()? as usize;
         let mut indexes = Vec::with_capacity(n_idx);
         for _ in 0..n_idx {
             let iid = r.u32()?;
             let col = r.u16()?;
-            let unique = r.u8()? != 0; // ⭐ O3
-            let global = if fmt >= 2 { r.u8()? != 0 } else { false }; // ⭐ F65 (v1 无此字段)
-            if col as usize >= columns.len() {
+            // ⭐ PG 兼容 (FMT_VER 7): 索引列集; v1-6 无此段 → 单列 [col]
+            let cols = if fmt >= 7 {
+                let n = r.u16()? as usize;
+                if n == 0 {
+                    return Err(SchemaError::BadFormat);
+                }
+                let mut cs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cs.push(r.u16()?);
+                }
+                cs
+            } else {
+                vec![col]
+            };
+            if col as usize >= columns.len() || cols.iter().any(|&c| c as usize >= columns.len()) {
                 return Err(SchemaError::BadRef);
             }
-            indexes.push(IndexDef { iid, col, unique, global });
+            let unique = r.u8()? != 0; // ⭐ O3
+            let global = if fmt >= 2 { r.u8()? != 0 } else { false }; // ⭐ F65 (v1 无此字段)
+            indexes.push(IndexDef { iid, col, cols, unique, global });
         }
         let next_iid = r.u32()?;
         if pk_col as usize >= columns.len() {
@@ -391,6 +519,18 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32, SchemaError> {
         Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
     }
+
+    fn i64(&mut self) -> Result<i64, SchemaError> {
+        Ok(i64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
+    }
+
+    fn f64(&mut self) -> Result<f64, SchemaError> {
+        Ok(f64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
+    }
+
+    fn i128(&mut self) -> Result<i128, SchemaError> {
+        Ok(i128::from_le_bytes(self.bytes(16)?.try_into().unwrap()))
+    }
 }
 
 #[cfg(test)]
@@ -400,15 +540,15 @@ mod tests {
     fn demo_schema() -> TableSchema {
         TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
-                Column { name: "name".into(), ty: ColType::Str, nullable: false },
-                Column { name: "score".into(), ty: ColType::F64, nullable: true },
-                Column { name: "blob".into(), ty: ColType::Bytes, nullable: true },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
+                Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
+                Column { name: "blob".into(), ty: ColType::Bytes, nullable: true, default: None },
             ],
             0,
             &[1, 2], // name / score 建索引
             &[3],    // blob 唯一索引 (⭐ O3 roundtrip)
-            &[],
+            &[], &[],
         )
         .unwrap()
     }
@@ -420,10 +560,10 @@ mod tests {
         let d = TableSchema::decode(&bytes).unwrap();
         assert_eq!(s, d);
         assert_eq!(d.indexes.len(), 3);
-        assert_eq!(d.indexes[0], IndexDef { iid: 0, col: 1, unique: false, global: false });
-        assert_eq!(d.indexes[1], IndexDef { iid: 1, col: 2, unique: false, global: false });
+        assert_eq!(d.indexes[0], IndexDef { iid: 0, col: 1, cols: vec![1], unique: false, global: false });
+        assert_eq!(d.indexes[1], IndexDef { iid: 1, col: 2, cols: vec![2], unique: false, global: false });
         // ⭐ O3: unique 位随序列化 roundtrip
-        assert_eq!(d.indexes[2], IndexDef { iid: 2, col: 3, unique: true, global: false });
+        assert_eq!(d.indexes[2], IndexDef { iid: 2, col: 3, cols: vec![3], unique: true, global: false });
         assert_eq!(d.next_iid, 3);
     }
 
@@ -435,18 +575,18 @@ mod tests {
         // 越界引用被拒
         assert_eq!(
             TableSchema::new(
-                vec![Column { name: "a".into(), ty: ColType::I64, nullable: false }],
+                vec![Column { name: "a".into(), ty: ColType::I64, nullable: false, default: None }],
                 1,
                 &[],
-                &[], &[]),
+                &[], &[], &[]),
             Err(SchemaError::BadRef)
         );
         assert_eq!(
             TableSchema::new(
-                vec![Column { name: "a".into(), ty: ColType::I64, nullable: false }],
+                vec![Column { name: "a".into(), ty: ColType::I64, nullable: false, default: None }],
                 0,
                 &[3],
-                &[], &[]),
+                &[], &[], &[]),
             Err(SchemaError::BadRef)
         );
     }

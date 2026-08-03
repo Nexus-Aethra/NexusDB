@@ -294,7 +294,8 @@ pub(crate) fn sql_dispatch_stmt(
         }
         // ⭐ F66: 系统表查询 (information_schema / pg_catalog 虚拟表)
         SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset } => {
-            let spec = SysQuerySpec { catalog, table, cols, conds, order, limit, offset };
+            let spec =
+                SysQuerySpec { catalog, table, cols, conds, order, limit, offset, exists: false };
             // 纯 db 列表的虚拟表 (schemata / pg_namespace) → 零任务直接合成;
             // 需表/列元数据的 → 发 CatalogDump 挂起
             if spec.needs_catalog() {
@@ -315,6 +316,35 @@ pub(crate) fn sql_dispatch_stmt(
                 conn.resp_complete(seq, bytes);
             }
         }
+        // ⭐ PG 兼容: SELECT EXISTS (SELECT ...) — 内层转系统查询 exists 判定
+        SqlStmt::ExistsStub { inner } => match *inner {
+            SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset } => {
+                let spec =
+                    SysQuerySpec { catalog, table, cols, conds, order, limit, offset, exists: true };
+                if spec.needs_catalog() {
+                    conn.sql_sysq.insert(seq, spec);
+                    let op = BatchOp::CatalogDump { db: db.clone() };
+                    let sid = hash_route_key(db, "", &[], num_shards);
+                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                } else {
+                    let dbs: Vec<String> =
+                        db_view.all_names().iter().map(|s| s.to_string()).collect();
+                    let mut dbs = dbs;
+                    if !dbs.iter().any(|d| d.as_str() == default_db.as_ref()) {
+                        dbs.push(default_db.to_string());
+                    }
+                    let bin = conn.mysql_binary.remove(&seq);
+                    let bytes = sysq_render_dblist(conn.proto, bin, &spec, &dbs);
+                    conn.resp_complete(seq, bytes);
+                }
+            }
+            _ => {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, "EXISTS over non-system query not supported (v1)"),
+                );
+            }
+        }
         SqlStmt::Use { db: name } => {
             // 校验存在 (default 库隐式不入 resolver, 特判)
             if name.as_str() == default_db.as_ref() || db_view.id_of(&name).is_some() {
@@ -325,6 +355,27 @@ pub(crate) fn sql_dispatch_stmt(
                     seq,
                     sql_err_bytes(conn.proto, &format!("Unknown database '{name}'")),
                 );
+            }
+        }
+        // ⭐ PG 兼容: CREATE DATABASE — 集群控制面 2PC 建库 (同步低频)
+        SqlStmt::CreateDb { name } => {
+            match conn.sql_shared.cluster_ctl() {
+                Some(mgr) => match mgr.create_db(&name) {
+                    Ok(()) => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0)),
+                    Err(e) => conn.resp_complete(
+                        seq,
+                        sql_err_bytes(
+                            conn.proto,
+                            &format!("database \"{name}\" create failed: {e}"),
+                        ),
+                    ),
+                },
+                None => {
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(conn.proto, "cluster control plane not available (CREATE DATABASE)"),
+                    );
+                }
             }
         }
         SqlStmt::CreateTable { table, schema, if_not_exists } => {
@@ -1853,13 +1904,12 @@ pub(crate) fn row_has_index_val(schema: &TableSchema, row: &[u8], iid: u32, enc_
         return false;
     };
     schema.indexes.iter().find(|i| i.iid == iid).is_some_and(|idx| {
-        let ty = schema.columns[idx.col as usize].ty;
-        storage::sql_rows::index_val_bytes(ty, &values[idx.col as usize])
-            .is_some_and(|e| e == enc_val)
+        storage::sql_rows::index_vals_bytes(schema, idx, &values).is_some_and(|e| e == enc_val)
     })
 }
 
 /// ⭐ F66: 系统表查询规格 (解析产物, worker 合成虚拟表用).
+/// `exists=true` (PG 兼容 SELECT EXISTS): 只判定过滤后是否非空, 回单行布尔.
 pub(crate) struct SysQuerySpec {
     catalog: String,
     table: String,
@@ -1868,6 +1918,7 @@ pub(crate) struct SysQuerySpec {
     order: Vec<(String, bool)>,
     limit: Option<u32>,
     offset: Option<u32>,
+    exists: bool,
 }
 
 impl SysQuerySpec {
@@ -1877,6 +1928,7 @@ impl SysQuerySpec {
             (self.catalog.as_str(), self.table.as_str()),
             ("information_schema", "schemata")
                 | ("pg_catalog", "pg_namespace")
+                | ("pg_catalog", "pg_database")
                 | ("__show__", "databases")
                 | ("__show__", "__empty__")
         )
@@ -1918,6 +1970,7 @@ pub(crate) fn sysq_finish(
                 name: n.to_string(),
                 ty: ColType::Str,
                 nullable: true,
+                default: None,
             })
             .collect(),
         pk_col: 0,
@@ -1995,6 +2048,11 @@ pub(crate) fn sysq_render_dblist(
                     .map(|(i, d)| vec![sbytes(d), sbytes(&(i as u32 + 1).to_string())])
                     .collect(),
             ),
+            // ⭐ PG 兼容: pg_database — migrator 建库探测 `WHERE datname=$1`
+            ("pg_catalog", "pg_database") => (
+                vec!["datname"],
+                dbs.iter().map(|d| vec![sbytes(d)]).collect(),
+            ),
             // ⭐ F66: SHOW DATABASES — 单列 "Database"
             ("__show__", "databases") => (
                 vec!["Database"],
@@ -2004,7 +2062,47 @@ pub(crate) fn sysq_render_dblist(
             ("__show__", "__empty__") => (vec![""], vec![]),
             _ => (vec![], vec![]),
         };
+    if spec.exists {
+        return sysq_exists(proto, binary, spec, &all_cols, rows);
+    }
     sysq_finish(proto, binary, spec, &all_cols, rows)
+}
+
+/// ⭐ PG 兼容: SELECT EXISTS 判定 — 过滤后非空 → 单行布尔 t/f (OID bool,
+/// pgx Scan(&bool) 可用). 复用 sysq_finish 的 WHERE 过滤语义 (eval_pred_sysq).
+fn sysq_exists(
+    proto: ProtocolKind,
+    binary: bool,
+    spec: &SysQuerySpec,
+    all_cols: &[&str],
+    rows: Vec<Vec<ColValue>>,
+) -> Vec<u8> {
+    let schema = TableSchema {
+        version: 1,
+        columns: all_cols
+            .iter()
+            .map(|n| storage::schema::Column {
+                name: n.to_string(),
+                ty: ColType::Str,
+                nullable: true,
+                default: None,
+            })
+            .collect(),
+        pk_col: 0,
+        indexes: Vec::new(),
+        dropped: Vec::new(),
+        next_iid: 0,
+        version_ncols: Vec::new(),
+    };
+    let mut rows = rows;
+    rows.retain(|r| eval_pred_sysq(&schema, r, &spec.conds));
+    let hit = !rows.is_empty();
+    sql_rows_bytes(
+        proto,
+        binary,
+        &[("?column?", ColType::Bool)],
+        &[vec![ColValue::I64(if hit { 1 } else { 0 })]],
+    )
 }
 
 /// ⭐ F66: 需 catalog 快照的虚拟表合成 (tables/columns/key_column_usage/pg_*).
@@ -2159,7 +2257,8 @@ pub(crate) fn sysq_render_catalog(
             entries
                 .iter()
                 .map(|(t, _)| {
-                    vec![sbytes("def"), sbytes(db), sbytes(t), sbytes("BASE TABLE")]
+                    // ⭐ PG 兼容: table_schema 固定 'public' (migrator 以 'public' 探表)
+                    vec![sbytes("def"), sbytes("public"), sbytes(t), sbytes("BASE TABLE")]
                 })
                 .collect(),
         ),
@@ -2252,6 +2351,9 @@ pub(crate) fn sysq_render_catalog(
         // 未知系统表 → 空结果 (工具探测容错)
         _ => (vec!["unknown"], vec![]),
     };
+    if spec.exists {
+        return sysq_exists(proto, binary, spec, &all_cols, rows);
+    }
     sysq_finish(proto, binary, spec, &all_cols, rows)
 }
 
@@ -3179,6 +3281,8 @@ pub(crate) fn sql_run_dml(
         | SqlStmt::DatabaseStub
         | SqlStmt::SystemQuery { .. }
         | SqlStmt::SystemVarStub { .. }
+        | SqlStmt::ExistsStub { .. }
+        | SqlStmt::CreateDb { .. }
         | SqlStmt::SelectJoin { .. } => {
             unreachable!("工具命令在 sql_dispatch_stmt 处理")
         }
@@ -3397,6 +3501,10 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
     let mut best: Option<(u32, usize, u32)> = None; // (score, idx_pos, iid)
     let mut best_bounds: (Option<ColValue>, Option<ColValue>) = (None, None);
     for (ipos, idx) in schema.indexes.iter().enumerate() {
+        // ⭐ PG 兼容 (FMT_VER 7): 复合索引 v1 不参与单列扫描 (退化全表, 正确性保底)
+        if idx.cols.len() != 1 {
+            continue;
+        }
         let col = &schema.columns[idx.col as usize];
         let mut lo: Option<ColValue> = None;
         let mut hi: Option<ColValue> = None;
@@ -3505,12 +3613,13 @@ mod tests {
     fn test_schema() -> TableSchema {
         TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
-                Column { name: "name".into(), ty: ColType::Str, nullable: true },
-                Column { name: "score".into(), ty: ColType::I64, nullable: true },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column { name: "name".into(), ty: ColType::Str, nullable: true, default: None },
+                Column { name: "score".into(), ty: ColType::I64, nullable: true, default: None },
             ],
             0,
             &[1, 2],
+            &[],
             &[],
             &[],
         )

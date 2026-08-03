@@ -156,10 +156,15 @@ mod tests {
         let s = parse(b"CREATE TABLE t (a INT UNIQUE, b INT)").unwrap();
         let SqlStmt::CreateTable { schema, .. } = s else { panic!("expected CreateTable") };
         assert_eq!(schema.columns[schema.pk_col as usize].name, "a", "{schema:?}");
-        // 表级复合 UNIQUE(a,b) → v1 解析只取首列 (既有退化) → L1 提升 a
+        // ⭐ PG 兼容 (FMT_VER 7): 表级复合 UNIQUE(a,b) → 整组唯一 (非取首列),
+        // 无单列唯一 → L2 注入 __rowid; 复合唯一作为多列索引存在
         let s = parse(b"CREATE TABLE t (a INT, b INT, UNIQUE(a, b))").unwrap();
         let SqlStmt::CreateTable { schema, .. } = s else { panic!("expected CreateTable") };
-        assert_eq!(schema.columns[schema.pk_col as usize].name, "a");
+        assert_eq!(schema.columns[schema.pk_col as usize].name, "__rowid");
+        assert!(
+            schema.indexes.iter().any(|i| i.unique && i.cols == vec![0, 1]),
+            "{schema:?}"
+        );
         // L2: 无 PK 无唯一 → 注入
         let s = parse(b"CREATE TABLE t (a INT, b TEXT)").unwrap();
         let SqlStmt::CreateTable { schema, .. } = s else { panic!("expected CreateTable") };

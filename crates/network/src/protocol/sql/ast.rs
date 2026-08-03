@@ -415,6 +415,11 @@ pub enum SqlStmt {
     /// ⭐ F66: `SELECT @@var [, @@var2]` 系统变量 (SQLAlchemy/驱动初始化探测).
     /// vars = 去 @@ 的变量名列表; worker 回合理值单行.
     SystemVarStub { vars: Vec<String> },
+    /// ⭐ PG 兼容: `SELECT EXISTS (SELECT ...)` — 内层非空 → 单行布尔 t/f.
+    /// v1: 内层仅支持 SystemQuery (pg_database / information_schema 探测).
+    ExistsStub { inner: Box<SqlStmt> },
+    /// ⭐ PG 兼容: `CREATE DATABASE name` — worker 走 shard 2PC 建库.
+    CreateDb { name: String },
     /// ⭐ F72 (子查询): FROM 派生表 `(SELECT ...) alias`. inner 先物化成
     /// 虚拟表 (worker 内存), 外层在其上过滤/投影/排序/截断.
     /// v1: 派生表为唯一数据源 (不参与 JOIN); 外层无 GROUP BY/HAVING/聚合

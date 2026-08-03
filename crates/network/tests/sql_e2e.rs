@@ -1684,6 +1684,56 @@ fn mysql_plain_unique_unchanged() {
     drop(mgr);
 }
 
+/// ⭐ PG 兼容 (FMT_VER 7): 复合 UNIQUE — 整组唯一 (拼接 key + IVAL_COMPOSITE).
+/// 同首列不同次列允许; 整组重复必拒 (1062); 复合索引不参与单列扫描 (正确性保底).
+#[test]
+fn mysql_composite_unique() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE uq (a INT, b INT, UNIQUE(a, b))");
+    c.query("INSERT INTO uq VALUES (1, 1)");
+    c.query("INSERT INTO uq VALUES (1, 2)"); // 同 a 不同 b: 允许
+    let r = c.query("INSERT INTO uq VALUES (1, 1)"); // 整组重复: 拒
+    assert!(matches!(r, QueryResult::Err { code: 1062, .. }), "复合 UNIQUE 整组重复必拒: {r:?}");
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM uq"),
+        QueryResult::Rows(vec![vec![Some("2".into())]]),
+        "冲突行零写入"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 // ===== ⭐ information_schema 系统表 (F66) =====
 
 /// 系统表虚拟化: tables/columns/key_column_usage/schemata + 投影/过滤/大小写/未知回空.

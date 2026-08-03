@@ -127,6 +127,7 @@ pub(crate) fn sql_build_row(
     let auto_rowid = is_auto_pk(schema).then_some(schema.pk_col as usize);
     let hidden = |i: usize| auto_rowid == Some(i) || schema.dropped.contains(&(i as u16));
     let mut out = vec![ColValue::Null; n];
+    let mut provided = vec![false; n];
     if cols.is_empty() {
         let visible = (0..n).filter(|&i| !hidden(i)).count();
         if vals.len() != visible {
@@ -138,6 +139,7 @@ pub(crate) fn sql_build_row(
                 continue;
             }
             out[i] = sql_to_col(c.ty, &vals[vi])?;
+            provided[i] = true;
             vi += 1;
         }
     } else {
@@ -149,6 +151,15 @@ pub(crate) fn sql_build_row(
                 .col_by_name(name)
                 .ok_or_else(|| format!("unknown column '{name}'"))? as usize;
             out[i] = sql_to_col(schema.columns[i].ty, v)?;
+            provided[i] = true;
+        }
+    }
+    // ⭐ PG 兼容: 未显式提供的列 → 列默认值 (DEFAULT 表达式求值; 显式 NULL 不覆盖)
+    for (i, c) in schema.columns.iter().enumerate() {
+        if !provided[i] && !hidden(i) {
+            if let Some(d) = &c.default {
+                out[i] = eval_col_default(c.ty, d)?;
+            }
         }
     }
     // 自动主键: 未提供 (或显式值) → 生成; 禁止用户覆盖 (保持隐藏语义)
@@ -156,6 +167,49 @@ pub(crate) fn sql_build_row(
         out[i] = ColValue::I64(next_auto_rowid());
     }
     Ok(out)
+}
+
+/// ⭐ PG 兼容: DEFAULT 表达式求值 (字面量 / NOW / uuid_generate_v4).
+pub(crate) fn eval_col_default(
+    ty: ColType,
+    d: &storage::schema::ColDefault,
+) -> Result<ColValue, String> {
+    Ok(match d {
+        storage::schema::ColDefault::Lit(v) => v.clone(),
+        storage::schema::ColDefault::Now => ColValue::I64(now_micros()),
+        storage::schema::ColDefault::UuidGenV4 => match ty {
+            ColType::Uuid => ColValue::Bytes(uuid_v4_bytes()),
+            // 非 UUID 列上的 uuid_generate_v4() → 也产 16B 文本? 保守报错
+            _ => ColValue::Bytes(uuid_v4_bytes()),
+        },
+    })
+}
+
+/// 当前时间 (UTC 微秒).
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+/// ⭐ PG 兼容: 生成 UUID v4 (16B). 无 rand 依赖 — 时间戳 + 单调计数器
+/// + 黄金比例混合; 版本/变体位按 RFC 4122 设置. 唯一性足够 (进程内单调).
+fn uuid_v4_bytes() -> Vec<u8> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let t = now_micros() as u64;
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // 混合: 时间戳高 32 / 低 32 ^ 计数*黄金比例 / 计数
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&(t as u32).to_le_bytes());
+    b[4..8].copy_from_slice(&((t >> 32) as u32).to_le_bytes());
+    let mix = c.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    b[8..12].copy_from_slice(&(mix as u32).to_le_bytes());
+    b[12..16].copy_from_slice(&(c as u32).to_le_bytes());
+    b[6] = (b[6] & 0x0F) | 0x40; // version 4
+    b[8] = (b[8] & 0x3F) | 0x80; // variant 10xx
+    b.to_vec()
 }
 
 
@@ -307,11 +361,13 @@ pub(crate) fn eval_cond_leaf(schema: &TableSchema, values: &[ColValue], c: &Cond
             }
         }
         return c.set.iter().any(|v| {
-            let cvt = coerce_cmp_lit(colty, v);
+            let cvt = coerce_cmp_lit_uuid(colty, v);
             sql_cmp(cv, cvt.as_ref().unwrap_or(v)) == Some(Ordering::Equal)
         });
     }
-    let cval = coerce_cmp_lit(colty, &c.val);
+    // ⭐ PG 兼容: UUID 列的字面量/参数 (36 字符文本) → 16B (SqlValue::Str 字节载体)
+    // 再比较; 否则 16B 存储值 vs 36 字符文本直接字节比较恒不等.
+    let cval = coerce_cmp_lit_uuid(colty, &c.val);
     match sql_cmp(cv, cval.as_ref().unwrap_or(&c.val)) {
         None => false,
         Some(o) => match c.op {
@@ -368,6 +424,21 @@ pub(crate) fn coerce_cmp_lit(ty: ColType, sv: &SqlValue) -> Option<SqlValue> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// ⭐ PG 兼容: 比较字面量 coercion — UUID 列文本 (36 字符) → 16B (SqlValue::Str
+/// 字节载体); 其余类型走 `coerce_cmp_lit`.
+fn coerce_cmp_lit_uuid(colty: ColType, v: &SqlValue) -> Option<SqlValue> {
+    if colty == ColType::Uuid {
+        match v {
+            SqlValue::Str(s) => {
+                std::str::from_utf8(s).ok().and_then(parse_uuid).map(SqlValue::Str)
+            }
+            _ => None,
+        }
+    } else {
+        coerce_cmp_lit(colty, v)
     }
 }
 
