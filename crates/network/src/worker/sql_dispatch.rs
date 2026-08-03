@@ -293,7 +293,7 @@ pub(crate) fn sql_dispatch_stmt(
             conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cols, &[row]));
         }
         // ⭐ F66: 系统表查询 (information_schema / pg_catalog 虚拟表)
-        SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset } => {
+        SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset, .. } => {
             let spec =
                 SysQuerySpec { catalog, table, cols, conds, order, limit, offset, exists: false };
             // 纯 db 列表的虚拟表 (schemata / pg_namespace) → 零任务直接合成;
@@ -318,7 +318,7 @@ pub(crate) fn sql_dispatch_stmt(
         }
         // ⭐ PG 兼容: SELECT EXISTS (SELECT ...) — 内层转系统查询 exists 判定
         SqlStmt::ExistsStub { inner } => match *inner {
-            SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset } => {
+            SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset, .. } => {
                 let spec =
                     SysQuerySpec { catalog, table, cols, conds, order, limit, offset, exists: true };
                 if spec.needs_catalog() {
@@ -440,7 +440,7 @@ pub(crate) fn sql_dispatch_stmt(
             }
         }
         // ⭐ F67 (JOIN): 两表 hash join — 建 ctx → 补 schema/gather 顺序启动
-        SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset } => {
+        SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset, .. } => {
             // ⭐ F75: 首表为派生表 → 先物化内层 (同 seq 完成点拦截), 完后 finish_derived 建 JOIN
             if let Some(inner) = from_inner {
                 if !matches!(*inner, SqlStmt::Select { .. }) {
@@ -463,6 +463,7 @@ pub(crate) fn sql_dispatch_stmt(
                 }
                 let join_stmt = SqlStmt::SelectJoin {
                     from, from_inner: None, joins, items, conds, order, limit, offset,
+                    limit_param: None, offset_param: None,
                 };
                 conn.sql_derived.insert(seq, DerivedCtx::JoinFrom { db: db.clone(), join_stmt });
                 sql_dispatch_stmt(
@@ -512,7 +513,7 @@ pub(crate) fn sql_dispatch_stmt(
         }
         // ⭐ F72: FROM 派生表 — 内层先物化 (同 seq 完成点拦截), 完后 finish_derived
         // 在 worker 内存执行外层 (过滤/投影/排序/截断; 不下推 shard)
-        SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset } => {
+        SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset, .. } => {
             // v1: 内层仅单表 SELECT (非 JOIN/系统表) — 否则绕过完成点拦截
             if !matches!(*inner, SqlStmt::Select { .. }) {
                 conn.resp_complete(
@@ -2844,7 +2845,7 @@ pub(crate) fn sql_run_dml(
                 }
             }
         }
-        SqlStmt::Select { table, items, mut conds, limit, order, offset, group_by, having } => {
+        SqlStmt::Select { table, items, mut conds, limit, order, offset, group_by, having, .. } => {
             // ⭐ 优化器 M1 (2026-08): 谓词归一 (NOT 下推/恒真恒假短路) 后再规划
             let (ncond, cond_false) = sql::normalize_pred_cond(&conds);
             conds = ncond;

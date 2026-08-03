@@ -761,6 +761,28 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
     Ok((stmt, p.next_param))
 }
 
+/// ⭐ PG 兼容 (LIMIT/OFFSET $n): 解析 limit 字面量或其参数索引, bind 后填真实值.
+/// 参数值支持 Int / Str (数字串).
+fn resolve_limit(lit: Option<u32>, param: Option<u16>, params: &[SqlValue]) -> Result<Option<u32>, String> {
+    if let Some(i) = param {
+        let v = params
+            .get(i as usize)
+            .ok_or_else(|| format!("missing parameter {}", i + 1))?;
+        match v {
+            SqlValue::Int(x) => u32::try_from(*x)
+                .map(Some)
+                .map_err(|_| format!("LIMIT/OFFSET out of range: {x}")),
+            SqlValue::Str(s) => {
+                let s = String::from_utf8_lossy(s).trim().to_string();
+                s.parse::<u32>().map(Some).map_err(|_| format!("bad LIMIT/OFFSET {s}"))
+            }
+            other => Err(format!("LIMIT/OFFSET must be integer, got {other:?}")),
+        }
+    } else {
+        Ok(lit)
+    }
+}
+
 /// ⭐ P1: 参数绑定 — 深拷贝模板, 替换全部 Param(i) 为 params[i].
 /// 个数不符/越界/params 内含 Param 报错.
 pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, String> {
@@ -800,16 +822,18 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
                 .map(|r| r.iter().map(&subst).collect::<Result<_, _>>())
                 .collect::<Result<_, _>>()?,
         },
-        SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having } => {
+        SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having, limit_param, offset_param } => {
             SqlStmt::Select {
                 table: table.clone(),
                 items: items.clone(),
                 conds: bind_conds(conds)?,
-                limit: *limit,
+                limit: resolve_limit(*limit, *limit_param, params)?,
                 order: order.clone(),
-                offset: *offset,
+                offset: resolve_limit(*offset, *offset_param, params)?,
                 group_by: group_by.clone(),
                 having: bind_conds(having)?,
+                limit_param: None,
+                offset_param: None,
             }
         }
         SqlStmt::Delete { table, conds } => SqlStmt::Delete {
@@ -825,7 +849,7 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
             conds: bind_conds(conds)?,
         },
         // ⭐ F67/F68 (JOIN): 替换 WHERE 限定条件里的占位符 (ON/from/joins 无字面量)
-        SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset } => {
+        SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset, limit_param, offset_param } => {
             SqlStmt::SelectJoin {
                 from: from.clone(),
                 // ⭐ F75: 派生表内层递归绑定
@@ -844,20 +868,24 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
                     })
                 })?,
                 order: order.clone(),
-                limit: *limit,
-                offset: *offset,
+                limit: resolve_limit(*limit, *limit_param, params)?,
+                offset: resolve_limit(*offset, *offset_param, params)?,
+                limit_param: None,
+                offset_param: None,
             }
         }
         // ⭐ F72: 派生表 — 内层递归绑定 + 外层 WHERE 绑定
-        SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset } => {
+        SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset, limit_param, offset_param } => {
             SqlStmt::SelectDerived {
                 inner: Box::new(bind_params(inner, params)?),
                 alias: alias.clone(),
                 items: items.clone(),
                 conds: bind_conds(conds)?,
                 order: order.clone(),
-                limit: *limit,
-                offset: *offset,
+                limit: resolve_limit(*limit, *limit_param, params)?,
+                offset: resolve_limit(*offset, *offset_param, params)?,
+                limit_param: None,
+                offset_param: None,
             }
         }
         // ⭐ PG 兼容: SELECT EXISTS — 内层 (SystemQuery) 递归绑定 $n
@@ -865,15 +893,17 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
             inner: Box::new(bind_params(inner, params)?),
         },
         // ⭐ F66: 系统表查询 — WHERE 条件支持 $n (migrator 探测)
-        SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset } => {
+        SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset, limit_param, offset_param } => {
             SqlStmt::SystemQuery {
                 catalog: catalog.clone(),
                 table: table.clone(),
                 cols: cols.clone(),
                 conds: bind_conds(conds)?,
                 order: order.clone(),
-                limit: *limit,
-                offset: *offset,
+                limit: resolve_limit(*limit, *limit_param, params)?,
+                offset: resolve_limit(*offset, *offset_param, params)?,
+                limit_param: None,
+                offset_param: None,
             }
         }
         // 无参数位的语句原样克隆
@@ -1424,9 +1454,9 @@ fn parse_derived(p: &mut P, items: Vec<SelectItem>, top: bool) -> Result<SqlStmt
     if pred_has_subquery(&conds) {
         return Err("subquery in derived-table outer WHERE is not supported (v1)".into());
     }
-    let (order, limit, offset) = parse_select_tail(p)?;
+    let (order, limit, offset, limit_param, offset_param) = parse_select_tail(p)?;
     p.done_if(top)?;
-    Ok(SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset })
+    Ok(SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset, limit_param, offset_param })
 }
 
 /// WHERE 子句 (AND 平铺; caller 决定是否必带).
@@ -2100,7 +2130,16 @@ fn split_system_table(name: &str) -> Option<(String, String)> {
 #[allow(clippy::type_complexity)]
 fn parse_select_tail(
     p: &mut P,
-) -> Result<(Vec<(String, bool)>, Option<u32>, Option<u32>), String> {
+) -> Result<
+    (
+        Vec<(String, bool)>,
+        Option<u32>,
+        Option<u32>,
+        Option<u16>,
+        Option<u16>,
+    ),
+    String,
+> {
     let mut order: Vec<(String, bool)> = Vec::new();
     if p.try_kw("ORDER") {
         p.kw("BY")?;
@@ -2122,6 +2161,8 @@ fn parse_select_tail(
     }
     let mut limit = None;
     let mut offset = None;
+    let mut limit_param = None; // ⭐ PG 兼容: LIMIT $n → 参数索引 (bind 时填)
+    let mut offset_param = None; // ⭐ PG 兼容: OFFSET $n → 参数索引
     if p.try_kw("LIMIT") {
         match p.next()? {
             Tok::Num(n) => {
@@ -2134,11 +2175,22 @@ fn parse_select_tail(
                             offset = Some(a);
                             limit = Some(m.parse::<u32>().map_err(|_| format!("bad LIMIT {m}"))?);
                         }
+                        Tok::Dollar(i) => {
+                            offset = Some(a);
+                            limit = Some(0);
+                            limit_param = Some(i - 1); // 0-based 索引 (与 SqlValue::Param 一致)
+                            p.next_param = p.next_param.max(i);
+                        }
                         other => return Err(format!("expected LIMIT count, got {other:?}")),
                     }
                 } else {
                     limit = Some(a);
                 }
+            }
+            Tok::Dollar(i) => {
+                p.next_param = p.next_param.max(i);
+                limit = Some(0); // 占位, bind_params 用参数值填
+                limit_param = Some(i - 1); // 0-based
             }
             other => return Err(format!("expected LIMIT count, got {other:?}")),
         }
@@ -2146,10 +2198,15 @@ fn parse_select_tail(
     if p.try_kw("OFFSET") {
         match p.next()? {
             Tok::Num(n) => offset = Some(n.parse::<u32>().map_err(|_| format!("bad OFFSET {n}"))?),
+            Tok::Dollar(i) => {
+                p.next_param = p.next_param.max(i);
+                offset = Some(0); // 占位
+                offset_param = Some(i - 1); // 0-based
+            }
             other => return Err(format!("expected OFFSET count, got {other:?}")),
         }
     }
-    Ok((order, limit, offset))
+    Ok((order, limit, offset, limit_param, offset_param))
 }
 
 /// ⭐ F66: SHOW [FULL] TABLES [FROM db] / SHOW [FULL] COLUMNS FROM t [FROM db]
@@ -2166,6 +2223,8 @@ fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
         order: Vec::new(),
         limit: None,
         offset: None,
+        limit_param: None,
+        offset_param: None,
     };
     // 内部标记 __table__ = 单叶子谓词
     let table_leaf = |table: String| {
@@ -2385,7 +2444,7 @@ fn parse_join_from(
     }
     // WHERE / ORDER / LIMIT / OFFSET 复用单表解析后把列名转限定名
     let conds_raw = parse_where(p)?;
-    let (order_raw, limit, offset) = parse_select_tail(p)?;
+    let (order_raw, limit, offset, limit_param, offset_param) = parse_select_tail(p)?;
     p.done()?;
     let items: Vec<JoinItem> = sel_items
         .iter()
@@ -2409,7 +2468,7 @@ fn parse_join_from(
         set: c.set.clone(),
     });
     let order = order_raw.into_iter().map(|(s, d)| (QualCol::parse(&s), d)).collect();
-    Ok(SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset })
+    Ok(SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset, limit_param, offset_param })
 }
 
 /// ⭐ F69: HAVING 谓词树 (OR<AND<NOT<primary; 叶子 = 输出列 label op val).
@@ -2627,7 +2686,7 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             return Err("DISTINCT on system tables is not supported (v1)".into());
         }
         let conds = parse_where(p)?;
-        let (order, limit, offset) = parse_select_tail(p)?;
+        let (order, limit, offset, limit_param, offset_param) = parse_select_tail(p)?;
         if top {
             p.done()?;
         }
@@ -2648,6 +2707,8 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             order,
             limit,
             offset,
+            limit_param,
+            offset_param,
         });
     }
     // ⭐ F76: 非系统表 → 剥 db 限定前缀 (`default.t` → `t`); 系统表已在上方按全名分派
@@ -2759,6 +2820,8 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     }
     let mut limit = None;
     let mut offset = None;
+    let mut limit_param = None; // ⭐ PG 兼容: LIMIT $n
+    let mut offset_param = None; // ⭐ PG 兼容: OFFSET $n
     if p.try_kw("LIMIT") {
         match p.next()? {
             Tok::Num(n) => {
@@ -2771,11 +2834,22 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                             offset = Some(a);
                             limit = Some(m.parse::<u32>().map_err(|_| format!("bad LIMIT {m}"))?);
                         }
+                        Tok::Dollar(i) => {
+                            offset = Some(a);
+                            limit = Some(0);
+                            limit_param = Some(i - 1); // 0-based 索引 (与 SqlValue::Param 一致)
+                            p.next_param = p.next_param.max(i);
+                        }
                         other => return Err(format!("expected LIMIT count, got {other:?}")),
                     }
                 } else {
                     limit = Some(a);
                 }
+            }
+            Tok::Dollar(i) => {
+                p.next_param = p.next_param.max(i);
+                limit = Some(0);
+                limit_param = Some(i - 1); // 0-based
             }
             other => return Err(format!("expected LIMIT count, got {other:?}")),
         }
@@ -2786,9 +2860,14 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             Tok::Num(n) => {
                 offset = Some(n.parse::<u32>().map_err(|_| format!("bad OFFSET {n}"))?);
             }
+            Tok::Dollar(i) => {
+                p.next_param = p.next_param.max(i);
+                offset = Some(0);
+                offset_param = Some(i - 1); // 0-based
+            }
             other => return Err(format!("expected OFFSET count, got {other:?}")),
         }
     }
     p.done_if(top)?;
-    Ok(SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having })
+    Ok(SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having, limit_param, offset_param })
 }

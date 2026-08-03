@@ -946,9 +946,18 @@ impl ConnState {
         // 填入 worker schema 缓存 (供 infer_param_oids 重推)
         let prepares = std::mem::take(&mut self.pg_pending_prepares);
         for (name, p) in prepares {
-            // 从 p.stmt (Insert) 提取表名填 schema 缓存
-            if let crate::protocol::sql::SqlStmt::Insert { table, .. } = &p.stmt {
-                let key = (self.current_db.as_ref().to_string(), table.clone());
+            // 从 p.stmt 提取目标表名填 schema 缓存 (Insert/Select/SystemQuery/SelectJoin)
+            let table = match &p.stmt {
+                crate::protocol::sql::SqlStmt::Insert { table, .. }
+                | crate::protocol::sql::SqlStmt::Select { table, .. }
+                | crate::protocol::sql::SqlStmt::SystemQuery { table, .. } => Some(table.clone()),
+                crate::protocol::sql::SqlStmt::SelectJoin { from, .. } => {
+                    Some(from.table.clone())
+                }
+                _ => None,
+            };
+            if let Some(table) = table {
+                let key = (self.current_db.as_ref().to_string(), table);
                 self.sql_cache.borrow_mut().schemas.insert(key, schema.clone());
             }
             // 重推参数 OID (schema 已缓存)
@@ -961,13 +970,20 @@ impl ConnState {
             }
             // 回 ParseComplete + ParameterDescription + NoData + ReadyForQuery
             // (先用 &oids 构造响应, 再 move 进 pg_stmts)
+            // ⭐ seq 用 next_to_send: 挂起批次经 GetSchemaOp 续跑, 期间未产生普通
+            // pending 包, next_to_send 停在挂起前; 用 next_seq 会无法 flush (等
+            // next_to_send 追上来而卡死). 直接用 next_to_send 保证立即发出.
             let mut out = Vec::with_capacity(64);
             out.extend_from_slice(&crate::protocol::pg::build_parse_complete());
             out.extend_from_slice(&crate::protocol::pg::build_param_description(&oids, p.params));
             out.extend_from_slice(&crate::protocol::pg::build_no_data());
             out.extend_from_slice(&crate::protocol::pg::build_ready());
-            let seq = self.next_seq;
-            self.next_seq += 1;
+            // ⭐ 用 next_to_send 作为 seq: resp_complete 内部 resp_flush_ready 从
+            // next_to_send 起 flush 挂起的包. 不能手动 +1 (会跳过导致不 flush).
+            let seq = self.next_to_send;
+            if self.next_seq <= seq {
+                self.next_seq = seq + 1;
+            }
             self.resp_complete(seq, out);
             self.pg_stmts.insert(name, PgPrepared { stmt: p.stmt, params: p.params, oids });
         }

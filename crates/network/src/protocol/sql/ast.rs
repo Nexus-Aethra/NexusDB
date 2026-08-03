@@ -386,6 +386,9 @@ pub enum SqlStmt {
         offset: Option<u32>,
         group_by: Vec<String>,
         having: Pred<Cond>,
+        /// ⭐ PG 兼容: LIMIT $n / OFFSET $n 的参数索引 (bind_params 时填字面量).
+        limit_param: Option<u16>,
+        offset_param: Option<u16>,
     },
     /// ⭐ S1: DELETE FROM t WHERE ... (WHERE 必带 — 全删由全表扫路径支撑).
     Delete { table: String, conds: Pred<Cond> },
@@ -422,6 +425,8 @@ pub enum SqlStmt {
         order: Vec<(String, bool)>,
         limit: Option<u32>,
         offset: Option<u32>,
+        limit_param: Option<u16>,
+        offset_param: Option<u16>,
     },
     /// ⭐ F66: `SELECT @@var [, @@var2]` 系统变量 (SQLAlchemy/驱动初始化探测).
     /// vars = 去 @@ 的变量名列表; worker 回合理值单行.
@@ -443,6 +448,8 @@ pub enum SqlStmt {
         order: Vec<(String, bool)>,
         limit: Option<u32>,
         offset: Option<u32>,
+        limit_param: Option<u16>,
+        offset_param: Option<u16>,
     },
     /// ⭐ F67/F68 (JOIN): N 表左深 hash join — worker 侧执行.
     /// 别名无时 = 表名; items 空 = `*` 展开各表全列; joins 为左深链.
@@ -456,6 +463,8 @@ pub enum SqlStmt {
         order: Vec<(QualCol, bool)>,
         limit: Option<u32>,
         offset: Option<u32>,
+        limit_param: Option<u16>,
+        offset_param: Option<u16>,
     },
     /// ⭐ 事务 v1 (F61): BEGIN / START TRANSACTION.
     /// ⭐ v2 (F62): 可选隔离级别与读写属性尾缀.

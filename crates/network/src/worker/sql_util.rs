@@ -50,8 +50,8 @@ pub(crate) fn stmt_where_conds(stmt: &SqlStmt) -> Option<&Pred<Cond>> {
 /// 重建 stmt 替换 conds (折叠后重跑外层用).
 pub(crate) fn stmt_replace_conds(stmt: SqlStmt, new: Pred<Cond>) -> SqlStmt {
     match stmt {
-        SqlStmt::Select { table, items, limit, order, offset, group_by, having, .. } => {
-            SqlStmt::Select { table, items, conds: new, limit, order, offset, group_by, having }
+        SqlStmt::Select { table, items, limit, order, offset, group_by, having, limit_param, offset_param, .. } => {
+            SqlStmt::Select { table, items, conds: new, limit, order, offset, group_by, having, limit_param, offset_param }
         }
         SqlStmt::Delete { table, .. } => SqlStmt::Delete { table, conds: new },
         SqlStmt::Update { table, sets, .. } => SqlStmt::Update { table, sets, conds: new },
@@ -154,6 +154,8 @@ pub(crate) fn decorrelate_exists(outer_table: &str, inner: &SqlStmt) -> Result<P
         offset: None,
         group_by: vec![],
         having: Pred::And(vec![]),
+        limit_param: None,
+        offset_param: None,
     };
     Ok(Pred::Leaf(Cond {
         col: outer_col,

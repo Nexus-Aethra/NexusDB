@@ -1010,51 +1010,108 @@ pub(crate) fn infer_param_oids(
     use storage::schema::ColType;
 
     let mut oids = vec![0u32; params as usize];
-    let SqlStmt::Insert { table, cols, rows } = stmt else {
+    // ⭐ LIMIT/OFFSET 参数恒为整数 (int8=20), 与 schema 无关 → 先推断 (即使 schema miss)
+    let (lim_p, off_p) = match stmt {
+        SqlStmt::Select { limit_param, offset_param, .. }
+        | SqlStmt::SystemQuery { limit_param, offset_param, .. }
+        | SqlStmt::SelectJoin { limit_param, offset_param, .. } => {
+            (*limit_param, *offset_param)
+        }
+        _ => (None, None),
+    };
+    for pidx in [lim_p, off_p].into_iter().flatten() {
+        let idx = pidx as usize;
+        if idx < oids.len() {
+            oids[idx] = 20; // int8
+        }
+    }
+    // ⭐ 推断 (仅对 NexusDB 支持二进制解码的类型; 其它保持 0 → text)
+    let oid_of = |ty: ColType| -> u32 {
+        match ty {
+            ColType::I64 | ColType::F64 | ColType::Bool | ColType::Str | ColType::Bytes
+            | ColType::Date | ColType::Time | ColType::Timestamp => type_oid(ty),
+            _ => 0,
+        }
+    };
+
+    // 提取目标表名 + schema; miss → 标记需拉取 (Parse 挂起续跑)
+    let target_table: Option<String> = match stmt {
+        SqlStmt::Insert { table, .. } => Some(table.clone()),
+        SqlStmt::Select { table, .. } => Some(table.clone()),
+        SqlStmt::SystemQuery { table, .. } => Some(table.clone()),
+        SqlStmt::SelectJoin { from, .. } => Some(from.table.clone()),
+        _ => None,
+    };
+    let Some(table) = target_table else {
         return (oids, None);
     };
-    // 本地 schema 缓存查表 (CREATE 已完成则已填充)
     let key = (conn.current_db.as_ref().to_string(), table.clone());
     let Some(schema) = conn.sql_cache.borrow().schemas.get(&key).cloned() else {
-        // ⭐ portal: INSERT 目标表 schema 未缓存 → 标记需拉取 (Parse 挂起)
+        // ⭐ portal: 目标表 schema 未入 worker 缓存 → 标记需拉取 (Parse 挂起)
         return (oids, Some(table.clone()));
     };
-    // 每个 VALUES 位置 → 目标列下标 (与 sql_build_row 的列映射一致)
-    let col_pos: Vec<Option<usize>> = if cols.is_empty() {
-        let n = schema.columns.len();
-        let auto_rowid = super::sql_eval::is_auto_pk(&schema).then_some(schema.pk_col as usize);
-        let hidden = |i: usize| auto_rowid == Some(i) || schema.dropped.contains(&(i as u16));
-        (0..n).filter(|&i| !hidden(i)).map(Some).collect()
-    } else {
-        cols.iter()
-            .map(|c| schema.col_by_name(c).map(|i| i as usize))
-            .collect()
-    };
-    for row in rows {
-        for (j, val) in row.iter().enumerate() {
-            if let SqlValue::Param(idx) = val {
-                let idx = *idx as usize;
-                if idx >= oids.len() {
-                    continue;
-                }
-                if let Some(Some(col)) = col_pos.get(j) {
-                    if let Some(col_def) = schema.columns.get(*col) {
-                        // ⭐ 只推断 decode_param 支持二进制解码的类型 (int/float/bool/
-                        // str/bytes/date/time/timestamp). json/uuid/decimal 等 NexusDB
-                        // 不支持二进制编码 → 保持 0 → Describe 按 text 报告 → pgx 用
-                        // 文本发送, decode_param format==0 走 Str, 再由 sql_to_col 转换.
-                        let oid = match col_def.ty {
-                            ColType::I64 | ColType::F64 | ColType::Bool | ColType::Str
-                            | ColType::Bytes | ColType::Date | ColType::Time
-                            | ColType::Timestamp => type_oid(col_def.ty),
-                            _ => 0,
-                        };
-                        oids[idx] = oid;
+
+    // 1) INSERT: 按 VALUES 位置 → 目标列推断
+    if let SqlStmt::Insert { cols, rows, .. } = stmt {
+        let col_pos: Vec<Option<usize>> = if cols.is_empty() {
+            let n = schema.columns.len();
+            let auto_rowid =
+                super::sql_eval::is_auto_pk(&schema).then_some(schema.pk_col as usize);
+            let hidden = |i: usize| auto_rowid == Some(i) || schema.dropped.contains(&(i as u16));
+            (0..n).filter(|&i| !hidden(i)).map(Some).collect()
+        } else {
+            cols.iter()
+                .map(|c| schema.col_by_name(c).map(|i| i as usize))
+                .collect()
+        };
+        for row in rows {
+            for (j, val) in row.iter().enumerate() {
+                if let SqlValue::Param(idx) = val {
+                    let idx = *idx as usize;
+                    if idx >= oids.len() {
+                        continue;
+                    }
+                    if let Some(Some(col)) = col_pos.get(j) {
+                        if let Some(col_def) = schema.columns.get(*col) {
+                            oids[idx] = oid_of(col_def.ty);
+                        }
                     }
                 }
             }
         }
     }
+
+    // 2) SELECT/SystemQuery: 遍历 WHERE 谓词, 对 `col <op> $param` / IN 集参数推断
+    let conds: Option<&crate::protocol::sql::Pred<crate::protocol::sql::Cond>> = match stmt {
+        SqlStmt::Select { conds, .. } => Some(conds),
+        SqlStmt::SystemQuery { conds, .. } => Some(conds),
+        _ => None,
+    };
+    if let Some(conds) = conds {
+        for leaf in conds.leaves() {
+            let col = &leaf.col;
+            if let Some(col_idx) = schema.col_by_name(col) {
+                if let Some(col_def) = schema.columns.get(col_idx as usize) {
+                    let oid = oid_of(col_def.ty);
+                    if let SqlValue::Param(idx) = &leaf.val {
+                        let idx = *idx as usize;
+                        if idx < oids.len() {
+                            oids[idx] = oid;
+                        }
+                    }
+                    for v in &leaf.set {
+                        if let SqlValue::Param(idx) = v {
+                            let idx = *idx as usize;
+                            if idx < oids.len() {
+                                oids[idx] = oid;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     (oids, None)
 }
 
