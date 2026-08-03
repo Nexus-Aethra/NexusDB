@@ -1031,7 +1031,7 @@ pub(crate) fn sql_join_index_hint(
                 if best_eq.is_none() || d > best_eq.as_ref().unwrap().0 {
                     best_eq = Some((
                         d,
-                        shard_manager::IndexHint { iid, lo: Some(v.clone()), hi: Some(v) },
+                        shard_manager::IndexHint { iid, lo: Some(v.clone()), hi: Some(v), pk: false },
                     ));
                 }
             }
@@ -1039,13 +1039,13 @@ pub(crate) fn sql_join_index_hint(
             CmpOp::Gt | CmpOp::Ge => {
                 let ratio = range_ratio(ctx, idx, iid, &v, ty, true);
                 if best_range.is_none() || ratio < best_range.as_ref().unwrap().0 {
-                    best_range = Some((ratio, shard_manager::IndexHint { iid, lo: Some(v), hi: None }));
+                    best_range = Some((ratio, shard_manager::IndexHint { iid, lo: Some(v), hi: None, pk: false }));
                 }
             }
             CmpOp::Lt | CmpOp::Le => {
                 let ratio = range_ratio(ctx, idx, iid, &v, ty, false);
                 if best_range.is_none() || ratio < best_range.as_ref().unwrap().0 {
-                    best_range = Some((ratio, shard_manager::IndexHint { iid, lo: None, hi: Some(v) }));
+                    best_range = Some((ratio, shard_manager::IndexHint { iid, lo: None, hi: Some(v), pk: false }));
                 }
             }
             _ => {}
@@ -2519,6 +2519,21 @@ pub(crate) fn sql_run_dml(
                     values,
                 });
             }
+            // ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键存在性预检.
+            // 非事务 autocommit 且本表有 fks 且父表 schema 已缓存 → 先验父行
+            // 存在再写 (全存在才发 RowPut). 父表 schema 缺失 / 类型不匹配 →
+            // v1 边界跳过引用检查 (Loom 前置校验父实体, 不依赖; 文档化).
+            if conn.txn.is_none() && !schema.fks.is_empty() {
+                // 父表 schema 均缓存 → 进入外键预检 (全存在才发 RowPut)
+                if all_parents_cached(conn, db, &schema) {
+                    if sql_fk_start(
+                        conn, conn_id, seq, worker_id, db, shard_inboxes, num_shards,
+                        &schema, &ops,
+                    ) {
+                        return;
+                    }
+                }
+            }
             // ⭐ 事务 v1 (F61): 事务中 INSERT 截流进 write_set (喂 bloom
             // 照旧 — rollback 只多假阳性), 立即回 OK, commit 时原子应用
             if conn.txn.is_some() {
@@ -2555,10 +2570,6 @@ pub(crate) fn sql_run_dml(
                     drop_key: None,
                 },
             );
-            // ⭐ DIAG: worker 端 push 计数 (临时, 定位批量 INSERT 丢行)
-            if ops.len() >= 5000 {
-                eprintln!("[W-DIAG] INSERT {} ops pushed to shards", ops.len());
-            }
             // ⭐ F65: 含全局唯一列且单行 autocommit → 走占坑编排
             let has_gu = schema.indexes.iter().any(|i| i.unique && i.global);
             if has_gu {
@@ -2597,7 +2608,26 @@ pub(crate) fn sql_run_dml(
                 // (value → 所在 shard; bloom 原子只增, 多 worker/门面并发安全)
                 let sid = hash_route_op(&op, num_shards);
                 feed_route_bloom(conn, db, &table, &schema, &op, sid);
-                push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                // ⭐ 巨型 INSERT 防死锁 (2026-08): 非阻塞 push, inbox 满时先
+                // drain reply_bus 处理回包 (释放 reply_bus 让 shard 继续消费
+                // inbox), 再重试 — 打破 worker↔shard 有界队列循环等待.
+                let mut task = shard_manager::request::ShardTask {
+                    conn_id,
+                    req_id: seq,
+                    worker_id,
+                    group: sid as u32,
+                    op,
+                };
+                loop {
+                    match shard_inboxes[sid].push(task) {
+                        Ok(()) => break,
+                        Err(rejected) => {
+                            conn.drain_replies(conn_id);
+                            task = rejected;
+                            std::thread::yield_now();
+                        }
+                    }
+                }
             }
         }
         // ⭐ S1: DELETE / UPDATE — pk 等值单发, 其余两阶段 (SELECT 内部路径收 pk)
@@ -2707,7 +2737,7 @@ pub(crate) fn sql_run_dml(
                     let op = sql_dml_op(db, &table, pk, &action);
                     push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
                 }
-                Ok(SqlPlan::Index { iid, lo, hi, .. }) => {
+                Ok(SqlPlan::Index { iid, lo, hi, limit_push: _, eq_enc: _, pk }) => {
                     // 两阶段 phase1: 复用 SELECT 广播路径收全行 (残余过滤需行值),
                     // 完成点取 pk 发 phase2. limit 不下推 (DML 无 LIMIT).
                     conn.sql_select_agg.insert(
@@ -2738,14 +2768,33 @@ pub(crate) fn sql_run_dml(
                     );
                     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
                     for sid in 0..num_shards {
-                        let op = BatchOp::IndexScan {
-                            db: db.clone(),
-                            table: table_arc.clone(),
-                            iid,
-                            lo: lo.clone(),
-                            hi: hi.clone(),
-                            limit: 0,
-                            with_rows: true,
+                        // ⭐ PG 兼容 (范围查): 主键区间用 ScanFiltered(pk hint),
+                        // 否则二级索引 IndexScan.
+                        let op = if pk {
+                            BatchOp::ScanFiltered {
+                                db: db.clone(),
+                                table: table_arc.clone(),
+                                preds: Vec::new(),
+                                proj: Vec::new(),
+                                index_hint: Some(shard_manager::IndexHint {
+                                    iid: 0,
+                                    lo: lo.clone(),
+                                    hi: hi.clone(),
+                                    pk: true,
+                                }),
+                                key_set_hint: None,
+                                limit: 0,
+                            }
+                        } else {
+                            BatchOp::IndexScan {
+                                db: db.clone(),
+                                table: table_arc.clone(),
+                                iid,
+                                lo: lo.clone(),
+                                hi: hi.clone(),
+                                limit: 0,
+                                with_rows: true,
+                            }
                         };
                         push_task_grouped(
                             conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes,
@@ -3118,7 +3167,85 @@ pub(crate) fn sql_run_dml(
                     push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
                 }
             }
-            Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc }) => {
+            Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc, pk: true }) => {
+                // ⭐ PG 兼容 (范围查): 主键区间扫描 — 全 shard 广播 ScanFiltered
+                // (index_hint { pk: true } 走主键 B+Tree 区间). 无覆盖/路由剪枝
+                // (主键范围); 行经残余过滤 (preds 完整下推).
+                let pk_col = schema.pk_col;
+                let cover = (count || proj.iter().all(|&c| c == pk_col))
+                    && conds.leaves().iter().all(|c| {
+                        schema.col_by_name(&c.col).is_some_and(|i| i == pk_col)
+                    });
+                let shard_limit = if limit_push && !count {
+                    limit.map(|l| l + offset).unwrap_or(0)
+                } else {
+                    0
+                };
+                let scan_preds: Vec<shard_manager::ScanPred> = conds
+                    .leaves()
+                    .iter()
+                    .filter_map(|c| {
+                        let Some(ci) = schema.col_by_name(&c.col) else { return None };
+                        let sop = match c.op {
+                            CmpOp::Eq => shard_manager::PredOp::Eq,
+                            CmpOp::Gt => shard_manager::PredOp::Gt,
+                            CmpOp::Ge => shard_manager::PredOp::Ge,
+                            CmpOp::Lt => shard_manager::PredOp::Lt,
+                            CmpOp::Le => shard_manager::PredOp::Le,
+                            _ => return None,
+                        };
+                        let ty = schema.columns[ci as usize].ty;
+                        let v = sql_to_col(ty, &c.val).ok()?;
+                        Some(shard_manager::ScanPred { col: ci, op: sop, val: v, set: Vec::new() })
+                    })
+                    .collect();
+                // 投影: 覆盖时投影列; 否则全列 (worker 端再按 proj 取)
+                let down_proj: Vec<u16> = if cover {
+                    proj.clone()
+                } else {
+                    (0..schema.columns.len() as u16).collect()
+                };
+                conn.sql_select_agg.insert(
+                    seq,
+                    SqlSelectAgg {
+                        remaining: num_shards,
+                        error: None,
+                        rows: Vec::new(),
+                        schema: schema.clone(),
+                        conds,
+                        limit,
+                        proj,
+                        cover: cover.then_some((pk_col, pk_col)),
+                        unique_early: false,
+                        done: false,
+                        dml: None,
+                        dml_target: None,
+                        order: order_cols,
+                        sorted: false,
+                        offset,
+                        count,
+                        agg_spec: None,
+                        out_names,
+                        expr_proj,
+                        down_proj: down_proj.clone(),
+                        plain_rows: Vec::new(),
+                    },
+                );
+                let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
+                for sid in 0..num_shards {
+                    let op = BatchOp::ScanFiltered {
+                        db: db.clone(),
+                        table: table_arc.clone(),
+                        preds: scan_preds.clone(),
+                        proj: down_proj.clone(),
+                        index_hint: Some(shard_manager::IndexHint { iid: 0, lo: lo.clone(), hi: hi.clone(), pk: true }),
+                        key_set_hint: None,
+                        limit: shard_limit as u32,
+                    };
+                    push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+                }
+            }
+            Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc, pk: false }) => {
                 // ⭐ O1: 覆盖判定 — 投影∪条件∪排序列 ⊆ {索引列, pk 列} → 免回表
                 let idx_col = schema
                     .indexes
@@ -3562,6 +3689,34 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
         let cv = sql_to_col(pk_col.ty, &c.val)?;
         return Ok(SqlPlan::PkGet { pk: sql_pk_bytes(pk_col.ty, &cv)? });
     }
+    // ⭐ PG 兼容 (范围查): 主键列范围谓词 (BETWEEN/>=/<=) → 走主键 B+Tree 区间
+    // 扫描 (避免全表扫). 收集 pk 列上的 Ge/Le/Gt/Lt 界.
+    {
+        let mut lo: Option<ColValue> = None;
+        let mut hi: Option<ColValue> = None;
+        let mut hit = false;
+        for c in conds.iter().filter(|c| c.col == pk_col.name) {
+            match c.op {
+                CmpOp::Ge | CmpOp::Gt => {
+                    hit = true;
+                    if lo.is_none() {
+                        lo = Some(sql_to_col(pk_col.ty, &c.val)?);
+                    }
+                }
+                CmpOp::Le | CmpOp::Lt => {
+                    hit = true;
+                    if hi.is_none() {
+                        hi = Some(sql_to_col(pk_col.ty, &c.val)?);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if hit {
+            // 单边范围选择性低 → 无界扫描接近全表, 仍用索引 (起点定位快于全扫)
+            return Ok(SqlPlan::Index { iid: 0, lo, hi, limit_push: true, eq_enc: None, pk: true });
+        }
+    }
     // 2. 多索引计分选择
     let mut best: Option<(u32, usize, u32)> = None; // (score, idx_pos, iid)
     let mut best_bounds: (Option<ColValue>, Option<ColValue>) = (None, None);
@@ -3665,7 +3820,7 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
             (Some(l), Some(h)) if l == h => storage::sql_rows::index_val_bytes(col.ty, l),
             _ => None,
         };
-        return Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc });
+        return Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc, pk: false });
     }
     // ⭐ S2: 无可用索引 → 全表扫 + 残余过滤 (v1 的报错路径退役)
     Ok(SqlPlan::FullScan)
@@ -3850,8 +4005,15 @@ mod tests {
     #[test]
     fn no_matching_index_falls_back_full_scan() {
         let schema = test_schema();
+        // ⭐ PG 兼容: 主键列范围谓词走主键索引 (非二级索引)
         let plan = sql_plan_select(&schema, &c("id", CmpOp::Gt, SqlValue::Int(0))).unwrap();
-        assert!(matches!(plan, SqlPlan::FullScan), "无索引命中应 FullScan, got {plan:?}");
+        assert!(
+            matches!(plan, SqlPlan::Index { pk: true, .. }),
+            "主键范围应走主键索引, got {plan:?}"
+        );
+        // 非索引非主键列范围 → FullScan
+        let plan = sql_plan_select(&schema, &c("score", CmpOp::Gt, SqlValue::Int(0))).unwrap();
+        assert!(matches!(plan, SqlPlan::Index { pk: false, .. } | SqlPlan::FullScan), "score 有二级索引应走索引: {plan:?}");
     }
 
     #[test]

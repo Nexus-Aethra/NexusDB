@@ -59,6 +59,9 @@ pub struct IndexHint {
     pub iid: u32,
     pub lo: Option<ColValue>,
     pub hi: Option<ColValue>,
+    /// ⭐ PG 兼容 (范围查): 扫主键 B+Tree 区间 (非二级索引). 主键列范围谓词
+    /// (BETWEEN/>=/<=) 用此走主键索引, 避免全表扫.
+    pub pk: bool,
 }
 
 /// ⭐ F70 (JOIN): 键集合索引点查提示 — probe 侧只回 join 键 ∈ keys 的行.
@@ -684,6 +687,99 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// ⭐ PG 兼容 (范围查): 主键 B+Tree 区间扫描 — 扫 `[KIND_STRING]` 段,
+    /// 起点 = `encode_string(pk_enc(lo))` (无 lo 从段头), 上界 = pk 编码
+    /// > pk_enc(hi) 即 Break (含界). 返回 (空 val, pk, row_bytes) 与
+    /// IndexEntry 同构; limit 0 = 不限. 主键列范围谓词避免全表扫.
+    pub async fn pk_scan_local(
+        &mut self,
+        db: &str,
+        table: &str,
+        lo: Option<&ColValue>,
+        hi: Option<&ColValue>,
+        limit: usize,
+        out: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), RegistryError> {
+        let Some(schema) = self.get_schema(db, table).await? else {
+            return Ok(());
+        };
+        let pk_ty = schema.columns[schema.pk_col as usize].ty;
+        // 主键保序编码界 — 与 worker `sql_pk_bytes` 同源 (数值 encode_idx/
+        // encode_f64_ordered/encode_i128_ordered, 字节串原样; 复合主键 v1 用
+        // 首列编码近似, 残余 preds 精确). ⭐ 不能用 index_val_bytes (带类型字节).
+        let enc_bound = |b: Option<&ColValue>| -> Result<Option<Vec<u8>>, RegistryError> {
+            let Some(v) = b else { return Ok(None) };
+            let enc = match (pk_ty, v) {
+                (ColType::I64, ColValue::I64(i)) => crate::keyspace::encode_idx(*i).to_vec(),
+                (ColType::F64, ColValue::F64(f)) => crate::keyspace::encode_f64_ordered(*f).to_vec(),
+                (ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp, ColValue::I64(i)) => {
+                    crate::keyspace::encode_idx(*i).to_vec()
+                }
+                (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b)) => {
+                    if b.is_empty() {
+                        return Err(se("bad pk bound (empty bytes)"));
+                    }
+                    b.clone()
+                }
+                (ColType::Decimal { .. }, ColValue::Decimal(x, _)) => {
+                    crate::keyspace::encode_i128_ordered(*x).to_vec()
+                }
+                _ => return Err(se("bad pk bound type")),
+            };
+            Ok(Some(crate::keyspace::encode_string(&enc)))
+        };
+        let lo_enc = enc_bound(lo)?;
+        let hi_enc = enc_bound(hi)?;
+        let root = self.open_table(db, table).await?.ok_or_else(|| {
+            RegistryError::TableNotFound(db.to_string(), table.to_string())
+        })?;
+        // 起点: 有 lo 用 encode_string(pk_enc(lo)) 精确定位; 无 lo 从 [S] 段头.
+        let start = lo_enc.clone().unwrap_or_else(|| vec![ks::KIND_STRING]);
+        // 段前缀: [S] 保证扫描不越入其他 kind (Hash/List/...)
+        let seg = vec![ks::KIND_STRING];
+        let mut n = 0usize;
+        crate::registry::table_scan_range(
+            self.pager_mut(),
+            root,
+            &start,
+            &seg,
+            &mut |k, _v| {
+                // 上界: 扫描越过 [KIND_STRING] 段 (非字符串 key) 或 pk 编码 > hi
+                if k.first() != Some(&ks::KIND_STRING) {
+                    return ControlFlow::Break(());
+                }
+                if let Some(h) = &hi_enc {
+                    // k = [S][klen][pk_enc], 与 [S][klen'][pk_enc(hi)] 整体比较
+                    if k > h.as_slice() {
+                        return ControlFlow::Break(());
+                    }
+                }
+                if let Some(pk) = ks::split_string(k) {
+                    out.push((Vec::new(), pk.to_vec(), Vec::new()));
+                    n += 1;
+                    if limit > 0 && n >= limit {
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        )
+        .await?;
+        // 回读行 (批量, 溢出展开)
+        let refs: Vec<&[u8]> = out.iter().map(|(_, pk, _)| pk.as_slice()).collect();
+        let rows = self.table_get_many(db, table, &refs).await?;
+        for ((_, _, rb), row) in out.iter_mut().zip(rows) {
+            if let Some(r) = row
+                && r.first() == Some(&row::TAG_ROW)
+            {
+                *rb = r;
+            } else {
+                *rb = Vec::new(); // 非 TAG_ROW → 过滤
+            }
+        }
+        Ok(())
+    }
+
     /// ⭐ F67/F68/F70 (JOIN): 带谓词+投影下推的本地扫. 行来源优先级:
     /// key_set (多键索引点查) > hint (单区间范围扫) > 全表扫; 三者都 decode 行
     /// → preds AND 过滤 (NULL 恒 false) → 按 proj 取列 → 收集. limit 0 = 不限.
@@ -706,10 +802,18 @@ impl StorageEngine {
         let raw_rows: Vec<Vec<u8>> = if let Some(ks) = key_set {
             self.index_multi_point_local(db, table, ks.iid, &ks.keys).await?
         } else if let Some(h) = hint {
-            let pairs = self
-                .index_scan_local(db, table, h.iid, h.lo.as_ref(), h.hi.as_ref(), 0)
-                .await?;
-            pairs.into_iter().map(|(_pk, rb)| rb).collect()
+            if h.pk {
+                // ⭐ PG 兼容: 主键区间扫描
+                let mut pairs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+                self.pk_scan_local(db, table, h.lo.as_ref(), h.hi.as_ref(), 0, &mut pairs)
+                    .await?;
+                pairs.into_iter().map(|(_v, _pk, rb)| rb).collect()
+            } else {
+                let pairs = self
+                    .index_scan_local(db, table, h.iid, h.lo.as_ref(), h.hi.as_ref(), 0)
+                    .await?;
+                pairs.into_iter().map(|(_pk, rb)| rb).collect()
+            }
         } else {
             let scan_limit = if preds.is_empty() { limit } else { 0 };
             let mut raw: Vec<IndexEntry> = Vec::new();

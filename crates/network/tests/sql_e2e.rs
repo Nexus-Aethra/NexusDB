@@ -1860,6 +1860,200 @@ fn mysql_update_set_expr() {
     drop(mgr);
 }
 
+/// ⭐ PG 兼容 (引用完整性, FMT_VER 8): INSERT 拒绝悬空外键引用.
+/// 父行存在 → 成功; 父行缺失 → 拒 (23503); NULL 外键允许; 多行含无效 → 整体拒.
+#[test]
+fn mysql_foreign_key_referential_integrity() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE fk_p (id INT PRIMARY KEY)");
+    c.query("CREATE TABLE fk_c (id INT PRIMARY KEY, pid INT REFERENCES fk_p(id) ON DELETE CASCADE)");
+    // 先插父行 (预热父表 schema)
+    c.query("INSERT INTO fk_p VALUES (1), (2)");
+    // 引用存在的父 → 成功
+    c.query("INSERT INTO fk_c VALUES (10, 1), (11, 2)");
+    // 引用不存在的父 → 拒
+    assert!(matches!(
+        c.query("INSERT INTO fk_c VALUES (12, 999)"),
+        QueryResult::Err { code: 1062, .. } | QueryResult::Err { code: _, .. }
+    ), "悬空外键引用必拒");
+    // NULL 外键 → 允许
+    c.query("INSERT INTO fk_c VALUES (13, NULL)");
+    // 多行混合 (1 有效 1 无效) → 整体拒, 无部分写入
+    assert!(matches!(
+        c.query("INSERT INTO fk_c VALUES (14, 1), (15, 888)"),
+        QueryResult::Err { .. }
+    ), "多行含无效外键整体拒");
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fk_c"),
+        QueryResult::Rows(vec![vec![Some("3".into())]]),
+        "仅 3 行 (10,11,13) 写入, 无部分写入"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ PG 兼容 (范围查): 主键列范围谓词走主键 B+Tree 索引 (非全表扫),
+/// 边界/残余过滤正确.
+#[test]
+fn mysql_pk_range_scan() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE rng (id INT PRIMARY KEY, v INT)");
+    // 批量插 5000 行
+    c.query(&format!(
+        "INSERT INTO rng VALUES {}",
+        (0..5000).map(|i| format!("({i},{i})")).collect::<Vec<_>>().join(",")
+    ));
+    // BETWEEN 范围 (走主键索引)
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM rng WHERE id BETWEEN 0 AND 999"),
+        QueryResult::Rows(vec![vec![Some("1000".into())]]),
+        "BETWEEN 0..999 = 1000 行"
+    );
+    // 单点边界
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM rng WHERE id BETWEEN 4999 AND 4999"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "BETWEEN 4999..4999 = 1 行"
+    );
+    // 单边下界
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM rng WHERE id >= 4990"),
+        QueryResult::Rows(vec![vec![Some("10".into())]]),
+        "id>=4990 = 10 行"
+    );
+    // 范围 + 残余过滤 (v 非索引列)
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM rng WHERE id BETWEEN 0 AND 99 AND v > 50"),
+        QueryResult::Rows(vec![vec![Some("49".into())]]),
+        "范围+残余过滤 = 49 行"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 巨型 INSERT 防死锁 (2026-08): 单条 INSERT VALUES 超过 inbox/reply_bus
+/// 容量 (8192) 时, worker 非阻塞 push + 满时 drain reply_bus, 打破循环等待.
+/// 5 万行单条不卡死且数据完整.
+#[test]
+fn mysql_huge_insert_no_deadlock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE big (id INT PRIMARY KEY, v INT)");
+    // 单条 1.5 万行 (> inbox 8192 容量, 触发反压 drain; < e2e 客户端 5s 超时)
+    let n = 15000;
+    let sql = format!(
+        "INSERT INTO big VALUES {}",
+        (0..n).map(|i| format!("({i},{i})")).collect::<Vec<_>>().join(",")
+    );
+    c.query(&sql);
+    // 数据完整 (COUNT = n)
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM big"),
+        QueryResult::Rows(vec![vec![Some("15000".into())]]),
+        "1.5 万行单条插入完整 (防死锁)"
+    );
+    // 抽查
+    assert_eq!(
+        c.query("SELECT v FROM big WHERE id = 14999"),
+        QueryResult::Rows(vec![vec![Some("14999".into())]]),
+        "抽查尾行"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 // ===== ⭐ information_schema 系统表 (F66) =====
 
 /// 系统表虚拟化: tables/columns/key_column_usage/schemata + 投影/过滤/大小写/未知回空.

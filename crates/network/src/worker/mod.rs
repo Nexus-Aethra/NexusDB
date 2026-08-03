@@ -42,6 +42,9 @@ mod sql_agg;
 /// ⭐ PG 兼容 (FMT_VER 8): 外键级联删除编排.
 mod sql_cascade;
 pub(crate) use sql_cascade::{cascade_job_done, cascade_kickoff, is_cascade_seq, CascadeJob};
+/// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检.
+mod sql_fk;
+pub(crate) use sql_fk::{all_parents_cached, sql_fk_on_reply, sql_fk_start};
 /// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
 mod sql_dispatch;
 /// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
@@ -494,6 +497,27 @@ struct SqlDmlAgg {
     drop_key: Option<(String, String)>,
 }
 
+/// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检状态.
+/// 流程: 收集全部父表引用 → 发 RowGet 存在性检查 (real seq) → 全存在则
+/// 注册 sql_dml_agg 发原 RowPut, 任一缺失拒. 以 real seq 为 key.
+#[derive(Debug)]
+pub struct SqlFkIns {
+    /// 剩余待回的存在性检查数.
+    pub remaining: usize,
+    /// 已确认存在的引用数.
+    pub ok: usize,
+    /// 缺失的引用 (父表, 编码) — 非空即拒.
+    pub missing: Vec<(String, Vec<u8>)>,
+    /// 失败错误.
+    pub error: Option<String>,
+    /// 原 INSERT 的 RowPut op (全通过后发).
+    pub ops: Vec<BatchOp>,
+    /// 本表 schema (bloom 喂路由用).
+    pub schema: std::sync::Arc<TableSchema>,
+    /// 原 db (bloom 喂路由用).
+    pub db: std::sync::Arc<str>,
+}
+
 /// SELECT pk 点查: RowGet 结果的过滤/渲染上下文.
 struct SqlRowCtx {
     schema: std::sync::Arc<TableSchema>,
@@ -567,6 +591,8 @@ enum SqlPlan {
         hi: Option<ColValue>,
         limit_push: bool,
         eq_enc: Option<Vec<u8>>,
+        /// ⭐ PG 兼容 (范围查): 扫主键 B+Tree 区间 (主键列范围谓词, 非二级索引).
+        pk: bool,
     },
     /// ⭐ S2: 无可用索引 → 广播全表扫 + 全条件残余过滤.
     FullScan,
@@ -768,6 +794,17 @@ struct ConnState {
     cascade_roots: HashMap<u64, crate::worker::sql_cascade::CascadeRoot>,
     /// ⭐ PG 兼容: 级联伪 seq 计数器.
     cascade_seq_ctr: u64,
+    /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检 (seq → 状态).
+    sql_fk_ins: HashMap<u64, SqlFkIns>,
+    /// ⭐ 巨型 INSERT 防死锁 (2026-08): worker reply bus + 路由上下文 — 批量 push
+    /// 超过 inbox/reply_bus 容量时, 在 push 循环内先 drain reply_bus 处理回包,
+    /// 打破 worker(等 inbox)↔shard(等 reply_bus) 循环等待.
+    reply_bus: SharedTaskReplyBus,
+    reply_db_view: std::sync::Arc<shard_manager::DbDirView>,
+    reply_worker_id: u32,
+    reply_num_shards: usize,
+    reply_default_db: std::sync::Arc<str>,
+    reply_shard_inboxes: Vec<SharedTaskInbox>,
     /// ⭐ 事务 v1 (F61): 当前事务缓冲 (None = autocommit).
     txn: Option<TxnState>,
     /// ⭐ 事务 v1 (F61): PG 语义 — 事务内语句出错后拒后续 (25P02),
@@ -876,6 +913,11 @@ impl ConnState {
         default_db: std::sync::Arc<str>,
         sql_cache: SharedSqlCache,
         sql_shared: std::sync::Arc<SqlSharedRoutes>,
+        reply_bus: SharedTaskReplyBus,
+        db_view: std::sync::Arc<shard_manager::DbDirView>,
+        worker_id: u32,
+        num_shards: usize,
+        shard_inboxes: Vec<SharedTaskInbox>,
     ) -> Self {
         let stream = unsafe { TcpStream::from_raw_fd(fd) };
         stream.set_nonblocking(true).ok();
@@ -907,7 +949,7 @@ impl ConnState {
             zstore_agg: HashMap::new(),
             geo_ctx: HashMap::new(),
             bit_ctx: HashMap::new(),
-            current_db: default_db,
+            current_db: default_db.clone(),
             table_cache: HashMap::new(),
             sql_cache,
             sql_shared,
@@ -917,6 +959,13 @@ impl ConnState {
             cascade_jobs: HashMap::new(),
             cascade_roots: HashMap::new(),
             cascade_seq_ctr: 0,
+            sql_fk_ins: HashMap::new(),
+            reply_bus,
+            reply_db_view: db_view,
+            reply_worker_id: worker_id,
+            reply_num_shards: num_shards,
+            reply_default_db: default_db,
+            reply_shard_inboxes: shard_inboxes,
             txn: None,
             txn_failed: false,
             sql_txn_agg: HashMap::new(),
@@ -1130,6 +1179,38 @@ impl ConnState {
         self.close_after_flush && self.pending.is_empty() && self.next_seq == self.next_to_send
     }
 
+    /// ⭐ 巨型 INSERT 防死锁 (2026-08): 批量 push 超过 inbox/reply_bus 容量时,
+    /// 在 push 循环内 drain reply_bus 并处理回包, 释放 reply_bus 空间让 shard
+    /// 继续消费 inbox — 打破 worker(等 inbox)↔shard(等 reply_bus) 循环等待.
+    fn drain_replies(&mut self, conn_id: u64) {
+        let results = self.reply_bus.drain();
+        if results.is_empty() {
+            return;
+        }
+        for r in results {
+            if r.conn_id != conn_id {
+                continue; // 只处理本连接的回包 (其余等事件循环)
+            }
+            let worker_id = self.reply_worker_id;
+            let num_shards = self.reply_num_shards;
+            let default_db = self.reply_default_db.clone();
+            let db_view = self.reply_db_view.clone();
+            let shard_inboxes = self.reply_shard_inboxes.clone();
+            handle_resp_shard_result(
+                self,
+                r.conn_id,
+                r.req_id,
+                r.group,
+                &r.result,
+                worker_id,
+                &default_db,
+                &db_view,
+                &shard_inboxes,
+                num_shards,
+            );
+        }
+    }
+
     /// ⭐ T2 (分表): 表名前缀 → Arc<str> (缓存复用, 免热路径 String 分配).
     fn table_arc(&mut self, prefix: &[u8]) -> std::sync::Arc<str> {
         if let Some(t) = self.table_cache.get(prefix) {
@@ -1214,7 +1295,7 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                 Ok(new_conn) => {
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone());
+                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone(), reply_bus.clone(), db_view.clone(), worker_id, num_shards, shard_inboxes.clone());
                     // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
                     if proto_kind == ProtocolKind::Sql {
                         let salt = mysql_gen_salt(id, worker_id);
@@ -1301,7 +1382,7 @@ fn worker_main_epoll(cfg: WorkerConfig) {
                 while let Ok(new_conn) = inbox.try_recv() {
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone());
+                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone(), reply_bus.clone(), db_view.clone(), worker_id, num_shards, shard_inboxes.clone());
                     // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
                     if proto_kind == ProtocolKind::Sql {
                         let salt = mysql_gen_salt(id, worker_id);
@@ -3158,6 +3239,13 @@ fn handle_resp_shard_result(
         }
         return;
     }
+    // ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键存在性预检回包
+    // (RowGet 对父表; 全存在才在 on_reply 内注册 sql_dml_agg 发原 RowPut)
+    if sql_fk_on_reply(
+        conn, conn_id, seq, worker_id, shard_inboxes, num_shards, result,
+    ) {
+        return;
+    }
     // ⭐ S1: DML 计数聚合 (INSERT 多行 / DELETE·UPDATE phase2 / DROP 广播)
     if let Some(agg) = conn.sql_dml_agg.get_mut(&seq) {
         match result {
@@ -3169,13 +3257,6 @@ fn handle_resp_shard_result(
         }
         agg.remaining -= 1;
         if agg.remaining == 0 {
-            // ⭐ DIAG: DmlAgg 完成计数 (临时, 定位批量 INSERT 丢行)
-            if agg.affected > 5000 {
-                eprintln!(
-                    "[R-DIAG] DmlAgg done: affected={} remaining_was=0 (after {} replies)",
-                    agg.affected, agg.affected
-                );
-            }
             let agg = conn.sql_dml_agg.remove(&seq).expect("just checked");
             conn.mysql_binary.remove(&seq);
             // ⭐ FK 级联 (FMT_VER 8): 级联子任务完成 → 推进级联 (不回复客户端)
