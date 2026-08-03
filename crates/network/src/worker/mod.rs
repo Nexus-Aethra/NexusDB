@@ -48,6 +48,12 @@ pub(crate) use sql_fk::{all_parents_cached, sql_fk_on_reply, sql_fk_start};
 /// ⭐ ORM-B2 (解耦 2026-08): 进程级共享路由缓存 (SqlSharedRoutes/FkIncoming).
 mod sql_routes;
 pub use sql_routes::{new_sql_shared, FkIncoming, SqlSharedRoutes};
+/// ⭐ 解耦 2026-08: RESP 跨 shard 聚合状态结构体.
+mod resp_agg;
+pub(crate) use resp_agg::{
+    BitCtx, DelAgg, ExistsAgg, GeoCtx, GetKind, MembersKind, MGetAgg, MSetAgg, MSetNxAgg,
+    PairsKind, ScoredMembers, SetAlgAgg, StoreFinishAgg, ZStoreAgg,
+};
 /// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
 mod sql_dispatch;
 /// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
@@ -141,142 +147,6 @@ impl WorkerPool {
         }
         Ok(())
     }
-}
-
-/// DEL 多 key 的聚合状态 (RESP :N 回复需等全部 Delete 完成).
-struct DelAgg {
-    remaining: usize,
-    count: i64,
-}
-
-/// ⭐ MGET 跨 shard 聚合: 每 shard 一组, Values 按组内索引表回填原始槽.
-struct MGetAgg {
-    remaining: usize,
-    /// 原始请求顺序的结果槽 (None = miss 或未回).
-    slots: Vec<Option<Vec<u8>>>,
-    /// group 号 → 该组 keys 的原始索引 (与 MultiGet keys 同序).
-    groups: Vec<Vec<usize>>,
-    /// 任一组失败: 记首个错误 (仍等全部组回齐再回复).
-    error: Option<String>,
-}
-
-/// ⭐ MSET 跨 shard 聚合: 全部组 MultiPutOk → +OK.
-struct MSetAgg {
-    remaining: usize,
-    error: Option<String>,
-}
-
-/// ⭐ EXISTS 多 key 聚合 (DEL 同构: 计数存在数).
-struct ExistsAgg {
-    remaining: usize,
-    count: i64,
-}
-
-/// ⭐ MSETNX 跨 shard 聚合: 全部分片 MultiPutNx 返回 1 → :1, 否则 :0.
-/// (跨 shard 非原子: 部分分片可能已写 — 已记为 gap.)
-struct MSetNxAgg {
-    remaining: usize,
-    all_set: bool,
-}
-
-/// ⭐ 单 op Get 的回复语义转换 (STRLEN/TYPE/HEXISTS 复用 Get/HGet 任务).
-#[derive(Clone, Copy)]
-enum GetKind {
-    Strlen,
-    TypeOf,
-    /// ⭐ Phase H: HEXISTS — GetValue(Some)→:1, None→:0
-    HExists,
-}
-
-/// ⭐ Phase H: Pairs 结果渲染形态 (HGETALL/HKEYS/HVALS/HSCAN 复用同一 op).
-#[derive(Clone, Copy)]
-enum PairsKind {
-    All,
-    Keys,
-    Vals,
-    Scan,
-    /// ⭐ C1: HRANDFIELD 无 count — 首 field 单 bulk / nil.
-    OneKey,
-}
-
-/// ⭐ Phase Set: Members 结果渲染形态.
-#[derive(Clone, Copy)]
-enum MembersKind {
-    /// SMEMBERS → *N
-    List,
-    /// SSCAN → ["0", *N]
-    Scan,
-    /// SPOP/SRANDMEMBER → bulk / nil (0/1 项)
-    One,
-}
-
-/// ⭐ Phase Set: SINTER/SUNION/SDIFF 跨 shard 聚合 — 每 key 一个 SMembers
-/// (group = key 序号), 全部回齐后 worker 端求交/并/差 (首 key 为基).
-struct SetAlgAgg {
-    remaining: usize,
-    op: SetAlgOp,
-    sets: Vec<Option<Vec<Vec<u8>>>>,
-    error: Option<String>,
-    /// ⭐ C1: SINTERCARD — 只回交集势 (Integer) 而非成员数组.
-    card_only: bool,
-    /// ⭐ C1: SINTERCARD LIMIT (0 = 无限制).
-    limit: usize,
-    /// ⭐ C3: *STORE — 结果写入 dst (先 DEL 再 SAdd), 回 :card.
-    store_dst: Option<Vec<u8>>,
-    /// ⭐ D3 (分库): 命令发起时的 (db, table) — 二阶段任务用, 防 pipeline 中
-    /// SELECT 切库后错库.
-    db: std::sync::Arc<str>,
-    table: std::sync::Arc<str>,
-}
-
-/// ⭐ C3: *STORE 第二阶段 (Delete dst + SAdd/ZAdd dst) 完成聚合.
-/// 跨 shard 非原子 (源读与目标写分离) — 与 SINTER/MSETNX 同级 gap.
-struct StoreFinishAgg {
-    remaining: usize,
-    card: i64,
-    error: Option<String>,
-}
-
-/// ⭐ C3: ZINTERSTORE/ZUNIONSTORE 源聚合 — 每源 key 一个 ZRange(withscores),
-/// 回齐后 SUM 聚合写 dst (无 weights/AGGREGATE, 计划内 defer).
-type ScoredMembers = Vec<(Vec<u8>, f64)>;
-struct ZStoreAgg {
-    remaining: usize,
-    inter: bool,
-    sets: Vec<Option<ScoredMembers>>,
-    error: Option<String>,
-    dst: Vec<u8>,
-    /// ⭐ D3 (分库): 命令发起时的 (db, table) — 二阶段任务用.
-    db: std::sync::Arc<str>,
-    table: std::sync::Arc<str>,
-}
-
-/// ⭐ Phase G: Geo 命令的渲染上下文 (复用 ZMScore/ZRange 结果 + geohash 解码).
-enum GeoCtx {
-    /// GEOPOS → *N 个 [lon, lat] / nil
-    Pos,
-    /// GEODIST → bulk 距离 / nil
-    Dist { factor: f64 },
-    /// GEOSEARCH → 距离过滤 + 排序 + 可选 WITHCOORD/WITHDIST
-    Search {
-        lon: f64,
-        lat: f64,
-        radius_m: f64,
-        asc: bool,
-        count: usize,
-        withcoord: bool,
-        withdist: bool,
-    },
-}
-
-/// ⭐ Phase B: Bitmap 读命令的渲染上下文 (Get 结果 + worker 位运算).
-enum BitCtx {
-    /// GETBIT offset → :0|:1
-    GetBit { offset: u64 },
-    /// BITCOUNT [start end] (BYTE, 含负索引) → :popcount
-    Count { start: i64, end: i64 },
-    /// BITPOS bit [start [end]] → :pos / :-1
-    Pos { bit: bool, start: i64, end: Option<i64> },
 }
 
 // =====================================================================
