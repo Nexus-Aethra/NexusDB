@@ -1,8 +1,9 @@
 // ⭐ 解耦 2026-08: WHERE 条件/表达式解析 (从 parser.rs 拆出).
 // 职责: WHERE 谓词树 (AND/OR/NOT/比较/IN) + 表达式 atom 求值 + 常量折叠.
 use super::ast::*;
-use super::parser::{
-    P, Tok, is_join_ahead, parse_join_from, parse_opt_alias, parse_select, parse_select_tail,
+use super::parser::{P, Tok};
+use super::parser_select::{
+    is_join_ahead, parse_join_from, parse_opt_alias, parse_select, parse_select_tail,
 };
 use storage::schema::{ColType, Column, TableSchema};
 
