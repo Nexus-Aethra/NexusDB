@@ -1978,7 +1978,7 @@ pub(crate) fn sysq_finish(
         dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
-    };
+            fks: Vec::new(),};
     // WHERE 残余过滤 (递归 eval; `__` 前缀的内部标记叶子如 __table__ 视为真,
     // 已在生成器里处理; 未知真实列的条件 → 不匹配则滤掉)
     rows.retain(|r| eval_pred_sysq(&schema, r, &spec.conds));
@@ -2093,7 +2093,7 @@ fn sysq_exists(
         dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
-    };
+            fks: Vec::new(),};
     let mut rows = rows;
     rows.retain(|r| eval_pred_sysq(&schema, r, &spec.conds));
     let hit = !rows.is_empty();
@@ -2635,6 +2635,13 @@ pub(crate) fn sql_run_dml(
                         return;
                     }
                     // pk 等值 → 单 shard 原子, 直发 phase2
+                    // ⭐ FK 级联 (FMT_VER 8): 记录被删 pk (等值单发不走 Fire::Dml)
+                    if matches!(action, SqlDmlAction::Delete) {
+                        conn.cascade_pending.insert(
+                            seq,
+                            ((*db).clone(), table.clone(), vec![pk.clone()]),
+                        );
+                    }
                     conn.sql_dml_agg.insert(
                         seq,
                         SqlDmlAgg { remaining: 1, affected: 0, error: None, drop_key: None },
@@ -3622,9 +3629,9 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
-        .unwrap()
-    }
+        .unwrap()}
 
     fn c(col: &str, op: CmpOp, val: SqlValue) -> Pred<Cond> {
         Pred::Leaf(Cond { col: col.into(), op, val, set: vec![] })

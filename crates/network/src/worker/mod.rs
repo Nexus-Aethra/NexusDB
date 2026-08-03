@@ -39,6 +39,9 @@ mod sql_util;
 use sql_util::*;
 /// ⭐ 拆分 (2026-08): SQL 聚合执行 (GROUP BY/聚合函数/HAVING).
 mod sql_agg;
+/// ⭐ PG 兼容 (FMT_VER 8): 外键级联删除编排.
+mod sql_cascade;
+pub(crate) use sql_cascade::{cascade_job_done, cascade_kickoff, is_cascade_seq, CascadeJob};
 /// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
 mod sql_dispatch;
 /// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
@@ -611,6 +614,10 @@ pub struct SqlSharedRoutes {
     route_bypassed: std::sync::atomic::AtomicU64,
     /// ⭐ PG 兼容: 集群控制面 (建库 2PC). worker 启动后由 main 注入.
     cluster_ctl: std::sync::RwLock<Option<std::sync::Arc<shard_manager::ShardManager>>>,
+    /// ⭐ PG 兼容 (FMT_VER 8): 外键反向引用 — (db, ref_table) → 引用它的表.
+    /// 由 CREATE TABLE 注册 / DROP TABLE 移除; 级联删除按此分发.
+    fk_incoming:
+        std::sync::RwLock<std::collections::HashMap<(std::sync::Arc<str>, String), Vec<FkIncoming>>>,
 }
 
 impl Default for SqlSharedRoutes {
@@ -622,6 +629,7 @@ impl Default for SqlSharedRoutes {
             route_pruned: std::sync::atomic::AtomicU64::new(0),
             route_bypassed: std::sync::atomic::AtomicU64::new(0),
             cluster_ctl: std::sync::RwLock::new(None),
+            fk_incoming: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -636,6 +644,51 @@ impl SqlSharedRoutes {
     pub fn cluster_ctl(&self) -> Option<std::sync::Arc<shard_manager::ShardManager>> {
         self.cluster_ctl.read().expect("cluster_ctl lock").clone()
     }
+
+    /// ⭐ PG 兼容 (FMT_VER 8): CREATE TABLE 注册外键反向引用.
+    pub fn register_fks(&self, db: &str, table: &str, schema: &TableSchema) {
+        if schema.fks.is_empty() {
+            return;
+        }
+        let mut m = self.fk_incoming.write().expect("fk_incoming lock");
+        for fk in &schema.fks {
+            m.entry((std::sync::Arc::from(db), fk.ref_table.clone()))
+                .or_default()
+                .push(FkIncoming {
+                    table: table.to_string(),
+                    col: schema.columns[fk.col as usize].name.clone(),
+                    action: fk.on_delete,
+                });
+        }
+    }
+
+    /// ⭐ PG 兼容 (FMT_VER 8): DROP TABLE 移除外键反向引用.
+    pub fn unregister_fks(&self, db: &str, table: &str) {
+        let mut m = self.fk_incoming.write().expect("fk_incoming lock");
+        m.remove(&(std::sync::Arc::from(db), table.to_string()));
+        m.retain(|_, v| {
+            v.retain(|i| i.table != table);
+            !v.is_empty()
+        });
+    }
+
+    /// ⭐ PG 兼容 (FMT_VER 8): 反向引用 — 谁引用了 `ref_table` (级联删除分发用).
+    pub fn incoming_fks(&self, db: &str, ref_table: &str) -> Vec<FkIncoming> {
+        self.fk_incoming
+            .read()
+            .expect("fk_incoming lock")
+            .get(&(std::sync::Arc::from(db), ref_table.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// ⭐ PG 兼容 (FMT_VER 8): 外键反向引用条目 (表 → 引用它的表/列/动作).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FkIncoming {
+    pub table: String,
+    pub col: String,
+    pub action: storage::schema::FkAction,
 }
 
 /// 进程级实例构造 (main/测试 每逻辑集群一个, 传给同数据的全部 SQL 门面).
@@ -703,6 +756,15 @@ struct ConnState {
     sql_ddl_agg: HashMap<u64, SqlDdlAgg>,
     /// ⭐ S1: DML 计数聚合 (多行 INSERT / DELETE·UPDATE phase2 / DROP 广播).
     sql_dml_agg: HashMap<u64, SqlDmlAgg>,
+    /// ⭐ PG 兼容 (FMT_VER 8): FK 级联 — 根/子 DELETE 的 phase1 收的
+    /// (表, 被删 pk) 列表 (Fire::Dml 存; DmlAgg 完成时触发/推进级联).
+    cascade_pending: HashMap<u64, (std::sync::Arc<str>, String, Vec<Vec<u8>>)>,
+    /// ⭐ PG 兼容: 级联子任务 (伪高位 seq → 完成时推进, 不回包).
+    cascade_jobs: HashMap<u64, CascadeJob>,
+    /// ⭐ PG 兼容: 级联根状态 (主 DELETE seq → 计数/失败/防环).
+    cascade_roots: HashMap<u64, crate::worker::sql_cascade::CascadeRoot>,
+    /// ⭐ PG 兼容: 级联伪 seq 计数器.
+    cascade_seq_ctr: u64,
     /// ⭐ 事务 v1 (F61): 当前事务缓冲 (None = autocommit).
     txn: Option<TxnState>,
     /// ⭐ 事务 v1 (F61): PG 语义 — 事务内语句出错后拒后续 (25P02),
@@ -848,6 +910,10 @@ impl ConnState {
             sql_shared,
             sql_ddl_agg: HashMap::new(),
             sql_dml_agg: HashMap::new(),
+            cascade_pending: HashMap::new(),
+            cascade_jobs: HashMap::new(),
+            cascade_roots: HashMap::new(),
+            cascade_seq_ctr: 0,
             txn: None,
             txn_failed: false,
             sql_txn_agg: HashMap::new(),
@@ -996,6 +1062,11 @@ impl ConnState {
 
     /// RESP: 回复字节进重排缓冲, 然后把从 next_to_send 起的连续段发出.
     fn resp_complete(&mut self, seq: u64, bytes: Vec<u8>) {
+        // ⭐ PG 兼容 (FMT_VER 8): 级联伪 seq 的回包不发给客户端 (完成/推进
+        // 由 DmlAgg/Fire 拦截点经 cascade_job_done 处理; 此处兜底防泄漏).
+        if is_cascade_seq(seq) {
+            return;
+        }
         // ⭐ P3: PG 扩展查询批次 — 响应前拼 [ParseComplete][BindComplete]... 前缀
         // (单点侵入; 非 Pg conn 恒空查零开销)
         let mut bytes = match self.pg_ext.remove(&seq) {
@@ -2966,10 +3037,28 @@ fn handle_resp_shard_result(
                 ),
                 Err(e) => {
                     conn.sql_derived.remove(&seq);
+                    // ⭐ FK 级联: 级联 job 的 phase1 收集出错 → 推进级联 (不回复)
+                    if is_cascade_seq(seq) {
+                        if let Some(job) = conn.cascade_jobs.remove(&seq) {
+                            cascade_job_done(
+                                conn, conn_id, seq, worker_id, default_db,
+                                db_view, shard_inboxes, num_shards, 0, Some(e), &job,
+                            );
+                            return;
+                        }
+                    }
                     conn.resp_complete(seq, sql_err_bytes(proto, &e));
                 }
             },
             Fire::Dml { pks, action, target } => {
+                // ⭐ PG 兼容 (FMT_VER 8): 记录被删 pk — 主 DELETE 或级联 DELETE
+                // 的 phase1 完成即存 (DmlAgg 完成时触发/推进级联); 仅 Delete 需要.
+                if matches!(action, SqlDmlAction::Delete) {
+                    conn.cascade_pending.insert(
+                        seq,
+                        (target.0.clone(), target.1.clone(), pks.clone()),
+                    );
+                }
                 // ⭐ 事务 v1 (F61): 两阶段 DML 的 phase2 在事务中截流
                 // (phase1 读的是已提交态 — v1 文档化语义)
                 if conn.txn.is_some() {
@@ -2977,18 +3066,47 @@ fn handle_resp_shard_result(
                     for pk in pks {
                         let op = sql_dml_op(&target.0, &target.1, pk, &action);
                         if let Err(e) = txn_buffer_op(conn, op) {
-                            conn.resp_complete(seq, sql_err_bytes(proto, &e));
+                            if is_cascade_seq(seq) {
+                                if let Some(job) = conn.cascade_jobs.remove(&seq) {
+                                    cascade_job_done(
+                                        conn, conn_id, seq, worker_id, default_db,
+                                        db_view, shard_inboxes, num_shards, 0, Some(e),
+                                        &job,
+                                    );
+                                }
+                            } else {
+                                conn.resp_complete(seq, sql_err_bytes(proto, &e));
+                            }
                             return;
                         }
                     }
-                    conn.resp_complete(seq, sql_ok_bytes(proto, n));
+                    if is_cascade_seq(seq) {
+                        if let Some(job) = conn.cascade_jobs.remove(&seq) {
+                            cascade_job_done(
+                                conn, conn_id, seq, worker_id, default_db,
+                                db_view, shard_inboxes, num_shards, n, None, &job,
+                            );
+                        }
+                    } else {
+                        conn.resp_complete(seq, sql_ok_bytes(proto, n));
+                    }
                     return;
                 }
                 // phase2: 逐 pk 按路由下发 (DML 禁早停保证此刻 phase1 已 drained,
                 // 同 seq 注册 dml_agg 无双聚合并存)
                 debug_assert!(drained, "DML phase1 必须全量回齐后才 fire");
                 if pks.is_empty() {
-                    conn.resp_complete(seq, sql_ok_bytes(proto, 0));
+                    // ⭐ FK 级联: 级联 job 无匹配引用行 → 推进 (无更深递归)
+                    if is_cascade_seq(seq) {
+                        if let Some(job) = conn.cascade_jobs.remove(&seq) {
+                            cascade_job_done(
+                                conn, conn_id, seq, worker_id, default_db,
+                                db_view, shard_inboxes, num_shards, 0, None, &job,
+                            );
+                        }
+                    } else {
+                        conn.resp_complete(seq, sql_ok_bytes(proto, 0));
+                    }
                 } else {
                     conn.sql_dml_agg.insert(
                         seq,
@@ -3052,6 +3170,26 @@ fn handle_resp_shard_result(
             }
             let agg = conn.sql_dml_agg.remove(&seq).expect("just checked");
             conn.mysql_binary.remove(&seq);
+            // ⭐ FK 级联 (FMT_VER 8): 级联子任务完成 → 推进级联 (不回复客户端)
+            if let Some(job) = conn.cascade_jobs.remove(&seq) {
+                cascade_job_done(
+                    conn, conn_id, seq, worker_id, default_db, db_view, shard_inboxes,
+                    num_shards, agg.affected, agg.error.clone(), &job,
+                );
+                return;
+            }
+            // ⭐ FK 级联: 根 DELETE 完成且无错误 → 有引用表则进入级联 (延迟回复)
+            if agg.error.is_none() && agg.drop_key.is_none() {
+                if let Some((db, t, pks)) = conn.cascade_pending.remove(&seq) {
+                    let affected = agg.affected;
+                    if cascade_kickoff(
+                        conn, conn_id, seq, worker_id, &db, default_db, db_view,
+                        shard_inboxes, num_shards, &t, pks, affected,
+                    ) {
+                        return;
+                    }
+                }
+            }
             let bytes = match agg.error {
                 Some(e) => sql_err_bytes(conn.proto, &e),
                 None => {
@@ -3061,6 +3199,8 @@ fn handle_resp_shard_result(
                         conn.sql_cache.borrow_mut().schemas.remove(&key);
                         let sh = &conn.sql_shared;
                         sh.created_here.write().unwrap().remove(&key);
+                        // ⭐ FK 级联 (FMT_VER 8): 移除该表的外键反向引用
+                        sh.unregister_fks(&key.0, &key.1);
                         sh.routes
                             .write()
                             .unwrap()
@@ -3111,7 +3251,12 @@ fn handle_resp_shard_result(
                         drop(routes);
                         sh.created_here.write().unwrap().insert(agg.key.clone());
                     }
-                    conn.sql_cache.borrow_mut().schemas.insert(agg.key, agg.schema);
+                    conn.sql_cache.borrow_mut().schemas.insert(agg.key.clone(), agg.schema.clone());
+                    // ⭐ FK 级联 (FMT_VER 8): 注册外键反向引用 (含 ALTER ADD COLUMN?)
+                    if !agg.schema.fks.is_empty() {
+                        conn.sql_shared
+                            .register_fks(&agg.key.0, &agg.key.1, &agg.schema);
+                    }
                     // ⭐ F79: ALTER 递增 ddl_epoch — 其他 worker 下次 dispatch 重拉新 schema,
                     // 避免用旧列数解码新写的行 (同 DROP 先例)
                     if agg.alter {
@@ -4241,7 +4386,7 @@ fn finish_derived_join(
         dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
-    });
+            fks: Vec::new(),});
     let ncols = cols.len() as u16;
     let mut tables: Vec<JoinTable> = Vec::with_capacity(joins.len() + 1);
     tables.push(JoinTable {
@@ -4338,7 +4483,7 @@ fn derived_render(
         dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
-    };
+            fks: Vec::new(),};
     let conds = match conds_in.try_map(&|c: &Cond| {
         let idx = resolve(&c.col)?;
         Ok::<_, String>(Cond {

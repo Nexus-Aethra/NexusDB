@@ -17,7 +17,7 @@ fn demo_schema() -> TableSchema {
         0,
         &[1, 2],
         &[],
-        &[], &[],
+        &[], &[], &[],
     )
     .unwrap()
 }

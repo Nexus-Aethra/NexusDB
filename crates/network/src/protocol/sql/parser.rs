@@ -886,6 +886,51 @@ fn read_col_list(p: &mut P) -> Result<Vec<String>, String> {
     Ok(cols)
 }
 
+/// ⭐ PG 兼容 (FMT_VER 8): 外键原始定义 (解析期; 列位转数字后入 TableSchema).
+struct FkDefRaw {
+    col: String,
+    ref_table: String,
+    ref_col: String,
+    action: storage::schema::FkAction,
+}
+
+/// ⭐ PG 兼容: 解析外键 `ON DELETE [CASCADE|SET NULL|NO ACTION|RESTRICT]` 动作,
+/// 吞掉后续 `ON UPDATE ...` 子句 (v1 不实现 UPDATE 级联).
+fn parse_fk_action(p: &mut P) -> Result<storage::schema::FkAction, String> {
+    use storage::schema::FkAction;
+    let mut action = FkAction::NoAction;
+    loop {
+        let Some(first) = p.peek().and_then(|t| match t {
+            Tok::Ident(s) => Some(s.to_ascii_lowercase()),
+            _ => None,
+        }) else {
+            break;
+        };
+        if first != "on" {
+            break;
+        }
+        p.next()?; // ON
+        let w = p.ident()?.to_ascii_lowercase(); // DELETE / UPDATE
+        let a = p.ident()?.to_ascii_lowercase();
+        if w == "delete" {
+            action = match a.as_str() {
+                "cascade" => FkAction::Cascade,
+                "set" => {
+                    p.kw("null")?;
+                    FkAction::SetNull
+                }
+                "no" => {
+                    let _ = p.ident()?; // ACTION
+                    FkAction::NoAction
+                }
+                _ => FkAction::NoAction, // RESTRICT / 其他 → v1 不检查
+            };
+        }
+        // ON UPDATE 的 action 已吞 (a 已消费; set null 已吞 null)
+    }
+    Ok(action)
+}
+
 /// ⭐ PG 兼容: 解析列 DEFAULT 表达式 → ColDefault (v1: 字面量 / NOW /
 /// uuid_generate_v4; 未知函数/表达式 → None, 吞掉不落默认). 含 `::type` 后缀.
 fn parse_col_default(
@@ -1018,6 +1063,7 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
     let mut unique_names: Vec<String> = Vec::new(); // ⭐ O3
     let mut global_unique_names: Vec<String> = Vec::new(); // ⭐ F65
     let mut composite_unique_names: Vec<Vec<String>> = Vec::new(); // ⭐ PG 兼容 (FMT_VER 7)
+    let mut fks: Vec<FkDefRaw> = Vec::new(); // ⭐ PG 兼容 (FMT_VER 8): 外键 (列级+表级)
     loop {
         if p.try_kw("INDEX") {
             p.expect(&Tok::LParen, "(")?;
@@ -1059,17 +1105,25 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                 index_names.push(c);
             }
         } else if p.try_kw("FOREIGN") {
-            // ⭐ F76: FOREIGN KEY (col) REFERENCES t (col) [ON ...] — v1 吞 (不强制外键)
+            // ⭐ PG 兼容 (FMT_VER 8): 表级外键 FOREIGN KEY (col) REFERENCES t(col) [ON ...]
             p.kw("KEY")?;
-            let _ = read_col_list(p)?;
+            let cols = read_col_list(p)?;
             p.kw("REFERENCES")?;
-            let _ = p.ident()?;
-            if p.peek() == Some(&Tok::LParen) {
-                let _ = read_col_list(p)?;
-            }
-            // 吞 ON DELETE/UPDATE ... 至下个 , 或 )
-            while !matches!(p.peek(), Some(Tok::Comma) | Some(Tok::RParen) | None) {
-                p.i += 1;
+            let ref_table = p.ident()?;
+            let ref_cols = if p.peek() == Some(&Tok::LParen) {
+                read_col_list(p)?
+            } else {
+                Vec::new()
+            };
+            let action = parse_fk_action(p)?;
+            // v1: 单列外键 (复合外键取首列)
+            if let Some(c) = cols.into_iter().next() {
+                fks.push(FkDefRaw {
+                    col: c,
+                    ref_table,
+                    ref_col: ref_cols.into_iter().next().unwrap_or_else(|| "id".to_string()),
+                    action,
+                });
             }
         } else if p.try_kw("CHECK") {
             // ⭐ compat: 表级 CHECK (expr) — v1 吞 (不强制约束)
@@ -1117,21 +1171,20 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                     // ⭐ F76: 吃 COMMENT '…'
                     let _ = p.value()?;
                 } else if p.try_kw("REFERENCES") {
-                    // ⭐ compat: 列级外键 `REFERENCES t (c) [ON DELETE ...]` — v1 吞 (不强制外键)
-                    let _ = p.ident()?;
-                    if p.peek() == Some(&Tok::LParen) {
-                        let _ = read_col_list(p)?;
-                    }
-                    // 吞 ON DELETE/UPDATE CASCADE|SET NULL|RESTRICT ... 至下个属性/逗号/右括号
-                    while !matches!(
-                        p.peek(),
-                        Some(Tok::Comma) | Some(Tok::RParen) | None
-                    ) && !matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("PRIMARY")
-                        || s.eq_ignore_ascii_case("NOT") || s.eq_ignore_ascii_case("UNIQUE")
-                        || s.eq_ignore_ascii_case("DEFAULT") || s.eq_ignore_ascii_case("REFERENCES"))
-                    {
-                        p.i += 1;
-                    }
+                    // ⭐ PG 兼容 (FMT_VER 8): 列级外键 `REFERENCES t (c) [ON DELETE ...]`
+                    let ref_table = p.ident()?;
+                    let ref_col = if p.peek() == Some(&Tok::LParen) {
+                        p.next()?;
+                        let c = p.ident()?;
+                        p.expect(&Tok::RParen, ")")?;
+                        c
+                    } else {
+                        // PG: REFERENCES t (无列) → 引用 t 的主键 (v1 记名 "id" 占位,
+                        // 级联时按引用表实际 pk 列解析)
+                        "id".to_string()
+                    };
+                    let action = parse_fk_action(p)?;
+                    fks.push(FkDefRaw { col: name.clone(), ref_table, ref_col, action });
                 } else if p.try_kw("CHECK") {
                     // ⭐ compat: 列级 CHECK (expr) — v1 吞 (不强制约束)
                     if p.peek() == Some(&Tok::LParen) {
@@ -1231,6 +1284,16 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
         }
         composite_unique_cols.push(cols);
     }
+    let mut fk_defs: Vec<storage::schema::FkDef> = Vec::with_capacity(fks.len());
+    for fk in &fks {
+        let col = col_pos(&fk.col, "FOREIGN KEY")?;
+        fk_defs.push(storage::schema::FkDef {
+            col,
+            ref_table: fk.ref_table.clone(),
+            ref_col: fk.ref_col.clone(),
+            on_delete: fk.action,
+        });
+    }
     let schema = TableSchema::new(
         columns,
         pk,
@@ -1238,6 +1301,7 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
         &unique_cols,
         &global_unique_cols,
         &composite_unique_cols,
+        &fk_defs,
     )
     .map_err(|e| e.to_string())?;
     Ok(SqlStmt::CreateTable { table, schema, if_not_exists })

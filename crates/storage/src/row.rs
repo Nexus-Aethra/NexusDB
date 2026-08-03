@@ -256,7 +256,7 @@ mod tests {
             ],
             0,
             &[1, 2],
-            &[], &[], &[])
+            &[], &[], &[], &[])
         .unwrap()
     }
 
@@ -374,7 +374,7 @@ mod tests {
                 Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
                 Column { name: "age".into(), ty: ColType::I64, nullable: true, default: None },
             ],
-            0, &[], &[], &[], &[],
+            0, &[], &[], &[], &[], &[],
         )
         .unwrap();
         assert_eq!(old.version, 1);
@@ -435,7 +435,7 @@ mod tests {
             0,
             &[],
             &[],
-            &[], &[],
+            &[], &[], &[],
         )
         .unwrap();
         let vals = vec![
@@ -497,7 +497,7 @@ mod tests {
             0,
             &[],
             &[],
-            &[], &[],
+            &[], &[], &[],
         )
         .unwrap();
         let vals = vec![

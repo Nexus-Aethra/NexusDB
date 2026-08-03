@@ -36,7 +36,7 @@ fn demo_schema() -> TableSchema {
         ],
         0,
         &[1, 2], // iid 0 = name, iid 1 = score
-        &[], &[], &[])
+        &[], &[], &[], &[])
     .unwrap()
 }
 
@@ -431,7 +431,7 @@ fn unique_index_rejects_duplicates() {
             ],
             0,
             &[],
-            &[1], &[], &[])
+            &[1], &[], &[], &[])
         .unwrap();
         e.set_schema("db1", "t1", &schema).await.unwrap();
         let row = |id: i64, em: &str| {

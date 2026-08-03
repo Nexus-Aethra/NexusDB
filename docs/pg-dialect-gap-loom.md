@@ -98,9 +98,35 @@
 - **扫描**：复合索引 v1 不参与单列索引扫描（退化全表，正确性保底）
 - **验证**：Loom 完整迁移 + 同一用户两世界允许、重复世界名报 `duplicate key on unique columns (user_id, name)`；新增 e2e `mysql_composite_unique`
 
+### 2026-08-03 完整性测试新增发现
+
+**外键完全未实现（parser 层吞掉，`v1 吞 (不强制外键)`）** —— Loom 对接的实质障碍：
+- 引用完整性不强制：插入悬空 `REFERENCES` 行成功（实测 characters 悬空 story_id 可插入）
+- **`ON DELETE CASCADE` 不执行**：实测 DELETE world 后 chapters/nodes/edges/characters 全残留（孤儿行）
+- Loom 8 张表全部依赖 `REFERENCES ... ON DELETE CASCADE`（删世界必须级联清子表），此缺口破坏 Loom 核心删除语义
+- compat 测试第 59/60 行只验证 CREATE TABLE 语法接受 → 假阳性（同 uuid_generate_v4）
+
+**跨 shard 复合唯一漏检（架构限制，文档已记录）**：
+- 实测 3 shard 下 40 次插入仅拒 2（期望拒 5，35 个唯一组合），跨 shard 重复漏检
+- 同 shard 必拒（单 shard 实测 + e2e 全过）
+
+**已排除（Loom 应用层未用，不阻塞）**：`INSERT...SELECT`、`||` 拼接、裸常量 SELECT 列。
+
+### 外键级联（追加完成，2026-08-03）
+
+实现方案（worker 编排 + 进程级反向引用）：
+- **parser**：列级 `REFERENCES t(col)` + 表级 `FOREIGN KEY` 解析 → `FkDef`（含 ON DELETE CASCADE/SET NULL），不再吞掉
+- **schema (FMT_VER 8)**：`TableSchema.fks` + 序列化（兼容 v1-7）
+- **反向引用**：`SqlSharedRoutes.fk_incoming`（CREATE 注册 / DROP 移除）——"通过 schema 了解当前表被哪些表引用"
+- **级联编排**（`worker/sql_cascade.rs`）：主 DELETE 完成（DmlAgg remaining==0 或 PkGet 单发）→ 按反向引用对每引用表递归下发 `DELETE WHERE fk_col IN (被删pks)` / `UPDATE ... SET fk_col=NULL` 子任务（伪高位 seq，回包拦截不发给客户端）→ 全部完成才回复根 DELETE
+- **防环**：visited (表, pk) 去重（自引用/菱形引用）；SET NULL 不过滤（更新引用行不删行）
+- **验证**：Loom 迁移全表级联（world→chapters→nodes→edges/nc/hooks 7 表全清）、chapters 自引用 SET NULL、e2e `mysql_foreign_key_cascade`、全量回归 40 passed
+- **边界**：引用完整性 v1 不强制（悬空插入允许）；跨 shard 引用行全广播删（正确性优先）
+
 ### 剩余（Loom 不阻塞）
 
 - RETURNING 未实现（Loom 当前不用，低优先级）。
+- 引用完整性检查（INSERT 拒绝悬空引用）— v1 未做，语法兼容层。
 
 ## 五、更新步骤（分阶段，原计划，已基本完成）
 

@@ -98,6 +98,27 @@ pub enum ColDefault {
     UuidGenV4,
 }
 
+/// ⭐ PG 兼容 (FMT_VER 8): 外键 ON DELETE 动作.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    /// 无动作 (默认; 仅语法兼容, v1 不做 RESTRICT 检查).
+    NoAction,
+    /// ON DELETE CASCADE — 删除父行时级联删引用行.
+    Cascade,
+    /// ON DELETE SET NULL — 删除父行时引用列置 NULL (要求列可空).
+    SetNull,
+}
+
+/// ⭐ PG 兼容 (FMT_VER 8): 外键定义 — 本表 `col` 引用 `ref_table(ref_col)`.
+/// v1: 单列外键; ref_table/ref_col 按名存储 (跨表引用, 位置在引用表 schema).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FkDef {
+    pub col: u16,
+    pub ref_table: String,
+    pub ref_col: String,
+    pub on_delete: FkAction,
+}
+
 /// ColDefault::Lit 编码 (值标签 + payload; 仅 DEFAULT 常用类型).
 fn encode_colvalue(v: &ColValue, out: &mut Vec<u8>) {
     match v {
@@ -173,6 +194,8 @@ pub struct TableSchema {
     /// ⭐ compat (DROP COLUMN): 已删除列的列号集合 (被删列仍占 columns 位置,
     /// 行布局/版本机制不变 → 存量行零重写; 新行该列写 NULL). 索引 on 该列一并移除.
     pub dropped: Vec<u16>,
+    /// ⭐ PG 兼容 (FMT_VER 8): 外键列表 (本表引用其他表; 反向查询在 worker 聚合).
+    pub fks: Vec<FkDef>,
 }
 
 /// 序列化格式版本 (与 schema.version 无关, 是编码布局版本).
@@ -182,7 +205,8 @@ pub struct TableSchema {
 /// ⭐ compat: 4→5 尾部加 dropped 列号列表; decode 兼容 v1-4 (dropped=[]).
 /// ⭐ PG 兼容: 5→6 每列追加 default 段; decode 兼容 v1-5 (default=None).
 /// ⭐ PG 兼容: 6→7 索引项追加 cols 列集; decode 兼容 v1-6 (cols=[col]).
-const FMT_VER: u8 = 7;
+/// ⭐ PG 兼容: 7→8 表尾追加 fks 外键列表; decode 兼容 v1-7 (fks=[]).
+const FMT_VER: u8 = 8;
 
 /// schema 反序列化错误.
 #[derive(Debug, PartialEq, Eq)]
@@ -218,6 +242,7 @@ impl TableSchema {
         unique_cols: &[u16],
         global_unique_cols: &[u16],
         composite_unique_cols: &[Vec<u16>],
+        fks: &[FkDef],
     ) -> Result<Self, SchemaError> {
         if pk_col as usize >= columns.len() {
             return Err(SchemaError::BadRef);
@@ -277,6 +302,7 @@ impl TableSchema {
             indexes,
             next_iid,
             dropped: Vec::new(),
+            fks: fks.to_vec(),
         })
     }
 
@@ -296,6 +322,7 @@ impl TableSchema {
             next_iid: self.next_iid,
             version_ncols,
             dropped: self.dropped.clone(),
+            fks: self.fks.clone(),
         })
     }
 
@@ -315,6 +342,7 @@ impl TableSchema {
             indexes: self.indexes.iter().filter(|i| i.col != col_idx).cloned().collect(),
             next_iid: self.next_iid,
             dropped,
+            fks: self.fks.clone(),
         })
     }
 
@@ -392,6 +420,18 @@ impl TableSchema {
         for &d in &self.dropped {
             out.extend_from_slice(&d.to_le_bytes());
         }
+        // ⭐ PG 兼容 (FMT_VER 8): fks 外键列表
+        out.extend_from_slice(&(self.fks.len() as u16).to_le_bytes());
+        for fk in &self.fks {
+            out.extend_from_slice(&fk.col.to_le_bytes());
+            let rt = fk.ref_table.as_bytes();
+            out.extend_from_slice(&(rt.len() as u8).to_le_bytes());
+            out.extend_from_slice(rt);
+            let rc = fk.ref_col.as_bytes();
+            out.extend_from_slice(&(rc.len() as u8).to_le_bytes());
+            out.extend_from_slice(rc);
+            out.push(fk.on_delete as u8);
+        }
         out
     }
 
@@ -399,7 +439,15 @@ impl TableSchema {
     pub fn decode(buf: &[u8]) -> Result<Self, SchemaError> {
         let mut r = Reader { buf, pos: 0 };
         let fmt = r.u8()?;
-        if fmt != FMT_VER && fmt != 1 && fmt != 2 && fmt != 3 && fmt != 4 && fmt != 5 && fmt != 6 {
+        if fmt != FMT_VER
+            && fmt != 1
+            && fmt != 2
+            && fmt != 3
+            && fmt != 4
+            && fmt != 5
+            && fmt != 6
+            && fmt != 7
+        {
             return Err(SchemaError::BadFormat);
         }
         let version = r.u8()?;
@@ -487,7 +535,37 @@ impl TableSchema {
         } else {
             Vec::new()
         };
-        Ok(Self { version, columns, pk_col, indexes, next_iid, version_ncols, dropped })
+        // ⭐ PG 兼容 (FMT_VER 8): fks 外键列表; v1-7 无此段 → 空
+        let fks = if fmt >= 8 {
+            let nf = r.u16()? as usize;
+            let mut fs = Vec::with_capacity(nf);
+            for _ in 0..nf {
+                let col = r.u16()?;
+                let rt_len = r.u8()? as usize;
+                let ref_table = String::from_utf8_lossy(r.bytes(rt_len)?).into_owned();
+                let rc_len = r.u8()? as usize;
+                let ref_col = String::from_utf8_lossy(r.bytes(rc_len)?).into_owned();
+                let action = match r.u8()? {
+                    1 => FkAction::Cascade,
+                    2 => FkAction::SetNull,
+                    _ => FkAction::NoAction,
+                };
+                fs.push(FkDef { col, ref_table, ref_col, on_delete: action });
+            }
+            fs
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            version,
+            columns,
+            pk_col,
+            indexes,
+            next_iid,
+            version_ncols,
+            dropped,
+            fks,
+        })
     }
 }
 
@@ -548,7 +626,7 @@ mod tests {
             0,
             &[1, 2], // name / score 建索引
             &[3],    // blob 唯一索引 (⭐ O3 roundtrip)
-            &[], &[],
+            &[], &[], &[],
         )
         .unwrap()
     }
@@ -578,7 +656,7 @@ mod tests {
                 vec![Column { name: "a".into(), ty: ColType::I64, nullable: false, default: None }],
                 1,
                 &[],
-                &[], &[], &[]),
+                &[], &[], &[], &[]),
             Err(SchemaError::BadRef)
         );
         assert_eq!(
@@ -586,7 +664,7 @@ mod tests {
                 vec![Column { name: "a".into(), ty: ColType::I64, nullable: false, default: None }],
                 0,
                 &[3],
-                &[], &[], &[]),
+                &[], &[], &[], &[]),
             Err(SchemaError::BadRef)
         );
     }

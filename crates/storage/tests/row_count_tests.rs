@@ -23,7 +23,7 @@ fn demo_schema() -> TableSchema {
         0,
         &[1], // iid 0 = name
         &[],
-        &[], &[],
+        &[], &[], &[],
     )
     .unwrap()
 }

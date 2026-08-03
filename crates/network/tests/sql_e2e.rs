@@ -1734,6 +1734,69 @@ fn mysql_composite_unique() {
     drop(mgr);
 }
 
+/// ⭐ PG 兼容 (FMT_VER 8): 外键级联删除 — ON DELETE CASCADE 删引用行,
+/// SET NULL 置空引用列; 引用完整性 v1 不强制 (语法兼容层).
+#[test]
+fn mysql_foreign_key_cascade() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE fk_parent (id INT PRIMARY KEY)");
+    c.query("CREATE TABLE fk_child (id INT PRIMARY KEY, pid INT REFERENCES fk_parent(id) ON DELETE CASCADE)");
+    c.query("CREATE TABLE fk_ref (id INT PRIMARY KEY, pid INT REFERENCES fk_parent(id) ON DELETE SET NULL)");
+    c.query("INSERT INTO fk_parent VALUES (1), (2)");
+    c.query("INSERT INTO fk_child VALUES (10, 1), (11, 1), (12, 2)");
+    c.query("INSERT INTO fk_ref VALUES (20, 1), (21, 2)");
+    // DELETE parent 1 → child 10/11 级联删, ref 20 置 NULL
+    c.query("DELETE FROM fk_parent WHERE id=1");
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fk_child"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "CASCADE 删掉引用 parent=1 的 child 行"
+    );
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fk_ref"),
+        QueryResult::Rows(vec![vec![Some("2".into())]]),
+        "SET NULL 保留 ref 行"
+    );
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fk_parent"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "父行删除"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 // ===== ⭐ information_schema 系统表 (F66) =====
 
 /// 系统表虚拟化: tables/columns/key_column_usage/schemata + 投影/过滤/大小写/未知回空.
