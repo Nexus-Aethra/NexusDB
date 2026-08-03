@@ -280,6 +280,14 @@ pub fn build_command_complete(tag: &str) -> Vec<u8> {
     frame(b'C', &p)
 }
 
+/// ⭐ PG 兼容 (multi-statement): 多语句顺序执行完成后, 回 CommandComplete +
+/// ReadyForQuery (PG 协议要求每条 simple query 以 ReadyForQuery 收尾).
+pub fn build_command_complete_multi() -> Vec<u8> {
+    let mut out = build_command_complete("SELECT 1");
+    out.extend_from_slice(&build_ready());
+    out
+}
+
 fn type_oid(ty: ColType) -> u32 {
     match ty {
         ColType::I64 => OID_INT8,

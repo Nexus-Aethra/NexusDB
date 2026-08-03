@@ -225,6 +225,15 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             b'-' => {
+                // ⭐ PG 兼容 (multi-statement): 跳过 `--` 行注释 (拆分后语句
+                // 可能以注释行开头, 或语句内嵌注释)
+                if b.get(i + 1) == Some(&b'-') {
+                    i += 2;
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
                 // ⭐ compat: JSONB 操作符 -> / ->> (优先于减号)
                 if b.get(i + 1) == Some(&b'>') {
                     if b.get(i + 2) == Some(&b'>') {

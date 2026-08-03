@@ -497,6 +497,25 @@ struct SqlDmlAgg {
     drop_key: Option<(String, String)>,
 }
 
+/// ⭐ PG 兼容 (multi-statement, 2026-08): PG simple Query 多语句顺序执行状态.
+/// story-loom 迁移把整文件作为一条 multi-statement Exec → 需顺序执行每条
+/// DDL (纯 DDL 走 sql_ddl_agg, 每条完成推进下一条), 全部完成回原 seq.
+#[derive(Debug)]
+pub struct MultiStmt {
+    /// 剩余待执行的语句 (SQL 文本).
+    pub stmts: std::collections::VecDeque<String>,
+    /// 首个语句子 seq (用于建 multi_sub_seq 映射基线).
+    pub base_sub_seq: u64,
+    /// 首个子 seq 已 dispatch 标记 (续跑从 base+idx).
+    pub dispatched: usize,
+    /// 是否遇错 (错则中断后续, 回错误).
+    pub error: Option<String>,
+    /// 当前语句类型 (1=DDL 走 ddl_agg, 2=DML 走 dml_agg, 0=同步/其他).
+    pub cur_kind: u8,
+    /// 发起连接的 id (同步语句推进 multi_step 用).
+    pub conn_id: u64,
+}
+
 /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检状态.
 /// 流程: 收集全部父表引用 → 发 RowGet 存在性检查 (real seq) → 全存在则
 /// 注册 sql_dml_agg 发原 RowPut, 任一缺失拒. 以 real seq 为 key.
@@ -796,6 +815,10 @@ struct ConnState {
     cascade_seq_ctr: u64,
     /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检 (seq → 状态).
     sql_fk_ins: HashMap<u64, SqlFkIns>,
+    /// ⭐ PG 兼容 (multi-statement): 原 seq → 多语句顺序执行状态.
+    multi_stmt: HashMap<u64, MultiStmt>,
+    /// ⭐ PG 兼容 (multi-statement): 子 seq → 原 seq (DDL/DML 完成时回映射推进).
+    multi_sub_seq: HashMap<u64, u64>,
     /// ⭐ 巨型 INSERT 防死锁 (2026-08): worker reply bus + 路由上下文 — 批量 push
     /// 超过 inbox/reply_bus 容量时, 在 push 循环内先 drain reply_bus 处理回包,
     /// 打破 worker(等 inbox)↔shard(等 reply_bus) 循环等待.
@@ -960,6 +983,8 @@ impl ConnState {
             cascade_roots: HashMap::new(),
             cascade_seq_ctr: 0,
             sql_fk_ins: HashMap::new(),
+            multi_stmt: HashMap::new(),
+            multi_sub_seq: HashMap::new(),
             reply_bus,
             reply_db_view: db_view,
             reply_worker_id: worker_id,
@@ -1119,6 +1144,26 @@ impl ConnState {
         if is_cascade_seq(seq) {
             return;
         }
+        // ⭐ PG 兼容 (multi-statement): 多语句子 seq 的回包由 multi_step 推进,
+        // 不直接发给客户端 (兜底防泄漏). 同步语句 (DdlStub 等) 直接 resp_complete
+        // 到这里 → 此处推进下一条.
+        if self.multi_sub_seq.contains_key(&seq) {
+            let orig = self.multi_sub_seq.get(&seq).cloned().unwrap_or(seq);
+            let conn_id = self
+                .multi_stmt
+                .get(&orig)
+                .map(|m| m.conn_id)
+                .unwrap_or(0);
+            let worker_id = self.reply_worker_id;
+            let num_shards = self.reply_num_shards;
+            let default_db = self.reply_default_db.clone();
+            let db_view = self.reply_db_view.clone();
+            let shard_inboxes = self.reply_shard_inboxes.clone();
+            self.multi_step(
+                seq, conn_id, worker_id, &default_db, &db_view, &shard_inboxes, num_shards,
+            );
+            return;
+        }
         // ⭐ P3: PG 扩展查询批次 — 响应前拼 [ParseComplete][BindComplete]... 前缀
         // (单点侵入; 非 Pg conn 恒空查零开销)
         let mut bytes = match self.pg_ext.remove(&seq) {
@@ -1177,6 +1222,111 @@ impl ConnState {
     /// RESP: 是否可以关闭 (QUIT/协议错误 且回复已全部发出).
     fn resp_should_close(&self) -> bool {
         self.close_after_flush && self.pending.is_empty() && self.next_seq == self.next_to_send
+    }
+
+    /// ⭐ PG 兼容 (multi-statement): 顺序执行一条语句. 解析后 dispatch,
+    /// 记录类型 (DDL/DML/同步) 供完成推进. 子 seq = base + dispatched.
+    fn dispatch_multi_one(
+        &mut self,
+        conn_id: u64,
+        worker_id: u32,
+        sub_seq: u64,
+        text: &str,
+        default_db: &std::sync::Arc<str>,
+        db_view: &std::sync::Arc<shard_manager::DbDirView>,
+        shard_inboxes: &[SharedTaskInbox],
+        num_shards: usize,
+    ) {
+        let cur_db = self.current_db.clone();
+        match sql::parse(text.as_bytes()) {
+            Err(e) => {
+                // 解析失败 → 整条多语句报错
+                if let Some(orig) = self.multi_sub_seq.get(&sub_seq).cloned() {
+                    self.multi_sub_seq.remove(&sub_seq);
+                    if let Some(m) = self.multi_stmt.get_mut(&orig) {
+                        m.error = Some(e);
+                        m.stmts.clear();
+                    }
+                    self.multi_finish(orig);
+                }
+            }
+            Ok(stmt) => {
+                // 记录类型
+                let kind = match &stmt {
+                    SqlStmt::CreateTable { .. } | SqlStmt::AlterTable { .. } => 1u8, // DDL
+                    SqlStmt::DropTable { .. } => 1u8, // DDL (DROP 走 dml_agg? 见下)
+                    _ => 0u8, // 同步/其他 (SELECT/SET/USE 等同步回包)
+                };
+                if let Some(orig) = self.multi_sub_seq.get(&sub_seq).cloned() {
+                    if let Some(m) = self.multi_stmt.get_mut(&orig) {
+                        m.cur_kind = kind;
+                    }
+                }
+                sql_dispatch_stmt(
+                    self, conn_id, sub_seq, worker_id, &cur_db, default_db, db_view,
+                    shard_inboxes, num_shards, stmt,
+                );
+            }
+        }
+    }
+
+    /// ⭐ PG 兼容 (multi-statement): 完成处理 — 推进下一条或全部完成回原 seq.
+    fn multi_step(
+        &mut self,
+        sub_seq: u64,
+        conn_id: u64,
+        worker_id: u32,
+        default_db: &std::sync::Arc<str>,
+        db_view: &std::sync::Arc<shard_manager::DbDirView>,
+        shard_inboxes: &[SharedTaskInbox],
+        num_shards: usize,
+    ) {
+        let Some(orig) = self.multi_sub_seq.get(&sub_seq).cloned() else { return };
+        let mut done = false;
+        let mut next: Option<String> = None;
+        let mut error: Option<String> = None;
+        {
+            let m = self.multi_stmt.get_mut(&orig).expect("multi 状态必在");
+            m.dispatched += 1;
+            if m.error.is_some() {
+                error = m.error.clone();
+                m.stmts.clear();
+            }
+            if let Some(nxt) = m.stmts.pop_front() {
+                next = Some(nxt);
+            } else {
+                done = true;
+            }
+        }
+        if let Some(e) = error {
+            self.multi_sub_seq.remove(&sub_seq);
+            self.multi_finish(orig);
+            return;
+        }
+        if let Some(nxt) = next {
+            // 续跑下一条: 新子 seq = orig? 不, 用 base + dispatched
+            let m = self.multi_stmt.get_mut(&orig).unwrap();
+            let next_sub_seq = m.base_sub_seq + m.dispatched as u64;
+            self.multi_sub_seq.insert(next_sub_seq, orig);
+            let text = nxt;
+            self.dispatch_multi_one(
+                conn_id, worker_id, next_sub_seq, &text, default_db, db_view,
+                shard_inboxes, num_shards,
+            );
+        } else if done {
+            self.multi_sub_seq.remove(&sub_seq);
+            self.multi_finish(orig);
+        }
+    }
+
+    /// ⭐ PG 兼容 (multi-statement): 全部完成 → 用原 seq 回 ReadyForQuery.
+    fn multi_finish(&mut self, orig: u64) {
+        let Some(m) = self.multi_stmt.remove(&orig) else { return };
+        let bytes = match m.error {
+            Some(e) => sql_err_bytes(ProtocolKind::Pg, &e),
+            None => crate::protocol::pg::build_command_complete_multi(),
+        };
+        self.resp_complete(orig, bytes);
     }
 
     /// ⭐ 巨型 INSERT 防死锁 (2026-08): 批量 push 超过 inbox/reply_bus 容量时,
@@ -3279,6 +3429,23 @@ fn handle_resp_shard_result(
                     }
                 }
             }
+            // ⭐ PG 兼容 (multi-statement): 该 seq 属于多语句序列 → 推进下一条
+            // (不直接回复客户端)
+            if conn.multi_sub_seq.contains_key(&seq) {
+                let had_err = agg.error.is_some();
+                if had_err {
+                    if let Some(orig) = conn.multi_sub_seq.get(&seq).cloned() {
+                        if let Some(m) = conn.multi_stmt.get_mut(&orig) {
+                            m.error = Some(agg.error.clone().unwrap_or_default());
+                            m.stmts.clear();
+                        }
+                    }
+                }
+                conn.multi_step(
+                    seq, conn_id, worker_id, default_db, db_view, shard_inboxes, num_shards,
+                );
+                return;
+            }
             let bytes = match agg.error {
                 Some(e) => sql_err_bytes(conn.proto, &e),
                 None => {
@@ -3317,6 +3484,51 @@ fn handle_resp_shard_result(
         if agg.remaining == 0 {
             let agg = conn.sql_ddl_agg.remove(&seq).expect("just checked");
             conn.mysql_binary.remove(&seq);
+            // ⭐ PG 兼容 (multi-statement): 该 seq 属多语句序列 → 推进下一条.
+            // DDL 的 schema 副作用在此处先应用 (CREATE 必须注册), 再 multi_step.
+            if conn.multi_sub_seq.contains_key(&seq) {
+                if let Some(orig) = conn.multi_sub_seq.get(&seq).cloned() {
+                    // 应用 DDL schema 副作用 (CREATE 成功注册)
+                    if agg.error.is_none() {
+                        // 复用下方逻辑: 提取 key/schema 做注册
+                        let mut routes = conn.sql_shared.routes.write().unwrap();
+                        for idx in &agg.schema.indexes {
+                            routes
+                                .entry((agg.key.0.clone(), agg.key.1.clone(), idx.iid))
+                                .or_insert_with(|| {
+                                    std::sync::Arc::new(
+                                        (0..num_shards)
+                                            .map(|_| storage::index_bloom::IndexBloom::new())
+                                            .collect(),
+                                    )
+                                });
+                        }
+                        drop(routes);
+                        conn.sql_shared.created_here.write().unwrap().insert(agg.key.clone());
+                        conn.sql_cache.borrow_mut().schemas.insert(
+                            agg.key.clone(),
+                            agg.schema.clone(),
+                        );
+                        if !agg.schema.fks.is_empty() {
+                            conn.sql_shared.register_fks(&agg.key.0, &agg.key.1, &agg.schema);
+                        }
+                        if agg.alter {
+                            conn.sql_shared
+                                .ddl_epoch
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    } else {
+                        if let Some(m) = conn.multi_stmt.get_mut(&orig) {
+                            m.error = Some(agg.error.clone().unwrap_or_default());
+                            m.stmts.clear();
+                        }
+                    }
+                }
+                conn.multi_step(
+                    seq, conn_id, worker_id, default_db, db_view, shard_inboxes, num_shards,
+                );
+                return;
+            }
             let bytes = match agg.error {
                 Some(e) => sql_err_bytes(conn.proto, &e),
                 None => {
@@ -5087,15 +5299,31 @@ fn process_pg_input(
                                 ),
                             }
                         } else if parts.len() > 1 {
-                            // ⚠️ multi-statement 暂不支持: DML 走异步 shard 广播,
-                            // 逐条 dispatch 会响应乱序/残留。story-loom 迁移的多语句
-                            // Exec 需"顺序执行 + 响应聚合器"专项 (2026-08 记录)。
-                            conn.resp_complete(
+                            // ⭐ PG 兼容 (multi-statement): 顺序执行每条 (story-loom
+                            // 迁移整文件 Exec). DDL 走 ddl_agg 完成后推进下一条;
+                            // 全部完成回原 seq. 仅支持 DDL/同步语句 (DML 异步广播
+                            // 需聚合, 见 dispatch_multi_stmt).
+                            let base_sub_seq = conn.next_seq;
+                            let mut stmts: std::collections::VecDeque<String> =
+                                parts.into_iter().collect();
+                            let first = stmts.pop_front().unwrap_or_default();
+                            conn.multi_stmt.insert(
                                 seq,
-                                sql_err_bytes(
-                                    ProtocolKind::Pg,
-                                    "multi-statement queries are not yet supported (DML 异步广播限制)",
-                                ),
+                                MultiStmt {
+                                    stmts,
+                                    base_sub_seq,
+                                    dispatched: 0,
+                                    error: None,
+                                    cur_kind: 0,
+                                    conn_id,
+                                },
+                            );
+                            // 首条也占一个子 seq (base_sub_seq), 从 base+1 开始续
+                            conn.next_seq = base_sub_seq + 1;
+                            conn.multi_sub_seq.insert(base_sub_seq, seq);
+                            conn.dispatch_multi_one(
+                                conn_id, worker_id, base_sub_seq, &first, default_db,
+                                db_view, shard_inboxes, num_shards,
                             );
                         }
                     }
