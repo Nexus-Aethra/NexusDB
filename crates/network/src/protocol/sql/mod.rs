@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn select_roundtrip() {
         let s = parse(b"SELECT * FROM t WHERE a = 1 AND b >= 2.5 AND c < 'x' LIMIT 10").unwrap();
-        let SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having } = s else { panic!() };
+        let SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having, .. } = s else { panic!() };
         assert!(order.is_empty() && offset.is_none() && group_by.is_empty() && having.is_true());
         assert_eq!(table, "t");
         assert!(items.is_empty(), "* = 全列");
