@@ -75,6 +75,10 @@ pub(crate) use sql_state::{
 };
 /// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
 mod sql_dispatch;
+/// ⭐ 解耦 2026-08: JOIN 编排 (从 sql_dispatch 拆出).
+mod sql_join;
+/// ⭐ 解耦 2026-08: 全局 UNIQUE 约束 INSERT 编排 (从 sql_dispatch 拆出).
+mod sql_unique;
 /// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
 mod sql_eval;
 pub(crate) use sql_agg::{
@@ -82,8 +86,12 @@ pub(crate) use sql_agg::{
     render_select_agg, sql_run_agg_select, AggSpec, BoundExpr,
 };
 pub(crate) use sql_dispatch::{
-    sql_dispatch_stmt, sql_join_drive, sql_join_kickoff, sql_plan_select, sql_run_dml,
-    sql_unique_drive, sysq_render_catalog, SysQuerySpec,
+    sql_dispatch_stmt, sql_plan_select, sql_run_dml, sysq_render_catalog, SysQuerySpec,
+};
+pub(crate) use sql_join::{sql_join_drive, sql_join_kickoff};
+pub(crate) use sql_unique::{
+    push_unique_op, row_global_unique_encs, schema_global_unique, sql_unique_drive,
+    sql_unique_ins_start,
 };
 pub(crate) use sql_eval::{
     col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq, is_auto_pk,
