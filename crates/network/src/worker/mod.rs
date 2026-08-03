@@ -56,6 +56,9 @@ pub(crate) use resp_agg::{
 };
 /// ⭐ 解耦 2026-08: SQL 规划/执行状态结构体 (事务/聚合/JOIN/规划/schema 缓存).
 mod sql_state;
+/// ⭐ 解耦 2026-08: 协议 wire 入口 (HTTP 处理).
+mod protocol_io;
+pub(crate) use protocol_io::{handle_http_request, mysql_err_packet, process_http_input};
 pub(crate) use sql_state::{
     DerivedCtx, MatResult, MultiStmt, PendingSql, SharedSqlCache, SqlDmlAgg, SqlFkIns,
     SqlPlan, SqlRowCtx, SqlTxnAgg, SqlUniqueIns, SqlWorkerCache, SubqCtx, TxnState,
@@ -290,77 +293,77 @@ const JOIN_KEYSET_MAX: usize = 1024;
 
 /// 单个连接状态.
 struct ConnState {
-    fd: RawFd,
-    stream: TcpStream,
+    pub(crate) fd: RawFd,
+    pub(crate) stream: TcpStream,
     /// ⭐ F83: TLS 会话 (None = 明文; Some = 已 STARTTLS 升级, recv/send 走 rustls).
-    tls: Option<Box<rustls::ServerConnection>>,
-    read_buf: Vec<u8>,
-    proto: ProtocolKind,
+    pub(crate) tls: Option<Box<rustls::ServerConnection>>,
+    pub(crate) read_buf: Vec<u8>,
+    pub(crate) proto: ProtocolKind,
     /// RESP: 是否已通过 AUTH (无密码配置时恒 true).
-    authenticated: bool,
+    pub(crate) authenticated: bool,
     /// RESP: 下一条命令分配的 seq (作为 ShardTask.req_id).
-    next_seq: u64,
+    pub(crate) next_seq: u64,
     /// RESP: 下一个应发送的 seq (FIFO 重排游标).
-    next_to_send: u64,
+    pub(crate) next_to_send: u64,
     /// RESP: 已就绪但前面还有洞的回复字节.
-    pending: BTreeMap<u64, Vec<u8>>,
+    pub(crate) pending: BTreeMap<u64, Vec<u8>>,
     /// RESP: DEL 多 key 聚合 (seq → 状态).
-    del_agg: HashMap<u64, DelAgg>,
+    pub(crate) del_agg: HashMap<u64, DelAgg>,
     /// RESP: MGET 聚合 (seq → 状态).
-    mget_agg: HashMap<u64, MGetAgg>,
+    pub(crate) mget_agg: HashMap<u64, MGetAgg>,
     /// RESP: MSET 聚合 (seq → 状态).
-    mset_agg: HashMap<u64, MSetAgg>,
+    pub(crate) mset_agg: HashMap<u64, MSetAgg>,
     /// RESP: EXISTS 聚合 (seq → 状态).
-    exists_agg: HashMap<u64, ExistsAgg>,
+    pub(crate) exists_agg: HashMap<u64, ExistsAgg>,
     /// RESP: STRLEN/TYPE 的 Get 语义转换 (seq → kind).
-    get_kind: HashMap<u64, GetKind>,
+    pub(crate) get_kind: HashMap<u64, GetKind>,
     /// RESP: GETRANGE 的 (start, end) 参数 (seq → 参数; Get 后切片).
-    getrange_ctx: HashMap<u64, (i64, i64)>,
+    pub(crate) getrange_ctx: HashMap<u64, (i64, i64)>,
     /// RESP: MSETNX 聚合 (seq → 状态).
-    msetnx_agg: HashMap<u64, MSetNxAgg>,
+    pub(crate) msetnx_agg: HashMap<u64, MSetNxAgg>,
     /// RESP: Pairs 结果渲染形态 (HGETALL/HKEYS/HVALS/HSCAN).
-    pairs_kind: HashMap<u64, PairsKind>,
+    pub(crate) pairs_kind: HashMap<u64, PairsKind>,
     /// RESP: HMSET 的 Integer 结果改回 +OK.
-    hmset_ok: std::collections::HashSet<u64>,
+    pub(crate) hmset_ok: std::collections::HashSet<u64>,
     /// RESP: Members 结果渲染形态 (SMEMBERS/SSCAN/SPOP...).
-    members_kind: HashMap<u64, MembersKind>,
+    pub(crate) members_kind: HashMap<u64, MembersKind>,
     /// RESP: SINTER/SUNION/SDIFF 聚合 (seq → 状态).
-    setalg_agg: HashMap<u64, SetAlgAgg>,
+    pub(crate) setalg_agg: HashMap<u64, SetAlgAgg>,
     /// ⭐ C1: ZMSCORE 的 Values 按裸 bulk 渲染 (score 串已成形, 不走 render tag).
-    values_raw: std::collections::HashSet<u64>,
+    pub(crate) values_raw: std::collections::HashSet<u64>,
     /// ⭐ C3: *STORE 第二阶段聚合 (seq → 状态).
-    store_agg: HashMap<u64, StoreFinishAgg>,
+    pub(crate) store_agg: HashMap<u64, StoreFinishAgg>,
     /// ⭐ C3: ZINTERSTORE/ZUNIONSTORE 源聚合 (seq → 状态).
-    zstore_agg: HashMap<u64, ZStoreAgg>,
+    pub(crate) zstore_agg: HashMap<u64, ZStoreAgg>,
     /// ⭐ Phase G: Geo 渲染上下文 (seq → 状态).
-    geo_ctx: HashMap<u64, GeoCtx>,
+    pub(crate) geo_ctx: HashMap<u64, GeoCtx>,
     /// ⭐ Phase B: Bitmap 读渲染上下文 (seq → 状态).
-    bit_ctx: HashMap<u64, BitCtx>,
+    pub(crate) bit_ctx: HashMap<u64, BitCtx>,
     /// ⭐ D3 (分库): 当前连接选中的 db (SELECT n 翻译后的 name; 断连重置).
-    current_db: std::sync::Arc<str>,
+    pub(crate) current_db: std::sync::Arc<str>,
     /// ⭐ T2 (分表): 表名前缀 → Arc<str> 缓存 (免热路径每 op 一次 String 分配).
-    table_cache: HashMap<Vec<u8>, std::sync::Arc<str>>,
+    pub(crate) table_cache: HashMap<Vec<u8>, std::sync::Arc<str>>,
     /// ⭐ X3 (SQL): worker 级共享缓存 (schema + 索引路由; 同 worker 全 conn 共享).
-    sql_cache: SharedSqlCache,
+    pub(crate) sql_cache: SharedSqlCache,
     /// ⭐ ORM-B2: 进程级共享路由缓存 (跨 worker/门面).
-    sql_shared: std::sync::Arc<SqlSharedRoutes>,
+    pub(crate) sql_shared: std::sync::Arc<SqlSharedRoutes>,
     /// ⭐ X3: CREATE TABLE 的 SetSchemaOp 广播聚合 (seq → 状态).
-    sql_ddl_agg: HashMap<u64, SqlDdlAgg>,
+    pub(crate) sql_ddl_agg: HashMap<u64, SqlDdlAgg>,
     /// ⭐ S1: DML 计数聚合 (多行 INSERT / DELETE·UPDATE phase2 / DROP 广播).
-    sql_dml_agg: HashMap<u64, SqlDmlAgg>,
+    pub(crate) sql_dml_agg: HashMap<u64, SqlDmlAgg>,
     /// ⭐ PG 兼容 (FMT_VER 8): FK 级联 — 根/子 DELETE 的 phase1 收的
     /// (表, 被删 pk) 列表 (Fire::Dml 存; DmlAgg 完成时触发/推进级联).
-    cascade_pending: HashMap<u64, (std::sync::Arc<str>, String, Vec<Vec<u8>>)>,
+    pub(crate) cascade_pending: HashMap<u64, (std::sync::Arc<str>, String, Vec<Vec<u8>>)>,
     /// ⭐ PG 兼容: 级联子任务 (伪高位 seq → 完成时推进, 不回包).
-    cascade_jobs: HashMap<u64, CascadeJob>,
+    pub(crate) cascade_jobs: HashMap<u64, CascadeJob>,
     /// ⭐ PG 兼容: 级联根状态 (主 DELETE seq → 计数/失败/防环).
-    cascade_roots: HashMap<u64, crate::worker::sql_cascade::CascadeRoot>,
+    pub(crate) cascade_roots: HashMap<u64, crate::worker::sql_cascade::CascadeRoot>,
     /// ⭐ PG 兼容: 级联伪 seq 计数器.
-    cascade_seq_ctr: u64,
+    pub(crate) cascade_seq_ctr: u64,
     /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检 (seq → 状态).
-    sql_fk_ins: HashMap<u64, SqlFkIns>,
+    pub(crate) sql_fk_ins: HashMap<u64, SqlFkIns>,
     /// ⭐ PG 兼容 (multi-statement): 原 seq → 多语句顺序执行状态.
-    multi_stmt: HashMap<u64, MultiStmt>,
+    pub(crate) multi_stmt: HashMap<u64, MultiStmt>,
     /// ⭐ PG 兼容 (multi-statement): 子 seq → 原 seq (DDL/DML 完成时回映射推进).
     multi_sub_seq: HashMap<u64, u64>,
     /// ⭐ 巨型 INSERT 防死锁 (2026-08): worker reply bus + 路由上下文 — 批量 push
@@ -1270,7 +1273,7 @@ fn process_resp_input(
 
 /// 分发单条 RESP 命令: 本地命令直接回 (占 seq 进重排缓冲), KV 命令进 shard.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_resp_command(
+pub(crate) fn dispatch_resp_command(
     conn: &mut ConnState,
     conn_id: u64,
     worker_id: u32,
@@ -2414,7 +2417,7 @@ fn dispatch_resp_command(
     }
 }
 
-fn push_task(
+pub(crate) fn push_task(
     conn: &mut ConnState,
     conn_id: u64,
     req_id: u64,
@@ -2443,7 +2446,7 @@ fn push_task(
 }
 
 /// ⭐ MGET/MSET: 定向 push 到指定 shard, 带组号 (聚合回填用).
-fn push_task_grouped(
+pub(crate) fn push_task_grouped(
     conn_id: u64,
     req_id: u64,
     worker_id: u32,
@@ -2498,7 +2501,7 @@ fn getrange_slice(data: &[u8], start: i64, end: i64) -> &[u8] {
 /// RESP: 处理 shard 回来的单条结果 (含 DEL/MGET/MSET 聚合).
 /// ⭐ C3: *STORE 二阶段任务的 (db, table) 存于 agg (发起时快照), 无需入参.
 #[allow(clippy::too_many_arguments)]
-fn handle_resp_shard_result(
+pub(crate) fn handle_resp_shard_result(
     conn: &mut ConnState,
     conn_id: u64,
     seq: u64,
@@ -3682,7 +3685,7 @@ fn batch_result_to_response(result: &BatchResult) -> Response {
     }
 }
 
-fn hash_route_op(op: &BatchOp, num_shards: usize) -> usize {
+pub(crate) fn hash_route_op(op: &BatchOp, num_shards: usize) -> usize {
     // ⭐ T1: 单源提取 (Multi op 已由 dispatch 预分组定向 push, 不经此路径;
     // locator 对 Multi 取首 key, 与预分组路由一致, 兜底亦安全)
     let (db, table, key) = op.locator();
@@ -3874,7 +3877,7 @@ fn render_bit(codec: &RespCodec, ctx: BitCtx, result: &BatchResult) -> Vec<u8> {
 /// ⭐ W2/事务 v1: RowPut 喂进程级路由 bloom (value → shard).
 /// 事务缓冲时也喂 — rollback 后只多假阳性 (只增语义无害);
 /// commit 时不重复喂.
-fn feed_route_bloom(
+pub(crate) fn feed_route_bloom(
     conn: &ConnState,
     db: &str,
     table: &str,
@@ -4423,7 +4426,7 @@ fn mysql_gen_salt(conn_id: u64, worker_id: u32) -> [u8; 20] {
 /// SQL 规划器 (占 conn.next_seq 进重排缓冲, 响应包 seq 恒从 1 起 —
 /// COM_QUERY 请求包 seq 恒为 0).
 #[allow(clippy::too_many_arguments)]
-fn process_sql_input(
+pub(crate) fn process_sql_input(
     conn: &mut ConnState,
     conn_id: u64,
     worker_id: u32,
@@ -4665,7 +4668,7 @@ fn process_sql_input(
 /// ⭐ S4: PostgreSQL wire 帧循环 — startup (SSLRequest 拒绝/参数解析) →
 /// cleartext 认证 → simple Query. 每语句回复自带 ReadyForQuery (sql_*_bytes).
 #[allow(clippy::too_many_arguments)]
-fn process_pg_input(
+pub(crate) fn process_pg_input(
     conn: &mut ConnState,
     conn_id: u64,
     worker_id: u32,
@@ -5017,300 +5020,3 @@ fn process_pg_input(
     }
 }
 
-/// ⭐ H1: HTTP/1.1 REST 帧循环 — preflight / Bearer 鉴权 / 路由分发.
-/// keep-alive pipeline 复用 seq 重排 (每请求一 seq); Connection: close →
-/// close_after_flush (pending 回复出完再关).
-#[allow(clippy::too_many_arguments)]
-fn process_http_input(
-    conn: &mut ConnState,
-    conn_id: u64,
-    worker_id: u32,
-    http_token: &Option<String>,
-    default_db: &std::sync::Arc<str>,
-    db_view: &std::sync::Arc<shard_manager::DbDirView>,
-    limits: &KvLimits,
-    num_shards_total: usize,
-    shard_inboxes: &[SharedTaskInbox],
-    num_shards: usize,
-) {
-    use crate::protocol::http as h;
-    let cors = crate::http_config::cors_origin();
-    let mut cursor = 0usize;
-    loop {
-        if conn.close_after_flush {
-            break;
-        }
-        match h::parse_request(&conn.read_buf[cursor..]) {
-            Ok(None) => break,
-            Err((code, msg)) => {
-                crate::metrics::HTTP_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let seq = conn.next_seq;
-                conn.next_seq += 1;
-                conn.resp_complete(seq, h::build_response(code, &h::error_body(msg), cors, false));
-                conn.close_after_flush = true;
-                break;
-            }
-            Ok(Some((n, req))) => {
-                cursor += n;
-                crate::metrics::HTTP_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if !req.keep_alive {
-                    conn.close_after_flush = true;
-                }
-                handle_http_request(
-                    conn, conn_id, worker_id, req, http_token, default_db, db_view, limits,
-                    num_shards_total, shard_inboxes, num_shards,
-                );
-            }
-        }
-    }
-    if cursor > 0 {
-        conn.read_buf.drain(..cursor);
-    }
-}
-
-/// 单请求路由分发 (worker 本地端点就地渲染, KV/SQL 走 shard 任务).
-#[allow(clippy::too_many_arguments)]
-fn handle_http_request(
-    conn: &mut ConnState,
-    conn_id: u64,
-    worker_id: u32,
-    req: crate::protocol::http::HttpRequest,
-    http_token: &Option<String>,
-    default_db: &std::sync::Arc<str>,
-    db_view: &std::sync::Arc<shard_manager::DbDirView>,
-    limits: &KvLimits,
-    num_shards_total: usize,
-    shard_inboxes: &[SharedTaskInbox],
-    num_shards: usize,
-) {
-    use crate::protocol::http as h;
-    use std::sync::atomic::Ordering::Relaxed;
-    let cors = crate::http_config::cors_origin();
-    let seq = conn.next_seq;
-    conn.next_seq += 1;
-    let ka = req.keep_alive;
-    let fail = |conn: &mut ConnState, seq, code: u16, msg: &str| {
-        crate::metrics::HTTP_ERRORS.fetch_add(1, Relaxed);
-        conn.resp_complete(seq, h::build_response(code, &h::error_body(msg), cors, ka));
-    };
-    // OPTIONS preflight (免鉴权)
-    if req.method == "OPTIONS" {
-        conn.resp_complete(seq, h::build_preflight(cors, ka));
-        return;
-    }
-    // Bearer 鉴权 (白名单: /metrics /v1/status — 监控接入惯例)
-    if let Some(token) = http_token
-        && req.path != "/metrics"
-        && req.path != "/v1/status"
-    {
-        let ok = req
-            .authorization
-            .as_deref()
-            .and_then(|a| a.strip_prefix("Bearer "))
-            .is_some_and(|t| t == token);
-        if !ok {
-            fail(conn, seq, 401, "unauthorized");
-            return;
-        }
-    }
-    // db 选择: query 参数 (KV) / body 字段 (SQL); 缺省 = default_db
-    let resolve_db = |name: Option<&str>| -> Result<std::sync::Arc<str>, String> {
-        match name.filter(|s| !s.is_empty()) {
-            None => Ok(conn_default(default_db)),
-            Some(d) if d == default_db.as_ref() || db_view.id_of(d).is_some() => {
-                Ok(std::sync::Arc::from(d))
-            }
-            Some(d) => Err(format!("Unknown database '{d}'")),
-        }
-    };
-    match (req.method.as_str(), req.path.as_str()) {
-        // ---- ⭐ H4: 可观测性端点 (worker 本地零任务) ----
-        ("GET", "/metrics") => {
-            let m = format!(
-                "# TYPE nexusdb_http_requests_total counter\n\
-                 nexusdb_http_requests_total {}\n\
-                 # TYPE nexusdb_http_errors_total counter\n\
-                 nexusdb_http_errors_total {}\n\
-                 # TYPE nexusdb_sql_queries_total counter\n\
-                 nexusdb_sql_queries_total {}\n\
-                 # TYPE nexusdb_kv_ops_total counter\n\
-                 nexusdb_kv_ops_total {}\n\
-                 # TYPE nexusdb_sql_join_est_rounds counter\n\
-                 nexusdb_sql_join_est_rounds {}\n\
-                 # TYPE nexusdb_sql_join_est_skipped counter\n\
-                 nexusdb_sql_join_est_skipped {}\n\
-                 # TYPE nexusdb_uptime_seconds gauge\n\
-                 nexusdb_uptime_seconds {}\n",
-                crate::metrics::HTTP_REQUESTS.load(Relaxed),
-                crate::metrics::HTTP_ERRORS.load(Relaxed),
-                crate::metrics::SQL_QUERIES.load(Relaxed),
-                crate::metrics::KV_OPS.load(Relaxed),
-                crate::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed),
-                crate::metrics::SQL_JOIN_EST_SKIPPED.load(Relaxed),
-                crate::metrics::uptime_seconds(),
-            );
-            conn.resp_complete(seq, h::build_text_response(200, m.as_bytes(), ka));
-        }
-        ("GET", "/v1/status") => {
-            let body = serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "uptime_seconds": crate::metrics::uptime_seconds(),
-                "num_shards": num_shards_total,
-                "protocols": {"binary": 5433, "resp": 6379, "mysql": 5434, "pg": 5435, "http": 6778},
-            });
-            conn.resp_complete(
-                seq,
-                h::build_response(200, &serde_json::to_vec(&body).unwrap_or_default(), cors, ka),
-            );
-        }
-        ("GET", "/v1/debug/sql-cache") => {
-            let body = {
-                use std::sync::atomic::Ordering::Relaxed;
-                let sh = &conn.sql_shared;
-                serde_json::json!({
-                    "worker_schemas": conn.sql_cache.borrow().schemas.len(),
-                    "routes": sh.routes.read().unwrap().len(),
-                    "created_here": sh.created_here.read().unwrap().len(),
-                    "ddl_epoch": sh.ddl_epoch.load(Relaxed),
-                    "route_pruned": sh.route_pruned.load(Relaxed),
-                    "route_bypassed": sh.route_bypassed.load(Relaxed),
-                })
-            };
-            conn.resp_complete(
-                seq,
-                h::build_response(200, &serde_json::to_vec(&body).unwrap_or_default(), cors, ka),
-            );
-        }
-        // ---- ⭐ H3: SQL ----
-        ("POST", "/v1/sql") => {
-            let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&req.body);
-            let Ok(body) = parsed else {
-                fail(conn, seq, 400, "body must be JSON");
-                return;
-            };
-            let Some(query) = body.get("query").and_then(|q| q.as_str()) else {
-                fail(conn, seq, 400, "missing 'query' field");
-                return;
-            };
-            let db = match resolve_db(body.get("db").and_then(|d| d.as_str())) {
-                Ok(d) => d,
-                Err(e) => {
-                    fail(conn, seq, 400, &e);
-                    return;
-                }
-            };
-            match sql::parse(query.as_bytes()) {
-                Err(e) => conn.resp_complete(seq, sql_err_bytes(ProtocolKind::Http, &e)),
-                Ok(stmt) => sql_dispatch_stmt(
-                    conn, conn_id, seq, worker_id, &db, default_db, db_view, shard_inboxes,
-                    num_shards, stmt,
-                ),
-            }
-        }
-        // ---- ⭐ H2: KV ----
-        (m, p) if p.starts_with("/v1/kv/") => {
-            let rest = &p["/v1/kv/".len()..];
-            let Some((table_raw, key_raw)) = rest.split_once('/') else {
-                fail(conn, seq, 404, "expected /v1/kv/{table}/{key}");
-                return;
-            };
-            let table = String::from_utf8_lossy(&h::percent_decode(table_raw)).into_owned();
-            let key = h::percent_decode(key_raw);
-            if table.is_empty() || key.is_empty() {
-                fail(conn, seq, 400, "empty table or key");
-                return;
-            }
-            if key.len() > limits.max_key_bytes {
-                fail(conn, seq, 400, "key too long");
-                return;
-            }
-            let db = match resolve_db(h::query_param(&req.query, "db")) {
-                Ok(d) => d,
-                Err(e) => {
-                    fail(conn, seq, 400, &e);
-                    return;
-                }
-            };
-            let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
-            crate::metrics::KV_OPS.fetch_add(1, Relaxed);
-            let (op, kv) = match m {
-                "GET" => (
-                    BatchOp::Get { db, table: table_arc, key },
-                    HttpKvOp::Get,
-                ),
-                "DELETE" => (
-                    BatchOp::Delete { db, table: table_arc, key },
-                    HttpKvOp::Delete,
-                ),
-                "PUT" | "POST" => {
-                    // body: {"value": <string|number>} — tag 与 RESP 同源
-                    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-                        fail(conn, seq, 400, "body must be JSON");
-                        return;
-                    };
-                    let stored = match body.get("value") {
-                        Some(serde_json::Value::String(s)) => crate::value_codec::encode_value(
-                            shard_manager::request::VALUE_TAG_RAW,
-                            s.as_bytes(),
-                        ),
-                        Some(v) if v.is_i64() => {
-                            shard_manager::value_num::encode_i64(v.as_i64().unwrap())
-                        }
-                        Some(v) if v.is_f64() => {
-                            shard_manager::value_num::encode_f64(v.as_f64().unwrap())
-                        }
-                        _ => {
-                            fail(conn, seq, 400, "missing 'value' (string or number)");
-                            return;
-                        }
-                    };
-                    if stored.len().saturating_sub(1) > limits.max_value_bytes {
-                        fail(conn, seq, 400, "value too long");
-                        return;
-                    }
-                    (
-                        BatchOp::Put { db, table: table_arc, key, val: stored },
-                        HttpKvOp::Put,
-                    )
-                }
-                _ => {
-                    fail(conn, seq, 405, "method not allowed");
-                    return;
-                }
-            };
-            conn.http_ctx.insert(seq, HttpReqCtx { op: kv, keep_alive: ka });
-            push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
-        }
-        _ => fail(conn, seq, 404, "not found"),
-    }
-}
-
-/// db 缺省 helper (borrow checker 拆分用).
-fn conn_default(default_db: &std::sync::Arc<str>) -> std::sync::Arc<str> {
-    default_db.clone()
-}
-
-/// SQL 错误 → MySQL ERR 包 (seq 1; 错误码按消息粗分类).
-fn mysql_err_packet(msg: &str) -> Vec<u8> {
-    let code = if msg.contains("unknown column") {
-        1054
-    } else if msg.contains("duplicate key") {
-        1062 // ER_DUP_ENTRY — UNIQUE 冲突 (ORM 据此识别 IntegrityError)
-    } else if msg.contains("serialization failure") {
-        1213 // MySQL deadlock/serialization 惯用重试码
-    } else if msg.contains("read-only transaction") {
-        1792
-    } else if msg.contains("Unknown database") {
-        1049
-    } else if msg.contains("has no schema") || msg.contains("doesn't exist") {
-        1146 // ER_NO_SUCH_TABLE — ORM has_table 据此判表不存在后发 CREATE
-    } else if msg.contains("expected") || msg.contains("unexpected") || msg.contains("unterminated")
-    {
-        1064
-    } else if msg.contains("Access denied") {
-        1045
-    } else {
-        1105
-    };
-    crate::protocol::mysql::build_err(1, code, msg)
-}
