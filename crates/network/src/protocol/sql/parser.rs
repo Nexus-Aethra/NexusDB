@@ -2,13 +2,14 @@
 //! 从 sql.rs 拆分 (2026-08). AST 类型见 ast.rs.
 
 use super::ast::*;
+use super::parser_ddl::*;
 use storage::schema::{ColType, Column, TableSchema};
 
 // tokenizer
 // =====================================================================
 
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
+pub(crate) enum Tok {
     /// 标识符/关键字 (原样保留, 关键字比较用 eq_ignore_ascii_case).
     Ident(String),
     /// 数字字面量 (原文, 含负号/小数点).
@@ -328,34 +329,34 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
 // parser (顺序读取器)
 // =====================================================================
 
-struct P {
-    toks: Vec<Tok>,
-    i: usize,
+pub(crate) struct P {
+    pub(crate) toks: Vec<Tok>,
+    pub(crate) i: usize,
     /// ⭐ P1: `?` 自动编号计数.
-    next_param: u16,
+    pub(crate) next_param: u16,
     /// ⭐ P1: 占位符风格混用检测 (?/$ 二选一).
-    saw_question: bool,
-    saw_dollar: bool,
+    pub(crate) saw_question: bool,
+    pub(crate) saw_dollar: bool,
 }
 
 impl P {
-    fn peek(&self) -> Option<&Tok> {
+    pub(crate) fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.i)
     }
 
     /// ⭐ PG 兼容: 第 i+1 个 token 是否为 `(` (区分 `version(` 函数 vs `version` 列).
-    fn peek2_is_lparen(&self) -> bool {
+    pub(crate) fn peek2_is_lparen(&self) -> bool {
         matches!(self.toks.get(self.i + 1), Some(Tok::LParen))
     }
 
-    fn next(&mut self) -> Result<Tok, String> {
+    pub(crate) fn next(&mut self) -> Result<Tok, String> {
         let t = self.toks.get(self.i).cloned().ok_or("unexpected end of statement")?;
         self.i += 1;
         Ok(t)
     }
 
     /// 消费一个关键字 (大小写不敏感), 不匹配报错.
-    fn kw(&mut self, want: &str) -> Result<(), String> {
+    pub(crate) fn kw(&mut self, want: &str) -> Result<(), String> {
         match self.next()? {
             Tok::Ident(s) if s.eq_ignore_ascii_case(want) => Ok(()),
             other => Err(format!("expected {want}, got {other:?}")),
@@ -364,7 +365,7 @@ impl P {
 
     /// 试探关键字: 匹配则消费返回 true.
     /// ⭐ G1 (F63): 比较算子 (HAVING 用, 与 WHERE 同集去 IN/BETWEEN/LIKE).
-    fn cmp_op(&mut self) -> Result<CmpOp, String> {
+    pub(crate) fn cmp_op(&mut self) -> Result<CmpOp, String> {
         match self.next()? {
             Tok::Eq => Ok(CmpOp::Eq),
             Tok::Gt => Ok(CmpOp::Gt),
@@ -376,7 +377,7 @@ impl P {
         }
     }
 
-    fn try_kw(&mut self, want: &str) -> bool {
+    pub(crate) fn try_kw(&mut self, want: &str) -> bool {
         if let Some(Tok::Ident(s)) = self.peek()
             && s.eq_ignore_ascii_case(want)
         {
@@ -386,7 +387,7 @@ impl P {
         false
     }
 
-    fn ident(&mut self) -> Result<String, String> {
+    pub(crate) fn ident(&mut self) -> Result<String, String> {
         match self.next()? {
             Tok::Ident(s) => Ok(s),
             other => Err(format!("expected identifier, got {other:?}")),
@@ -394,16 +395,16 @@ impl P {
     }
 
     /// ⭐ F76: 表位置标识符 — 读 ident 并剥 db 限定前缀 (`db.tbl` → `tbl`).
-    fn table_ident(&mut self) -> Result<String, String> {
+    pub(crate) fn table_ident(&mut self) -> Result<String, String> {
         Ok(strip_db_qual(self.ident()?))
     }
 
-    fn expect(&mut self, want: &Tok, what: &str) -> Result<(), String> {
+    pub(crate) fn expect(&mut self, want: &Tok, what: &str) -> Result<(), String> {
         let t = self.next()?;
         if &t == want { Ok(()) } else { Err(format!("expected {what}, got {t:?}")) }
     }
 
-    fn value(&mut self) -> Result<SqlValue, String> {
+    pub(crate) fn value(&mut self) -> Result<SqlValue, String> {
         match self.next()? {
             Tok::Num(n) => {
                 if n.contains('.') {
@@ -453,7 +454,7 @@ impl P {
         }
     }
 
-    fn done(&self) -> Result<(), String> {
+    pub(crate) fn done(&self) -> Result<(), String> {
         if self.i == self.toks.len() {
             Ok(())
         } else {
@@ -462,12 +463,12 @@ impl P {
     }
 
     /// ⭐ F71: 仅顶层语句校验尾部无残余 token; 子查询 (top=false) 不校验.
-    fn done_if(&self, top: bool) -> Result<(), String> {
+    pub(crate) fn done_if(&self, top: bool) -> Result<(), String> {
         if top { self.done() } else { Ok(()) }
     }
 
     /// ⭐ F71: 当前是 `( SELECT` (子查询开头), 区分于 `(` 分组/字面量列表.
-    fn peek_paren_select(&self) -> bool {
+    pub(crate) fn peek_paren_select(&self) -> bool {
         self.peek() == Some(&Tok::LParen)
             && matches!(self.toks.get(self.i + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("SELECT"))
     }
@@ -913,127 +914,6 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
 
 /// ⭐ F76: 读 `(col [, col ...])` 列名列表 (表级约束/索引列; 反引号已在 tokenizer 去).
 /// ⭐ compat: 吞可选 ASC/DESC 排序后缀 (CREATE INDEX ... (col DESC)).
-fn read_col_list(p: &mut P) -> Result<Vec<String>, String> {
-    p.expect(&Tok::LParen, "(")?;
-    let mut cols = Vec::new();
-    loop {
-        cols.push(p.ident()?);
-        // 排序后缀 (仅索引列场景)
-        p.try_kw("ASC");
-        p.try_kw("DESC");
-        match p.next()? {
-            Tok::Comma => continue,
-            Tok::RParen => break,
-            other => return Err(format!("expected ',' or ')' in column list, got {other:?}")),
-        }
-    }
-    Ok(cols)
-}
-
-/// ⭐ PG 兼容 (FMT_VER 8): 外键原始定义 (解析期; 列位转数字后入 TableSchema).
-struct FkDefRaw {
-    col: String,
-    ref_table: String,
-    ref_col: String,
-    action: storage::schema::FkAction,
-}
-
-/// ⭐ PG 兼容: 解析外键 `ON DELETE [CASCADE|SET NULL|NO ACTION|RESTRICT]` 动作,
-/// 吞掉后续 `ON UPDATE ...` 子句 (v1 不实现 UPDATE 级联).
-fn parse_fk_action(p: &mut P) -> Result<storage::schema::FkAction, String> {
-    use storage::schema::FkAction;
-    let mut action = FkAction::NoAction;
-    loop {
-        let Some(first) = p.peek().and_then(|t| match t {
-            Tok::Ident(s) => Some(s.to_ascii_lowercase()),
-            _ => None,
-        }) else {
-            break;
-        };
-        if first != "on" {
-            break;
-        }
-        p.next()?; // ON
-        let w = p.ident()?.to_ascii_lowercase(); // DELETE / UPDATE
-        let a = p.ident()?.to_ascii_lowercase();
-        if w == "delete" {
-            action = match a.as_str() {
-                "cascade" => FkAction::Cascade,
-                "set" => {
-                    p.kw("null")?;
-                    FkAction::SetNull
-                }
-                "no" => {
-                    let _ = p.ident()?; // ACTION
-                    FkAction::NoAction
-                }
-                _ => FkAction::NoAction, // RESTRICT / 其他 → v1 不检查
-            };
-        }
-        // ON UPDATE 的 action 已吞 (a 已消费; set null 已吞 null)
-    }
-    Ok(action)
-}
-
-/// ⭐ PG 兼容: 解析列 DEFAULT 表达式 → ColDefault (v1: 字面量 / NOW /
-/// uuid_generate_v4; 未知函数/表达式 → None, 吞掉不落默认). 含 `::type` 后缀.
-fn parse_col_default(
-    p: &mut P,
-    ty: ColType,
-) -> Result<Option<storage::schema::ColDefault>, String> {
-    use storage::schema::ColDefault;
-    // 函数调用 / 裸标识 (true/false/null/未加引号文本)
-    if let Some(Tok::Ident(_)) = p.peek() {
-        let name = p.ident()?.to_ascii_lowercase();
-        if p.peek() == Some(&Tok::LParen) {
-            // 函数: NOW() / uuid_generate_v4() — 吞括号及参数
-            p.next()?;
-            let mut depth = 1;
-            while depth > 0 {
-                match p.next()? {
-                    Tok::LParen => depth += 1,
-                    Tok::RParen => depth -= 1,
-                    _ => {}
-                }
-            }
-            let d = match name.as_str() {
-                "now" | "current_timestamp" | "current_date" | "current_time" => {
-                    Some(ColDefault::Now)
-                }
-                "uuid_generate_v4" => Some(ColDefault::UuidGenV4),
-                _ => None, // 未知函数 → 吞掉不落默认
-            };
-            // ::type 后缀
-            if p.peek() == Some(&Tok::Colon) {
-                p.next()?;
-                let _ = p.ident()?;
-            }
-            return Ok(d);
-        }
-        // 裸标识 (PG 允许 DEFAULT true / 'text')
-        let val = match name.as_str() {
-            "true" => crate::protocol::sql::SqlValue::Int(1),
-            "false" => crate::protocol::sql::SqlValue::Int(0),
-            "null" => crate::protocol::sql::SqlValue::Null,
-            _ => crate::protocol::sql::SqlValue::Str(name.into_bytes()),
-        };
-        let cv = crate::worker::sql_to_col(ty, &val)?;
-        if p.peek() == Some(&Tok::Colon) {
-            p.next()?;
-            let _ = p.ident()?;
-        }
-        return Ok(Some(ColDefault::Lit(cv)));
-    }
-    // 字面量 (含 '{}'::jsonb 等)
-    let val = p.value()?;
-    if p.peek() == Some(&Tok::Colon) {
-        p.next()?;
-        let _ = p.ident()?;
-    }
-    let cv = crate::worker::sql_to_col(ty, &val)?;
-    Ok(Some(ColDefault::Lit(cv)))
-}
-
 /// `CREATE TABLE t (...) | CREATE INDEX [IF NOT EXISTS] name ON t (cols) | CREATE EXTENSION ... | ...`
 fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("CREATE")?;
@@ -1812,7 +1692,7 @@ fn parse_update(p: &mut P) -> Result<SqlStmt, String> {
 fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
     use crate::protocol::sql::{ArithOp, ScalarExpr};
     // 解析一个"项" (字面量 / 列引用 / NOT 前缀)
-    fn atom(p: &mut P) -> Result<ScalarExpr, String> {
+    pub(crate) fn atom(p: &mut P) -> Result<ScalarExpr, String> {
         match p.peek().cloned() {
             Some(Tok::Ident(s)) => {
                 let up = s.to_ascii_uppercase();

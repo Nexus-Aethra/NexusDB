@@ -13,7 +13,8 @@
 
 mod ast;
 mod optimizer;
-mod parser;
+pub(crate) mod parser;
+mod parser_ddl;
 
 pub use ast::*;
 pub use optimizer::{
