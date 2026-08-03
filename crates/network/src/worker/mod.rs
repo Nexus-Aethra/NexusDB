@@ -79,16 +79,20 @@ mod sql_dispatch;
 mod sql_join;
 /// ⭐ 解耦 2026-08: 全局 UNIQUE 约束 INSERT 编排 (从 sql_dispatch 拆出).
 mod sql_unique;
+/// ⭐ 解耦 2026-08: 系统表查询虚拟表合成 (从 sql_dispatch 拆出).
+mod sql_sysquery;
 /// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
 mod sql_eval;
 pub(crate) use sql_agg::{
     bind_scalar_expr, cmp_colvalue, eval_bound_expr, eval_json_exists, materialize_select_agg,
     render_select_agg, sql_run_agg_select, AggSpec, BoundExpr,
 };
-pub(crate) use sql_dispatch::{
-    sql_dispatch_stmt, sql_plan_select, sql_run_dml, sysq_render_catalog, SysQuerySpec,
-};
+pub(crate) use sql_dispatch::{sql_dispatch_stmt, sql_plan_select, sql_run_dml};
 pub(crate) use sql_join::{sql_join_drive, sql_join_kickoff};
+pub(crate) use sql_sysquery::{
+    coltype_sql_name, sbytes, sysq_exists, sysq_finish, sysq_render_catalog, sysq_render_dblist,
+    SysQuerySpec,
+};
 pub(crate) use sql_unique::{
     push_unique_op, row_global_unique_encs, schema_global_unique, sql_unique_drive,
     sql_unique_ins_start,
