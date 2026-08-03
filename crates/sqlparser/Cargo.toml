@@ -1,0 +1,25 @@
+# ⭐ 嵌入的 sqlparser-rs (Apache DataFusion) — 源码 vendored 自 sqlparser-rs 0.62.0
+# 仅启用 std 核心; 关闭 serde/bigdecimal/recursive-protection 等可选特性, 最小化依赖.
+[package]
+name = "sqlparser"
+version = "0.62.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Extensible SQL Lexer and Parser (embedded, minimal deps)"
+
+[lib]
+name = "sqlparser"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+# 声明但未启用的上游 feature (避免 unexpected_cfg 警告)
+serde = []
+visitor = []
+derive-dialect = []
+bigdecimal = []
+
+[dependencies]
+# 仅调试日志 (debug!), 无 logger 时 no-op
+log = "0.4"

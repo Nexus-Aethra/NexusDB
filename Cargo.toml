@@ -8,6 +8,7 @@ members = [
     "crates/network",
     "crates/config",
     "crates/logging",
+    "crates/sqlparser",
 ]
 
 [package]

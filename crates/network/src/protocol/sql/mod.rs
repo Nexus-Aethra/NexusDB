@@ -14,6 +14,7 @@
 mod ast;
 mod optimizer;
 mod parser;
+mod sqlparser_bridge;
 
 pub use ast::*;
 pub use optimizer::{
@@ -23,6 +24,10 @@ pub use optimizer::{
 pub use parser::{
     bind_params, parse, parse_prepared, split_sql_statements,
 };
+pub use sqlparser_bridge::parse_select;
+
+#[cfg(test)]
+mod sqlparser_bridge_tests;
 
 #[cfg(test)]
 mod tests {
@@ -261,7 +266,7 @@ mod tests {
     #[test]
     fn select_roundtrip() {
         let s = parse(b"SELECT * FROM t WHERE a = 1 AND b >= 2.5 AND c < 'x' LIMIT 10").unwrap();
-        let SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having } = s else { panic!() };
+        let SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having, .. } = s else { panic!() };
         assert!(order.is_empty() && offset.is_none() && group_by.is_empty() && having.is_true());
         assert_eq!(table, "t");
         assert!(items.is_empty(), "* = 全列");
@@ -319,7 +324,9 @@ mod tests {
         assert!(parse(b"SELECT * FROM t WHERE a = NULL").unwrap_err().contains("NULL"));
         assert!(parse(b"SELECT * FROM t WHERE a ! 1").is_err());
         assert!(parse(b"SELECT * FROM t LIMIT x").is_err());
-        assert!(parse(b"SELECT * FROM t garbage").unwrap_err().contains("trailing"));
+        // ⭐ 渐进式替换: bridge 接管 SELECT, `FROM t garbage` 的 garbage 视为隐式别名 (PG 合法)
+        // 非 trailing 错误; 但 trailing 语义通过手写对非 SELECT 的 DML 仍生效 (见 select_trailing_dml)
+        let _ = parse(b"SELECT * FROM t garbage");
         assert!(parse(b"SELECT * FROM t WHERE name = 'unterminated").is_err());
     }
 

@@ -9,6 +9,8 @@ scheduler = { path = "../scheduler" }
 shard_manager = { path = "../shard_manager" }
 storage = { path = "../storage" }
 nlog = { path = "../logging" }
+# ⭐ 嵌入的 sqlparser-rs (PG 方言前端; 渐进替换手写 parser)
+sqlparser = { path = "../sqlparser" }
 crossbeam-channel = "0.5"
 libc = "0.2"
 thiserror = "2"
