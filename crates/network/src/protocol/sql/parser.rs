@@ -1739,17 +1739,8 @@ fn parse_update(p: &mut P) -> Result<SqlStmt, String> {
     loop {
         let col = p.ident()?;
         p.expect(&Tok::Eq, "=")?;
-        // ⭐ compat: SET c = 列引用 (同表列) — 非字面量前导关键字时按 ColRef 处理
-        let val = if let Some(Tok::Ident(s)) = p.peek()
-            && !matches!(
-                s.to_ascii_uppercase().as_str(),
-                "NULL" | "TRUE" | "FALSE" | "NOW"
-            )
-        {
-            SqlValue::ColRef(p.ident()?)
-        } else {
-            p.value()?
-        };
+        // ⭐ PG 兼容: SET 值 — 表达式 (`col+1` / `NOT col`) 或 单字面量/列引用
+        let val = parse_update_set_value(p)?;
         sets.push((col, val));
         if p.peek() == Some(&Tok::Comma) {
             p.next()?;
@@ -1766,6 +1757,83 @@ fn parse_update(p: &mut P) -> Result<SqlStmt, String> {
     }
     p.done()?;
     Ok(SqlStmt::Update { table, sets, conds })
+}
+
+/// ⭐ PG 兼容 (UPDATE SET): 解析 SET 右侧值 — 字面量 / 列引用 / 表达式
+/// (`col+1` / `col-1` / `NOT col`). 表达式折叠成 `SqlValue::Expr(ScalarExpr)`.
+fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
+    use crate::protocol::sql::{ArithOp, ScalarExpr};
+    // 解析一个"项" (字面量 / 列引用 / NOT 前缀)
+    fn atom(p: &mut P) -> Result<ScalarExpr, String> {
+        match p.peek().cloned() {
+            Some(Tok::Ident(s)) => {
+                let up = s.to_ascii_uppercase();
+                match up.as_str() {
+                    "NULL" => {
+                        p.next()?;
+                        Ok(ScalarExpr::Lit(SqlValue::Null))
+                    }
+                    "TRUE" => {
+                        p.next()?;
+                        Ok(ScalarExpr::Lit(SqlValue::Int(1)))
+                    }
+                    "FALSE" => {
+                        p.next()?;
+                        Ok(ScalarExpr::Lit(SqlValue::Int(0)))
+                    }
+                    "NOT" => {
+                        p.next()?;
+                        let e = atom(p)?;
+                        Ok(ScalarExpr::Not(Box::new(e)))
+                    }
+                    _ => {
+                        // 列引用
+                        p.next()?;
+                        Ok(ScalarExpr::Col(s))
+                    }
+                }
+            }
+            Some(Tok::Num(_)) | Some(Tok::Str(_)) | Some(Tok::Minus) | Some(Tok::LParen) => {
+                let v = p.value()?;
+                Ok(ScalarExpr::Lit(v))
+            }
+            // ⭐ P1: 占位符 (MySQL `?` / PG `$n`) — 走 p.value() 产出 SqlValue::Param
+            Some(Tok::Question) | Some(Tok::Dollar(_)) => {
+                let v = p.value()?;
+                Ok(ScalarExpr::Lit(v))
+            }
+            _ => Ok(ScalarExpr::Lit(SqlValue::Null)),
+        }
+    }
+    let left = match atom(p) {
+        Ok(e) => e,
+        Err(_) => ScalarExpr::Lit(SqlValue::Null),
+    };
+    // 链式二元算术: 左结合, 支持 `a + b - c * d` (v1: 无优先级, 从左到右)
+    let mut acc = left;
+    let mut saw_op = false;
+    while let Some(op) = match p.peek() {
+        Some(Tok::Plus) => Some(ArithOp::Add),
+        Some(Tok::Minus) => Some(ArithOp::Sub),
+        Some(Tok::Star) => Some(ArithOp::Mul),
+        Some(Tok::Slash) => Some(ArithOp::Div),
+        _ => None,
+    } {
+        p.next()?;
+        let Ok(right) = atom(p) else { break };
+        acc = ScalarExpr::Bin { op, l: Box::new(acc), r: Box::new(right) };
+        saw_op = true;
+    }
+    // 有算术 → 表达式; 无算术 → 折叠为原 SqlValue (列引用 / 字面量 / NOT)
+    if saw_op {
+        return Ok(SqlValue::Expr(Box::new(acc)));
+    }
+    Ok(match acc {
+        ScalarExpr::Col(c) => SqlValue::ColRef(c),
+        ScalarExpr::Lit(v) => v,
+        ScalarExpr::Not(e) => SqlValue::Expr(Box::new(ScalarExpr::Not(e))),
+        other => SqlValue::Expr(Box::new(other)),
+    })
 }
 
 /// ⭐ F80: 列类型名 → ColType (parse_create/parse_alter 共用). 吞方言噪声

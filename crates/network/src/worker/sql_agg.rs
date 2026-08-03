@@ -215,6 +215,8 @@ pub(crate) enum BoundExpr {
     Bin { op: sql::ArithOp, l: Box<BoundExpr>, r: Box<BoundExpr> },
     /// ⭐ compat: JSONB 取字段 (-> 保留文本 / ->> 输出文本; v1 均 Str 承载).
     JsonGet { base: Box<BoundExpr>, key: Box<BoundExpr>, as_text: bool },
+    /// ⭐ PG 兼容 (UPDATE SET): 一元 NOT (布尔取反).
+    Not(Box<BoundExpr>),
 }
 
 /// ⭐ compat: JSONB 取字段求值 — base 为 JSON 文本 (Bytes), key 为字段名;
@@ -335,6 +337,14 @@ pub(crate) fn eval_bound_expr(e: &BoundExpr, row: &[ColValue]) -> ColValue {
                 ColValue::F64(out)
             }
         }
+        BoundExpr::Not(e) => {
+            let v = eval_bound_expr(e, row);
+            match v {
+                ColValue::I64(x) => ColValue::I64(if x == 0 { 1 } else { 0 }),
+                ColValue::Null => ColValue::Null,
+                _ => ColValue::Null,
+            }
+        }
     }
 }
 
@@ -376,6 +386,10 @@ pub(crate) fn bind_scalar_expr(
                 BoundExpr::JsonGet { base: Box::new(bb), key: Box::new(kb), as_text: *as_text },
                 ColType::Str,
             ))
+        }
+        sql::ScalarExpr::Not(e) => {
+            let (b, _) = bind_scalar_expr(schema, e)?;
+            Ok((BoundExpr::Not(Box::new(b)), ColType::Bool))
         }
     }
 }

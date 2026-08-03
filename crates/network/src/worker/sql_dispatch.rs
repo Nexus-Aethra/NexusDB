@@ -2374,12 +2374,57 @@ pub(crate) fn strip_pred_qual(pred: &mut Pred<Cond>, table: &str) {
     }
 }
 
+/// ⭐ PG 兼容 (UPDATE SET 表达式): SQL ScalarExpr → storage RowExpr
+/// (绑定列名→列号). 未知列/JSONB 取字段 → Err.
+fn sql_update_expr_to_row(
+    schema: &TableSchema,
+    e: &sql::ScalarExpr,
+) -> Result<storage::row::RowExpr, String> {
+    use storage::row::{RowArith, RowExpr};
+    Ok(match e {
+        sql::ScalarExpr::Col(name) => {
+            let i = schema.col_by_name(name).ok_or_else(|| format!("unknown column '{name}'"))?;
+            RowExpr::Col(i)
+        }
+        sql::ScalarExpr::Lit(v) => {
+            let cv = match v {
+                sql::SqlValue::Int(x) => ColValue::I64(*x),
+                sql::SqlValue::Float(x) => ColValue::F64(*x),
+                sql::SqlValue::Str(b) => ColValue::Bytes(b.clone()),
+                _ => ColValue::Null,
+            };
+            RowExpr::Lit(cv)
+        }
+        sql::ScalarExpr::Not(inner) => {
+            RowExpr::Not(Box::new(sql_update_expr_to_row(schema, inner)?))
+        }
+        sql::ScalarExpr::Bin { op, l, r } => {
+            let lo = sql_update_expr_to_row(schema, l)?;
+            let ro = sql_update_expr_to_row(schema, r)?;
+            RowExpr::Bin {
+                op: match op {
+                    sql::ArithOp::Add => RowArith::Add,
+                    sql::ArithOp::Sub => RowArith::Sub,
+                    sql::ArithOp::Mul => RowArith::Mul,
+                    sql::ArithOp::Div => RowArith::Div,
+                },
+                l: Box::new(lo),
+                r: Box::new(ro),
+            }
+        }
+        sql::ScalarExpr::JsonGet { .. } => {
+            return Err("JSONB field expression not supported in UPDATE SET (v1)".into())
+        }
+    })
+}
+
 /// ⭐ compat: 表达式投影 base 列号 (JSONB 表达式根列; v1: 递归取 JsonGet 底层
 /// 列引用; Lit 等无列场景回退列 0 — 渲染时求值仍可取到值).
 fn bound_base_col(e: &BoundExpr) -> u16 {
     match e {
         BoundExpr::Col(i) => *i,
         BoundExpr::JsonGet { base, .. } => bound_base_col(base),
+        BoundExpr::Not(inner) => bound_base_col(inner),
         BoundExpr::Lit(_) | BoundExpr::Bin { .. } => 0,
     }
 }
@@ -2560,8 +2605,8 @@ pub(crate) fn sql_run_dml(
             let (table, conds, action) = match stmt {
                 SqlStmt::Delete { table, conds } => (table, conds, SqlDmlAction::Delete),
                 SqlStmt::Update { table, conds, sets } => {
-                    // 校验 + 转换 sets → (列号, ColValue)
-                    let mut out: Vec<(u16, ColValue)> = Vec::with_capacity(sets.len());
+                    // 校验 + 转换 sets → (列号, 值或表达式)
+                    let mut out: Vec<(u16, storage::row::SetVal)> = Vec::with_capacity(sets.len());
                     for (name, v) in &sets {
                         let Some(i) = schema.col_by_name(name) else {
                             conn.resp_complete(
@@ -2596,6 +2641,19 @@ pub(crate) fn sql_run_dml(
                             );
                             return;
                         }
+                        // ⭐ PG 兼容: 表达式 SET → SetVal::Expr (shard 端对旧行求值)
+                        if let SqlValue::Expr(e) = v {
+                            match sql_update_expr_to_row(&schema, e) {
+                                Ok(re) => {
+                                    out.push((i, storage::row::SetVal::Expr(re)));
+                                    continue;
+                                }
+                                Err(ee) => {
+                                    conn.resp_complete(seq, sql_err_bytes(conn.proto, &ee));
+                                    return;
+                                }
+                            }
+                        }
                         let cv = match sql_to_col(schema.columns[i as usize].ty, v) {
                             Ok(c) => c,
                             Err(e) => {
@@ -2610,7 +2668,7 @@ pub(crate) fn sql_run_dml(
                             );
                             return;
                         }
-                        out.push((i, cv));
+                        out.push((i, storage::row::SetVal::Val(cv)));
                     }
                     // ⭐ compat: 全部 set 为 pk 同值 (SET pk = pk) → no-op, 直接回 OK
                     if out.is_empty() {

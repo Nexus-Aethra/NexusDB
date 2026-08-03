@@ -123,10 +123,32 @@
 - **验证**：Loom 迁移全表级联（world→chapters→nodes→edges/nc/hooks 7 表全清）、chapters 自引用 SET NULL、e2e `mysql_foreign_key_cascade`、全量回归 40 passed
 - **边界**：引用完整性 v1 不强制（悬空插入允许）；跨 shard 引用行全广播删（正确性优先）
 
+### UPDATE SET 表达式（追加完成，2026-08-03）
+
+Loom 的乐观锁 / 开关 toggle 依赖 SET 表达式，现支持：
+- **parse**：`SET col = <expr>` 解析为 `SqlValue::Expr(ScalarExpr)`（列引用 / 字面量 / 一元 NOT / 链式二元算术 `col*2+1`，左结合）
+- **exec**：shard 端 `row_update` 读旧行 → `eval_row_expr` 对旧行求值 → 原子写回（引擎单线程天然 CAS 语义；复用现有 RowPut 的 UNIQUE/索引跟随）
+- 值传递：`BatchOp::RowUpdate.sets: Vec<(u16, SetVal)>`，`SetVal::{Val, Expr}`
+- **验证**（Loom 真实 SQL）：
+  - `SET version = version + 1 WHERE ... AND version=$N` 乐观锁（simple + pgx 扩展协议）✅
+  - `SET enabled = NOT enabled` toggle ✅
+  - 多列 SET（`version+1, updated_at=...`）✅
+  - 链式 `version*2+1` ✅
+  - e2e `mysql_update_set_expr` + 全量回归 42 passed
+- 边界：除法产生浮点写回整型列报类型不匹配（Loom 不用）；事务内表达式退化为不支持
+
 ### 剩余（Loom 不阻塞）
 
 - RETURNING 未实现（Loom 当前不用，低优先级）。
 - 引用完整性检查（INSERT 拒绝悬空引用）— v1 未做，语法兼容层。
+
+## 六、迁移就绪结论（2026-08-03）
+
+**Loom 对接的方言障碍已全部清除**。已实现并实测：
+启动兼容（postgres 别名/系统表/EXISTS/CREATE DATABASE）+ 默认值（uuid/NOW/字面量）
++ 复合唯一（key 拼接）+ 外键级联（worker 编排）+ UPDATE SET 表达式（乐观锁/toggle）。
+Loom 的 40 个仓储方法 SQL 逐条核对，剩余差异均为 Loom 刻意规避（无 RETURNING/无 NOW()/
+无 jsonb 操作符），可直接迁移。
 
 ## 五、更新步骤（分阶段，原计划，已基本完成）
 

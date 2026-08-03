@@ -608,7 +608,7 @@ impl StorageEngine {
         db: &str,
         table: &str,
         pk: &[u8],
-        sets: &[(u16, ColValue)],
+        sets: &[(u16, row::SetVal)],
     ) -> Result<bool, RegistryError> {
         let schema = self
             .get_schema(db, table)
@@ -618,12 +618,17 @@ impl StorageEngine {
             return Ok(false);
         };
         let mut values = row::decode_row(&schema, &old).map_err(se)?;
-        for (col, v) in sets {
+        for (col, sv) in sets {
             let i = *col as usize;
             if i >= values.len() || i == schema.pk_col as usize {
                 return Err(se(format!("bad update column {col}")));
             }
-            values[i] = v.clone();
+            // ⭐ PG 兼容: 表达式对旧行求值 (行内引用用已更新列的前序 set 结果 —
+            // PG 语义: 同一 SET 列表按书写序, 后续引用可见前序更新).
+            values[i] = match sv {
+                row::SetVal::Val(v) => v.clone(),
+                row::SetVal::Expr(e) => row::eval_row_expr(e, &values),
+            };
         }
         self.row_put(db, table, pk, &values).await?;
         Ok(true)

@@ -335,10 +335,12 @@ struct SqlSelectAgg {
 }
 
 /// ⭐ S1: 两阶段 DML 的动作 (phase2 每 pk 一发).
+/// ⭐ PG 兼容: Update 的 sets 支持值或表达式 (SetVal), 表达式由 shard 端
+/// `row_update` 读旧行后求值 (原子读改写).
 #[derive(Clone)]
 enum SqlDmlAction {
     Delete,
-    Update(Vec<(u16, ColValue)>),
+    Update(Vec<(u16, storage::row::SetVal)>),
 }
 
 /// ⭐ F67/F68 (JOIN): N 表左深 hash join 状态机阶段.
@@ -502,8 +504,9 @@ struct SqlRowCtx {
     count: bool,
     /// ⭐ v2 (F62): OCC 读集记录坐标 (SERIALIZABLE 事务内的 pk 点查).
     read_key: Option<(String, String, Vec<u8>)>,
-    /// ⭐ RYOW (F63): 事务内 UPDATE 基于已提交盘行时, 读盘后叠加的 sets.
-    ryow_overlay: Vec<(u16, ColValue)>,
+    /// ⭐ RYOW (F63): 事务内 UPDATE 基于已提交盘行时, 读盘后叠加的 sets
+    /// (值或表达式).
+    ryow_overlay: Vec<(u16, storage::row::SetVal)>,
     /// ⭐ F76: 投影输出列名 (与 proj 同序; None = 用 schema 列名, 空 vec = 全 None).
     out_names: Vec<Option<String>>,
 }
@@ -2868,9 +2871,14 @@ fn handle_resp_shard_result(
                 match storage::row::decode_row(&ctx.schema, row) {
                     Ok(mut values) => {
                         // ⭐ RYOW (F63): 事务内 UPDATE 基于此盘行 → 叠加未提交 sets
-                        for (ci, cv) in &ctx.ryow_overlay {
+                        // (表达式对叠加中的 values 求值 — 与 row_update 同语义)
+                        for (ci, sv) in &ctx.ryow_overlay {
+                            let nv = match sv {
+                                storage::row::SetVal::Val(cv) => cv.clone(),
+                                storage::row::SetVal::Expr(e) => storage::row::eval_row_expr(e, &values),
+                            };
                             if let Some(slot) = values.get_mut(*ci as usize) {
-                                *slot = cv.clone();
+                                *slot = nv;
                             }
                         }
                         let hit = eval_pred(&ctx.schema, &values, &ctx.conds);
@@ -4065,7 +4073,7 @@ fn feed_route_bloom(
 /// - `NeedBase(sets)`: 首 op 是基于已提交行的 UPDATE, 需读盘基行再叠加 sets
 enum RyowState {
     Resolved(Option<Vec<ColValue>>),
-    NeedBase(Vec<(u16, ColValue)>),
+    NeedBase(Vec<(u16, storage::row::SetVal)>),
 }
 
 fn resolve_ryow(txn: &TxnState, tkey: &(String, String, Vec<u8>)) -> Option<RyowState> {
@@ -4082,7 +4090,7 @@ fn resolve_ryow(txn: &TxnState, tkey: &(String, String, Vec<u8>)) -> Option<Ryow
         return None;
     }
     let mut cur: Option<Vec<ColValue>> = None; // 纯内存态
-    let mut pending_sets: Vec<(u16, ColValue)> = Vec::new(); // 基于盘行的叠加
+    let mut pending_sets: Vec<(u16, storage::row::SetVal)> = Vec::new(); // 基于盘行的叠加
     let mut based_on_disk = false;
     for op in ops {
         match op {
@@ -4099,20 +4107,24 @@ fn resolve_ryow(txn: &TxnState, tkey: &(String, String, Vec<u8>)) -> Option<Ryow
                 based_on_disk = false;
             }
             BatchOp::RowUpdate { sets, .. } => {
+                // ⭐ PG 兼容: SET 值或表达式; 事务缓冲 v1 仅支持值 (表达式需
+                // 旧行求值, 事务内退化为不支持 — 由 worker 在非事务路径处理).
                 if let Some(v) = cur.as_mut() {
-                    for (ci, cv) in sets {
-                        if let Some(slot) = v.get_mut(*ci as usize) {
+                    for (ci, sv) in sets {
+                        let Some(slot) = v.get_mut(*ci as usize) else { continue };
+                        if let storage::row::SetVal::Val(cv) = sv {
                             *slot = cv.clone();
                         }
+                        // Expr 在事务纯内存态无法求值 → 保持旧值 (v1 边界)
                     }
                 } else {
-                    // 基于已提交盘行: 累积 sets (后写覆盖前写)
+                    // 基于已提交盘行: 累积 sets (后写覆盖前写); 表达式保留待 shard
                     based_on_disk = true;
-                    for (ci, cv) in sets {
+                    for (ci, sv) in sets {
                         if let Some(e) = pending_sets.iter_mut().find(|(c, _)| c == ci) {
-                            e.1 = cv.clone();
+                            e.1 = sv.clone();
                         } else {
-                            pending_sets.push((*ci, cv.clone()));
+                            pending_sets.push((*ci, sv.clone()));
                         }
                     }
                 }

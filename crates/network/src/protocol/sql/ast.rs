@@ -18,6 +18,9 @@ pub enum SqlValue {
     /// WHERE 比较 RHS (相关条件). decorrelate_pred 改写为非关联 IN 后消失;
     /// 泄漏到执行层是 bug (sql_to_col 防御报错). 同 “执行前必解”占位家族.
     ColRef(String),
+    /// ⭐ PG 兼容 (UPDATE SET 表达式): `SET c = <expr>` — 二值算术/一元 NOT/
+    /// 列自引用. 仅在 UPDATE SET RHS 出现; worker 读旧行后对旧值求值.
+    Expr(Box<ScalarExpr>),
 }
 
 /// ⭐ F73: IN 集合原地排序去重 (同型集合: 全 Int 按值 / 全 Str 按字节序).
@@ -131,6 +134,8 @@ pub enum ScalarExpr {
     /// ⭐ compat: JSONB 取字段 `base->key` (as_text=false) / `base->>key` (as_text=true).
     /// 仅支持 base=列 + key=字符串字面量 (v1).
     JsonGet { base: Box<ScalarExpr>, key: Box<ScalarExpr>, as_text: bool },
+    /// ⭐ PG 兼容 (UPDATE SET): 一元 `NOT expr` (布尔取反; SET 表达式 RHS).
+    Not(Box<ScalarExpr>),
 }
 
 impl ScalarExpr {
@@ -148,6 +153,7 @@ impl ScalarExpr {
             ScalarExpr::JsonGet { base, key, as_text } => {
                 format!("{} {} {}", base.render(), if *as_text { "->>" } else { "->" }, key.render())
             }
+            ScalarExpr::Not(e) => format!("NOT {}", e.render()),
         }
     }
     /// 是否单一裸列引用 (COUNT(DISTINCT col) / 单列聚合退化判定).
@@ -170,6 +176,7 @@ impl ScalarExpr {
                 base.for_each_col(f);
                 key.for_each_col(f);
             }
+            ScalarExpr::Not(e) => e.for_each_col(f),
         }
     }
     /// 就地改写所有列名 (供 strip_qual 剥表限定前缀).
@@ -185,6 +192,7 @@ impl ScalarExpr {
                 base.for_each_col_mut(f);
                 key.for_each_col_mut(f);
             }
+            ScalarExpr::Not(e) => e.for_each_col_mut(f),
         }
     }
 }

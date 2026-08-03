@@ -1797,6 +1797,69 @@ fn mysql_foreign_key_cascade() {
     drop(mgr);
 }
 
+/// ⭐ PG 兼容 (UPDATE SET 表达式): `SET col = col + 1` 乐观锁, `NOT col` toggle,
+/// 链式算术. 由 shard 端 row_update 读旧行求值 (原子读改写).
+#[test]
+fn mysql_update_set_expr() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE ctr (id INT PRIMARY KEY, version INT DEFAULT 0, enabled BOOL DEFAULT true)");
+    c.query("INSERT INTO ctr (id) VALUES (1), (2), (3)");
+    // 乐观锁: version = version + 1 (id=1, 期望 0→1)
+    c.query("UPDATE ctr SET version = version + 1 WHERE id = 1 AND version = 0");
+    assert_eq!(
+        c.query("SELECT id, version FROM ctr WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("1".into()), Some("1".into())]]),
+        "version=version+1 乐观锁"
+    );
+    // toggle: enabled = NOT enabled (id=1, 期望 true→false)
+    c.query("UPDATE ctr SET enabled = NOT enabled WHERE id = 1");
+    assert_eq!(
+        c.query("SELECT id, enabled FROM ctr WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("1".into()), Some("0".into())]]),
+        "enabled=NOT enabled"
+    );
+    // 链式算术: version = version * 2 + 1 (id=2, 0*2+1=1)
+    c.query("UPDATE ctr SET version = version * 2 + 1 WHERE id = 2");
+    assert_eq!(
+        c.query("SELECT id, version FROM ctr WHERE id = 2"),
+        QueryResult::Rows(vec![vec![Some("2".into()), Some("1".into())]]),
+        "链式算术 version*2+1"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 // ===== ⭐ information_schema 系统表 (F66) =====
 
 /// 系统表虚拟化: tables/columns/key_column_usage/schemata + 投影/过滤/大小写/未知回空.

@@ -296,8 +296,8 @@ pub enum BatchOp {
     /// 删一行 (含全部索引行): 回 DeleteExisted.
     RowDelete { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8> },
     /// ⭐ S1: 部分列更新 — shard 端读-改-写 (单 shard 原子, UNIQUE/索引跟随).
-    /// sets = (列号, 新值); 回 DeleteExisted (true = 行存在且已更新).
-    RowUpdate { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8>, sets: Vec<(u16, storage::row::ColValue)> },
+    /// sets = (列号, 值或表达式); 回 DeleteExisted (true = 行存在且已更新).
+    RowUpdate { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8>, sets: Vec<(u16, storage::row::SetVal)> },
     /// ⭐ S1: 广播 op — 数据面删表 (物理数据 + schema/bloom 派生状态). 回 PutOk.
     DropTableOp { db: std::sync::Arc<str>, table: std::sync::Arc<str> },
     /// ⭐ S2: 广播 op — 全表扫 (`[S]` 前缀收 TAG_ROW 行, 跳过纯 KV 行).
