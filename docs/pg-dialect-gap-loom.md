@@ -137,10 +137,20 @@ Loom 的乐观锁 / 开关 toggle 依赖 SET 表达式，现支持：
   - e2e `mysql_update_set_expr` + 全量回归 42 passed
 - 边界：除法产生浮点写回整型列报类型不匹配（Loom 不用）；事务内表达式退化为不支持
 
+### 引用完整性检查（追加完成，2026-08-03，P0）
+
+外键"真正生效"的最后一环 — INSERT 拒绝悬空引用：
+- **worker 预检**（`worker/sql_fk.rs`）：INSERT 构建完 RowPut 后，若本表有 fks 且父表 schema 已缓存，先对每个非 NULL 外键值向父表发 `RowGet` 存在性检查（real seq，聚合于 `sql_fk_ins`）；全父行存在才注册 sql_dml_agg 发原 RowPut，任一缺失 → 拒
+- **原子性**：多行混合（部分有效部分无效）→ 整体拒绝，无部分写入
+- **NULL 外键**：不校验（PG 语义）
+- **跨 shard**：RowGet 按父主键 hash 路由到父表所在 shard
+- **验证**（3 shard 实测）：引用存在的父 → 成功；引用不存在的父 → `foreign key violation`；Loom 真实场景 world→chapter 悬空拒；多行混合整体拒；级联删除不受影响
+- e2e `mysql_foreign_key_referential_integrity`
+- **v1 边界**：父表 schema 不在缓存时跳过检查（但 CREATE TABLE 后父表已进缓存，实测总是生效）
+
 ### 剩余（Loom 不阻塞）
 
 - RETURNING 未实现（Loom 当前不用，低优先级）。
-- 引用完整性检查（INSERT 拒绝悬空引用）— v1 未做，语法兼容层。
 
 ## 六、迁移就绪结论（2026-08-03）
 
