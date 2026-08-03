@@ -240,6 +240,19 @@ pub(crate) fn sql_to_col(ty: ColType, v: &SqlValue) -> Result<ColValue, String> 
         (_, SqlValue::Subquery(_)) => return Err("unresolved subquery".into()),
         // ⭐ F74: 列引用未去相关就流到执行层 = bug (防御)
         (_, SqlValue::ColRef(_)) => return Err("unresolved column reference".into()),
+        // ⭐ PG 兼容 (UPDATE SET `= NOW()`): 展开为当前 Unix 微秒
+        (_, SqlValue::Now) => {
+            let micros = now_micros();
+            match ty {
+                ColType::Date | ColType::Time | ColType::Timestamp | ColType::I64 => {
+                    ColValue::I64(micros)
+                }
+                ColType::Str | ColType::Json => {
+                    ColValue::Bytes(render_timestamp(micros).into_bytes())
+                }
+                _ => ColValue::Null,
+            }
+        }
         (ColType::I64, SqlValue::Int(i)) => ColValue::I64(*i),
         (ColType::F64, SqlValue::Int(i)) => ColValue::F64(*i as f64),
         (ColType::F64, SqlValue::Float(f)) => ColValue::F64(*f),

@@ -798,15 +798,57 @@ pub(crate) fn process_pg_input(
                                 if oids.len() < params as usize {
                                     oids.resize(params as usize, 0);
                                 }
-                                let inferred = infer_param_oids(conn, &stmt, params);
+                                let (inferred, needs_schema) =
+                                    infer_param_oids(conn, &stmt, params);
                                 for (i, o) in inferred.iter().enumerate() {
                                     if i < oids.len() && oids[i] == 0 {
                                         oids[i] = *o;
                                     }
                                 }
-                                conn.pg_stmts.insert(name, PgPrepared { stmt, params, oids });
-                                let pc = pg::build_parse_complete();
-                                conn.pg_batch.prefix.extend_from_slice(&pc);
+                                // ⭐ portal: INSERT 目标表 schema 未入缓存 → 挂起 Parse,
+                                // 发 GetSchemaOp 拉 schema, 续跑时再推断 OID 回 ParseComplete.
+                                // 期间同批的 Describe/Sync 一并挂起 (statement 不在 pg_stmts,
+                                // Sync 检测 pg_waiting_schema 不 flush).
+                                if let Some(table) = needs_schema {
+                                    let seq = conn.next_seq;
+                                    conn.next_seq += 1;
+                                    conn.pg_pending_prepares.insert(
+                                        name.clone(),
+                                        PgPendingPrepare {
+                                            name: name.clone(),
+                                            stmt,
+                                            params,
+                                            oids,
+                                        },
+                                    );
+                                    conn.pg_waiting_schema = true;
+                                    conn.pg_waiting_schema_seq = seq;
+                                    let table_arc: std::sync::Arc<str> =
+                                        std::sync::Arc::from(table.as_str());
+                                    let db_arc: std::sync::Arc<str> =
+                                        std::sync::Arc::from(conn.current_db.as_ref().to_string());
+                                    let op = crate::worker::BatchOp::GetSchemaOp {
+                                        db: db_arc,
+                                        table: table_arc,
+                                    };
+                                    push_task(
+                                        conn,
+                                        conn_id,
+                                        seq,
+                                        worker_id,
+                                        op,
+                                        shard_inboxes,
+                                        num_shards,
+                                    );
+                                    // 不回 ParseComplete (挂起)
+                                } else {
+                                    conn.pg_stmts.insert(
+                                        name,
+                                        PgPrepared { stmt, params, oids },
+                                    );
+                                    let pc = pg::build_parse_complete();
+                                    conn.pg_batch.prefix.extend_from_slice(&pc);
+                                }
                             }
                             Err(e) => {
                                 if conn.pg_batch.error.is_none() {
@@ -891,6 +933,11 @@ pub(crate) fn process_pg_input(
                         // 路径记录为 gap)
                     }
                     b'S' => {
+                        // ⭐ portal: 批次在等 schema (Parse 挂起拉 GetSchemaOp) →
+                        // 不 flush 不回包, 保留 pg_batch, 待 GetSchemaOp 回包续跑.
+                        if conn.pg_waiting_schema {
+                            continue;
+                        }
                         let batch = std::mem::take(&mut conn.pg_batch);
                         let seq = conn.next_seq;
                         conn.next_seq += 1;
@@ -947,8 +994,16 @@ pub(crate) fn process_pg_input(
 /// 客户端 Parse 未声明参数类型时, 真实 PG 依据 SQL 上下文推断 (如 INSERT 的
 /// 目标列类型). 这里基于 worker 本地 schema 缓存对 INSERT 的参数做同样推断,
 /// 避免 pgx 等客户端因参数 OID 默认 text(25) 而无法编码 int/bool 等值报错.
-/// 未命中 schema / 未知语句类型 → 回退全 0 (Describe 时按 text 报告, 行为不变).
-fn infer_param_oids(conn: &ConnState, stmt: &crate::protocol::sql::SqlStmt, params: u16) -> Vec<u32> {
+///
+/// 返回 `(oids, needs_schema)`:
+/// - `oids`: 推断出的参数 OID (0 = 未推断, Describe 按 text 报告)
+/// - `needs_schema`: INSERT 且目标表 schema 未入 worker 缓存 → 需要 Parse 挂起,
+///   经 GetSchemaOp 拉回 schema 后重推, 否则 pgx 对 bool/int 参数无法编码.
+pub(crate) fn infer_param_oids(
+    conn: &ConnState,
+    stmt: &crate::protocol::sql::SqlStmt,
+    params: u16,
+) -> (Vec<u32>, Option<String>) {
     use crate::protocol::pg::type_oid;
     use crate::protocol::sql::SqlStmt;
     use crate::protocol::sql::SqlValue;
@@ -956,12 +1011,13 @@ fn infer_param_oids(conn: &ConnState, stmt: &crate::protocol::sql::SqlStmt, para
 
     let mut oids = vec![0u32; params as usize];
     let SqlStmt::Insert { table, cols, rows } = stmt else {
-        return oids;
+        return (oids, None);
     };
     // 本地 schema 缓存查表 (CREATE 已完成则已填充)
     let key = (conn.current_db.as_ref().to_string(), table.clone());
     let Some(schema) = conn.sql_cache.borrow().schemas.get(&key).cloned() else {
-        return oids;
+        // ⭐ portal: INSERT 目标表 schema 未缓存 → 标记需拉取 (Parse 挂起)
+        return (oids, Some(table.clone()));
     };
     // 每个 VALUES 位置 → 目标列下标 (与 sql_build_row 的列映射一致)
     let col_pos: Vec<Option<usize>> = if cols.is_empty() {
@@ -999,6 +1055,6 @@ fn infer_param_oids(conn: &ConnState, stmt: &crate::protocol::sql::SqlStmt, para
             }
         }
     }
-    oids
+    (oids, None)
 }
 

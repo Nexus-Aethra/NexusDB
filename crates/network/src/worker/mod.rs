@@ -425,6 +425,12 @@ struct ConnState {
     mysql_binary: std::collections::HashSet<u64>,
     /// ⭐ P3: PG 命名预处理语句 (Parse 注册; "" = unnamed, 每次覆盖).
     pg_stmts: HashMap<String, PgPrepared>,
+    /// ⭐ P3 (portal): Parse 时 schema miss 挂起的 prepared (name → 待解析).
+    pg_pending_prepares: HashMap<String, PgPendingPrepare>,
+    /// ⭐ P3 (portal): 当前扩展批次在等 schema (Sync 到达时暂不 flush, 等续跑).
+    pg_waiting_schema: bool,
+    /// ⭐ P3 (portal): 挂起批次的 GetSchemaOp 关联 seq (回包续跑用).
+    pg_waiting_schema_seq: u64,
     /// ⭐ P3: 扩展查询批次累积 (Parse..Sync 之间).
     pg_batch: PgBatch,
     /// ⭐ P3: seq → 扩展协议响应前缀 (resp_complete 单点拼接).
@@ -455,6 +461,15 @@ struct PgPrepared {
     stmt: SqlStmt,
     params: u16,
     /// Parse 声明的参数 OID (二进制格式参数解码依据; 0 = 未声明).
+    oids: Vec<u32>,
+}
+
+/// ⭐ P3 (portal): Parse 时目标表 schema 未入 worker 缓存 → 挂起的 prepared.
+/// 待 GetSchemaOp 拉回 schema 后推断参数 OID, 再插入 pg_stmts 并续跑批次.
+struct PgPendingPrepare {
+    name: String,
+    stmt: SqlStmt,
+    params: u16,
     oids: Vec<u32>,
 }
 
@@ -568,6 +583,9 @@ impl ConnState {
             next_stmt_id: 1,
             mysql_binary: std::collections::HashSet::new(),
             pg_stmts: HashMap::new(),
+            pg_pending_prepares: HashMap::new(),
+            pg_waiting_schema: false,
+            pg_waiting_schema_seq: 0,
             pg_batch: PgBatch::default(),
             pg_ext: HashMap::new(),
             close_after_flush: false,
@@ -911,6 +929,52 @@ impl ConnState {
         if self.next_seq < span_end {
             self.next_seq = span_end;
         }
+    }
+
+    /// ⭐ P3 (portal): 清理挂起批次的残留状态 (清空 pg_batch, 复位等待标志).
+    fn clear_pg_waiting_schema(&mut self) {
+        self.pg_waiting_schema = false;
+        self.pg_waiting_schema_seq = 0;
+        self.pg_pending_prepares.clear();
+        std::mem::take(&mut self.pg_batch);
+    }
+
+    /// ⭐ P3 (portal): 续跑挂起的 PG Parse — GetSchemaOp 回包到达后, 用 schema
+    /// 推断参数 OID, 插入 pg_stmts, 回 ParseComplete+ParameterDescription+NoData
+    /// +ReadyForQuery (pgx 的 Prepare 是独立往返 Parse+Describe+Sync, 此时回包即可).
+    fn resume_pg_pending_parse(&mut self, schema: std::sync::Arc<storage::schema::TableSchema>) {
+        // 填入 worker schema 缓存 (供 infer_param_oids 重推)
+        let prepares = std::mem::take(&mut self.pg_pending_prepares);
+        for (name, p) in prepares {
+            // 从 p.stmt (Insert) 提取表名填 schema 缓存
+            if let crate::protocol::sql::SqlStmt::Insert { table, .. } = &p.stmt {
+                let key = (self.current_db.as_ref().to_string(), table.clone());
+                self.sql_cache.borrow_mut().schemas.insert(key, schema.clone());
+            }
+            // 重推参数 OID (schema 已缓存)
+            let (inferred, _) = crate::worker::protocol_io::infer_param_oids(self, &p.stmt, p.params);
+            let mut oids = p.oids;
+            for (i, o) in inferred.iter().enumerate() {
+                if i < oids.len() && oids[i] == 0 {
+                    oids[i] = *o;
+                }
+            }
+            // 回 ParseComplete + ParameterDescription + NoData + ReadyForQuery
+            // (先用 &oids 构造响应, 再 move 进 pg_stmts)
+            let mut out = Vec::with_capacity(64);
+            out.extend_from_slice(&crate::protocol::pg::build_parse_complete());
+            out.extend_from_slice(&crate::protocol::pg::build_param_description(&oids, p.params));
+            out.extend_from_slice(&crate::protocol::pg::build_no_data());
+            out.extend_from_slice(&crate::protocol::pg::build_ready());
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.resp_complete(seq, out);
+            self.pg_stmts.insert(name, PgPrepared { stmt: p.stmt, params: p.params, oids });
+        }
+        // 复位等待标志并清空残留批次 (挂起时未 take 的 pg_batch)
+        self.pg_waiting_schema = false;
+        self.pg_waiting_schema_seq = 0;
+        std::mem::take(&mut self.pg_batch);
     }
 
     /// ⭐ 巨型 INSERT 防死锁 (2026-08): 批量 push 超过 inbox/reply_bus 容量时,

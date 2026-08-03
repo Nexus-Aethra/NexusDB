@@ -21,6 +21,9 @@ pub enum SqlValue {
     /// ⭐ PG 兼容 (UPDATE SET 表达式): `SET c = <expr>` — 二值算术/一元 NOT/
     /// 列自引用. 仅在 UPDATE SET RHS 出现; worker 读旧行后对旧值求值.
     Expr(Box<ScalarExpr>),
+    /// ⭐ PG 兼容 (UPDATE SET `= NOW()`): 当前时间戳字面量. 求值时展开为
+    /// 当前 Unix 微秒 (时间列) 或 ISO 字符串 (其他列), 由 sql_to_col 转换.
+    Now,
 }
 
 /// ⭐ F73: IN 集合原地排序去重 (同型集合: 全 Int 按值 / 全 Str 按字节序).

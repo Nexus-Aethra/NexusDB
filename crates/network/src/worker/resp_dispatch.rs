@@ -1329,6 +1329,30 @@ pub(crate) fn handle_resp_shard_result(
     if sql_join_drive(conn, conn_id, seq, worker_id, group, result, shard_inboxes, num_shards) {
         return;
     }
+    // ⭐ portal: PG 扩展协议 Parse 挂起 (等 schema) 的续跑 — GetSchemaOp 回包到达后
+    // 推断参数 OID, 插 pg_stmts, 回 ParseComplete+ParameterDescription+ReadyForQuery.
+    if conn.pg_waiting_schema && conn.pg_waiting_schema_seq == seq {
+        if let BatchResult::GetValue(Some(bytes)) = result
+            && let Ok(s) = TableSchema::decode(bytes)
+        {
+            let schema = std::sync::Arc::new(s);
+            conn.resume_pg_pending_parse(schema);
+        } else {
+            // schema 拉取失败 → 清挂起并回错
+            conn.pg_pending_prepares.clear();
+            conn.pg_waiting_schema = false;
+            let mut out = std::mem::take(&mut conn.pg_batch).prefix;
+            out.extend_from_slice(&crate::protocol::pg::build_error(
+                "42P01",
+                "relation does not exist",
+            ));
+            out.extend_from_slice(&crate::protocol::pg::build_ready());
+            let s = conn.next_seq;
+            conn.next_seq += 1;
+            conn.resp_complete(s, out);
+        }
+        return;
+    }
     // ⭐ X3: SQL 钩子 — schema 拉取续跑 (挂起语句在 schema 到达后继续规划)
     if let Some(pending) = conn.sql_pending.remove(&seq) {
         match result {

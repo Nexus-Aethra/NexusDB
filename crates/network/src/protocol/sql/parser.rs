@@ -1805,6 +1805,28 @@ fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
                         Ok(ScalarExpr::Not(Box::new(e)))
                     }
                     _ => {
+                        // ⭐ PG 兼容 (UPDATE SET): 函数调用 `NOW()` / `CURRENT_TIMESTAMP`
+                        // 等 — 吞掉括号及参数, 解析为当前时间字面量 (时间列默认/更新).
+                        // 其他未知函数同样吞掉调用, 回退 Null (避免 `SET c = fn()` 报
+                        // "trailing tokens" 卡死后续多列 SET 解析).
+                        if p.peek() == Some(&Tok::LParen) {
+                            let fname = s.to_ascii_lowercase();
+                            p.next()?; // (
+                            let mut depth = 1;
+                            while depth > 0 {
+                                match p.next()? {
+                                    Tok::LParen => depth += 1,
+                                    Tok::RParen => depth -= 1,
+                                    _ => {}
+                                }
+                            }
+                            return match fname.as_str() {
+                                "now" | "current_timestamp" | "current_date" | "current_time" => {
+                                    Ok(ScalarExpr::Lit(SqlValue::Now))
+                                }
+                                _ => Ok(ScalarExpr::Lit(SqlValue::Null)),
+                            };
+                        }
                         // 列引用
                         p.next()?;
                         Ok(ScalarExpr::Col(s))
