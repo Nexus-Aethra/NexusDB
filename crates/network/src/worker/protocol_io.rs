@@ -538,6 +538,34 @@ pub(crate) fn process_sql_input(
     }
 }
 
+/// ⭐ PG 兼容: 判断语句是否为"纯注释/空白" (剥 `--`/`/* */`/空白后为空).
+/// pgx stdlib 的 db.Ping() 发送 `-- ping` — 需返回 EmptyQuery 而非解析报错.
+fn is_empty_stmt(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            _ => return false, // 有非注释内容
+        }
+    }
+    true
+}
+
 /// ⭐ S4: PostgreSQL wire 帧循环 — startup (SSLRequest 拒绝/参数解析) →
 /// cleartext 认证 → simple Query. 每语句回复自带 ReadyForQuery (sql_*_bytes).
 #[allow(clippy::too_many_arguments)]
@@ -703,6 +731,14 @@ pub(crate) fn process_pg_input(
                         conn.next_seq += 1;
                         if parts.is_empty() {
                             // EmptyQueryResponse + ReadyForQuery
+                            let mut out = Vec::new();
+                            out.push(b'I');
+                            out.extend_from_slice(&4u32.to_be_bytes());
+                            out.extend_from_slice(&pg::build_ready());
+                            conn.resp_complete(seq, out);
+                        } else if parts.len() == 1 && is_empty_stmt(&parts[0]) {
+                            // ⭐ PG 兼容: 纯注释/空语句 (如 pgx Ping 发 '-- ping')
+                            // → EmptyQueryResponse, 不解析
                             let mut out = Vec::new();
                             out.push(b'I');
                             out.extend_from_slice(&4u32.to_be_bytes());
