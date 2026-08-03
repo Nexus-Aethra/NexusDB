@@ -2996,6 +2996,8 @@ pub(crate) fn sql_run_dml(
                                     read_key,
                                     ryow_overlay: overlay,
                                     out_names: out_names.clone(),
+                                    row: None,
+                                    error: None,
                                 },
                             );
                             let op = BatchOp::RowGet {
@@ -3012,7 +3014,17 @@ pub(crate) fn sql_run_dml(
                 let read_key = sql_read_key(conn, db, &table, &pk);
                 conn.sql_row_ctx.insert(
                     seq,
-                    SqlRowCtx { schema, conds, proj, count, read_key, ryow_overlay: Vec::new(), out_names },
+                    SqlRowCtx {
+                        schema,
+                        conds,
+                        proj,
+                        count,
+                        read_key,
+                        ryow_overlay: Vec::new(),
+                        out_names,
+                        row: None,
+                        error: None,
+                    },
                 );
                 let op = BatchOp::RowGet {
                     db: db.clone(),

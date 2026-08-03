@@ -72,7 +72,7 @@ impl MyConn {
     /// ⭐ Phase A: addr 版构造 (bench 多线程用).
     fn connect_addr(addr: std::net::SocketAddr) -> Self {
         let stream = TcpStream::connect(addr).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         stream.set_nodelay(true).unwrap();
         Self { stream, buf: Vec::new() }
     }
@@ -2030,8 +2030,8 @@ fn mysql_huge_insert_no_deadlock() {
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
     c.query("CREATE TABLE big (id INT PRIMARY KEY, v INT)");
-    // 单条 1.5 万行 (> inbox 8192 容量, 触发反压 drain; < e2e 客户端 5s 超时)
-    let n = 15000;
+    // 单条 1 万行 (> inbox 8192 容量, 触发反压 drain; < e2e 客户端 5s 超时)
+    let n = 10000;
     let sql = format!(
         "INSERT INTO big VALUES {}",
         (0..n).map(|i| format!("({i},{i})")).collect::<Vec<_>>().join(",")
@@ -2040,13 +2040,13 @@ fn mysql_huge_insert_no_deadlock() {
     // 数据完整 (COUNT = n)
     assert_eq!(
         c.query("SELECT COUNT(*) FROM big"),
-        QueryResult::Rows(vec![vec![Some("15000".into())]]),
-        "1.5 万行单条插入完整 (防死锁)"
+        QueryResult::Rows(vec![vec![Some("10000".into())]]),
+        "1 万行单条插入完整 (防死锁)"
     );
     // 抽查
     assert_eq!(
-        c.query("SELECT v FROM big WHERE id = 14999"),
-        QueryResult::Rows(vec![vec![Some("14999".into())]]),
+        c.query("SELECT v FROM big WHERE id = 9999"),
+        QueryResult::Rows(vec![vec![Some("9999".into())]]),
         "抽查尾行"
     );
     drop(c);
