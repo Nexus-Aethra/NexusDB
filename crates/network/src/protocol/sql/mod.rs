@@ -15,6 +15,7 @@ mod ast;
 mod optimizer;
 pub(crate) mod parser;
 mod parser_ddl;
+mod parser_where;
 
 pub use ast::*;
 pub use optimizer::{
