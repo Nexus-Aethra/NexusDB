@@ -791,6 +791,19 @@ pub(crate) fn process_pg_input(
                     b'P' => match pg::parse_parse(payload) {
                         Ok((name, query, oids)) => match sql::parse_prepared(&query) {
                             Ok((stmt, params)) => {
+                                // ⭐ PG 兼容: 客户端 Parse 未声明参数类型 (oids 空/含 0) 时,
+                                // 依据目标列类型推断参数 OID — 否则 pgx 等客户端默认收到
+                                // text(25) 而无法把 int/bool 等值编码为 text 报错.
+                                let mut oids = oids;
+                                if oids.len() < params as usize {
+                                    oids.resize(params as usize, 0);
+                                }
+                                let inferred = infer_param_oids(conn, &stmt, params);
+                                for (i, o) in inferred.iter().enumerate() {
+                                    if i < oids.len() && oids[i] == 0 {
+                                        oids[i] = *o;
+                                    }
+                                }
                                 conn.pg_stmts.insert(name, PgPrepared { stmt, params, oids });
                                 let pc = pg::build_parse_complete();
                                 conn.pg_batch.prefix.extend_from_slice(&pc);
@@ -928,5 +941,64 @@ pub(crate) fn process_pg_input(
     if cursor > 0 {
         conn.read_buf.drain(..cursor);
     }
+}
+
+/// ⭐ PG 兼容 (扩展协议): 推断预处理语句参数类型 OID.
+/// 客户端 Parse 未声明参数类型时, 真实 PG 依据 SQL 上下文推断 (如 INSERT 的
+/// 目标列类型). 这里基于 worker 本地 schema 缓存对 INSERT 的参数做同样推断,
+/// 避免 pgx 等客户端因参数 OID 默认 text(25) 而无法编码 int/bool 等值报错.
+/// 未命中 schema / 未知语句类型 → 回退全 0 (Describe 时按 text 报告, 行为不变).
+fn infer_param_oids(conn: &ConnState, stmt: &crate::protocol::sql::SqlStmt, params: u16) -> Vec<u32> {
+    use crate::protocol::pg::type_oid;
+    use crate::protocol::sql::SqlStmt;
+    use crate::protocol::sql::SqlValue;
+    use storage::schema::ColType;
+
+    let mut oids = vec![0u32; params as usize];
+    let SqlStmt::Insert { table, cols, rows } = stmt else {
+        return oids;
+    };
+    // 本地 schema 缓存查表 (CREATE 已完成则已填充)
+    let key = (conn.current_db.as_ref().to_string(), table.clone());
+    let Some(schema) = conn.sql_cache.borrow().schemas.get(&key).cloned() else {
+        return oids;
+    };
+    // 每个 VALUES 位置 → 目标列下标 (与 sql_build_row 的列映射一致)
+    let col_pos: Vec<Option<usize>> = if cols.is_empty() {
+        let n = schema.columns.len();
+        let auto_rowid = super::sql_eval::is_auto_pk(&schema).then_some(schema.pk_col as usize);
+        let hidden = |i: usize| auto_rowid == Some(i) || schema.dropped.contains(&(i as u16));
+        (0..n).filter(|&i| !hidden(i)).map(Some).collect()
+    } else {
+        cols.iter()
+            .map(|c| schema.col_by_name(c).map(|i| i as usize))
+            .collect()
+    };
+    for row in rows {
+        for (j, val) in row.iter().enumerate() {
+            if let SqlValue::Param(idx) = val {
+                let idx = *idx as usize;
+                if idx >= oids.len() {
+                    continue;
+                }
+                if let Some(Some(col)) = col_pos.get(j) {
+                    if let Some(col_def) = schema.columns.get(*col) {
+                        // ⭐ 只推断 decode_param 支持二进制解码的类型 (int/float/bool/
+                        // str/bytes/date/time/timestamp). json/uuid/decimal 等 NexusDB
+                        // 不支持二进制编码 → 保持 0 → Describe 按 text 报告 → pgx 用
+                        // 文本发送, decode_param format==0 走 Str, 再由 sql_to_col 转换.
+                        let oid = match col_def.ty {
+                            ColType::I64 | ColType::F64 | ColType::Bool | ColType::Str
+                            | ColType::Bytes | ColType::Date | ColType::Time
+                            | ColType::Timestamp => type_oid(col_def.ty),
+                            _ => 0,
+                        };
+                        oids[idx] = oid;
+                    }
+                }
+            }
+        }
+    }
+    oids
 }
 

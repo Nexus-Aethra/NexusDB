@@ -884,13 +884,33 @@ impl ConnState {
     /// + ReadyForQuery (PG 协议要求每条语句一个 CommandComplete).
     fn multi_finish(&mut self, orig: u64) {
         let Some(m) = self.multi_stmt.remove(&orig) else { return };
+        // ⭐ 修复 (2026-08): multi 子语句占用了客户端 seq 区间 [base, base+N),
+        // 但回包只发 orig 一个 seq. resp_complete(orig) 后 next_to_send 停在
+        // orig+1(=base), 而 base..base+N-1 的子 seq 无单独 pending 包 → 顺序
+        // 推进的 resp_flush_ready 永久等空洞, 导致 multi 完成后同一连接的后续
+        // 任何请求 (如 portal 迁移的 INSERT INTO schema_migrations) 全部挂起.
+        // 解决: 完成后把 next_to_send / next_seq 直接推进到 span_end(=base+N),
+        // 跳过空洞子 seq, 使后续请求恢复可派发.
+        let span_end = m.base_sub_seq + m.dispatched as u64;
         if let Some(e) = m.error {
             self.resp_complete(orig, sql_err_bytes(ProtocolKind::Pg, &e));
+            if self.next_to_send < span_end {
+                self.next_to_send = span_end;
+            }
+            if self.next_seq < span_end {
+                self.next_seq = span_end;
+            }
             return;
         }
         let mut out = m.cmd_bytes;
         out.extend_from_slice(&crate::protocol::pg::build_ready());
         self.resp_complete(orig, out);
+        if self.next_to_send < span_end {
+            self.next_to_send = span_end;
+        }
+        if self.next_seq < span_end {
+            self.next_seq = span_end;
+        }
     }
 
     /// ⭐ 巨型 INSERT 防死锁 (2026-08): 批量 push 超过 inbox/reply_bus 容量时,

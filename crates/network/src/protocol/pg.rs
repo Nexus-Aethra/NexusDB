@@ -34,6 +34,10 @@ pub const OID_JSON: u32 = 114;
 pub const OID_UUID: u32 = 2950;
 pub const OID_NUMERIC: u32 = 1700;
 
+/// ⭐ PG 兼容: PG 时间戳二进制 epoch = 2000-01-01, NexusDB 内部 epoch =
+/// 1970-01-01 → 微秒偏移 = 10957 天 (30 年含 7 闰). PG 值 + offset = NexusDB 值.
+pub(crate) const PG_EPOCH_OFFSET_MICROS: i64 = 10_957 * 86_400_000_000;
+
 /// startup 阶段帧: `[len u32 BE 含自身][payload]` (无 type 字节).
 /// 返回 (消耗字节, payload).
 pub fn read_startup_frame(buf: &[u8]) -> Option<(usize, &[u8])> {
@@ -288,7 +292,7 @@ pub fn build_command_complete_multi() -> Vec<u8> {
     out
 }
 
-fn type_oid(ty: ColType) -> u32 {
+pub(crate) fn type_oid(ty: ColType) -> u32 {
     match ty {
         ColType::I64 => OID_INT8,
         ColType::F64 => OID_FLOAT8,
@@ -537,6 +541,21 @@ pub fn decode_param(
             .map_err(|_| "bad float4 param".into()),
         16 => Ok(SqlValue::Int((b.first() == Some(&1)) as i64)),
         25 | 1043 | 17 => Ok(SqlValue::Str(b.to_vec())),
+        // ⭐ PG 兼容: 时间戳/日期/时间二进制参数. PG 二进制时间戳为距 2000-01-01
+        // 的微秒 (int64), 日期为距 2000-01-01 的天数 (int32), 时间为当日微秒 (int64).
+        // NexusDB 内部均以距 1970-01-01 的微秒 (i64) 存储 → 需加 epoch 偏移.
+        1114 => b
+            .try_into()
+            .map(|a| SqlValue::Int(i64::from_be_bytes(a) + PG_EPOCH_OFFSET_MICROS))
+            .map_err(|_| "bad timestamp param".into()),
+        1082 => b
+            .try_into()
+            .map(|a| SqlValue::Int((i32::from_be_bytes(a) as i64 + 10_957) * 86_400_000_000))
+            .map_err(|_| "bad date param".into()),
+        1083 => b
+            .try_into()
+            .map(|a| SqlValue::Int(i64::from_be_bytes(a)))
+            .map_err(|_| "bad time param".into()),
         0 => Err("binary parameter requires declared type OID".into()),
         other => Err(format!("unsupported binary parameter OID {other}")),
     }
