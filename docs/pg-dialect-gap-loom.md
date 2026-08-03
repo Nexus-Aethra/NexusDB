@@ -201,3 +201,41 @@ Loom 的 40 个仓储方法 SQL 逐条核对，剩余差异均为 Loom 刻意规
 | 2 | 函数注册 + DEFAULT 求值 | 中（1-2 天） |
 | 3 | 解析器字面量 bug | 小（0.5-1 天） |
 | 4 | 测试加固 | 中（1-2 天） |
+
+---
+
+## 七、Portal 对接（追加，2026-08-03）
+
+用 NexusDB 替换 Nexus-Portal 的 PostgreSQL 存储引擎时, 用真实 pgx 客户端 (宿主机 + 容器双路径) + tcpdump 抓包定位并修复了 2 大阻塞, portal 完整启动并幂等重启稳定。
+
+### Portal 阻塞 1 — multi-statement 执行后连接永久挂起
+
+- **现象**: `conn.Exec(multi-statement)` 成功返回后, 同一连接的后续任何请求 (portal 迁移 0001 后的 `INSERT INTO schema_migrations`) 全部 HUNG。此前误判为"multi 推进到 dispatched=31 后没触发 multi_finish"。
+- **定位**: tcpdump 抓包证明 NexusDB 已回 32×`SELECT 1` + ReadyForQuery, portal 也收到并继续发 INSERT — 卡点在 INSERT 而非 multi 本身。
+- **根因**: multi 子语句占用客户端 seq 区间 `[base, base+N)`, 但 `multi_finish` 只对 `orig` seq 回包。`resp_flush_ready` 按 `next_to_send` 顺序推进, 遇 base+1..base+N-1 的**无 pending 包空洞子 seq** 永久等待 → 连接卡死。
+- **修复** (`worker/mod.rs multi_finish`): 完成后把 `next_to_send` / `next_seq` 推进到 `base_sub_seq + dispatched`, 跳过空洞子 seq (error 分支同样处理)。
+
+### Portal 阻塞 2 — 扩展协议参数类型 OID 缺失
+
+- **现象** (层层下钻):
+  1. `unable to encode 0 into text format for text (OID 25)` — pgx 端编码 int 失败
+  2. `unsupported binary parameter OID 1114` — NexusDB `decode_param` 不认识 timestamp
+  3. `unable to encode time.Time into text (OID 25)` — timestamp 回退 text 后 pgx 仍失败
+- **根因**: Parse 未声明参数类型时 `build_param_description` 一律按 text(25) 报告; 真实 PG 会按目标列推断。
+- **修复**:
+  - `worker/protocol_io.rs infer_param_oids`: 基于本地 schema 缓存对 INSERT 参数按目标列推断 OID。
+  - `protocol/pg.rs decode_param`: 补支持 PG 二进制 timestamp(1114)/date(1082)/time(1083) 解码, 含 `PG_EPOCH_OFFSET_MICROS` epoch 偏移。
+
+### Portal 代码 bug (Nexus-Portal 项目)
+
+`module.JwtKey.RotatedAt` 为非指针 `time.Time`, `SELECT * FROM jwt_keys` 扫描 NULL `rotated_at` 报错 → 误判无 key → 重复创建冲突。改为 `*time.Time` (与 ModuleKey 一致) + `RotateKey` 赋值适配。
+
+### Portal 端到端验证
+
+- 迁移 `migrations completed` / 幂等 `skip`; JWT key k0 生成; `Default admin account created` / 重启 `skip bootstrap`; `POST /api/v1/auth/login` → `OK` + 有效 JWT; `/health` 200。
+
+### 边界
+
+- 参数 OID 推断仅覆盖 INSERT 目标列; 未命中缓存回退 text。
+- PG 二进制时间戳按微秒精度; date 按天、time 按当日微秒。
+- `SELECT 1` (无 FROM) 仍报语法错误, 非本次范围。
