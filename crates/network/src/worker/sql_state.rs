@@ -138,6 +138,9 @@ pub struct MultiStmt {
     pub cur_kind: u8,
     /// 发起连接的 id (同步语句推进 multi_step 用).
     pub conn_id: u64,
+    /// ⭐ PG 兼容: 每条语句的 CommandComplete 累积 (multi-statement 需逐条
+    /// 响应, 否则 pgx 等不足 N 个 CommandComplete 而挂起).
+    pub cmd_bytes: Vec<u8>,
 }
 
 /// ⭐ X3: SELECT pk 点查渲染上下文 (seq → 状态).

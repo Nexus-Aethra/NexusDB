@@ -343,6 +343,11 @@ impl P {
         self.toks.get(self.i)
     }
 
+    /// ⭐ PG 兼容: 第 i+1 个 token 是否为 `(` (区分 `version(` 函数 vs `version` 列).
+    fn peek2_is_lparen(&self) -> bool {
+        matches!(self.toks.get(self.i + 1), Some(Tok::LParen))
+    }
+
     fn next(&mut self) -> Result<Tok, String> {
         let t = self.toks.get(self.i).cloned().ok_or("unexpected end of statement")?;
         self.i += 1;
@@ -1149,10 +1154,14 @@ fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
             }
         } else {
             let name = p.ident()?;
-            let ty = parse_col_type(p)?;
+            let (ty, is_serial) = parse_col_type(p)?;
             let mut nullable = true;
             let mut is_pk = false;
             let mut default: Option<storage::schema::ColDefault> = None;
+            if is_serial {
+                // ⭐ PG 兼容 (portal): SERIAL/BIGSERIAL → 自动递增默认值
+                default = Some(storage::schema::ColDefault::Serial);
+            }
             loop {
                 if p.try_kw("PRIMARY") {
                     p.kw("KEY")?;
@@ -1847,7 +1856,8 @@ fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
 
 /// ⭐ F80: 列类型名 → ColType (parse_create/parse_alter 共用). 吞方言噪声
 /// (`DOUBLE PRECISION` / `VARCHAR(n)` / `DECIMAL(p,s)` 长度与精度参数).
-fn parse_col_type(p: &mut P) -> Result<ColType, String> {
+/// 返回 (ColType, is_serial) — SERIAL 列由调用方设自动递增默认值.
+fn parse_col_type(p: &mut P) -> Result<(ColType, bool), String> {
     let ty_name = p.ident()?;
     let up = ty_name.to_ascii_uppercase();
     // ⭐ F81: DECIMAL/NUMERIC(p,s) — 捕获精度与标度存入类型
@@ -1871,8 +1881,9 @@ fn parse_col_type(p: &mut P) -> Result<ColType, String> {
         if scale > 38 || precision > 38 {
             return Err("DECIMAL precision/scale must be <= 38".into());
         }
-        return Ok(ColType::Decimal { precision, scale });
+        return Ok((ColType::Decimal { precision, scale }, false));
     }
+    let serial = matches!(up.as_str(), "SERIAL" | "BIGSERIAL" | "SMALLSERIAL");
     let ty = match up.as_str() {
         "INT" | "BIGINT" | "INTEGER" | "SMALLINT" => ColType::I64,
         "BOOLEAN" | "BOOL" => ColType::Bool,
@@ -1884,6 +1895,10 @@ fn parse_col_type(p: &mut P) -> Result<ColType, String> {
         "TIMESTAMP" | "DATETIME" | "TIMESTAMPTZ" => ColType::Timestamp, // ⭐ compat: TIMESTAMPTZ 别名
         "JSON" | "JSONB" => ColType::Json,
         "UUID" => ColType::Uuid,
+        // ⭐ PG 兼容 (portal): INET — 网络地址存文本
+        "INET" => ColType::Str,
+        // ⭐ PG 兼容 (portal): SERIAL/BIGSERIAL — 自增整型主键
+        "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" => ColType::I64,
         other => return Err(format!("unknown type {other}")),
     };
     if ty_name.eq_ignore_ascii_case("DOUBLE") {
@@ -1915,12 +1930,12 @@ fn parse_col_type(p: &mut P) -> Result<ColType, String> {
         };
     if is_array {
         // 数组类型映射为 Str 列 (值为 JSON 数组文本); 保持类型信息在注释/元数据
-        return Ok(match ty {
+        return Ok((match ty {
             ColType::I64 => ColType::I64,
             _ => ColType::Str,
-        });
+        }, false));
     }
-    Ok(ty)
+    Ok((ty, serial))
 }
 
 /// ⭐ S1: `DROP TABLE [IF EXISTS] t`
@@ -1968,10 +1983,13 @@ fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
     // ⭐ compat: ADD COLUMN IF NOT EXISTS
     let if_not_exists = p.try_kw("IF") && { p.try_kw("NOT"); p.try_kw("EXISTS"); true };
     let name = p.ident()?;
-    let ty = parse_col_type(p)?;
+    let (ty, is_serial) = parse_col_type(p)?;
     // 列属性: NULL/NOT NULL/DEFAULT
     let mut nullable = true;
     let mut default: Option<storage::schema::ColDefault> = None;
+    if is_serial {
+        default = Some(storage::schema::ColDefault::Serial);
+    }
     loop {
         if p.try_kw("NOT") {
             p.kw("NULL")?;
@@ -2432,14 +2450,19 @@ fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     } else if !top && matches!(p.peek(), Some(Tok::Num(_))) {
         // ⭐ F71: 子查询中的字面量投影 (如 EXISTS 的 `SELECT 1`) — 值无关, 视为全列
         p.next()?;
-    } else if top && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("VERSION")) {
-        // ⭐ S3: SELECT version() — psql/驱动探测 stub
+    } else if top && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("VERSION"))
+        && p.peek2_is_lparen()
+    {
+        // ⭐ S3: SELECT version() — psql/驱动探测 stub (仅当 `version(` 是函数调用;
+        // `SELECT version FROM t` 中 version 是普通列名, 走常规投影)
         p.next()?;
         p.expect(&Tok::LParen, "(")?;
         p.expect(&Tok::RParen, ")")?;
         p.done()?;
         return Ok(SqlStmt::VersionStub);
-    } else if top && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("DATABASE")) {
+    } else if top && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("DATABASE"))
+        && p.peek2_is_lparen()
+    {
         // ⭐ S5: SELECT DATABASE() — mysql cli USE 后探测
         p.next()?;
         p.expect(&Tok::LParen, "(")?;

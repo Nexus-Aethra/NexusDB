@@ -96,6 +96,8 @@ pub enum ColDefault {
     Now,
     /// uuid_generate_v4() — 随机 UUID (16B).
     UuidGenV4,
+    /// ⭐ PG 兼容 (portal): SERIAL/BIGSERIAL — 进程级单调递增 I64.
+    Serial,
 }
 
 /// ⭐ PG 兼容 (FMT_VER 8): 外键 ON DELETE 动作.
@@ -395,6 +397,7 @@ impl TableSchema {
                 }
                 Some(ColDefault::Now) => out.push(2),
                 Some(ColDefault::UuidGenV4) => out.push(3),
+                Some(ColDefault::Serial) => out.push(4),
             }
         }
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
@@ -476,6 +479,7 @@ impl TableSchema {
                     1 => Some(ColDefault::Lit(decode_colvalue(&mut r)?)),
                     2 => Some(ColDefault::Now),
                     3 => Some(ColDefault::UuidGenV4),
+                    4 => Some(ColDefault::Serial),
                     _ => return Err(SchemaError::BadFormat),
                 }
             } else {

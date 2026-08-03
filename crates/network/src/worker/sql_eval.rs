@@ -182,6 +182,8 @@ pub(crate) fn eval_col_default(
             // 非 UUID 列上的 uuid_generate_v4() → 也产 16B 文本? 保守报错
             _ => ColValue::Bytes(uuid_v4_bytes()),
         },
+        // ⭐ PG 兼容 (portal): SERIAL/BIGSERIAL → 进程级单调递增
+        storage::schema::ColDefault::Serial => ColValue::I64(next_auto_rowid()),
     })
 }
 

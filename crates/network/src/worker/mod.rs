@@ -842,7 +842,12 @@ impl ConnState {
         let mut next: Option<String> = None;
         let mut error: Option<String> = None;
         {
-            let m = self.multi_stmt.get_mut(&orig).expect("multi 状态必在");
+            // ⭐ 防御: 同 sub_seq 可能被 DDL agg 完成 + resp_complete 守卫双触发,
+            // multi 状态可能已移除 → 安全返回 (防 worker panic / 连接关闭)
+            let Some(m) = self.multi_stmt.get_mut(&orig) else { return };
+            // ⭐ PG 兼容: 每条语句回一个 CommandComplete (multi-statement 需逐条
+            // 响应, 否则 pgx 等不足 N 个 CommandComplete 而挂起)
+            m.cmd_bytes.extend_from_slice(&crate::protocol::pg::build_command_complete("SELECT 1"));
             m.dispatched += 1;
             if m.error.is_some() {
                 error = m.error.clone();
@@ -875,14 +880,17 @@ impl ConnState {
         }
     }
 
-    /// ⭐ PG 兼容 (multi-statement): 全部完成 → 用原 seq 回 ReadyForQuery.
+    /// ⭐ PG 兼容 (multi-statement): 全部完成 → 用原 seq 回逐条 CommandComplete
+    /// + ReadyForQuery (PG 协议要求每条语句一个 CommandComplete).
     fn multi_finish(&mut self, orig: u64) {
         let Some(m) = self.multi_stmt.remove(&orig) else { return };
-        let bytes = match m.error {
-            Some(e) => sql_err_bytes(ProtocolKind::Pg, &e),
-            None => crate::protocol::pg::build_command_complete_multi(),
-        };
-        self.resp_complete(orig, bytes);
+        if let Some(e) = m.error {
+            self.resp_complete(orig, sql_err_bytes(ProtocolKind::Pg, &e));
+            return;
+        }
+        let mut out = m.cmd_bytes;
+        out.extend_from_slice(&crate::protocol::pg::build_ready());
+        self.resp_complete(orig, out);
     }
 
     /// ⭐ 巨型 INSERT 防死锁 (2026-08): 批量 push 超过 inbox/reply_bus 容量时,

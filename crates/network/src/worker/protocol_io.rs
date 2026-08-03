@@ -772,6 +772,7 @@ pub(crate) fn process_pg_input(
                                     error: None,
                                     cur_kind: 0,
                                     conn_id,
+                                    cmd_bytes: Vec::new(),
                                 },
                             );
                             // 首条也占一个子 seq (base_sub_seq), 从 base+1 开始续
