@@ -100,6 +100,54 @@ fn socket_read_write_roundtrip() {
     });
 }
 
+/// 场景 3: io_uring 读 eventfd — 验证 reply_bus / new_conn 通知也能走 io_uring.
+/// worker 协程化后需用 io_uring 监听 eventfd (取代 epoll), 本测试确认其可行.
+#[test]
+fn io_uring_read_eventfd() {
+    run_with_timeout(20000, || {
+        let sched = setup();
+        let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(efd >= 0, "eventfd failed");
+
+        let result: Arc<Mutex<Option<Result<u64, String>>>> = Arc::new(Mutex::new(None));
+        let result2 = result.clone();
+        let sched = setup();
+
+        // 协程: io_uring 读 eventfd (读回 8 字节计数).
+        scheduler::spawn_on(&sched, async move {
+            let r = async {
+                let mut buf = [0u8; 8];
+                let n = scheduler::io_ops::read(efd, &mut buf, u64::MAX)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                assert_eq!(n, 8, "eventfd read should return 8 bytes");
+                Ok(u64::from_ne_bytes(buf))
+            }
+            .await;
+            *result2.lock().unwrap() = Some(r);
+        });
+
+        // 先写 eventfd (数据已就绪, io_uring 读将立即完成), 再非阻塞驱动.
+        let v: u64 = 1;
+        unsafe {
+            libc::write(efd, &v as *const u64 as *const libc::c_void, 8);
+        }
+        let mut iters = 0;
+        while result.lock().unwrap().is_none() && iters < 200_000 {
+            drive_thread(sched.clone(), 4096);
+            iters += 1;
+        }
+        let got = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("eventfd read never completed")
+            .expect("eventfd io_uring failed");
+        assert_eq!(got, 1, "eventfd counter mismatch");
+        unsafe { libc::close(efd) };
+    });
+}
+
 /// 场景 2: 多协程并发 socket 读写, 验证调度公平 + 数据不串.
 #[test]
 fn socket_concurrent_tasks() {
