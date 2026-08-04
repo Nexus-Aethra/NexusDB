@@ -9,11 +9,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_channel::Sender;
 
-/// 待处理的新连接 (含 fd + peer addr).
+/// 待处理的新连接 (含 fd + peer addr + 协议门面).
+///
+/// ⭐ 解耦 (Phase 3): 协议信息随连接传递 (端口即协议, acceptor 投递时打标),
+/// 使 worker 可处理来自不同端口的连接 (全局共享 worker 池的前提).
 #[derive(Debug)]
 pub struct NewConn {
     pub fd: RawFd,
     pub peer: SocketAddr,
+    pub protocol: crate::worker::ProtocolKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +35,8 @@ pub struct AcceptorConfig {
     /// 精确唤醒 worker 的 epoll (空 = 不通知, 兼容旧行为).
     pub worker_wakeups: Vec<RawFd>,
     pub lb_strategy: LbStrategy,
+    /// ⭐ 解耦 (Phase 3): 本 acceptor 服务的协议门面 (端口即协议), 投递连接时打标.
+    pub protocol: crate::worker::ProtocolKind,
 }
 
 pub struct Acceptor;
@@ -78,7 +84,7 @@ impl Acceptor {
                 }
             };
 
-            let new_conn = NewConn { fd, peer };
+            let new_conn = NewConn { fd, peer, protocol: config.protocol };
             if config.worker_queues[idx].send(new_conn).is_err() {
                 // 关闭 fd (没人会重建这个连接)
                 // SAFETY: fd 是合法 owned fd, drop 时 close.

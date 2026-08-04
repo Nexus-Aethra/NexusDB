@@ -47,7 +47,6 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
     let db_view = cfg.db_view;
     let inbox = cfg.inbox;
     let conn_eventfd = cfg.conn_eventfd;
-    let proto_kind = cfg.protocol;
     let auth_password = cfg.auth_password;
     let auth_required = auth_password.is_some();
     let tls_config = cfg.tls_config;
@@ -127,7 +126,6 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
     let db_view2 = db_view.clone();
     let auth_required2 = auth_required;
     let tls_config2 = tls_config.clone();
-    let proto2 = proto_kind;
     let sched3 = sched.clone();
     let worker_id2 = worker_id;
     let stop2 = stop.clone();
@@ -161,9 +159,11 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
             for nc in new_conns {
                 let id = next_conn_id;
                 next_conn_id += 1;
+                // ⭐ 解耦 (Phase 3): 协议随连接传递 (acceptor 按端口打标), worker 不再用固定 proto2.
+                let proto = nc.protocol;
                 let mut state = ConnState::new(
                     nc.fd,
-                    proto2,
+                    proto,
                     auth_required2,
                     db2.clone(),
                     sql_cache2.clone(),
@@ -175,7 +175,7 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                     shard_inboxes2.clone(),
                 );
                 // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
-                if proto2 == ProtocolKind::Sql {
+                if proto == ProtocolKind::Sql {
                     let salt = mysql_gen_salt(id, worker_id2);
                     state.mysql = Some(MysqlState { salt, phase: 0, pending_db: None });
                     let greeting = my::build_handshake_v10_caps(&salt, 1, false);

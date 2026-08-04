@@ -120,6 +120,7 @@ impl NetworkServer {
             worker_queues: worker_inboxes.clone(),
             worker_wakeups,
             lb_strategy: crate::acceptor::LbStrategy::RoundRobin,
+            protocol: config.protocol,
         };
         let acceptor_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let acceptor_stop_clone = acceptor_stop.clone();
@@ -242,7 +243,7 @@ fn acceptor_run_with_listener(
             }
         };
 
-        let new_conn = NewConn { fd, peer };
+        let new_conn = NewConn { fd, peer, protocol: config.protocol };
         if config.worker_queues[idx].send(new_conn).is_err() {
             let _ = unsafe { std::net::TcpStream::from_raw_fd(fd) };
             nlog::warn!("acceptor", "worker {idx} inbox closed; shutdown");

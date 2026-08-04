@@ -33,7 +33,6 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
     let db_view = cfg.db_view;
     let inbox = cfg.inbox;
     let conn_eventfd = cfg.conn_eventfd;
-    let proto_kind = cfg.protocol;
     let limits = cfg.limits;
     let auth_password = cfg.auth_password;
     let auth_required = auth_password.is_some();
@@ -54,9 +53,11 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                 Ok(new_conn) => {
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone(), reply_bus.clone(), db_view.clone(), worker_id, num_shards, shard_inboxes.clone());
+                    // ⭐ 解耦 (Phase 3): 协议随连接传递 (acceptor 按端口打标), worker 不再用固定 proto_kind.
+                    let proto = new_conn.protocol;
+                    let mut state = ConnState::new(new_conn.fd, proto, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone(), reply_bus.clone(), db_view.clone(), worker_id, num_shards, shard_inboxes.clone());
                     // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
-                    if proto_kind == ProtocolKind::Sql {
+                    if proto == ProtocolKind::Sql {
                         let salt = mysql_gen_salt(id, worker_id);
                         state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
                             &salt, id as u32, tls_config.is_some(),
@@ -141,9 +142,10 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                 while let Ok(new_conn) = inbox.try_recv() {
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone(), reply_bus.clone(), db_view.clone(), worker_id, num_shards, shard_inboxes.clone());
+                    let proto = new_conn.protocol;
+                    let mut state = ConnState::new(new_conn.fd, proto, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone(), reply_bus.clone(), db_view.clone(), worker_id, num_shards, shard_inboxes.clone());
                     // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
-                    if proto_kind == ProtocolKind::Sql {
+                    if proto == ProtocolKind::Sql {
                         let salt = mysql_gen_salt(id, worker_id);
                         state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
                             &salt, id as u32, tls_config.is_some(),
