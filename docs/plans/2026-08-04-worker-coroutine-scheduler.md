@@ -143,6 +143,12 @@
   - 性能修复: drive 忙循环 (drive_until_idle 1e6 次 ≈14s) → 小上限+sleep (prepared 14.8s→0.47s)
   - 旧 epoll worker 全绿 (77 unit + 22 resp + 7 pg + 45 sql_e2e + 168 storage + 27 shard)
   - ⭐ 范围: 协程 worker 当前支持 SQL 门面; RESP/PG/HTTP 门面后续扩展 (架构相同)
+- [x] **T2.8** 全协议门面扩展 ✅ — 协程 worker 支持全部 5 种协议:
+  - `conn_coro` 协议分发补全: Sql/Pg/Http/Binary 走各自 `process_*_input`, Resp 走 `process_resp_input`
+  - 传入 `table`(default_table) + `limits`(KvLimits) 参数 (RESP 需要)
+  - Binary 回包直发 (batch_result_to_response + send_binary_response), 其余走 handle_resp_shard_result 聚合
+  - 验证 (NEXUS_CORO_WORKER=1): 45 sql_e2e + 22 resp_e2e + 7 pg_e2e + 3 http_e2e + 11 binary + 77 unit 全绿
+  - epoll worker (默认) 同套全绿, 零回归
 - [ ] **T3** (原 Phase 3) 全局共享 worker 池 + 多协议 (协程 worker 天然支持)
 - [ ] **T4** (原 Phase 4) TLS 协程化 + 清理 + 文档
 

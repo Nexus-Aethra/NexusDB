@@ -10,8 +10,10 @@
 //! - 协议处理仍为同步 (`process_*_input` 纯解析→push→返回, 回包走事件驱动),
 //!   因此只需把"读 socket"与"等 reply"替换为 io_uring await.
 //!
-//! **当前范围 (Phase 1b)**: 先支持 SQL 门面 (握手 + COM_QUERY), 验证协程 worker
-//! 端到端 (含 shard 回包 + 多连接 reply 路由). 其他协议后续扩展 (架构相同).
+//! **范围 (Phase 1b/1c)**: 支持全部 5 种协议门面 (SQL/RESP/PG/HTTP/Binary).
+//! SQL 连接建立即发 HandshakeV10; RESP/PG 由客户端先发言; 回包按协议分发
+//! (SQL/PG/HTTP 走 handle_resp_shard_result 聚合, RESP 走 process_resp_input,
+//! Binary 直发 batch 结果).
 //!
 //! **可回退**: 与 `worker_main_epoll` 并存, 通过 server.rs 的 env 开关选择.
 
@@ -37,6 +39,8 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
     let reply_bus = cfg.reply_bus;
     let worker_id = cfg.worker_id;
     let db: std::sync::Arc<str> = std::sync::Arc::from(cfg.default_db.as_str());
+    let table: std::sync::Arc<str> = std::sync::Arc::from(cfg.default_table.as_str());
+    let limits = cfg.limits;
     let sql_cache: SharedSqlCache =
         std::rc::Rc::new(std::cell::RefCell::new(SqlWorkerCache::default()));
     let sql_shared = cfg.sql_shared;
@@ -116,6 +120,8 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
     let shard_inboxes2 = shard_inboxes.clone();
     let reply_bus2 = reply_bus.clone();
     let db2 = db.clone();
+    let table2 = table.clone();
+    let limits2 = limits;
     let sql_cache2 = sql_cache.clone();
     let sql_shared2 = sql_shared.clone();
     let db_view2 = db_view.clone();
@@ -194,6 +200,8 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 let shard_inboxes_c = shard_inboxes2.clone();
                 let db_view_c = db_view2.clone();
                 let db_c = db2.clone();
+                let table_c = table2.clone();
+                let limits_c = limits2;
                 let sql_password_c = auth_password.clone();
                 let tls_c = tls_config2.clone();
                 scheduler::spawn_on(&sched_conn, async move {
@@ -205,6 +213,8 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                         pcefd,
                         reg_c,
                         db_c,
+                        table_c,
+                        limits_c,
                         db_view_c,
                         sql_password_c,
                         shard_inboxes_c,
@@ -260,6 +270,8 @@ async fn conn_coro(
     reply_eventfd: std::os::unix::io::RawFd,
     registry: ConnRegistry,
     db: std::sync::Arc<str>,
+    table: std::sync::Arc<str>,
+    limits: KvLimits,
     db_view: std::sync::Arc<shard_manager::DbDirView>,
     sql_password: Option<String>,
     shard_inboxes: Vec<SharedTaskInbox>,
@@ -292,8 +304,62 @@ async fn conn_coro(
                             );
                             conn.resp_should_close()
                         }
-                        // ⭐ 协程 worker 当前先支持 SQL; 其他协议后续扩展 (架构相同).
-                        _ => conn.resp_should_close(),
+                        ProtocolKind::Pg => {
+                            process_pg_input(
+                                &mut conn,
+                                conn_id,
+                                worker_id,
+                                &sql_password,
+                                &db,
+                                &db_view,
+                                &shard_inboxes,
+                                num_shards,
+                                &tls_config,
+                            );
+                            conn.resp_should_close()
+                        }
+                        ProtocolKind::Resp => {
+                            process_resp_input(
+                                &mut conn,
+                                conn_id,
+                                worker_id,
+                                &db_view,
+                                &table,
+                                &limits,
+                                &sql_password,
+                                &shard_inboxes,
+                                num_shards,
+                            );
+                            conn.resp_should_close()
+                        }
+                        ProtocolKind::Http => {
+                            process_http_input(
+                                &mut conn,
+                                conn_id,
+                                worker_id,
+                                &sql_password,
+                                &db,
+                                &db_view,
+                                &limits,
+                                num_shards,
+                                &shard_inboxes,
+                                num_shards,
+                            );
+                            conn.resp_should_close()
+                        }
+                        ProtocolKind::Binary => {
+                            process_binary_input(
+                                &mut conn,
+                                conn_id,
+                                worker_id,
+                                &db,
+                                &table,
+                                &limits,
+                                &shard_inboxes,
+                                num_shards,
+                            );
+                            conn.resp_should_close()
+                        }
                     };
                     if should_close {
                         break;
@@ -315,18 +381,24 @@ async fn conn_coro(
                     reg.get_mut(&conn_id).and_then(|e| e.queue.pop_front())
                 };
                 let Some(r) = r else { break };
-                handle_resp_shard_result(
-                    &mut conn,
-                    conn_id,
-                    r.req_id,
-                    r.group,
-                    &r.result,
-                    worker_id,
-                    &db,
-                    &db_view,
-                    &shard_inboxes,
-                    num_shards,
-                );
+                if conn.proto == ProtocolKind::Binary {
+                    // Binary 门面: 直发 batch 结果 (不聚合, 每 op 一回包).
+                    let resp = batch_result_to_response(&r.result);
+                    conn.send_binary_response(r.req_id, &resp);
+                } else {
+                    handle_resp_shard_result(
+                        &mut conn,
+                        conn_id,
+                        r.req_id,
+                        r.group,
+                        &r.result,
+                        worker_id,
+                        &db,
+                        &db_view,
+                        &shard_inboxes,
+                        num_shards,
+                    );
+                }
                 close = close || conn.resp_should_close();
             }
             if close {
