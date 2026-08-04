@@ -148,6 +148,47 @@ fn io_uring_read_eventfd() {
     });
 }
 
+/// 场景 4: io_ops::poll 监听 socket 可读 (协程 worker 的事件等待原语).
+/// 验证 poll 在数据到达时正确唤醒, 替代 epoll 的等待.
+#[test]
+fn io_uring_poll_socket_readable() {
+    run_with_timeout(20000, || {
+        let sched = setup();
+        let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let fd_b = b.as_raw_fd();
+
+        let result: Arc<Mutex<Option<Result<u32, String>>>> = Arc::new(Mutex::new(None));
+        let result2 = result.clone();
+
+        // 协程: poll fd_b 可读 (POLLIN) → 返回触发 mask.
+        scheduler::spawn_on(&sched, async move {
+            let r = scheduler::io_ops::poll(fd_b, libc::POLLIN)
+                .await
+                .map_err(|e| e.to_string());
+            *result2.lock().unwrap() = Some(r);
+        });
+
+        // 先写数据到 a 使 b 可读, 再驱动.
+        std::io::Write::write_all(&mut a, b"x").unwrap();
+        let mut iters = 0;
+        while result.lock().unwrap().is_none() && iters < 200_000 {
+            drive_thread(sched.clone(), 4096);
+            iters += 1;
+        }
+        let got = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("poll never woke")
+            .expect("poll failed");
+        assert_ne!(got & libc::POLLIN as u32, 0, "should be readable (POLLIN)");
+        drop(a);
+        drop(b);
+    });
+}
+
 /// 场景 2: 多协程并发 socket 读写, 验证调度公平 + 数据不串.
 #[test]
 fn socket_concurrent_tasks() {

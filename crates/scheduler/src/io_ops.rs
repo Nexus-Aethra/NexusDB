@@ -328,6 +328,62 @@ impl Future for Close {
     }
 }
 
+// ---------- PollFd (协程 worker: 监听 socket / eventfd 可读) ----------
+
+struct PollFd {
+    fd: RawFd,
+    events: libc::c_short,
+    user_data: Cell<Option<u64>>,
+}
+
+/// 把 io_uring CQE result (mask) 转成 io::Result<u32>.
+fn map_result_poll(r: i32) -> io::Result<u32> {
+    if r < 0 {
+        Err(io::Error::from_raw_os_error(-r))
+    } else {
+        Ok(r as u32)
+    }
+}
+
+impl Future for PollFd {
+    type Output = io::Result<u32>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if let Some(ud) = this.user_data.get() {
+            if let Some(code) = poll_cqe!(ud, cx, map_result_poll) {
+                this.user_data.set(None);
+                return Poll::Ready(code);
+            }
+            return Poll::Pending;
+        }
+
+        let slot_id = with_current_slot(|id| id).unwrap_or(0);
+        // IORING_OP_POLL_ADD: 注册对 fd 的事件监听, 返回触发的事件 mask.
+        let entry = io_uring::opcode::PollAdd::new(
+            io_uring::types::Fd(this.fd),
+            this.events as u32,
+        )
+        .build();
+        let ud = submit_sqe!(entry, slot_id, cx);
+        this.user_data.set(Some(ud));
+        Poll::Pending
+    }
+}
+
+/// 公开 API: 等待 fd 上指定的 poll 事件 (如 libc::POLLIN).
+/// ⭐ 协程 worker 用: 监听 socket 可读 / reply eventfd 可读, 替代 epoll 的等待.
+/// 返回触发的事件 mask. 若 fd 已关闭则返回 error.
+pub async fn poll(fd: RawFd, events: libc::c_short) -> io::Result<u32> {
+    PollFd {
+        fd,
+        events,
+        user_data: Cell::new(None),
+    }
+    .await
+}
+
 // ---------- ReadFixed (T18a) ----------
 
 struct ReadFixed<'a> {

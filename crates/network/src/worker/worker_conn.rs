@@ -4,6 +4,7 @@
 //! PG 扩展协议 schema 恢复, 分表路由辅助.
 
 use super::*;
+use std::os::fd::AsRawFd;
 
 impl ConnState {
     pub(crate) fn new(
@@ -98,10 +99,11 @@ impl ConnState {
         }
     }
 
-    /// 从连接 recv 数据, 追加到 read_buf.
+    /// 从连接 recv 数据, 追加到 read_buf. (epoll worker 用, 同步)
     /// 返回 Ok(true) = 有数据, Ok(false) = 连接关闭, Err = 错误.
+    /// TLS 路径读密文喂 rustls → 冲刷握手 → 读明文入 read_buf; 明文路径直接读.
     pub(crate) fn recv(&mut self) -> std::io::Result<bool> {
-        // ⭐ F83: TLS 路径 — 读密文喂 rustls → 冲刷握手待写 → 读明文入 read_buf.
+        // ⭐ F83: TLS 路径
         if let Some(tls) = self.tls.as_mut() {
             let mut eof = false;
             loop {
@@ -120,7 +122,6 @@ impl ConnState {
                     Err(e) => return Err(e),
                 }
             }
-            // 冲刷握手/告警等待写字节 (spin, 同明文 send 语义)
             while tls.wants_write() {
                 match tls.write_tls(&mut self.stream) {
                     Ok(0) => break,
@@ -132,7 +133,6 @@ impl ConnState {
                     Err(_) => break,
                 }
             }
-            // 读明文
             let before = self.read_buf.len();
             let mut tmp = [0u8; 4096];
             loop {
@@ -144,9 +144,9 @@ impl ConnState {
                 }
             }
             let got_plain = self.read_buf.len() > before;
-            // EOF 且本轮无新明文 → 连接关闭
             return Ok(!(eof && !got_plain));
         }
+        // 明文路径
         let mut tmp = [0u8; 4096];
         loop {
             match self.stream.read(&mut tmp) {
@@ -162,6 +162,31 @@ impl ConnState {
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// 协程 worker 用: 从连接 recv 数据 (io_uring async), 追加到 read_buf.
+    /// 返回 Ok(true) = 有数据, Ok(false) = 连接关闭, Err = 错误.
+    /// ⭐ 协程化 (2026-08): 用 scheduler::io_ops::read 替代同步 read + WouldBlock 自旋.
+    /// 仅在协程上下文 (Scheduler 线程) 中调用. 暂只支持非 TLS 明文路径
+    /// (测试未启用 TLS, TLS 协程化独立后续).
+    pub(crate) async fn recv_async(&mut self) -> std::io::Result<bool> {
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = match scheduler::io_ops::read(self.stream.as_raw_fd(), &mut tmp, u64::MAX).await
+            {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if n == 0 {
+                return Ok(false); // EOF
+            }
+            self.read_buf.extend_from_slice(&tmp[..n]);
+            if n < tmp.len() {
+                return Ok(true); // 读完了本次可用数据
+            }
+            // 可能还有更多, 继续 read
         }
     }
 
