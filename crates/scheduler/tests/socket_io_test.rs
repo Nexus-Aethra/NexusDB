@@ -231,6 +231,37 @@ fn io_uring_select_read_two_fds() {
     });
 }
 
+/// 场景 6: 诊断 — scheduler drop (含 in-flight poll) 是否慢.
+/// 怀疑 worker 线程退出 13s 来自 scheduler drop 等待 in-flight io.
+#[test]
+fn scheduler_drop_with_inflight_poll() {
+    run_with_timeout(20000, || {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        b.set_nonblocking(true).unwrap();
+        let fd_b = b.as_raw_fd();
+        let (a2, b2) = std::os::unix::net::UnixStream::pair().unwrap();
+        b2.set_nonblocking(true).unwrap();
+        let fd_b2 = b2.as_raw_fd();
+
+        let sched = setup();
+        // spawn 两个 poll future (in-flight, 模拟 reply_dispatch + new_conn_loop).
+        scheduler::spawn_on(&sched, async move {
+            let _ = scheduler::io_ops::poll(fd_b2, libc::POLLIN).await;
+        });
+        scheduler::spawn_on(&sched, async move {
+            let _ = scheduler::io_ops::poll(fd_b, libc::POLLIN).await;
+        });
+
+        // drop scheduler (SchedHandle 最后一个 owner), 测耗时.
+        let t = Instant::now();
+        drop(sched);
+        let elapsed = t.elapsed();
+        eprintln!("[sched-drop] scheduler dropped in {:?}", elapsed);
+        assert!(elapsed < Duration::from_secs(5), "scheduler drop too slow: {elapsed:?}");
+        drop(a);
+    });
+}
+
 /// 场景 2: 多协程并发 socket 读写, 验证调度公平 + 数据不串.
 #[test]
 fn socket_concurrent_tasks() {

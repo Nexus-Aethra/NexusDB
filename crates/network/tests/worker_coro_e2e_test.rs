@@ -121,13 +121,11 @@ fn coro_worker_e2e_sql_query() {
     let (s, mgr) = start();
     let mut c = Conn::new(&s);
     c.login(&s);
-    // 简单查询 (SELECT 1 非法; 用 DESCRIBE 或实际表)
     let r = c.q("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)");
     assert_eq!(r[0], 0, "CREATE TABLE ok");
     let r = c.q("INSERT INTO users VALUES (1, 'alice')");
     assert_eq!(r[0], 0, "INSERT ok");
     let r = c.q("SELECT COUNT(*) FROM users");
-    // 结果集: 第一帧首字节 = lenenc 列数 (COUNT 1 列 → 0x01); 后续含列定义/行.
     assert_eq!(r[0], 1, "SELECT COUNT returns 1 column: {r:?}");
     drop(c);
     s.shutdown().unwrap();
