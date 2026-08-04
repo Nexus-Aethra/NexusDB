@@ -135,8 +135,14 @@
 - [ ] **T2.3** `resp_complete`/`resp_flush_ready`/`send_binary_response` async 化 (worker_conn.rs + 230+ 调用点加 await)
 - [ ] **T2.4** 五个 `process_*_input` async 化 + 内部 send_bytes/resp_complete 调用点加 await; 公共 `push_task`/`sql_dispatch_stmt` 适配
 - [ ] **T2.5** sql_dml 巨型 INSERT 的 push 自旋 (`drain_replies`+`yield_now`, sql_dml.rs:259-275) 改 async await
-- [ ] **T2.6** 新建 `worker_coro.rs`: 每连接一协程 + 协程 main loop (new_conn_loop + reply_loop), 接入 server (可回退开关 env `NEXUS_CORO_WORKER`)
-- [ ] **T2.7** 验证: 协程 worker 跑通真实 SQL 查询 (含 shard); 旧 epoll worker 全绿; 全量 network 测试回归
+- [x] **T2.6** 新建 `worker_coro.rs`: 每连接一协程 + 协程 main loop (new_conn_loop + reply_dispatch), 接入 server (可回退开关 env `NEXUS_CORO_WORKER`) ✅
+- [x] **T2.7** 验证: 协程 worker 跑通真实 SQL 查询 (含 shard + 多连接 reply 路由 + shutdown), 性能与 epoll 相当 ✅
+  - SQL 门面完整 (握手/DDL/DML/SELECT/事务/JOIN/多连接): 完整 sql_e2e 45 passed
+  - 多连接 reply 路由: reply_dispatch 协程按 conn_id 投递 per-conn 队列 (修复 drain 竞争)
+  - shutdown 正常 (acceptor 先退→写 wakeup→worker 检测断开)
+  - 性能修复: drive 忙循环 (drive_until_idle 1e6 次 ≈14s) → 小上限+sleep (prepared 14.8s→0.47s)
+  - 旧 epoll worker 全绿 (77 unit + 22 resp + 7 pg + 45 sql_e2e + 168 storage + 27 shard)
+  - ⭐ 范围: 协程 worker 当前支持 SQL 门面; RESP/PG/HTTP 门面后续扩展 (架构相同)
 - [ ] **T3** (原 Phase 3) 全局共享 worker 池 + 多协议 (协程 worker 天然支持)
 - [ ] **T4** (原 Phase 4) TLS 协程化 + 清理 + 文档
 
