@@ -31,6 +31,7 @@ pub mod chunk_lock;
 pub mod chunk_lru;
 pub mod chunk_writer;
 pub mod collections;
+pub mod collections_list;
 pub mod db_name_resolver;
 pub mod engine;
 pub mod engine_io;
