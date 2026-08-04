@@ -58,10 +58,13 @@ pub(crate) use resp_agg::{
 mod sql_state;
 /// ⭐ 解耦 2026-08: RESP 命令分发 + 跨 shard 回包处理.
 mod resp_dispatch;
-pub(crate) use resp_dispatch::{
-    dispatch_resp_command, handle_resp_shard_result, hash_route_key, push_task,
-    push_task_grouped,
-};
+pub(crate) use resp_dispatch::{getrange_slice, hash_route_key, push_task, push_task_grouped};
+/// ⭐ 解耦 2026-08: RESP 命令分发主函数 (拆自 resp_dispatch).
+mod resp_dispatch_cmd;
+pub(crate) use resp_dispatch_cmd::dispatch_resp_command;
+/// ⭐ 解耦 2026-08: shard 回包处理主函数 (拆自 resp_dispatch).
+mod resp_shard;
+pub(crate) use resp_shard::handle_resp_shard_result;
 /// ⭐ 解耦 2026-08: 协议 wire 入口 (HTTP 处理).
 mod protocol_io;
 pub(crate) use protocol_io::{
@@ -316,7 +319,7 @@ const JOIN_KEYSET_MAX: usize = 1024;
 // SQL 规划/执行状态结构体已拆至 sql_state.rs (解耦 2026-08), 见上方 re-export.
 
 /// 单个连接状态.
-struct ConnState {
+pub(crate) struct ConnState {
     pub(crate) fd: RawFd,
     pub(crate) stream: TcpStream,
     /// ⭐ F83: TLS 会话 (None = 明文; Some = 已 STARTTLS 升级, recv/send 走 rustls).
