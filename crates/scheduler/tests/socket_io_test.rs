@@ -189,6 +189,48 @@ fn io_uring_poll_socket_readable() {
     });
 }
 
+/// 场景 5: select_read 同时等待 socket 与 eventfd, 验证优先返回就绪者.
+#[test]
+fn io_uring_select_read_two_fds() {
+    run_with_timeout(20000, || {
+        let sched = setup();
+        // fd1 = socket pair 一端 (b), fd2 = eventfd (无通知).
+        let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let fd_sock = b.as_raw_fd();
+        let fd_efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+
+        let result: Arc<Mutex<Option<Result<u8, String>>>> = Arc::new(Mutex::new(None));
+        let result2 = result.clone();
+
+        scheduler::spawn_on(&sched, async move {
+            let r = scheduler::io_ops::select_read(fd_sock, fd_efd)
+                .await
+                .map_err(|e| e.to_string());
+            *result2.lock().unwrap() = Some(r);
+        });
+
+        // 写 socket 使 fd_sock 可读 (fd_efd 无通知), 应返回 1.
+        std::io::Write::write_all(&mut a, b"y").unwrap();
+        let mut iters = 0;
+        while result.lock().unwrap().is_none() && iters < 200_000 {
+            drive_thread(sched.clone(), 4096);
+            iters += 1;
+        }
+        let got = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("select never woke")
+            .expect("select failed");
+        assert_eq!(got, 1, "socket readable should win (fd1)");
+        drop(a);
+        drop(b);
+        unsafe { libc::close(fd_efd) };
+    });
+}
+
 /// 场景 2: 多协程并发 socket 读写, 验证调度公平 + 数据不串.
 #[test]
 fn socket_concurrent_tasks() {

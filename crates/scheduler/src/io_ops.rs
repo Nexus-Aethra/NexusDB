@@ -384,6 +384,71 @@ pub async fn poll(fd: RawFd, events: libc::c_short) -> io::Result<u32> {
     .await
 }
 
+// ---------- SelectRead (协程 worker: 同时等待两个 fd 可读) ----------
+
+/// 组合 future: 同时监听 fd1 / fd2 的可读 (POLLIN), 返回哪个先就绪 (1 or 2).
+///
+/// 内部常驻两个 PollFd (不重建): 每次 poll 重新驱动两者 — 已完成的自动重新 submit,
+/// pending 的保持注册. 任一触发时, 其余 PollFd 的残留 CQE 会被 registry 忽略
+/// (cancel_slot), 下次 select 重新注册, 无 SQE 累积.
+pub struct SelectRead {
+    f1: Pin<Box<PollFd>>,
+    f2: Pin<Box<PollFd>>,
+    done1: bool,
+    done2: bool,
+}
+
+impl SelectRead {
+    pub(crate) fn new(fd1: RawFd, fd2: RawFd) -> Self {
+        Self {
+            f1: Box::pin(PollFd { fd: fd1, events: libc::POLLIN, user_data: Cell::new(None) }),
+            f2: Box::pin(PollFd { fd: fd2, events: libc::POLLIN, user_data: Cell::new(None) }),
+            done1: false,
+            done2: false,
+        }
+    }
+}
+
+impl Future for SelectRead {
+    type Output = io::Result<u8>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        // 驱动 fd1
+        if !this.done1 {
+            match this.f1.as_mut().poll(cx) {
+                Poll::Ready(Ok(mask)) if mask & libc::POLLIN as u32 != 0 => {
+                    this.done1 = true;
+                    return Poll::Ready(Ok(1));
+                }
+                Poll::Ready(Ok(_)) => {} // POLLIN 未置位 (如 HUP), 继续等
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+        }
+        // 驱动 fd2
+        if !this.done2 {
+            match this.f2.as_mut().poll(cx) {
+                Poll::Ready(Ok(mask)) if mask & libc::POLLIN as u32 != 0 => {
+                    this.done2 = true;
+                    return Poll::Ready(Ok(2));
+                }
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+        }
+        Poll::Pending
+    }
+}
+
+/// 公开 API: 同时等待 fd1 / fd2 可读, 返回哪个先就绪 (1 or 2).
+/// ⭐ 协程 worker 用: 连接协程同时监听 socket (fd1) 与 reply eventfd (fd2).
+pub async fn select_read(fd1: RawFd, fd2: RawFd) -> io::Result<u8> {
+    SelectRead::new(fd1, fd2).await
+}
+
 // ---------- ReadFixed (T18a) ----------
 
 struct ReadFixed<'a> {
