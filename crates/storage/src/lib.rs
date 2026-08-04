@@ -45,6 +45,7 @@ pub mod page_pool;
 pub mod pager;
 pub mod pager_backend;
 pub mod pager_io;
+pub mod pager_write;
 pub mod recover;
 pub mod registry;
 pub mod row;
