@@ -30,14 +30,10 @@ use scheduler::io_ops as sio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// 每连接的 reply 队列 + 精确唤醒 (slot_id: 连接协程的 scheduler task id, 供 unpark).
-///
-/// ⭐ 优化 (2026-08): 去掉 per-conn eventfd — reply_dispatch 与连接协程在同一
-/// scheduler 线程, push 队列后直接 `unpark(slot_id)` 唤醒连接协程 (park 机制),
-/// 免去 eventfd 的 poll/read/write syscall (多连接场景瓶颈).
+/// 每连接的 reply 队列 + 精确唤醒 eventfd.
 struct ConnReply {
     queue: VecDeque<shard_manager::TaskResult>,
-    slot_id: usize,
+    eventfd: std::os::unix::io::RawFd,
 }
 
 type ConnRegistry = Arc<Mutex<HashMap<u64, ConnReply>>>;
@@ -105,8 +101,15 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 for r in results {
                     if let Some(entry) = reg.get_mut(&r.conn_id) {
                         entry.queue.push_back(r);
-                        // ⭐ 优化: 直接 unpark 连接协程 (同一 scheduler 线程), 免 per-conn eventfd.
-                        scheduler::unpark(entry.slot_id);
+                        // 精确唤醒该连接协程 (level-triggered eventfd)
+                        let val: u64 = 1;
+                        unsafe {
+                            libc::write(
+                                entry.eventfd,
+                                &val as *const u64 as *const libc::c_void,
+                                8,
+                            );
+                        }
                     }
                     // conn 已移除 (已关闭) → 回包丢弃 (client 已断开)
                 }
@@ -187,12 +190,15 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                     let greeting = my::build_handshake_v10_caps(&salt, 1, false);
                     state.send_bytes(&greeting);
                 }
-                // 建 per-conn reply 队列 (slot_id 由连接协程首次 poll 时写入)
+                // 建 per-conn reply 队列 + eventfd
+                let pcefd =
+                    unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                assert!(pcefd >= 0, "per-conn eventfd failed");
                 registry2.lock().unwrap().insert(
                     id,
                     ConnReply {
                         queue: VecDeque::new(),
-                        slot_id: 0,
+                        eventfd: pcefd,
                     },
                 );
                 // spawn 连接协程
@@ -214,6 +220,7 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                         id,
                         worker_id2,
                         nc.fd,
+                        pcefd,
                         reg_c,
                         db_c,
                         table_c,
@@ -248,7 +255,12 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
 
     // ---- 收尾 ----
     // 不在此 drive (worker 已停止调度). reply_dispatch 的 stop_efd 通知仅用于让其在
-    // scheduler drop 前自然退出. registry (含连接队列) 随 drop 清理.
+    // scheduler drop 前自然退出. 关闭 per-conn eventfd (残留).
+    for (_, entry) in registry.lock().unwrap().drain() {
+        unsafe {
+            libc::close(entry.eventfd);
+        }
+    }
     // 关闭 stop_efd (reply_dispatch 协程结束时也会 close, 但 worker 也 move 了一份用于写).
     unsafe {
         libc::close(stop_efd);
@@ -265,6 +277,7 @@ async fn conn_coro(
     conn_id: u64,
     worker_id: u32,
     fd: std::os::unix::io::RawFd,
+    reply_eventfd: std::os::unix::io::RawFd,
     registry: ConnRegistry,
     db: std::sync::Arc<str>,
     table: std::sync::Arc<str>,
@@ -275,51 +288,16 @@ async fn conn_coro(
     num_shards: usize,
     tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
 ) {
-    // ⭐ 优化: 注册本协程 slot_id (reply_dispatch 用 unpark 唤醒本协程).
-    registry.lock().unwrap().get_mut(&conn_id).unwrap().slot_id = scheduler::current_task_id();
     loop {
-        // 先处理已有 reply (可能被 unpark 唤醒, 队列有回包)
-        let mut close = false;
-        loop {
-            let r = {
-                let mut reg = registry.lock().unwrap();
-                reg.get_mut(&conn_id).and_then(|e| e.queue.pop_front())
-            };
-            let Some(r) = r else { break };
-            if conn.proto == ProtocolKind::Binary {
-                let resp = batch_result_to_response(&r.result);
-                conn.send_binary_response(r.req_id, &resp);
-            } else {
-                handle_resp_shard_result(
-                    &mut conn,
-                    conn_id,
-                    r.req_id,
-                    r.group,
-                    &r.result,
-                    worker_id,
-                    &db,
-                    &db_view,
-                    &shard_inboxes,
-                    num_shards,
-                );
-            }
-            close = close || conn.resp_should_close();
-        }
-        if close {
-            break;
-        }
+        // 同时等 socket 可读 (1) 或 本连接 reply 到达 (2)
+        let which = match sio::select_read(fd, reply_eventfd).await {
+            Ok(w) => w,
+            Err(_) => break, // fd 关闭/错误 → 结束
+        };
 
-        // 等 socket 可读 (1) 或 被 unpark 唤醒 (2, reply 队列有新数据)
-        // ⭐ 优化: select_fd_or_unpark 组合 io_uring poll + park, 免 per-conn eventfd.
-        match sio::select_fd_or_unpark(fd).await {
-            Ok(1) => {}                    // socket 可读
-            Ok(2) => continue,             // 被 unpark → 回循环顶部 drain 队列
-            Ok(_) => continue,
-            Err(_) => break,               // fd 关闭/错误 → 结束
-        }
-
-        // socket 可读: 读数据 → 协议处理
-        match conn.recv_async().await {
+        if which == 1 {
+            // socket 可读: 读数据 → 协议处理
+            match conn.recv_async().await {
                 Ok(true) => {
                     let should_close = match conn.proto {
                         ProtocolKind::Sql => {
@@ -400,9 +378,50 @@ async fn conn_coro(
                 Ok(false) => break, // EOF
                 Err(_) => break,
             }
+        } else {
+            // 本连接 reply 到达: 消耗 eventfd + drain 自己队列处理
+            let mut v: u64 = 0;
+            unsafe {
+                libc::read(reply_eventfd, &mut v as *mut u64 as *mut libc::c_void, 8);
+            }
+            let mut close = false;
+            loop {
+                let r = {
+                    let mut reg = registry.lock().unwrap();
+                    reg.get_mut(&conn_id).and_then(|e| e.queue.pop_front())
+                };
+                let Some(r) = r else { break };
+                if conn.proto == ProtocolKind::Binary {
+                    // Binary 门面: 直发 batch 结果 (不聚合, 每 op 一回包).
+                    let resp = batch_result_to_response(&r.result);
+                    conn.send_binary_response(r.req_id, &resp);
+                } else {
+                    handle_resp_shard_result(
+                        &mut conn,
+                        conn_id,
+                        r.req_id,
+                        r.group,
+                        &r.result,
+                        worker_id,
+                        &db,
+                        &db_view,
+                        &shard_inboxes,
+                        num_shards,
+                    );
+                }
+                close = close || conn.resp_should_close();
+            }
+            if close {
+                break;
+            }
+        }
     }
 
-    // 连接协程结束: 移除 registry 条目.
-    registry.lock().unwrap().remove(&conn_id);
+    // 连接协程结束: 移除 registry 条目 + 关闭 per-conn eventfd.
+    if let Some(entry) = registry.lock().unwrap().remove(&conn_id) {
+        unsafe {
+            libc::close(entry.eventfd);
+        }
+    }
     // ConnState drop 会关闭其持有的 TcpStream (fd 所有权已转给 ConnState), 不在此手动 close.
 }
