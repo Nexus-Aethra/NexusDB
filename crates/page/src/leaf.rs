@@ -659,11 +659,11 @@ pub fn leaf_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
             idx.segments[effective_seg_idx].item_count
         );
         let merged =
-            crate::index::apply_pre_merge(page, &mut idx, effective_seg_idx, ItemKind::Leaf)?;
+            crate::index_merge::apply_pre_merge(page, &mut idx, effective_seg_idx, ItemKind::Leaf)?;
         dprintln!(leaf, "[LEAF_DELETE] pre_merge result: {}", merged);
         if !merged {
             // total > MAX: 尝试 steal/borrow. 借调后 left 达到 MIN, right 仍 > 0.
-            let stolen = crate::index::apply_pre_merge_steal(
+            let stolen = crate::index_merge::apply_pre_merge_steal(
                 page,
                 &mut idx,
                 effective_seg_idx,

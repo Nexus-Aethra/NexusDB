@@ -433,11 +433,11 @@ pub fn internal_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
             idx.segments[effective_seg_idx].item_count
         );
         let merged =
-            crate::index::apply_pre_merge(page, &mut idx, effective_seg_idx, ItemKind::Internal)?;
+            crate::index_merge::apply_pre_merge(page, &mut idx, effective_seg_idx, ItemKind::Internal)?;
         dprintln!(internal, "[INTERNAL_DELETE] pre_merge result: {}", merged);
         if !merged {
             // total > MAX: 尝试 steal/borrow
-            let stolen = crate::index::apply_pre_merge_steal(
+            let stolen = crate::index_merge::apply_pre_merge_steal(
                 page,
                 &mut idx,
                 effective_seg_idx,
