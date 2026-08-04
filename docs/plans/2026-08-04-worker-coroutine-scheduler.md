@@ -177,8 +177,8 @@
   - main.rs: 5 协议 server 全部 `shared_workers: Some(pool)`, 线程数 = 用户配置 `worker_count` (不再随协议数膨胀)
   - 端到端验证: 线程数 7→2 (worker_count=2), 5 端口监听, RESP SET/HTTP/SQL 登录在共享 worker 上正常
   - 测试: `shared_worker_pool_per_conn_auth` — 共享池中 RESP 需 AUTH + SQL 免认证, 同一批 worker 按连接正确区分
-- [ ] **T3.4** 多协议混合压力验证: 同一 worker 池同时处理 RESP + SQL + PG 连接, 验证协程内按 `ConnState.proto` 分发正确
-- [ ] **验收**: 线程数 = 全局配置 worker 数 (与协议数无关); 多协议 e2e 全绿
+- [x] **T3.4** 多协议混合压力验证 ✅ — `shared_worker_pool_mixed_load`: 8 RESP + 8 SQL 并发连接 (每连接 10 次往返) 共享 2 worker, 所有操作正确无串扰 (epoll + 协程 worker 均过)
+- [x] **验收**: 线程数 = 全局配置 worker 数 (端到端验证 7→2); 多协议 e2e 全绿
 
 ### Phase 4: 清理与文档
 

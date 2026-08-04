@@ -232,3 +232,57 @@ fn shared_worker_pool_per_conn_auth() {
     drop(mgr);
     std::thread::sleep(Duration::from_millis(50));
 }
+
+/// T3.4: 多协议混合压力 — 同一共享池同时处理 RESP + SQL 多连接并发, 无串扰.
+#[test]
+fn shared_worker_pool_mixed_load() {
+    let mgr = open_mgr();
+    let base = base_cfg(&mgr, ProtocolKind::Resp);
+    let shared = SharedWorkerPool::new(&base, 0).expect("shared pool");
+
+    let mut cfg_a = base_cfg(&mgr, ProtocolKind::Resp);
+    cfg_a.shared_workers = Some(shared.clone());
+    let mut cfg_b = base_cfg(&mgr, ProtocolKind::Sql);
+    cfg_b.shared_workers = Some(shared.clone());
+    let server_a = NetworkServer::start(cfg_a).expect("start RESP");
+    let server_b = NetworkServer::start(cfg_b).expect("start SQL");
+
+    // 并发: 8 RESP 连接 + 8 SQL 连接, 每连接多次往返.
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let addr_a = server_a.local_addr();
+        let addr_b = server_b.local_addr();
+        handles.push(std::thread::spawn(move || {
+            // RESP: 每连接独立 key, SET+GET 往返多次
+            for j in 0..10 {
+                let mut s = TcpStream::connect(addr_a).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let key = format!("k{i}_{j}");
+                let val = format!("v{i}_{j}");
+                s.write_all(&resp_cmd(&[b"SET", key.as_bytes(), val.as_bytes()]))
+                    .unwrap();
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).unwrap();
+                assert_eq!(&buf[..n], b"+OK\r\n");
+                s.write_all(&resp_cmd(&[b"GET", key.as_bytes()])).unwrap();
+                let n = s.read(&mut buf).unwrap();
+                assert_eq!(&buf[..n], format!("${}\r\n{}\r\n", val.len(), val).as_bytes());
+            }
+        }));
+        handles.push(std::thread::spawn(move || {
+            // SQL: 多次握手 (每次新连接)
+            for _ in 0..10 {
+                sql_ping(addr_b);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("load thread panicked");
+    }
+
+    server_a.shutdown().unwrap();
+    server_b.shutdown().unwrap();
+    drop(shared);
+    drop(mgr);
+    std::thread::sleep(Duration::from_millis(50));
+}
