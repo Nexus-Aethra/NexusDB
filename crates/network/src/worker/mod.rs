@@ -75,6 +75,8 @@ pub(crate) use sql_state::{
 };
 /// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
 mod sql_dispatch;
+/// ⭐ 解耦 2026-08: DML 执行 (从 sql_dispatch 拆出).
+mod sql_dml;
 /// ⭐ 解耦 2026-08: JOIN 编排 (从 sql_dispatch 拆出).
 mod sql_join;
 /// ⭐ 解耦 2026-08: 全局 UNIQUE 约束 INSERT 编排 (从 sql_dispatch 拆出).
@@ -87,7 +89,8 @@ pub(crate) use sql_agg::{
     bind_scalar_expr, cmp_colvalue, eval_bound_expr, eval_json_exists, materialize_select_agg,
     render_select_agg, sql_run_agg_select, AggSpec, BoundExpr,
 };
-pub(crate) use sql_dispatch::{sql_dispatch_stmt, sql_plan_select, sql_run_dml};
+pub(crate) use sql_dispatch::{sql_dispatch_stmt, sql_plan_select};
+pub(crate) use sql_dml::sql_run_dml;
 pub(crate) use sql_join::{sql_join_drive, sql_join_kickoff};
 pub(crate) use sql_sysquery::{
     coltype_sql_name, sbytes, sysq_exists, sysq_finish, sysq_render_catalog, sysq_render_dblist,
