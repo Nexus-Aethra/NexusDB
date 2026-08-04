@@ -38,6 +38,14 @@ fn open_mgr() -> Arc<ShardManager> {
 }
 
 fn base_cfg(mgr: &Arc<ShardManager>, protocol: ProtocolKind) -> NetworkServerConfig {
+    base_cfg_auth(mgr, protocol, None)
+}
+
+fn base_cfg_auth(
+    mgr: &Arc<ShardManager>,
+    protocol: ProtocolKind,
+    auth_password: Option<String>,
+) -> NetworkServerConfig {
     NetworkServerConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         shard_manager: mgr.clone(),
@@ -47,7 +55,7 @@ fn base_cfg(mgr: &Arc<ShardManager>, protocol: ProtocolKind) -> NetworkServerCon
         inbox_capacity: 64,
         protocol,
         limits: KvLimits::default(),
-        auth_password: None,
+        auth_password,
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
@@ -66,11 +74,22 @@ fn resp_cmd(args: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-fn resp_set_get(addr: SocketAddr) {
+/// auth: None = 免认证; Some(pw) = 先 AUTH 再操作.
+fn resp_set_get(addr: SocketAddr, auth: Option<&str>) {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    s.write_all(&resp_cmd(&[b"SET", b"k1", b"v1"])).unwrap();
     let mut buf = [0u8; 64];
+    if let Some(pw) = auth {
+        // 无 AUTH 先操作应被拒
+        s.write_all(&resp_cmd(&[b"SET", b"k0", b"x"])).unwrap();
+        let n = s.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"-NOAUTH Authentication required.\r\n", "未认证应拒");
+        // AUTH
+        s.write_all(&resp_cmd(&[b"AUTH", pw.as_bytes()])).unwrap();
+        let n = s.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"+OK\r\n", "AUTH should OK");
+    }
+    s.write_all(&resp_cmd(&[b"SET", b"k1", b"v1"])).unwrap();
     let n = s.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"+OK\r\n", "SET should OK");
     s.write_all(&resp_cmd(&[b"GET", b"k1"])).unwrap();
@@ -174,7 +193,7 @@ fn shared_worker_pool_resp_and_sql() {
     assert_eq!(workers, 2, "共享池应只有 2 个 worker 线程, 实际 {workers}");
 
     // 功能: RESP + SQL 在同一批 worker 上正常
-    resp_set_get(server_a.local_addr());
+    resp_set_get(server_a.local_addr(), None);
     sql_ping(server_b.local_addr());
 
     // 关闭: 两个 server 先停 (各停 acceptor), 池最后 drop (join workers)
@@ -183,5 +202,33 @@ fn shared_worker_pool_resp_and_sql() {
     drop(shared);
     drop(mgr);
     // 等 worker 线程退出 (join 已由 SharedWorkerPool drop 完成)
+    std::thread::sleep(Duration::from_millis(50));
+}
+
+/// T3.3: 共享池中不同 server 用不同 auth_password — worker 按连接取 per-conn 配置.
+/// RESP server 需 AUTH (secret), SQL server 免认证. 同一批 worker 正确区分.
+#[test]
+fn shared_worker_pool_per_conn_auth() {
+    let mgr = open_mgr();
+    let base = base_cfg(&mgr, ProtocolKind::Resp);
+    let shared = SharedWorkerPool::new(&base, 0).expect("shared pool");
+
+    let mut cfg_a = base_cfg_auth(&mgr, ProtocolKind::Resp, Some("secret".to_string()));
+    cfg_a.shared_workers = Some(shared.clone());
+    let mut cfg_b = base_cfg(&mgr, ProtocolKind::Sql);
+    cfg_b.shared_workers = Some(shared.clone());
+    let server_a = NetworkServer::start(cfg_a).expect("start RESP (auth)");
+    let server_b = NetworkServer::start(cfg_b).expect("start SQL (no auth)");
+
+    // 同一批 worker (2 个) 处理两个协议, 且 RESP 需 AUTH
+    let workers = worker_thread_count();
+    assert_eq!(workers, 2, "共享池应只有 2 个 worker, 实际 {workers}");
+    resp_set_get(server_a.local_addr(), Some("secret"));
+    sql_ping(server_b.local_addr());
+
+    server_a.shutdown().unwrap();
+    server_b.shutdown().unwrap();
+    drop(shared);
+    drop(mgr);
     std::thread::sleep(Duration::from_millis(50));
 }

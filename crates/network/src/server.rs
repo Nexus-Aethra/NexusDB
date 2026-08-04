@@ -234,6 +234,11 @@ impl NetworkServer {
             worker_wakeups,
             lb_strategy: crate::acceptor::LbStrategy::RoundRobin,
             protocol: config.protocol,
+            default_db: std::sync::Arc::from(config.default_db.as_str()),
+            default_table: std::sync::Arc::from(config.default_table.as_str()),
+            limits: config.limits,
+            auth_password: config.auth_password.clone(),
+            tls_config: config.tls_config.clone(),
         };
         let acceptor_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let acceptor_stop_clone = acceptor_stop.clone();
@@ -360,7 +365,16 @@ fn acceptor_run_with_listener(
             }
         };
 
-        let new_conn = NewConn { fd, peer, protocol: config.protocol };
+        let new_conn = NewConn {
+            fd,
+            peer,
+            protocol: config.protocol,
+            default_db: config.default_db.clone(),
+            default_table: config.default_table.clone(),
+            limits: config.limits,
+            auth_password: config.auth_password.clone(),
+            tls_config: config.tls_config.clone(),
+        };
         if config.worker_queues[idx].send(new_conn).is_err() {
             let _ = unsafe { std::net::TcpStream::from_raw_fd(fd) };
             nlog::warn!("acceptor", "worker {idx} inbox closed; shutdown");

@@ -362,6 +362,14 @@ pub(crate) struct ConnState {
     pub(crate) tls: Option<Box<rustls::ServerConnection>>,
     pub(crate) read_buf: Vec<u8>,
     pub(crate) proto: ProtocolKind,
+    /// ⭐ 解耦 (Phase 3/T3.3): per-conn 默认表 (共享 worker 池按连接取).
+    pub(crate) default_table: std::sync::Arc<str>,
+    /// ⭐ 解耦 (Phase 3/T3.3): per-conn 协议长度限制 (共享 worker 池按连接取).
+    pub(crate) limits: crate::protocol::KvLimits,
+    /// ⭐ 解耦 (Phase 3/T3.3): per-conn 认证密码 (共享 worker 池按连接取).
+    pub(crate) auth_password: Option<String>,
+    /// ⭐ 解耦 (Phase 3/T3.3): per-conn TLS 配置 (共享 worker 池按连接取).
+    pub(crate) tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// RESP: 是否已通过 AUTH (无密码配置时恒 true).
     pub(crate) authenticated: bool,
     /// RESP: 下一条命令分配的 seq (作为 ShardTask.req_id).

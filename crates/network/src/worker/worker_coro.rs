@@ -159,13 +159,14 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
             for nc in new_conns {
                 let id = next_conn_id;
                 next_conn_id += 1;
-                // ⭐ 解耦 (Phase 3): 协议随连接传递 (acceptor 按端口打标), worker 不再用固定 proto2.
+                // ⭐ 解耦 (Phase 3): 协议与 per-conn 配置随连接传递 (acceptor 按端口打标).
                 let proto = nc.protocol;
                 let mut state = ConnState::new(
                     nc.fd,
                     proto,
-                    auth_required2,
-                    db2.clone(),
+                    nc.auth_password.is_some(),
+                    nc.default_db.clone(),
+                    nc.default_table.clone(),
                     sql_cache2.clone(),
                     sql_shared2.clone(),
                     reply_bus2.clone(),
@@ -173,6 +174,9 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                     worker_id2,
                     num_shards,
                     shard_inboxes2.clone(),
+                    nc.limits,
+                    nc.auth_password.clone(),
+                    nc.tls_config.clone(),
                 );
                 // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
                 if proto == ProtocolKind::Sql {
@@ -199,11 +203,12 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 let sched_conn = sched3.clone();
                 let shard_inboxes_c = shard_inboxes2.clone();
                 let db_view_c = db_view2.clone();
-                let db_c = db2.clone();
-                let table_c = table2.clone();
-                let limits_c = limits2;
-                let sql_password_c = auth_password.clone();
-                let tls_c = tls_config2.clone();
+                // ⭐ 解耦 (T3.3): per-conn 配置从 NewConn 取 (共享 worker 池).
+                let db_c = nc.default_db.clone();
+                let table_c = nc.default_table.clone();
+                let limits_c = nc.limits;
+                let sql_password_c = nc.auth_password.clone();
+                let tls_c = nc.tls_config.clone();
                 scheduler::spawn_on(&sched_conn, async move {
                     conn_coro(
                         state,

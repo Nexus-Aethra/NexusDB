@@ -12,6 +12,7 @@ impl ConnState {
         proto: ProtocolKind,
         auth_required: bool,
         default_db: std::sync::Arc<str>,
+        default_table: std::sync::Arc<str>,
         sql_cache: SharedSqlCache,
         sql_shared: std::sync::Arc<SqlSharedRoutes>,
         reply_bus: SharedTaskReplyBus,
@@ -19,6 +20,9 @@ impl ConnState {
         worker_id: u32,
         num_shards: usize,
         shard_inboxes: Vec<SharedTaskInbox>,
+        limits: crate::protocol::KvLimits,
+        auth_password: Option<String>,
+        tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     ) -> Self {
         let stream = unsafe { TcpStream::from_raw_fd(fd) };
         stream.set_nonblocking(true).ok();
@@ -28,6 +32,10 @@ impl ConnState {
             fd,
             stream,
             tls: None,
+            default_table,
+            limits,
+            auth_password,
+            tls_config,
             read_buf: Vec::with_capacity(4096),
             proto,
             authenticated: !auth_required,

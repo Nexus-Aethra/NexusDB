@@ -87,16 +87,11 @@ fn main() {
 
     // 4. 启动 ShardManager
     let io_backend = cfg.storage.io_backend().expect("validated backend");
-    // 三协议 server 并存时 worker_id 空间不重叠, reply_bus 总数 = 三者 worker 之和
+    // ⭐ 解耦 (Phase 3/T3): 全局共享 worker 池 — 多协议 server 共享同一批 worker,
+    // 线程数 = 用户配置的 worker_count (不再随协议数/各协议独立 worker 数膨胀).
+    // sql_worker_count 在共享池下仅作参考, 实际取 worker_count.
     let resp_enabled = !cfg.server.redis_addr.is_empty();
-    let binary_workers = cfg.server.worker_count;
-    let resp_workers = if resp_enabled { cfg.server.worker_count } else { 0 };
-    // ⭐ ORM-B3: SQL/PG 门面 worker 数可配 (路由缓存进程级共享后正确性成立)
-    let sqlwc = cfg.server.sql_worker_count.max(1);
-    let sql_workers = if cfg.server.sql_addr.is_empty() { 0 } else { sqlwc };
-    let pg_workers = if cfg.server.pg_addr.is_empty() { 0 } else { sqlwc };
-    // ⭐ H1: HTTP REST 门面 1 worker
-    let http_workers = if cfg.server.http_addr.is_empty() { 0 } else { 1 };
+    let total_workers = cfg.server.worker_count.max(1);
     let opts = ShardManagerOptions {
         num_shards: cfg.storage.num_shards,
         block_root: cfg.storage.block_root.clone(),
@@ -107,10 +102,8 @@ fn main() {
             ..Default::default()
         },
         chunk_cache_size: cfg.storage.chunk_cache_size,
-        reply_bus_count: Some(
-            (binary_workers + resp_workers + sql_workers + pg_workers + http_workers)
-                .max(cfg.storage.num_shards),
-        ),
+        // reply_bus 数 = 共享池 worker 数 (worker_id 0..total_workers-1).
+        reply_bus_count: Some(total_workers.max(cfg.storage.num_shards)),
         // ⭐ WAL (F60): off | periodic (默认) | strict (validate 已挡非法值)
         wal_mode: storage::wal::WalMode::parse(&cfg.storage.wal_mode)
             .unwrap_or_default(),
@@ -158,10 +151,40 @@ fn main() {
         None
     };
     let listen_addr = cfg.server.listen_addr.parse().expect("validated addr");
+    // ⭐ 解耦 (Phase 3/T3): 全局共享 worker 池 — 多协议 server 共享同一批 worker,
+    // 线程数 = 用户配置的 worker_count (不再随协议数/各协议独立 worker 数膨胀).
+    // ⭐ 注意: sql_worker_count 在共享池下仅作为"至少 worker 数"参考, 实际取 worker_count.
+    let total_workers = cfg.server.worker_count.max(1);
+    let shared_pool = network::SharedWorkerPool::new(
+        &NetworkServerConfig {
+            listen_addr,
+            shard_manager: mgr.clone(),
+            worker_count: total_workers,
+            default_db: cfg.storage.default_db.clone(),
+            default_table: cfg.storage.default_table.clone(),
+            inbox_capacity: 1024,
+            protocol: ProtocolKind::Binary,
+            limits,
+            auth_password: None,
+            worker_id_base: 0,
+            sql_shared: sql_shared.clone(),
+            tls_config: tls_config.clone(),
+            shared_workers: None,
+        },
+        0,
+    );
+    let shared_pool = match shared_pool {
+        Ok(p) => p,
+        Err(e) => {
+            nlog::error!("main", "shared worker pool create failed: {e}");
+            nlog::shutdown();
+            std::process::exit(1);
+        }
+    };
     let server = match NetworkServer::start(NetworkServerConfig {
         listen_addr,
         shard_manager: mgr.clone(),
-        worker_count: binary_workers,
+        worker_count: total_workers,
         default_db: cfg.storage.default_db.clone(),
         default_table: cfg.storage.default_table.clone(),
         inbox_capacity: 1024,
@@ -171,7 +194,7 @@ fn main() {
         worker_id_base: 0,
             sql_shared: sql_shared.clone(),
             tls_config: None,
-        shared_workers: None,
+        shared_workers: Some(shared_pool.clone()),
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -192,17 +215,17 @@ fn main() {
         match NetworkServer::start(NetworkServerConfig {
             listen_addr: redis_addr,
             shard_manager: mgr.clone(),
-            worker_count: resp_workers,
+            worker_count: total_workers,
             default_db: cfg.storage.default_db.clone(),
             default_table: cfg.storage.default_table.clone(),
             inbox_capacity: 1024,
             protocol: ProtocolKind::Resp,
             limits,
             auth_password,
-            worker_id_base: binary_workers as u32,
+            worker_id_base: 0,
             sql_shared: sql_shared.clone(),
             tls_config: None,
-            shared_workers: None,
+            shared_workers: Some(shared_pool.clone()),
         }) {
             Ok(s) => {
                 nlog::info!("main", "RESP (Redis) listening on {}", s.local_addr());
@@ -231,17 +254,17 @@ fn main() {
         match NetworkServer::start(NetworkServerConfig {
             listen_addr: sql_addr,
             shard_manager: mgr.clone(),
-            worker_count: sqlwc,
+            worker_count: total_workers,
             default_db: cfg.storage.default_db.clone(),
             default_table: cfg.storage.default_table.clone(),
             inbox_capacity: 1024,
             protocol: ProtocolKind::Sql,
             limits,
             auth_password: sql_password,
-            worker_id_base: (binary_workers + resp_workers) as u32,
+            worker_id_base: 0,
             sql_shared: sql_shared.clone(),
             tls_config: tls_config.clone(),
-            shared_workers: None,
+            shared_workers: Some(shared_pool.clone()),
         }) {
             Ok(s) => {
                 nlog::info!("main", "SQL (MySQL wire) listening on {}", s.local_addr());
@@ -269,17 +292,17 @@ fn main() {
         match NetworkServer::start(NetworkServerConfig {
             listen_addr: pg_addr,
             shard_manager: mgr.clone(),
-            worker_count: sqlwc,
+            worker_count: total_workers,
             default_db: cfg.storage.default_db.clone(),
             default_table: cfg.storage.default_table.clone(),
             inbox_capacity: 1024,
             protocol: ProtocolKind::Pg,
             limits,
             auth_password: pg_password,
-            worker_id_base: (binary_workers + resp_workers + sql_workers) as u32,
+            worker_id_base: 0,
             sql_shared: sql_shared.clone(),
             tls_config: tls_config.clone(),
-            shared_workers: None,
+            shared_workers: Some(shared_pool.clone()),
         }) {
             Ok(s) => {
                 nlog::info!("main", "SQL (PostgreSQL wire) listening on {}", s.local_addr());
@@ -309,17 +332,17 @@ fn main() {
         match NetworkServer::start(NetworkServerConfig {
             listen_addr: http_addr,
             shard_manager: mgr.clone(),
-            worker_count: 1,
+            worker_count: total_workers,
             default_db: cfg.storage.default_db.clone(),
             default_table: cfg.storage.default_table.clone(),
             inbox_capacity: 1024,
             protocol: ProtocolKind::Http,
             limits,
             auth_password: http_token, // = Bearer token
-            worker_id_base: (binary_workers + resp_workers + sql_workers + pg_workers) as u32,
+            worker_id_base: 0,
             sql_shared: sql_shared.clone(),
             tls_config: None,
-            shared_workers: None,
+            shared_workers: Some(shared_pool.clone()),
         }) {
             Ok(s) => {
                 nlog::info!("main", "REST (HTTP) listening on {}", s.local_addr());

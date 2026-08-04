@@ -171,7 +171,12 @@
   - server shutdown 只停 acceptor + 唤醒; worker 由池统一 join
   - 验证: `shared_workers_test.rs` — RESP + SQL 两 server 共享 2 worker (线程数=2 非 4), 功能全通, epoll + 协程 worker 均过
 - [x] **T3.2** accept 时按端口标记协议 ✅ — `NewConn.protocol` + `AcceptorConfig.protocol` (端口即协议), worker 用 `new_conn.protocol` 创建 ConnState (替代 `cfg.protocol` 固定值)
-- [ ] **T3.3** `WorkerConfig` 去掉固定 `protocol`, 改为每连接传递协议上下文; 移除 per-server worker_count 语义, 改为全局 worker 数 (default_db/limits/auth/tls per-conn 化, main.rs 多协议共享池落地 — 后续)
+- [x] **T3.3** per-conn 配置 + main.rs 共享池落地 ✅:
+  - `NewConn`/`AcceptorConfig` 携带 per-conn 配置: default_db/default_table/limits/auth_password/tls_config (acceptor 按 server 打标)
+  - `ConnState` 增加 per-conn 字段 (default_table/limits/auth_password/tls_config), worker 用 NewConn 配置创建连接, process_*_input 从 conn 取 (替代 worker 级固定值)
+  - main.rs: 5 协议 server 全部 `shared_workers: Some(pool)`, 线程数 = 用户配置 `worker_count` (不再随协议数膨胀)
+  - 端到端验证: 线程数 7→2 (worker_count=2), 5 端口监听, RESP SET/HTTP/SQL 登录在共享 worker 上正常
+  - 测试: `shared_worker_pool_per_conn_auth` — 共享池中 RESP 需 AUTH + SQL 免认证, 同一批 worker 按连接正确区分
 - [ ] **T3.4** 多协议混合压力验证: 同一 worker 池同时处理 RESP + SQL + PG 连接, 验证协程内按 `ConnState.proto` 分发正确
 - [ ] **验收**: 线程数 = 全局配置 worker 数 (与协议数无关); 多协议 e2e 全绿
 
