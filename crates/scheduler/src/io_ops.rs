@@ -26,6 +26,9 @@ use crate::scheduler::with_current_slot;
 macro_rules! poll_cqe {
     ($ud:expr, $cx:expr, $cancel_code:expr) => {{
         with_current(|s| {
+            // ⭐ 批量提交: 扫描 CQ 前先提交攒下的 SQE, 否则 CQE 永不出现
+            // (block_on_io 同步忙等路径不经过驱动循环, 靠这里保证正确性).
+            s.flush_sq();
             let mut cq = s.ring.completion();
             cq.sync();
             // 也扫 CQ, 把任何还没 mark 的 CQE 都 mark 进 registry (drain_completions 可能还没跑).
@@ -51,18 +54,39 @@ macro_rules! poll_cqe {
     }};
 }
 
-/// 公共逻辑: 首次 poll → 注册 + push SQE + submit.
+/// 公共逻辑: 首次 poll → 注册 + push SQE.
+///
+/// ⭐ 批量提交 (2026-08): push 后**不立即 submit**, 只置 `sq_pending` 标志.
+/// 驱动循环在每轮 Phase C / CQ 扫描前统一 `flush_sq()` 一次 submit 提交全部 —
+/// 把 N 次 io_uring_enter 合并为 1 次 (协程 worker 每请求 ~20 次 syscall 的
+/// 主瓶颈). 正确性由两条路径兜底:
+///   - 驱动循环: `drain_completions_*` 开头 flush_sq.
+///   - 同步忙等 (block_on_io 不经过驱动循环): `poll_cqe` 扫描 CQ 前 flush_sq.
+/// SQ 满时 push 失败 → 立即 sync + submit 腾空间重试.
 macro_rules! submit_sqe {
     ($entry:expr, $slot_id:expr, $cx:expr) => {{
         let ud = with_current(|s| {
             let ud = s.registry.register($slot_id, $cx.waker().clone());
-            let mut sq = s.ring.submission();
-            unsafe {
-                let _ = sq.push(&$entry.user_data(ud));
+            let e = $entry.user_data(ud);
+            let mut pushed = false;
+            while !pushed {
+                let mut sq = s.ring.submission();
+                match unsafe { sq.push(&e) } {
+                    Ok(()) => {
+                        drop(sq);
+                        pushed = true;
+                    }
+                    Err(_) => {
+                        // SQ 满: sync tail + submit 腾空间后重试 (io_uring 0.6:
+                        // push 失败不会更新 tail, 需显式 sync).
+                        sq.sync();
+                        drop(sq);
+                        s.ring.submit().expect("io_uring submit (sq full flush)");
+                    }
+                }
             }
-            drop(sq);
-            s.ring.submit().expect("io_uring submit");
-            crate::trace!("io_ops submit_sqe ud={} slot={}", ud, $slot_id);
+            s.mark_sq_pending();
+            crate::trace!("io_ops submit_sqe(batch) ud={} slot={}", ud, $slot_id);
             ud
         })
         .expect("no current scheduler");

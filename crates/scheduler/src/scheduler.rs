@@ -55,6 +55,11 @@ pub struct Scheduler {
     stop_flag: Arc<AtomicBool>,
     pub(crate) registry: IoRegistry,
     pub(crate) ring: io_uring::IoUring,
+    /// ⭐ 批量提交: SQ ring 里是否有 push 了但还没 submit 的 SQE.
+    /// `submit_sqe!` push 后置 true; 所有 CQ 扫描路径 (poll_cqe / drain) 前
+    /// 调 `flush_sq()` 一次 submit 提交全部 — 驱动循环攒批 (少 enter), 同步
+    /// 忙等路径 (block_on_io) 也能保证 SQE 不被滞留 (正确性).
+    pub(crate) sq_pending: bool,
 }
 
 /// 跨线程 stop 句柄 (Send). 克隆后任意线程可调 `stop()` 设置 flag,
@@ -107,6 +112,7 @@ impl Scheduler {
             stop_flag,
             registry: IoRegistry::new(),
             ring,
+            sq_pending: false,
         }
     }
 
@@ -270,6 +276,8 @@ impl Scheduler {
     /// 生产路径: 阻塞等待内核完成至少 1 个 IO. 调用于 `drive_once`.
     /// 安全的前提: 有 in-flight SQE (registry 非空) 时才调用, 内核必然完成.
     fn drain_completions_and_wait(&mut self) {
+        // ⭐ 批量提交: 先提交本轮攒下的 SQE, 否则内核不会执行 → CQE 永不出现.
+        self.flush_sq();
         self.drain_completions();
         if !self.registry.is_empty() {
             // submit_and_wait(1) 阻塞直到 1 个 CQE 到达.
@@ -284,8 +292,8 @@ impl Scheduler {
 
     /// 非阻塞 poll + submit 版本 (SchedHandle 驱动用). 不挂起线程, 适合测试.
     fn drain_completions_with_submit(&mut self) {
-        // 提交今年 pending 的 SQE
-        let _ = self.ring.submit();
+        // ⭐ 批量提交: 把本轮攒下的 SQE 一次性 submit (少 io_uring_enter).
+        self.flush_sq();
         self.drain_completions();
 
         // 检查 SQ ring 是否还有未消费的 SQE.
@@ -298,6 +306,21 @@ impl Scheduler {
             let _ = self.ring.submit_and_wait(1);
             self.drain_completions();
         }
+    }
+
+    /// ⭐ 批量提交: 有 pending SQE (push 了没 submit) 时一次性提交.
+    /// 由 `submit_sqe!` push 后置位; 所有 CQ 扫描路径 (poll_cqe / drain)
+    /// 扫描前调用, 保证 SQE 不被滞留 (block_on_io 同步忙等路径正确性关键).
+    pub(crate) fn flush_sq(&mut self) {
+        if self.sq_pending {
+            let _ = self.ring.submit();
+            self.sq_pending = false;
+        }
+    }
+
+    /// ⭐ 批量提交: 标记有 pending SQE 待提交 (submit_sqe! push 后调用).
+    pub(crate) fn mark_sq_pending(&mut self) {
+        self.sq_pending = true;
     }
 
     fn drain_completions(&mut self) {
