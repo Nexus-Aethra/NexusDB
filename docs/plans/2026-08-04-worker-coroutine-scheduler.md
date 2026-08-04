@@ -113,14 +113,16 @@
 - [x] **T0.2** 建立基线 ✅ — network 测试全绿: 77 unit + 45 sql_e2e + 22 resp_e2e + 7 pg_e2e + bigdata 5
 - [x] **T0.3** 明确 worker 与 server 的依赖边界 ✅ — 关键发现: `WorkerConfig.protocol` 只在 `worker_epoll.rs:36` 读取一次, 用于初始化新连接 `ConnState.proto`; 而 `ConnState.proto` 在渲染/协议逻辑中被广泛使用 (120+ 处, `conn.proto`)。**协议信息本质是连接级的** — 全局 worker 池只需把 `ConnState::new` 的 `proto_kind` 从"worker 固定值"改为"按端口标记的连接协议", 那 120+ 处 `conn.proto` 用法无需改动。D4/D5 改造比预想容易
 
-### Phase 1: 连接 IO 走 io_uring (保留 epoll + conn_map 结构)
+### Phase 1: 协程 worker 骨架 (关键调整 — 原设计 P1/P2 耦合)
 
-> **目标**: 先把 IO 原语换成异步, 不动连接生命周期管理, 最小风险验证 socket io_uring 稳定性。
+> **⚠️ 关键发现 (Phase 0 调研)**: 连接"可读事件"要么由 epoll 管 (然后同步读), 要么由 io_uring 管 (然后协程读), **不能混用**。非阻塞 socket 若 epoll 通知可读后协程又去 io_uring read, 会双重事件源冲突。因此**无法"只把 recv 换成 io_uring 而保留 epoll + conn_map"** — P1 必须同时引入协程事件驱动, 即原 P2 的核心。P1 调整为"搭建协程 worker 骨架, 先最小闭环跑通, 不改连接处理语义"。
 
-- [ ] **T1.1** `worker_conn.rs`: `recv()`/`send_bytes()` 增加 io_uring 路径 — 在保持现有同步逻辑可回退的前提下, 实现 `async` 版本用 `scheduler::io_ops`
-- [ ] **T1.2** 在 worker 线程初始化一个 `Scheduler`, 连接收发从同步改为提交 io_uring SQE + poll 完成
-- [ ] **T1.3** 跑通全部 network 测试, 验证无回归 (重点: RESP/SQL/PG/HTTP 各协议收发正确)
-- [ ] **验收**: `cargo test -p network` 全绿; 无 WouldBlock 自旋
+- [ ] **T1.1** 新建协程 worker 执行入口 `worker_coro.rs`: worker 线程初始化 `Scheduler`, 跑两个协程:
+  - `new_conn_loop`: 用 io_uring 读 `conn_eventfd`, 从 inbox 收新连接并 spawn 连接协程
+  - `reply_loop`: 用 io_uring 读 `reply_bus.eventfd`, drain 回包并按 conn_id 匹配
+- [ ] **T1.2** 单连接协程最小闭环: `spawn` 一个连接协程, 用 `io_ops::read`(socket, offset=u64::MAX) 读首帧 → 调现有协议解析 (首次先只支持 SQL 门面握手) → 渲染 → `io_ops::write` 回包, 跑通一个真实 SQL 查询 (验证整条链: 协程 worker → io_uring socket → 协议处理 → shard → 回包)
+- [ ] **T1.3** 作为**可回退开关**接入 `server.rs` (env/配置切换协程 worker vs 旧 epoll worker), 旧路径完全保留
+- [ ] **验收**: 新协程 worker 单连接跑通真实 SQL; 旧 epoll worker 路径全绿 (network 测试无回归)
 
 ### Phase 2: 每连接一个协程 (替换 epoll 连接管理)
 
