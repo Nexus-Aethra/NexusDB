@@ -53,9 +53,11 @@ pub mod dump;
 mod error;
 mod header;
 mod index;
+mod index_merge;
 mod internal;
 mod item;
 mod leaf;
+mod leaf_split;
 mod ptr;
 mod varint;
 
@@ -71,18 +73,17 @@ pub use header::{
     page_key_count, page_set_flags, page_set_free_off, page_set_key_count, page_set_version,
     page_set_vpid, page_type, page_version, page_vpid,
 };
-pub use index::{
-    PageIndex, Segment, apply_pre_merge, apply_pre_merge_steal, pre_merge_segment,
-    pre_split_segment,
-};
+pub use index::{PageIndex, Segment, pre_split_segment};
+pub use index_merge::{apply_pre_merge, apply_pre_merge_steal, pre_merge_segment};
 pub use internal::{
     internal_child, internal_child_with_bounds, internal_delete, internal_insert, internal_new, internal_push_back,
     internal_split, internal_update,
 };
 pub use item::{Item, ItemKind, decode_item, encode_internal_item, encode_leaf_item};
 pub use leaf::{
-    leaf_delete, leaf_get, leaf_get_with, leaf_insert, leaf_new, leaf_push_back, leaf_scan_from, leaf_split, leaf_update,
+    leaf_delete, leaf_get, leaf_get_with, leaf_insert, leaf_new, leaf_push_back, leaf_scan_from, leaf_update,
 };
+pub use leaf_split::leaf_split;
 pub use ptr::{InternalItemPtr, ItemPtr, LeafItemPtr};
 
 /// 虚拟页 ID (B+Tree 内部命名空间).

@@ -30,6 +30,104 @@ pub enum ColValue {
     Decimal(i128, u8),
 }
 
+/// ⭐ PG 兼容 (FMT_VER 6): ColDefault::Lit 需要 Eq (schema 比较/测试).
+/// f64 语义上 NaN 破坏 Eq 定律, 但仅作 trait bound 满足 (无 HashMap key 用途).
+impl Eq for ColValue {}
+
+/// ⭐ PG 兼容 (UPDATE SET 表达式): 更新集 — 值 或 表达式 (对旧行求值).
+/// 由 worker 把 SQL 表达式翻译成此结构; `row_update` 读旧行后对旧行值求值
+/// (引擎单线程天然原子 = CAS 读改写语义).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetVal {
+    /// 直接赋值.
+    Val(ColValue),
+    /// 表达式 (旧行上下文求值).
+    Expr(RowExpr),
+}
+
+/// ⭐ PG 兼容 (UPDATE SET): 行更新表达式树 (v1: 数值算术 + 一元 NOT + 列引用 + 字面量).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowExpr {
+    /// 字面量.
+    Lit(ColValue),
+    /// 列引用 (同表当前旧行, 按列号).
+    Col(u16),
+    /// 一元 NOT (布尔取反: 0→1, 非0→0, NULL→NULL).
+    Not(Box<RowExpr>),
+    /// 二元算术 (+ - * / %; 数值). Div 除零 → Null; 全整且非 Div → I64, 否则 F64.
+    Bin {
+        op: RowArith,
+        l: Box<RowExpr>,
+        r: Box<RowExpr>,
+    },
+}
+
+/// 二元算术操作符.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowArith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+/// ⭐ PG 兼容: 对旧行值求值行更新表达式. 未知/类型不符 → Null (与 SQL 语义对齐).
+pub fn eval_row_expr(e: &RowExpr, values: &[ColValue]) -> ColValue {
+    match e {
+        RowExpr::Lit(v) => v.clone(),
+        RowExpr::Col(i) => values.get(*i as usize).cloned().unwrap_or(ColValue::Null),
+        RowExpr::Not(inner) => match eval_row_expr(inner, values) {
+            ColValue::I64(x) => ColValue::I64(if x == 0 { 1 } else { 0 }),
+            ColValue::Null => ColValue::Null,
+            _ => ColValue::Null,
+        },
+        RowExpr::Bin { op, l, r } => {
+            let (lv, rv) = (eval_row_expr(l, values), eval_row_expr(r, values));
+            // 提数: (值, 是否整型); 非数值/NULL → None
+            let num = |v: &ColValue| -> Option<(i64, f64, bool)> {
+                match v {
+                    ColValue::I64(x) => Some((*x, *x as f64, true)),
+                    ColValue::F64(x) => Some((0, *x, false)),
+                    _ => None,
+                }
+            };
+            let (Some((li, lf, li_is)), Some((ri, rf, ri_is))) = (num(&lv), num(&rv)) else {
+                return ColValue::Null;
+            };
+            let both_int = li_is && ri_is && *op != RowArith::Div;
+            if both_int {
+                let out = match op {
+                    RowArith::Add => li.checked_add(ri),
+                    RowArith::Sub => li.checked_sub(ri),
+                    RowArith::Mul => li.checked_mul(ri),
+                    RowArith::Div => unreachable!(),
+                    RowArith::Rem => li.checked_rem(ri),
+                };
+                return out.map(ColValue::I64).unwrap_or(ColValue::Null);
+            }
+            let out = match op {
+                RowArith::Add => lf + rf,
+                RowArith::Sub => lf - rf,
+                RowArith::Mul => lf * rf,
+                RowArith::Div => {
+                    if rf == 0.0 {
+                        return ColValue::Null;
+                    }
+                    lf / rf
+                }
+                RowArith::Rem => {
+                    if rf == 0.0 {
+                        return ColValue::Null;
+                    }
+                    lf % rf
+                }
+            };
+            ColValue::F64(out)
+        }
+    }
+}
+
 /// row 编解码错误.
 #[derive(Debug, PartialEq)]
 pub enum RowError {
@@ -244,15 +342,15 @@ mod tests {
     fn schema() -> TableSchema {
         TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
-                Column { name: "name".into(), ty: ColType::Str, nullable: false },
-                Column { name: "score".into(), ty: ColType::F64, nullable: true },
-                Column { name: "blob".into(), ty: ColType::Bytes, nullable: true },
-                Column { name: "note".into(), ty: ColType::Str, nullable: true },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
+                Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
+                Column { name: "blob".into(), ty: ColType::Bytes, nullable: true, default: None },
+                Column { name: "note".into(), ty: ColType::Str, nullable: true, default: None },
             ],
             0,
             &[1, 2],
-            &[], &[])
+            &[], &[], &[], &[])
         .unwrap()
     }
 
@@ -366,11 +464,11 @@ mod tests {
         // 旧 schema: 3 列 (id I64 pk, name Str, age I64)
         let old = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
-                Column { name: "name".into(), ty: ColType::Str, nullable: false },
-                Column { name: "age".into(), ty: ColType::I64, nullable: true },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
+                Column { name: "age".into(), ty: ColType::I64, nullable: true, default: None },
             ],
-            0, &[], &[], &[],
+            0, &[], &[], &[], &[], &[],
         )
         .unwrap();
         assert_eq!(old.version, 1);
@@ -379,7 +477,7 @@ mod tests {
 
         // ADD COLUMN email Str (nullable) → version 2, 4 列
         let new = old
-            .with_added_column(Column { name: "email".into(), ty: ColType::Str, nullable: true })
+            .with_added_column(Column { name: "email".into(), ty: ColType::Str, nullable: true, default: None })
             .unwrap();
         assert_eq!(new.version, 2);
         assert_eq!(new.version_ncols, vec![3, 4]);
@@ -420,18 +518,18 @@ mod tests {
     fn f80_new_types_roundtrip() {
         let s = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
-                Column { name: "active".into(), ty: ColType::Bool, nullable: false },
-                Column { name: "d".into(), ty: ColType::Date, nullable: true },
-                Column { name: "t".into(), ty: ColType::Time, nullable: true },
-                Column { name: "ts".into(), ty: ColType::Timestamp, nullable: true },
-                Column { name: "meta".into(), ty: ColType::Json, nullable: true },
-                Column { name: "uid".into(), ty: ColType::Uuid, nullable: true },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column { name: "active".into(), ty: ColType::Bool, nullable: false, default: None },
+                Column { name: "d".into(), ty: ColType::Date, nullable: true, default: None },
+                Column { name: "t".into(), ty: ColType::Time, nullable: true, default: None },
+                Column { name: "ts".into(), ty: ColType::Timestamp, nullable: true, default: None },
+                Column { name: "meta".into(), ty: ColType::Json, nullable: true, default: None },
+                Column { name: "uid".into(), ty: ColType::Uuid, nullable: true, default: None },
             ],
             0,
             &[],
             &[],
-            &[],
+            &[], &[], &[],
         )
         .unwrap();
         let vals = vec![
@@ -470,27 +568,30 @@ mod tests {
     fn f81_decimal_roundtrip() {
         let s = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
                 Column {
                     name: "amt".into(),
                     ty: ColType::Decimal { precision: 18, scale: 2 },
                     nullable: false,
+                    default: None,
                 },
                 Column {
                     name: "note".into(),
                     ty: ColType::Str,
                     nullable: true,
+                    default: None,
                 },
                 Column {
                     name: "big".into(),
                     ty: ColType::Decimal { precision: 38, scale: 4 },
                     nullable: true,
+                    default: None,
                 },
             ],
             0,
             &[],
             &[],
-            &[],
+            &[], &[], &[],
         )
         .unwrap();
         let vals = vec![

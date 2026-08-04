@@ -110,7 +110,7 @@ impl MetaPage {
         Self {
             dbs: BTreeMap::new(),
             resolver: DbNameResolver::new(),
-            page_buf: Box::new([0u8; PAGE_SIZE]),
+            page_buf: crate::page_pool::alloc_zeroed(),
         }
     }
 
@@ -196,7 +196,7 @@ impl MetaPage {
         }
 
         // 6. 复制 page bytes
-        let mut page_buf = Box::new([0u8; PAGE_SIZE]);
+        let mut page_buf = crate::page_pool::alloc_zeroed();
         page_buf.copy_from_slice(page);
         Ok(Self {
             dbs,

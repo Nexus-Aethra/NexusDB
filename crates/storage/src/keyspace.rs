@@ -275,6 +275,9 @@ pub const IVAL_NUM: u8 = 0x01;
 pub const IVAL_BYTES: u8 = 0x02;
 /// ⭐ F81: Decimal 索引值型别字节 (17B: 型别 + 16B i128 符号翻转 BE 保序).
 pub const IVAL_DECIMAL: u8 = 0x03;
+/// ⭐ PG 兼容 (FMT_VER 7): 复合索引值型别字节
+/// (`[0x04][nseg][u16 len][enc]...` 长度前缀拼接, 防分界歧义).
+pub const IVAL_COMPOSITE: u8 = 0x04;
 
 /// 整个 iid 的扫描前缀: `[I][iid u32 BE]`.
 pub fn index_prefix(iid: u32) -> Vec<u8> {
@@ -371,6 +374,23 @@ pub fn split_index_val(rest: &[u8]) -> Option<(&[u8], &[u8])> {
                     _ => return None,
                 }
             }
+        }
+        // ⭐ PG 兼容 (FMT_VER 7): 复合索引值 `[IVAL_COMPOSITE][nseg][u16 len][enc]...`
+        IVAL_COMPOSITE => {
+            let nseg = *rest.get(1)? as usize;
+            let mut pos = 2usize;
+            for _ in 0..nseg {
+                if pos + 2 > rest.len() {
+                    return None;
+                }
+                let seg = u16::from_le_bytes(rest[pos..pos + 2].try_into().ok()?) as usize;
+                pos += 2;
+                if pos + seg > rest.len() {
+                    return None;
+                }
+                pos += seg;
+            }
+            Some((&rest[..pos], &rest[pos..]))
         }
         _ => None,
     }

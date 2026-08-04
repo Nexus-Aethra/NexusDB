@@ -44,12 +44,14 @@
 
 pub mod coordinator;
 pub mod error;
+pub mod exec_cmds;
 pub mod inbox;
 pub mod latency_probe;
 pub mod manager;
 pub mod reply;
 pub mod request;
 pub mod router;
+pub mod shard_thread;
 pub mod task_inbox;
 pub mod task_reply_bus;
 pub mod value_num;

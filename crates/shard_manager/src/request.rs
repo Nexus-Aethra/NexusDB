@@ -189,6 +189,14 @@ pub enum BatchOp {
     /// ⭐ SETRANGE: 从 offset 覆盖写 data (零扩展), 结果存 TAG_RAW,
     /// 返回新长度 (Integer).
     SetRange { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, offset: u32, data: Vec<u8> },
+    /// ⭐ M3-2 (CBO): 估算表近似行数 (内存增量统计, 未统计=0). 返回 RowCount.
+    EstimateRowCount { db: std::sync::Arc<str>, table: std::sync::Arc<str> },
+    /// ⭐ M3-4 (CBO): 索引列近似 distinct 基数 (worker 已算好 iid 列表; 免 shard 查 schema).
+    /// 返回 DistinctCounts (与 iids 同序).
+    EstimateDistinct { db: std::sync::Arc<str>, table: std::sync::Arc<str>, iids: Vec<u32> },
+    /// ⭐ M3-5 (CBO): 索引列 (min, max) 有序字节 (范围选择度; 未统计 = (None, None)).
+    /// 返回 RangeBounds (与 iids 同序).
+    EstimateRanges { db: std::sync::Arc<str>, table: std::sync::Arc<str>, iids: Vec<u32> },
     // ---- ⭐ Phase H: Hash (全部单 key 路由, 一个 hash 的所有 field 同 shard) ----
     /// HSET 多 field: 返回新增 field 数 (Integer). value 带 tag.
     HSet { db: std::sync::Arc<str>, table: std::sync::Arc<str>, key: Vec<u8>, pairs: Vec<(Vec<u8>, Vec<u8>)> },
@@ -288,8 +296,8 @@ pub enum BatchOp {
     /// 删一行 (含全部索引行): 回 DeleteExisted.
     RowDelete { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8> },
     /// ⭐ S1: 部分列更新 — shard 端读-改-写 (单 shard 原子, UNIQUE/索引跟随).
-    /// sets = (列号, 新值); 回 DeleteExisted (true = 行存在且已更新).
-    RowUpdate { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8>, sets: Vec<(u16, storage::row::ColValue)> },
+    /// sets = (列号, 值或表达式); 回 DeleteExisted (true = 行存在且已更新).
+    RowUpdate { db: std::sync::Arc<str>, table: std::sync::Arc<str>, pk: Vec<u8>, sets: Vec<(u16, storage::row::SetVal)> },
     /// ⭐ S1: 广播 op — 数据面删表 (物理数据 + schema/bloom 派生状态). 回 PutOk.
     DropTableOp { db: std::sync::Arc<str>, table: std::sync::Arc<str> },
     /// ⭐ S2: 广播 op — 全表扫 (`[S]` 前缀收 TAG_ROW 行, 跳过纯 KV 行).
@@ -307,6 +315,14 @@ pub enum BatchOp {
         index_hint: Option<storage::sql_rows::IndexHint>,
         /// ⭐ F70 (JOIN): 键集合点查提示 (Some 时只回 join 键 ∈ keys 的行; 优先于 index_hint).
         key_set_hint: Option<storage::sql_rows::KeySetHint>,
+        limit: u32,
+    },
+    /// ⭐ 修复 (2026-08): DML phase1 范围扫 — 与 ScanFiltered 同走索引/主键范围,
+    /// 但返回完整 `Rows` (索引原值, pk, row_bytes) 供 collect_dml_pks 提取 pk 执行 phase2.
+    ScanFilteredRows {
+        db: std::sync::Arc<str>,
+        table: std::sync::Arc<str>,
+        index_hint: Option<storage::sql_rows::IndexHint>,
         limit: u32,
     },
     /// ⭐ 事务 v1 (F61): COMMIT 原子批 — worker 把 conn 层 write_set 按 shard
@@ -442,6 +458,14 @@ impl BatchOp {
             }
             // ⭐ F67 (JOIN): 广播 op, 不走 locator 路由 (兵底空 key)
             ScanFiltered { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
+            // ⭐ DML phase1 范围扫 (2026-08): 广播 op, 不走 locator 路由
+            ScanFilteredRows { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
+            // ⭐ M3-2: 行数估计广播 op, 不走路由 (空 key)
+            EstimateRowCount { db, table } => (db.as_ref(), table.as_ref(), &[]),
+            // ⭐ M3-4: distinct 估计广播 op, 不走路由
+            EstimateDistinct { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
+            // ⭐ M3-5: min/max 估计广播 op, 不走路由
+            EstimateRanges { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ 事务批: 取第一个 op 的 locator (组内同 shard, 仅兼容用;
             // ensure_table 在 shard 端逐 op 处理)
             TxnApply { ops, .. } => ops.first().map(|o| o.locator()).unwrap_or(("", "", &[])),
@@ -532,6 +556,13 @@ impl BatchOp {
             RowPut { .. } | RowGet { .. } | RowDelete { .. } | RowUpdate { .. }
             | IndexScan { .. } | DropTableOp { .. } | TableScan { .. } => None,
             ScanFiltered { .. } => None,
+            ScanFilteredRows { .. } => None,
+            // ⭐ M3-2: 行数估计无 key (不参与 RESP 冒号选表)
+            EstimateRowCount { .. } => None,
+            // ⭐ M3-4: distinct 估计无 key
+            EstimateDistinct { .. } => None,
+            // ⭐ M3-5: min/max 估计无 key
+            EstimateRanges { .. } => None,
             // ⭐ X2: schema op 无 key
             SetSchemaOp { .. } | GetSchemaOp { .. } => None,
             TxnApply { .. } => None,
@@ -597,6 +628,12 @@ pub enum BatchResult {
     Catalog(Vec<(String, Vec<u8>)>),
     /// ⭐ F67 (JOIN): ScanFiltered 结果 — 只含投影列值的行 (省带宽, worker 免 decode).
     ProjRows(Vec<Vec<storage::row::ColValue>>),
+    /// ⭐ M3-2 (CBO): 表近似行数估计 (EstimateRowCount 响应).
+    RowCount(u64),
+    /// ⭐ M3-4 (CBO): 索引列 distinct 计数 (EstimateDistinct 响应, 与 cols 同序).
+    DistinctCounts(Vec<u64>),
+    /// ⭐ M3-5 (CBO): 索引列 (min, max) 有序字节 (EstimateRanges 响应, 与 iids 同序).
+    RangeBounds(Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>),
     Error(String),
 }
 

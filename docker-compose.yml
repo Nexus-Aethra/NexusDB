@@ -13,13 +13,15 @@ services:
       - "6778:6778"   # HTTP REST + /metrics
     volumes:
       - nexusdb-data:/data
-      # 覆盖默认配置 (可选): 取消注释并提供自己的 toml
-      # - ./deploy/nexusdb.docker.toml:/etc/nexusdb/nexusdb.toml:ro
       # 启用 TLS (可选): 挂证书目录, 并在配置里指向 /etc/nexusdb/certs/*.pem
       # - ./certs:/etc/nexusdb/certs:ro
-    # io_uring 若被宿主 seccomp 拦截, 放开(或改配置 io_backend=stdfs):
-    # security_opt:
-    #   - seccomp=unconfined
+    # ⭐ 让 NexusDB 在容器内使用 io_uring:
+    #   compose 的 security_opt 内联 JSON 会因过长触发 "file name too long",
+    #   因此用 docker run 脚本 (deploy/run.sh) 启动, 由 daemon 直接读取 profile 文件。
+    #   docker run 支持 seccomp=<file> 由 daemon 读文件, 无长度限制。
+    #   参考 deploy/run.sh 的完整启动命令。
+    cap_add:
+      - SYS_ADMIN
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6778/v1/status || exit 1"]
       interval: 15s

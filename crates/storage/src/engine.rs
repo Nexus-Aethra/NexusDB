@@ -25,6 +25,7 @@ use std::path::PathBuf;
 
 use crate::chunk_lru::ChunkList;
 use crate::chunk_writer::{ChunkWriter, NowChunks};
+use crate::engine_io::init_meta_page;
 use crate::meta_cache::MetaCache;
 use crate::meta_page::{META_PID, META_VPID, MetaPage};
 use crate::pager::Pager;
@@ -128,29 +129,40 @@ pub enum StorageError {
 /// **⭐ T16**: `_io_runner` 持有 `SchedulerRunner` daemon 线程, 在 IoUring 模式下
 /// 保持后台 io_uring 事件循环存活. 用 `_` 前缀表明"不直接使用, 仅防 Drop".
 pub struct StorageEngine {
-    pager: Pager,
+    pub(crate) pager: Pager,
     /// T11: 多 db/多表 catalog 缓存 (write-through 镜像 MetaPage + 各 TableDirectory)
-    registry: DbRegistry,
+    pub(crate) registry: DbRegistry,
     /// ⭐ T12.16 当前 db 的 `DbId`. 默认 `DEFAULT_DB_ID` (= 0, "default" db).
     /// 用 `use_db(name)` 切换; ShardManager 创建多 engine 时显式 set.
-    current_db: DbId,
+    pub(crate) current_db: DbId,
     /// ⭐ PERF (F49): "表内出现过复合类型" 单调提示 (db → table 集合).
     /// 只增不减 — 用于纯 String 表跳过热路径类型探测 (SET purge / GET-miss
     /// WRONGTYPE); false positive 无害 (仅多一次点查), 开库时由
     /// `rebuild_composite_counts` 从 `[#]` meta 行重建.
-    composite_tables: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    pub(crate) composite_tables: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// ⭐ Q1 (SQL 索引): table schema 常驻镜像 ((db, table) → schema).
     /// write-through: set_schema 先落 `[$]` 行再更新; lazy load (首次 get miss
     /// 时读 `[$]` 行); 无 schema 行 = 纯 KV 表 (缓存 None 免重复探盘).
-    schemas: std::collections::HashMap<(String, String), SchemaSlot>,
+    pub(crate) schemas: std::collections::HashMap<(String, String), SchemaSlot>,
     /// ⭐ Y1 (布隆剪枝): 每 (db, table, iid) 一个本地索引 bloom.
     /// 等值 IndexScan 快速拒绝; set_schema 建空 bloom, row_put 喂值,
     /// 开库随 rebuild_composite_counts 扫 [I] 前缀重建 (永不假阴性).
-    index_blooms: std::collections::HashMap<(String, String, u32), crate::index_bloom::IndexBloom>,
+    pub(crate) index_blooms: std::collections::HashMap<(String, String, u32), crate::index_bloom::IndexBloom>,
     /// ⭐ Y1: 剪枝命中计数 (等值扫被 bloom 短路的次数; 测试/观测用).
     pub bloom_skip_count: u64,
     /// ⭐ WAL (F60): per-shard 预写日志 (None = Off 档 / 重放期间).
-    wal: Option<crate::wal::WalWriter>,
+    pub(crate) wal: Option<crate::wal::WalWriter>,
+    /// ⭐ M3-1 (CBO 统计): 每 (db, table) 近似行数 (内存增量维护).
+    /// put 新 key +1 (覆盖不加, 由 put_physical 返回 existed), delete -1;
+    /// put_many 近似 +N (覆盖会高估). 重启后从 0 重算 (持久化 M3-1b).
+    pub(crate) row_counts: std::collections::HashMap<(String, String), u64>,
+    /// ⭐ M3-4 (CBO): 每索引列近似 distinct 基数 (索引值写入时 bloom miss = 新值 → +1;
+    /// bloom 假阳性 → 低估, 近似可接受). 内存增量, 重启后从 0 重算.
+    pub(crate) distinct_counts: std::collections::HashMap<(String, String, u32), u64>,
+    /// ⭐ M3-5 (CBO): 每索引列 (min, max) 有序字节 (值序比较; 范围选择度/直方图基础).
+    pub(crate) range_counts: std::collections::HashMap<(String, String, u32), (Vec<u8>, Vec<u8>)>,
+    /// ⭐ M3-1b: CBO 统计持久化文件 (block_dir/stats.bin; 崩溃不保证, 近似统计可接受).
+    pub(crate) stats_path: std::path::PathBuf,
 }
 
 /// ⭐ Q1: schema 镜像槽别名 (None = 已确认无 schema 的纯 KV 表).
@@ -283,6 +295,8 @@ impl StorageEngine {
         // Pager 实际写 .block 时, 走 key.file_id + 1 命名
         // recover 推断 last_file_id 后, 新写入从 next_file_id 开始
         // 简化: 我们总是用 next_file_id 推断的 block_path
+        // ⭐ M3-1b: 统计持久化路径 (block_dir/stats.bin; 须在 pager move block_dir_for_io 前算好)
+        let stats_path = block_dir_for_io.join("stats.bin");
         let active_file_id = recovered.pid_alloc.current().0;
         let block_path = block_dir_for_io.join(format!("{:06}.block", active_file_id + 1));
         // 如果推断的 block 不存在 (e.g., new db), 用第一个
@@ -342,7 +356,13 @@ impl StorageEngine {
             index_blooms: std::collections::HashMap::new(),
             bloom_skip_count: 0,
             wal: None, // 重放期间保持 None (append 自动跳过)
+            row_counts: std::collections::HashMap::new(),
+            distinct_counts: std::collections::HashMap::new(),
+            range_counts: std::collections::HashMap::new(),
+            stats_path,
         };
+        // ⭐ M3-1b: 加载持久化统计 (缺失/损坏 → 空统计, 无碍)
+        engine.load_stats();
         // ⭐ U3: 从 data 行重建复合结构计数 (修复 crash 中 meta count 漂移).
         engine.rebuild_composite_counts().await.map_err(|e| {
             StorageError::Io(std::io::Error::other(format!("rebuild_composite_counts: {e}")))
@@ -418,7 +438,10 @@ impl StorageEngine {
 
     /// 显式 flush: nowchunks → .block (pwrite + fsync) → chunk_list → meta flush.
     pub async fn flush(&mut self) -> io::Result<()> {
-        self.pager.flush().await
+        self.pager.flush().await?;
+        // ⭐ M3-1b: 统计随 flush 持久化 (重启后保留近似统计)
+        self.save_stats();
+        Ok(())
     }
 
     /// 隐式 flush 后 drop. **不**保证 fsync (调用方应先调 flush).
@@ -429,6 +452,8 @@ impl StorageEngine {
         // 两步内部都保证 "chunk data 全部写完才刷 meta".
         self.pager.flush().await?;
         self.pager.drive_write_queue().await?;
+        // ⭐ M3-1b: 统计落盘 (close 直调 pager.flush 绕过 engine.flush, 需显式 save)
+        self.save_stats();
         // ⭐ WAL (F60): 正常关闭 = 全量已落盘, 全部段可删 (重启免重放)
         if let Some(mut w) = self.wal.take() {
             w.purge_all();
@@ -662,352 +687,8 @@ impl StorageEngine {
         let db_handle = self.registry.open_db(db)?;
         Ok(db_handle.list_tables())
     }
-
-    /// 写 (key, value) 到指定 table.
-    ///
-    /// **⭐ T15**: 如果 table BTree 内部发生 root split:
-    /// 1. 新的 root_vpid 写回 `DbHandle.tables[table]` (内存缓存)
-    /// 2. 通过 `TableDirectory::update_table` 持久化到 TableDirectory BTree
-    ///
-    /// 否则 reopen 后 DbRegistry::load 读 TableDirectory 拿到旧 root,
-    /// 旧 root 只含 split 左半数据, 找不到右半的 key.
-    pub async fn table_put(
-        &mut self,
-        db: &str,
-        table: &str,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<(), RegistryError> {
-        // ⭐ Phase K: user key 统一编码为 [S][klen][key]
-        // ⭐ U2: SET 覆盖异类旧值 — 若 key 当前是复合类型先 purge (Redis 语义).
-        // ⭐ PERF (F49): 表内从未写过复合类型 → 不可能有旧复合行, 跳过探测.
-        if self.has_composite(db, table) {
-            self.purge_composite_if_any(db, table, key).await?;
-        }
-        let ek = crate::keyspace::encode_string(key);
-        self.put_physical(db, table, &ek, value).await
-    }
-
-    // =================================================================
-    // ⭐ Phase H: 物理 key 层辅助 (复合结构 op 用; String 入口是其薄封装).
-    // pkey = 已编码的 BTree 物理 key (keyspace::encode_*).
-    // =================================================================
-
-    /// 按物理 key 写入 (含 root split 的 TableDirectory 回写, 与 table_put 同逻辑).
-    pub(crate) async fn put_physical(
-        &mut self,
-        db: &str,
-        table: &str,
-        pkey: &[u8],
-        value: &[u8],
-    ) -> Result<(), RegistryError> {
-        let db_handle = self.registry.open_db(db)?;
-        let table_vpid = db_handle
-            .open_table(&mut self.pager, table)
-            .await?
-            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-
-        let new_root =
-            crate::registry::table_put(&mut self.pager, table_vpid, pkey, value).await?;
-
-        // ⭐ WAL (F60): 成功路径记录结果态 (重放幂等)
-        if let Some(w) = self.wal.as_mut() {
-            w.append_put(db, table, pkey, value);
-        }
-
-        // ⭐ T15: root split 时同步 TableDirectory BTree + 缓存
-        if let Some(new_root) = new_root {
-            let db_handle = self.registry.open_db(db)?;
-            db_handle
-                .table_dir_mut()
-                .update_table(&mut self.pager, table, new_root)
-                .await
-                .map_err(RegistryError::from)?;
-            let db_handle = self.registry.open_db(db)?;
-            db_handle.update_table_root(table, new_root);
-        }
-        Ok(())
-    }
-
-    /// 按物理 key 读 (溢出链自动展开).
-    pub(crate) async fn get_physical(
-        &mut self,
-        db: &str,
-        table: &str,
-        pkey: &[u8],
-    ) -> Result<Option<Vec<u8>>, RegistryError> {
-        let db_handle = self.registry.open_db(db)?;
-        let table_vpid = db_handle
-            .open_table(&mut self.pager, table)
-            .await?
-            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        crate::registry::table_get(&mut self.pager, table_vpid, pkey).await
-    }
-
-    /// ⭐ O2: 物理 key 批量读 (LeafGuide 区间复用, 结果按输入序, 溢出展开).
-    /// 复合 op 多 field/member 探在从逐条 travel 摊薄为区间复用.
-    pub(crate) async fn get_physical_many(
-        &mut self,
-        db: &str,
-        table: &str,
-        pkeys: &[&[u8]],
-    ) -> Result<Vec<Option<Vec<u8>>>, RegistryError> {
-        let db_handle = self.registry.open_db(db)?;
-        let table_vpid = db_handle
-            .open_table(&mut self.pager, table)
-            .await?
-            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        crate::registry::table_get_many(&mut self.pager, table_vpid, pkeys).await
-    }
-
-    /// ⭐ O2: 物理 key 批量写 (排序 + 同 leaf 一次 batch 提交;
-    /// root split 同步 TableDirectory, 与 put_physical 同逻辑).
-    pub(crate) async fn put_physical_many(
-        &mut self,
-        db: &str,
-        table: &str,
-        pairs: &[(Vec<u8>, &[u8])],
-    ) -> Result<(), RegistryError> {
-        if pairs.is_empty() {
-            return Ok(());
-        }
-        let db_handle = self.registry.open_db(db)?;
-        let table_vpid = db_handle
-            .open_table(&mut self.pager, table)
-            .await?
-            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        let new_root =
-            crate::registry::table_put_many(&mut self.pager, table_vpid, pairs).await?;
-        // ⭐ WAL (F60): 批量记录 (一次遍历, flush 时共享后续 fsync)
-        if let Some(w) = self.wal.as_mut() {
-            for (pkey, value) in pairs {
-                w.append_put(db, table, pkey, value);
-            }
-        }
-        if let Some(new_root) = new_root {
-            let db_handle = self.registry.open_db(db)?;
-            db_handle
-                .table_dir_mut()
-                .update_table(&mut self.pager, table, new_root)
-                .await
-                .map_err(RegistryError::from)?;
-            let db_handle = self.registry.open_db(db)?;
-            db_handle.update_table_root(table, new_root);
-        }
-        Ok(())
-    }
-
-    /// 按物理 key 删 (溢出链自动释放). 返回是否存在.
-    pub(crate) async fn delete_physical(
-        &mut self,
-        db: &str,
-        table: &str,
-        pkey: &[u8],
-    ) -> Result<bool, RegistryError> {
-        let db_handle = self.registry.open_db(db)?;
-        let table_vpid = db_handle
-            .open_table(&mut self.pager, table)
-            .await?
-            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        let existed = crate::registry::table_delete(&mut self.pager, table_vpid, pkey).await?;
-        // ⭐ WAL (F60): 存在才记 (不存在的 delete 重放无意义)
-        if existed && let Some(w) = self.wal.as_mut() {
-            w.append_del(db, table, pkey);
-        }
-        Ok(existed)
-    }
-
-    /// 读 key 对应 value. 返回 None 表示 key 不存在.
-    pub async fn table_get(
-        &mut self,
-        db: &str,
-        table: &str,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>, RegistryError> {
-        let ek = crate::keyspace::encode_string(key);
-        self.get_physical(db, table, &ek).await
-    }
-
-    /// ⭐ 批量读 (MGET): LeafGuide 区间复用, 结果按输入顺序.
-    pub async fn table_get_many(
-        &mut self,
-        db: &str,
-        table: &str,
-        keys: &[&[u8]],
-    ) -> Result<Vec<Option<Vec<u8>>>, RegistryError> {
-        let db_handle = self.registry.open_db(db)?;
-        let table_vpid = db_handle
-            .open_table(&mut self.pager, table)
-            .await?
-            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        // ⭐ Phase K: 每个 key 编码为 [S][klen][key] 再交给 registry.
-        // 编码后物理序 != 裸 key 序 (klen 前缀), 但 registry 内部按传入的
-        // 物理 key 排序走 LeafGuide, 结果按输入索引还原 — 一致性成立.
-        let encoded: Vec<Vec<u8>> = keys.iter().map(|k| crate::keyspace::encode_string(k)).collect();
-        let refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
-        crate::registry::table_get_many(&mut self.pager, table_vpid, &refs).await
-    }
-
-    /// ⭐ 批量写 (MSET): LeafGuide 区间复用, 同 leaf 一次 batch 提交.
-    /// root split 时同步 TableDirectory (与 table_put 同逻辑).
-    pub async fn table_put_many(
-        &mut self,
-        db: &str,
-        table: &str,
-        pairs: &[(Vec<u8>, Vec<u8>)],
-    ) -> Result<(), RegistryError> {
-        let db_handle = self.registry.open_db(db)?;
-        let table_vpid = db_handle
-            .open_table(&mut self.pager, table)
-            .await?
-            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-
-        // ⭐ U2: MSET 覆盖异类旧值 — 逐 key purge 复合旧值 (与 SET 一致).
-        for (k, _) in pairs {
-            self.purge_composite_if_any(db, table, k).await?;
-        }
-        // ⭐ Phase K: 编码 key (value 借用不动, 避免大 value 拷贝).
-        let encoded: Vec<(Vec<u8>, &[u8])> = pairs
-            .iter()
-            .map(|(k, v)| (crate::keyspace::encode_string(k), v.as_slice()))
-            .collect();
-        let new_root =
-            crate::registry::table_put_many(&mut self.pager, table_vpid, &encoded).await?;
-
-        if let Some(new_root) = new_root {
-            let db_handle = self.registry.open_db(db)?;
-            db_handle
-                .table_dir_mut()
-                .update_table(&mut self.pager, table, new_root)
-                .await
-                .map_err(RegistryError::from)?;
-            let db_handle = self.registry.open_db(db)?;
-            db_handle.update_table_root(table, new_root);
-        }
-        Ok(())
-    }
-
-    /// 删 key. 返回 true 表示存在并删除, false 表示不存在.
-    pub async fn table_delete(
-        &mut self,
-        db: &str,
-        table: &str,
-        key: &[u8],
-    ) -> Result<bool, RegistryError> {
-        let ek = crate::keyspace::encode_string(key);
-        self.delete_physical(db, table, &ek).await
-    }
-
-    /// 暴露内部 DbRegistry (高级用法: 测试 / 调试).
-    pub fn registry_mut(&mut self) -> &mut DbRegistry {
-        &mut self.registry
-    }
-
-    /// 当前 DbRegistry 的不可变访问.
-    pub fn registry(&self) -> &DbRegistry {
-        &self.registry
-    }
-
-    // =================================================================
-    // ⭐ T12.16: 多 db 上下文 API (current_db)
-    // =================================================================
-
-    /// 当前 db 的 `DbId`. 默认 0 (= "default" db).
-    ///
-    /// **含义**: 这是"本 engine 当前在哪个 db"的状态标识. 单 db 模式
-    /// 始终是 0; 多 db 模式 ShardManager 显式调用 `use_db` / `set_current_db` 切换.
-    ///
-    /// **不影响已有的 `db: &str` API**: 已有 API 显式传 db 名, 不依赖 current_db.
-    /// current_db 是 ShardManager 等高层模块的"默认 db"标记.
-    pub fn current_db(&self) -> DbId {
-        self.current_db
-    }
-
-    /// 当前 db 的名称 (解析 `current_db` 到 db name).
-    ///
-    /// **错误**: 如果 current_db 在 resolver 中找不到对应 name, 返回 DbNotFound.
-    /// 这种情况理论上不应该发生 (current_db 永远从 resolver 拿), 但作为防御性检查.
-    pub fn current_db_name(&self) -> Result<String, RegistryError> {
-        self.registry
-            .db_name(self.current_db)
-            .ok_or_else(|| RegistryError::DbNotFound(format!("db_id={}", self.current_db)))
-    }
-
-    /// 按 name 切换当前 db. 返回新 current_db 的 `DbId`.
-    ///
-    /// **调用场景**: ShardManager 收到 "USE dbname" 类命令, 调此方法切到目标 db.
-    /// 如果 db 不存在, 返回 DbNotFound.
-    ///
-    /// **不会触发 IO**: 只是更新内存中的 current_db 字段 + 解析 db name → id.
-    /// 不读不写磁盘.
-    pub fn use_db(&mut self, name: &str) -> Result<DbId, RegistryError> {
-        let id = self
-            .registry
-            .db_id(name)
-            .ok_or_else(|| RegistryError::DbNotFound(name.to_string()))?;
-        self.current_db = id;
-        Ok(id)
-    }
-
-    /// 按 DbId 切换当前 db. **不**验证 id 存在 (因为 resolver 没有反向 in-memory API,
-    /// 走 name 解析更安全). 内部主要用于 ShardManager 已通过 use_db 拿到 id 后,
-    /// 序列化场景下直接 set.
-    ///
-    /// **警告**: caller 应保证 `id` 是有效 DbId (从 `use_db` / `create_db` 返回的).
-    /// 非法 id 不会立即报错, 但后续 `current_db_name()` 会返回 DbNotFound.
-    pub fn set_current_db(&mut self, id: DbId) {
-        self.current_db = id;
-    }
 }
 
-// =====================================================================
-// Drop: 不隐式 flush, 但确保资源释放不 panic
-// =====================================================================
-
-impl Drop for StorageEngine {
-    fn drop(&mut self) {
-        // 不隐式 flush (因 flush 可能 IO 阻塞, Drop 不应阻塞).
-        // 注意: 调用方应负责 close() 或显式 flush().
-    }
-}
-
-// =====================================================================
-// MetaPage 初始化: 写空 MetaPage 到 chunk 0 page 0 (T9 集成)
-// =====================================================================
-
-/// 写一个空的 MetaPage 到 block_dir/000001.block 的 chunk 0 page 0 (offset 0),
-/// 并在 MetaCache 中登记 vpid 0 → META_PID.
-///
-/// **调用场景**: `StorageEngine::open` 时, 如果 recover 发现 vpid 0 未映射 (全新库),
-/// 则认为 MetaPage 还没初始化, 主动写一个空 MetaPage 落盘 + 注册映射.
-///
-/// **不更新 vpid_alloc**: 调用方负责设置 `vpid_alloc` 起点 (本函数不感知 alloc).
-fn init_meta_page(block_dir: &std::path::Path, meta: &mut MetaCache) -> io::Result<()> {
-    // 1. 构造空 MetaPage 字节
-    let meta_page = MetaPage::new_empty();
-    let bytes = meta_page.flush();
-
-    // 2. 写盘: block_dir/000001.block, offset 0 (chunk 0 page 0)
-    let block_path = block_dir.join("000001.block");
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&block_path)?;
-    // use FileExt for write_all_at
-    use std::os::unix::fs::FileExt;
-    f.write_all_at(&*bytes, 0)?;
-    f.sync_all()?;
-    drop(f);
-
-    // 3. 在 MetaCache 中登记 vpid 0 → META_PID
-    meta.write(META_VPID, META_PID);
-
-    Ok(())
-}
-
-// =====================================================================
 // 单元测试 (集成测试在 tests/engine_e2e.rs)
 // =====================================================================
 

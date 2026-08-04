@@ -139,6 +139,8 @@ fn main() {
     };
     // ⭐ ORM-B2: 进程级共享 SQL 路由缓存 (五门面同集群共用一个)
     let sql_shared = network::new_sql_shared();
+    // ⭐ PG 兼容: 注入集群控制面 (CREATE DATABASE 走 shard 2PC)
+    sql_shared.set_cluster_ctl(mgr.clone());
     // ⭐ F83: TLS 配置 (SQL/PG 门面共用; 两路径均非空才启用, 否则明文)
     let tls_config = if !cfg.server.tls_cert.is_empty() && !cfg.server.tls_key.is_empty() {
         match network::tls::load_server_config(&cfg.server.tls_cert, &cfg.server.tls_key) {

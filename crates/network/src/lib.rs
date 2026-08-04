@@ -36,6 +36,10 @@ pub mod metrics {
     pub static SQL_QUERIES: AtomicU64 = AtomicU64::new(0);
     /// RESP 命令计数.
     pub static KV_OPS: AtomicU64 = AtomicU64::new(0);
+    /// ⭐ 方案 A (调优): JOIN EstimateRows 统计广播轮数 (合并行数后每批 +1).
+    pub static SQL_JOIN_EST_ROUNDS: AtomicU64 = AtomicU64::new(0);
+    /// ⭐ 方案 A (调优): 小表阈值跳过统计收集次数 (行数批收齐直接决策).
+    pub static SQL_JOIN_EST_SKIPPED: AtomicU64 = AtomicU64::new(0);
     /// 进程启动 unix 秒 (uptime 计算).
     pub static START_UNIX: OnceLock<u64> = OnceLock::new();
 

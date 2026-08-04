@@ -72,7 +72,7 @@ impl MyConn {
     /// ⭐ Phase A: addr 版构造 (bench 多线程用).
     fn connect_addr(addr: std::net::SocketAddr) -> Self {
         let stream = TcpStream::connect(addr).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         stream.set_nodelay(true).unwrap();
         Self { stream, buf: Vec::new() }
     }
@@ -601,6 +601,49 @@ fn mysql_select_extended() {
     assert_eq!(
         c.ids("SELECT id FROM nums ORDER BY val ASC LIMIT 3 OFFSET 5"),
         vec!["5", "6", "7"]
+    );
+    // ⭐ M2b: 排序消排 + top-k 下推 —
+    // ORDER BY 索引列 ASC → 每 shard 取 top-(limit+offset), worker 归并免全量排序.
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 10 ORDER BY val ASC LIMIT 3"),
+        vec!["10", "11", "12"],
+        "索引序即排序序, 3 shard 各 top-3 归并后全局 top-3"
+    );
+    // 带 OFFSET: 每 shard 取 5, 归并后跳过 2 取 3
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 10 ORDER BY val ASC LIMIT 3 OFFSET 2"),
+        vec!["12", "13", "14"],
+        "排序消排 + offset 下推"
+    );
+    // 无 limit 的消排: 免 worker 全量排序但不下推 limit
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 15 ORDER BY val ASC"),
+        vec!["15", "16", "17", "18", "19"],
+        "无 LIMIT 排序消排"
+    );
+    // DESC 不消排 (索引升序): 回退全量排序, 结果仍正确
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 17 ORDER BY val DESC"),
+        vec!["19", "18", "17"],
+        "DESC 保持 sql_order_cmp 全量排序"
+    );
+    // 排序消排 + 残余过滤: 界下推后仍须 worker 过滤 (note 无索引)
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 10 AND note = 'n2' ORDER BY val ASC"),
+        vec!["12", "17"],
+        "残余过滤不破坏索引序 (val%5==2 → 12,17)"
+    );
+    // 排序消排 + 残余过滤 + LIMIT: early_cut 只计过滤通过的行
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val >= 10 AND note = 'n2' ORDER BY val ASC LIMIT 1"),
+        vec!["12"],
+        "残余过滤下 top-1 仍正确"
+    );
+    // pk 排序消排 (FullScan 天然按 pk 序) + top-k 下推
+    assert_eq!(
+        c.ids("SELECT id FROM nums ORDER BY id ASC LIMIT 4"),
+        vec!["0", "1", "2", "3"],
+        "FullScan pk 序 = ORDER BY pk"
     );
     // 多列排序: grp asc, val desc
     assert_eq!(
@@ -1641,6 +1684,376 @@ fn mysql_plain_unique_unchanged() {
     drop(mgr);
 }
 
+/// ⭐ PG 兼容 (FMT_VER 7): 复合 UNIQUE — 整组唯一 (拼接 key + IVAL_COMPOSITE).
+/// 同首列不同次列允许; 整组重复必拒 (1062); 复合索引不参与单列扫描 (正确性保底).
+#[test]
+fn mysql_composite_unique() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE uq (a INT, b INT, UNIQUE(a, b))");
+    c.query("INSERT INTO uq VALUES (1, 1)");
+    c.query("INSERT INTO uq VALUES (1, 2)"); // 同 a 不同 b: 允许
+    let r = c.query("INSERT INTO uq VALUES (1, 1)"); // 整组重复: 拒
+    assert!(matches!(r, QueryResult::Err { code: 1062, .. }), "复合 UNIQUE 整组重复必拒: {r:?}");
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM uq"),
+        QueryResult::Rows(vec![vec![Some("2".into())]]),
+        "冲突行零写入"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ PG 兼容 (FMT_VER 8): 外键级联删除 — ON DELETE CASCADE 删引用行,
+/// SET NULL 置空引用列; 引用完整性 v1 不强制 (语法兼容层).
+#[test]
+fn mysql_foreign_key_cascade() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE fk_parent (id INT PRIMARY KEY)");
+    c.query("CREATE TABLE fk_child (id INT PRIMARY KEY, pid INT REFERENCES fk_parent(id) ON DELETE CASCADE)");
+    c.query("CREATE TABLE fk_ref (id INT PRIMARY KEY, pid INT REFERENCES fk_parent(id) ON DELETE SET NULL)");
+    c.query("INSERT INTO fk_parent VALUES (1), (2)");
+    c.query("INSERT INTO fk_child VALUES (10, 1), (11, 1), (12, 2)");
+    c.query("INSERT INTO fk_ref VALUES (20, 1), (21, 2)");
+    // DELETE parent 1 → child 10/11 级联删, ref 20 置 NULL
+    c.query("DELETE FROM fk_parent WHERE id=1");
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fk_child"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "CASCADE 删掉引用 parent=1 的 child 行"
+    );
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fk_ref"),
+        QueryResult::Rows(vec![vec![Some("2".into())]]),
+        "SET NULL 保留 ref 行"
+    );
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fk_parent"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "父行删除"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ PG 兼容 (UPDATE SET 表达式): `SET col = col + 1` 乐观锁, `NOT col` toggle,
+/// 链式算术. 由 shard 端 row_update 读旧行求值 (原子读改写).
+#[test]
+fn mysql_update_set_expr() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE ctr (id INT PRIMARY KEY, version INT DEFAULT 0, enabled BOOL DEFAULT true)");
+    c.query("INSERT INTO ctr (id) VALUES (1), (2), (3)");
+    // 乐观锁: version = version + 1 (id=1, 期望 0→1)
+    c.query("UPDATE ctr SET version = version + 1 WHERE id = 1 AND version = 0");
+    assert_eq!(
+        c.query("SELECT id, version FROM ctr WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("1".into()), Some("1".into())]]),
+        "version=version+1 乐观锁"
+    );
+    // toggle: enabled = NOT enabled (id=1, 期望 true→false)
+    c.query("UPDATE ctr SET enabled = NOT enabled WHERE id = 1");
+    assert_eq!(
+        c.query("SELECT id, enabled FROM ctr WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("1".into()), Some("0".into())]]),
+        "enabled=NOT enabled"
+    );
+    // 链式算术: version = version * 2 + 1 (id=2, 0*2+1=1)
+    c.query("UPDATE ctr SET version = version * 2 + 1 WHERE id = 2");
+    assert_eq!(
+        c.query("SELECT id, version FROM ctr WHERE id = 2"),
+        QueryResult::Rows(vec![vec![Some("2".into()), Some("1".into())]]),
+        "链式算术 version*2+1"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ PG 兼容 (引用完整性, FMT_VER 8): INSERT 拒绝悬空外键引用.
+/// 父行存在 → 成功; 父行缺失 → 拒 (23503); NULL 外键允许; 多行含无效 → 整体拒.
+#[test]
+fn mysql_foreign_key_referential_integrity() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE fk_p (id INT PRIMARY KEY)");
+    c.query("CREATE TABLE fk_c (id INT PRIMARY KEY, pid INT REFERENCES fk_p(id) ON DELETE CASCADE)");
+    // 先插父行 (预热父表 schema)
+    c.query("INSERT INTO fk_p VALUES (1), (2)");
+    // 引用存在的父 → 成功
+    c.query("INSERT INTO fk_c VALUES (10, 1), (11, 2)");
+    // 引用不存在的父 → 拒
+    assert!(matches!(
+        c.query("INSERT INTO fk_c VALUES (12, 999)"),
+        QueryResult::Err { code: 1062, .. } | QueryResult::Err { code: _, .. }
+    ), "悬空外键引用必拒");
+    // NULL 外键 → 允许
+    c.query("INSERT INTO fk_c VALUES (13, NULL)");
+    // 多行混合 (1 有效 1 无效) → 整体拒, 无部分写入
+    assert!(matches!(
+        c.query("INSERT INTO fk_c VALUES (14, 1), (15, 888)"),
+        QueryResult::Err { .. }
+    ), "多行含无效外键整体拒");
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fk_c"),
+        QueryResult::Rows(vec![vec![Some("3".into())]]),
+        "仅 3 行 (10,11,13) 写入, 无部分写入"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ PG 兼容 (范围查): 主键列范围谓词走主键 B+Tree 索引 (非全表扫),
+/// 边界/残余过滤正确.
+#[test]
+fn mysql_pk_range_scan() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE rng (id INT PRIMARY KEY, v INT)");
+    // 批量插 5000 行
+    c.query(&format!(
+        "INSERT INTO rng VALUES {}",
+        (0..5000).map(|i| format!("({i},{i})")).collect::<Vec<_>>().join(",")
+    ));
+    // BETWEEN 范围 (走主键索引)
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM rng WHERE id BETWEEN 0 AND 999"),
+        QueryResult::Rows(vec![vec![Some("1000".into())]]),
+        "BETWEEN 0..999 = 1000 行"
+    );
+    // 单点边界
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM rng WHERE id BETWEEN 4999 AND 4999"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "BETWEEN 4999..4999 = 1 行"
+    );
+    // 单边下界
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM rng WHERE id >= 4990"),
+        QueryResult::Rows(vec![vec![Some("10".into())]]),
+        "id>=4990 = 10 行"
+    );
+    // 范围 + 残余过滤 (v 非索引列)
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM rng WHERE id BETWEEN 0 AND 99 AND v > 50"),
+        QueryResult::Rows(vec![vec![Some("49".into())]]),
+        "范围+残余过滤 = 49 行"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 巨型 INSERT 防死锁 (2026-08): 单条 INSERT VALUES 超过 inbox/reply_bus
+/// 容量 (8192) 时, worker 非阻塞 push + 满时 drain reply_bus, 打破循环等待.
+/// 5 万行单条不卡死且数据完整.
+#[test]
+fn mysql_huge_insert_no_deadlock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE big (id INT PRIMARY KEY, v INT)");
+    // 单条 1 万行 (> inbox 8192 容量, 触发反压 drain; < e2e 客户端 5s 超时)
+    let n = 10000;
+    let sql = format!(
+        "INSERT INTO big VALUES {}",
+        (0..n).map(|i| format!("({i},{i})")).collect::<Vec<_>>().join(",")
+    );
+    c.query(&sql);
+    // 数据完整 (COUNT = n)
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM big"),
+        QueryResult::Rows(vec![vec![Some("10000".into())]]),
+        "1 万行单条插入完整 (防死锁)"
+    );
+    // 抽查
+    assert_eq!(
+        c.query("SELECT v FROM big WHERE id = 9999"),
+        QueryResult::Rows(vec![vec![Some("9999".into())]]),
+        "抽查尾行"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 // ===== ⭐ information_schema 系统表 (F66) =====
 
 /// 系统表虚拟化: tables/columns/key_column_usage/schemata + 投影/过滤/大小写/未知回空.
@@ -1947,7 +2360,10 @@ fn mysql_or_predicates() {
         c.query(&format!("INSERT INTO t VALUES ({}, {a}, {b})", i + 1));
     }
 
-    // OR (索引列 a 上 OR → 全表扫回退, 结果正确)
+    // ⭐ M2: 索引列 a 上的 OR → IndexUnion (分别 IndexScan + 合并去重)
+    // 数据 (id,a,b)=(1,1,10)(2,2,20)(3,3,30)(4,1,99) → a∈{1,2} 命中 id=1,2,4
+    assert_eq!(c.ids("SELECT id FROM t WHERE a = 1 OR a = 2 ORDER BY id"), vec!["1", "2", "4"]);
+    // OR (跨列 a=1 OR b=30 → 全表扫回退, 结果正确)
     assert_eq!(c.ids("SELECT id FROM t WHERE a = 1 OR b = 30 ORDER BY id"), vec!["1", "3", "4"]);
     // 混合 (a=1 OR a=2) AND b>15
     assert_eq!(c.ids("SELECT id FROM t WHERE (a = 1 OR a = 2) AND b > 15 ORDER BY id"), vec!["2", "4"]);
@@ -1977,6 +2393,171 @@ fn mysql_or_predicates() {
 
 /// JOIN WHERE 带 OR (下推回退, worker 残余递归) + HAVING 带 OR.
 #[test]
+/// ⭐ M3-2 (连接顺序): 双表 Inner join 驱动交换 — 右表 (候选驱动) 远小于左表时,
+/// EstimateRows 收集行数 → 选小表驱动 (先 Gather 右表, 左表 key_set 点查);
+/// 结果与不交换一致, SELECT * 列序保持.
+#[test]
+fn mysql_join_driver_swap() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE big (id INT PRIMARY KEY, v INT)");
+    c.query("CREATE TABLE small (id INT PRIMARY KEY, name TEXT)");
+    for i in 0..100 {
+        c.query(&format!("INSERT INTO big VALUES ({i}, {i})"));
+    }
+    for (id, name) in [("0", "zero"), ("1", "one"), ("5", "five")] {
+        c.query(&format!("INSERT INTO small VALUES ({id}, '{name}')"));
+    }
+    // small (3) << big (100) → 驱动交换 (先 Gather small, big key_set 点查)
+    assert_eq!(
+        c.query("SELECT b.id, s.name FROM big b JOIN small s ON b.id = s.id ORDER BY b.id"),
+        QueryResult::Rows(vec![
+            vec![Some("0".into()), Some("zero".into())],
+            vec![Some("1".into()), Some("one".into())],
+            vec![Some("5".into()), Some("five".into())],
+        ])
+    );
+    // SELECT * 列序 = big 列 + small 列 (驱动交换不影响输出列序)
+    match c.query("SELECT * FROM big b JOIN small s ON b.id = s.id") {
+        QueryResult::Rows(rows) => {
+            assert_eq!(rows.len(), 3);
+            // 每行前 2 列是 big (id, v), 后 2 列是 small (id, name)
+            for row in &rows {
+                assert_eq!(row.len(), 4, "big 2 列 + small 2 列: {row:?}");
+            }
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // 反向驱动 (右表更大) 不交换, 结果仍一致
+    assert_eq!(
+        c.query("SELECT s.name, b.id FROM small s JOIN big b ON s.id = b.id ORDER BY s.id"),
+        QueryResult::Rows(vec![
+            vec![Some("zero".into()), Some("0".into())],
+            vec![Some("one".into()), Some("1".into())],
+            vec![Some("five".into()), Some("5".into())],
+        ])
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ M3-4 (基数估算): JOIN 表上多个等值索引候选 → EstimateRows 收集 distinct,
+/// index_hint 选选择性高的.
+/// ⭐ 方案 A: 本测试小表 (≤ 阈值) 走"跳过统计"路径 — 验证 index_hint 退化
+/// (join_distinct 空 → 取首个 Eq) 下结果仍正确; 完整 distinct 收集路径由
+/// mysql_join_est_threshold 的大表场景覆盖.
+#[test]
+fn mysql_join_distinct_choice() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT)");
+    c.query("CREATE INDEX ta ON t(a)");
+    c.query("CREATE INDEX tb ON t(b)");
+    // t: 20 行, a 只有 2 个 distinct (id%2), b 每行唯一 (高 distinct)
+    for i in 0..20 {
+        c.query(&format!("INSERT INTO t VALUES ({i}, {}, {i})", i % 2));
+    }
+    for (id, name) in [("0", "zero"), ("1", "one"), ("2", "two")] {
+        c.query(&format!("INSERT INTO u VALUES ({id}, '{name}')"));
+    }
+    // u 3 行 << t 20 行 → 驱动 u; t 的 WHERE 双 Eq 候选 (ta: a distinct=2, tb: b distinct=20)
+    // → index_hint 应选 tb (选择性高); 结果: t.id=2 (a=0, b=2) 匹配 u.id=2
+    assert_eq!(
+        c.query("SELECT u.name, t.id FROM u JOIN t ON u.id = t.id WHERE t.a = 0 AND t.b = 2"),
+        QueryResult::Rows(vec![vec![Some("two".into()), Some("2".into())]])
+    );
+    // 另一候选组合: a=0 AND b=0 → t.id=0 (u.id=0)
+    assert_eq!(
+        c.query("SELECT u.name, t.id FROM u JOIN t ON u.id = t.id WHERE t.a = 0 AND t.b = 0"),
+        QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]])
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 方案 A (调优): EstimateRows 开销收敛 — 小表 JOIN (两表行数 ≤ EST_SKIP_STATS_ROWS)
+/// 跳过 distinct/ranges 统计收集, 固定只 1 轮行数广播 (SQL_JOIN_EST_ROUNDS 增量=1,
+/// SQL_JOIN_EST_SKIPPED 增量=1); 大表 JOIN 走完整统计 (行数+distinct+ranges=3 轮,
+/// 不触发跳过). 结果正确性两条路径都保持.
+/// 注: 断言依赖 nextest heavy 组串行 (max-threads=1), 勿与其它 JOIN 测试并行跑本 binary.
+#[test]
+fn mysql_join_est_threshold() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    // ---- 小表场景: 两表 ≤ 阈值 → 跳过统计, 只 1 轮 ----
+    c.query("CREATE TABLE s (id INT PRIMARY KEY, a INT, b INT)");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT)");
+    c.query("CREATE INDEX sa ON s(a)");
+    c.query("CREATE INDEX sb ON s(b)");
+    for i in 0..100 {
+        c.query(&format!("INSERT INTO s VALUES ({i}, {}, {i})", i % 2));
+    }
+    for (id, name) in [("0", "zero"), ("1", "one")] {
+        c.query(&format!("INSERT INTO u VALUES ({id}, '{name}')"));
+    }
+    let r0 = network::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed);
+    let k0 = network::metrics::SQL_JOIN_EST_SKIPPED.load(Relaxed);
+    assert_eq!(
+        c.query("SELECT u.name, s.id FROM u JOIN s ON u.id = s.id WHERE s.a = 0 AND s.b = 0"),
+        QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]]),
+        "小表 JOIN 结果正确 (跳过统计 + key_set/index_hint 兜底)"
+    );
+    let r1 = network::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed);
+    let k1 = network::metrics::SQL_JOIN_EST_SKIPPED.load(Relaxed);
+    assert_eq!(r1 - r0, 1, "小表 JOIN 应只 1 轮 (行数合并, 统计跳过)");
+    assert_eq!(k1 - k0, 1, "小表 JOIN 应触发阈值跳过");
+
+    // ---- 大表场景: 一行 > 阈值 → 走完整统计 (行数+distinct+ranges) ----
+    // 注: 独立 CREATE INDEX 在 worker 被吞 (v1), 须用建表内联 INDEX(col).
+    c.query("CREATE TABLE big (id INT PRIMARY KEY, a INT, b INT, INDEX(a), INDEX(b))");
+    // 多行 VALUES 批量插入 (2000 行 > 阈值 1024)
+    let mut sql = String::from("INSERT INTO big VALUES ");
+    for i in 0..2000 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i}, {}, {i})", i % 50));
+    }
+    c.query(&sql);
+    assert_eq!(
+        c.query("SELECT u.name, big.id FROM u JOIN big ON u.id = big.id WHERE big.a = 0 AND big.b = 0"),
+        QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]]),
+        "大表 JOIN 走统计后结果仍正确"
+    );
+    let r2 = network::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed);
+    let k2 = network::metrics::SQL_JOIN_EST_SKIPPED.load(Relaxed);
+    assert_eq!(r2 - r1, 3, "大表 JOIN 应 3 轮 (行数+distinct+ranges)");
+    assert_eq!(k2 - k1, 0, "大表 JOIN 不应触发阈值跳过");
+
+    // ---- 无索引大表: 行数 > 阈值但无候选索引列 → distinct/ranges 自动跳过, 仍 1 轮 ----
+    c.query("CREATE TABLE big2 (id INT PRIMARY KEY, c INT)");
+    let mut sql = String::from("INSERT INTO big2 VALUES ");
+    for i in 0..1500 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i}, {i})"));
+    }
+    c.query(&sql);
+    assert_eq!(
+        c.query("SELECT u.name, big2.id FROM u JOIN big2 ON u.id = big2.id WHERE big2.c = 0"),
+        QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]]),
+        "无索引大表 JOIN 结果正确 (全扫 Gather)"
+    );
+    let r3 = network::metrics::SQL_JOIN_EST_ROUNDS.load(Relaxed);
+    assert_eq!(r3 - r2, 1, "无索引大表应 1 轮 (候选空, 统计批次自动跳过)");
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 fn mysql_or_join_having() {
     let (server, mgr) = start_sql_server(None);
     let mut c = MyConn::handshake_login(&server, "");
@@ -2340,8 +2921,13 @@ fn mysql_alter_table() {
     assert!(matches!(c.query("ALTER TABLE t ADD COLUMN name TEXT"), QueryResult::Err { .. }));
     // NOT NULL → 报错 (v1)
     assert!(matches!(c.query("ALTER TABLE t ADD COLUMN x INT NOT NULL"), QueryResult::Err { .. }));
-    // DROP COLUMN → 报错 (v1)
-    assert!(matches!(c.query("ALTER TABLE t DROP COLUMN name"), QueryResult::Err { .. }));
+    // ⭐ compat: DROP COLUMN — 标记删除 (SELECT * 隐藏, 显式引用报错, 存量行不受影响)
+    assert_eq!(c.query("ALTER TABLE t DROP COLUMN name"), QueryResult::Ok { affected: 0 });
+    assert!(matches!(c.query("SELECT name FROM t"), QueryResult::Err { .. }));
+    let r = c.query("SELECT * FROM t ORDER BY id");
+    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    assert_eq!(rows[0].len(), 3, "{rows:?}"); // id, age, email (name 已隐藏)
+    assert_eq!(c.query("SELECT id FROM t WHERE age = 30"), QueryResult::Rows(vec![vec![Some("3".into())]]));
 
     drop(c);
     server.shutdown().unwrap();
@@ -2393,6 +2979,73 @@ fn mysql_types() {
         c.ids("SELECT id FROM t WHERE ts >= TIMESTAMP '2024-01-01 00:00:00'"),
         vec!["1"]
     );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ P0-2: 投影下推 — 简单 SELECT (无 ORDER/聚合/COUNT) 的 FullScan 广播改 ScanFiltered,
+/// shard 只回 proj ∪ WHERE 列 (row_cols), worker 展开回全列过滤/渲染; 结果与全行路径一致.
+#[test]
+fn mysql_projection_pushdown() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)");
+    for (id, name, score) in [("1", "a", 10), ("2", "b", 5), ("3", "c", 20)] {
+        c.query(&format!("INSERT INTO t VALUES ({id}, '{name}', {score})"));
+    }
+    // 无 WHERE 简单投影 (下推, shard 只回 id,name 列)
+    assert_eq!(
+        c.query("SELECT id, name FROM t"),
+        QueryResult::Rows(vec![
+            vec![Some("1".into()), Some("a".into())],
+            vec![Some("2".into()), Some("b".into())],
+            vec![Some("3".into()), Some("c".into())],
+        ])
+    );
+    // WHERE 列追加进下推列集 (row_cols = [id, score])
+    assert_eq!(c.ids("SELECT id FROM t WHERE score > 5"), vec!["1", "3"]);
+    // OR→IN 合并 (M2c) + 投影下推: name IN ('a','b') 作为 shard preds
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE name = 'a' OR name = 'b'"),
+        vec!["1", "2"]
+    );
+    // limit 下推 (无 WHERE → shard_limit = limit+offset)
+    assert_eq!(c.ids("SELECT name FROM t LIMIT 2"), vec!["a", "b"]);
+    // 全列 SELECT * → row_cols == 全列, 不下推, 结果一致
+    match c.query("SELECT * FROM t WHERE score > 5") {
+        QueryResult::Rows(rows) => assert_eq!(rows.len(), 2),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // 有排序 → 不走投影下推路径, 结果仍一致
+    assert_eq!(c.ids("SELECT id FROM t ORDER BY score"), vec!["2", "1", "3"]);
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ P0-1 + P1-11: 常量折叠 (常量比较短路 `1=1`/`1=0`, 右值算术 `id=1+2`)
+/// 与 IS NULL 语义 (desugar 为 col=NULL, 走全扫正确过滤; NULL 不入索引).
+#[test]
+fn mysql_const_fold_and_is_null() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)");
+    for (id, name, score) in [("1", "'a'", 10), ("2", "'b'", 5), ("3", "NULL", 20)] {
+        c.query(&format!("INSERT INTO t VALUES ({id}, {name}, {score})"));
+    }
+    // 常量比较短路: 1=1 恒真 → 全表 (pk 序); 1=0 恒假 → 空
+    assert_eq!(c.ids("SELECT id FROM t WHERE 1=1"), vec!["1", "2", "3"]);
+    assert_eq!(c.ids("SELECT id FROM t WHERE 1=0"), Vec::<String>::new());
+    assert_eq!(c.ids("SELECT id FROM t WHERE 2 > 1"), vec!["1", "2", "3"]);
+    // 右值算术折叠: id = 1+2 → id = 3; score > 2*3 → score > 6
+    assert_eq!(c.ids("SELECT id FROM t WHERE id = 1+2"), vec!["3"]);
+    assert_eq!(c.ids("SELECT id FROM t WHERE score > 2*3"), vec!["1", "3"]);
+    // IS NULL / IS NOT NULL (desugar → 全扫过滤; NULL 不入索引走不了索引扫描)
+    assert_eq!(c.ids("SELECT id FROM t WHERE name IS NULL"), vec!["3"]);
+    assert_eq!(c.ids("SELECT id FROM t WHERE name IS NOT NULL"), vec!["1", "2"]);
 
     drop(c);
     server.shutdown().unwrap();

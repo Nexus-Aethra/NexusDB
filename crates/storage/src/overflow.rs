@@ -85,7 +85,7 @@ pub fn decode_descriptor(stored: &[u8]) -> Option<(u64, u32)> {
 
 /// 构造带标准页头的空页 (vpid 由 PageWriteBatch::submit 写入 0x18).
 fn blank_page(page_type: PageType) -> Box<[u8; PAGE_SIZE]> {
-    let mut p = Box::new([0u8; PAGE_SIZE]);
+    let mut p = crate::page_pool::alloc_zeroed();
     p[0..4].copy_from_slice(b"LCBP");
     p[4] = page_type as u8;
     p[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // version

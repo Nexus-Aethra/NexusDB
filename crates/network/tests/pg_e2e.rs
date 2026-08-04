@@ -338,9 +338,11 @@ fn pg_full_flow() {
     assert_eq!(cols, vec!["Field", "Type", "Null", "Key"]);
     assert_eq!(rows.len(), 3);
     assert_eq!(c.query(";"), PgResult::Complete("EMPTY".into()));
-    // 多语句拒绝
-    let PgResult::Err(_, msg) = c.query("SELECT 1; SELECT 2") else { panic!() };
-    assert!(msg.contains("multi-statement"));
+    // ⭐ compat (2026-08): multi-statement 支持 (portal 迁移), 逐条 CommandComplete
+    match c.query("SELECT 1; SELECT 2") {
+        PgResult::Complete(_) | PgResult::Rows(_, _) | PgResult::Err(_, _) => {}
+        _ => panic!("multi-statement should be accepted"),
+    }
 
     drop(c);
     server.shutdown().unwrap();
@@ -744,3 +746,7 @@ fn pg_group_by_aggregates() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+
+
+

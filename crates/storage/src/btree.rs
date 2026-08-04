@@ -186,6 +186,27 @@ pub async fn travel_to_leaf(
                 depth += 1;
             }
             other => {
+                // ⭐ DIAG: 坏页诊断 — dump 页头 + meta 映射 (NLOG_DIAG=1)
+                if std::env::var("NLOG_DIAG").is_ok_and(|v| v == "1") {
+                    let hdr_vpid = u64::from_le_bytes(
+                        page[0x18..0x20].try_into().unwrap_or_default(),
+                    );
+                    let pid_info = pager.meta_debug_iter()
+                        .into_iter()
+                        .find(|(v, _)| *v == current_vpid)
+                        .map(|(_, p)| format!(
+                            "file={} chunk={} page_idx={}",
+                            p.file_id(), p.chunk_idx(), p.page_idx()
+                        ))
+                        .unwrap_or_else(|| "UNMAPPED".into());
+                    eprintln!(
+                        "[DIAG-BADPAGE] vpid={current_vpid} root={root_vpid} depth={depth} \
+                         expected=Leaf/Internal got={other:?} \
+                         hdr_vpid={hdr_vpid} hdr_magic={:02X?} \
+                         meta_pid=[{pid_info}] key={key:?}",
+                        &page[0..4]
+                    );
+                }
                 return Err(BTreeError::BadPageType {
                     vpid: current_vpid,
                     page_type: other,
@@ -286,6 +307,27 @@ pub async fn travel_to_leaf_guided(
                 depth += 1;
             }
             other => {
+                // ⭐ DIAG: 坏页诊断 (guided 版)
+                if std::env::var("NLOG_DIAG").is_ok_and(|v| v == "1") {
+                    let hdr_vpid = u64::from_le_bytes(
+                        page[0x18..0x20].try_into().unwrap_or_default(),
+                    );
+                    let pid_info = pager.meta_debug_iter()
+                        .into_iter()
+                        .find(|(v, _)| *v == current_vpid)
+                        .map(|(_, p)| format!(
+                            "file={} chunk={} page_idx={}",
+                            p.file_id(), p.chunk_idx(), p.page_idx()
+                        ))
+                        .unwrap_or_else(|| "UNMAPPED".into());
+                    eprintln!(
+                        "[DIAG-BADPAGE] vpid={current_vpid} root={root_vpid} depth={depth} \
+                         expected=Leaf/Internal got={other:?} \
+                         hdr_vpid={hdr_vpid} hdr_magic={:02X?} \
+                         meta_pid=[{pid_info}] key={key:?}",
+                        &page[0..4]
+                    );
+                }
                 return Err(BTreeError::BadPageType {
                     vpid: current_vpid,
                     page_type: other,
@@ -361,16 +403,31 @@ pub async fn btree_scan_from<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()
 ) -> Result<(), BTreeError> {
     use core::ops::ControlFlow;
     let mut start: Vec<u8> = start.to_vec();
+    let mut leaf_count = 0u32;
+    let mut total_keys = 0u64;
     loop {
         let (guide, leaf_bytes) = travel_to_leaf_guided(pager, root_vpid, &start).await?;
+        let kc = page::page_key_count(&leaf_bytes[..]);
         // 本 leaf 扫 key >= start; 首遇不带 prefix 的 key → Break (全局下界)
+        let mut scanned = 0u64;
         let flow = page::leaf_scan_from(&leaf_bytes[..], &start, &mut |k: &[u8], v: &[u8]| {
             if !k.starts_with(prefix) {
                 return ControlFlow::Break(());
             }
+            scanned += 1;
             f(k, v)
         });
+        leaf_count += 1;
+        total_keys += scanned;
         let upper = guide.upper.clone();
+        // ⭐ DIAG: 扫描路径追踪 (NLOG_DIAG=1)
+        if crate::chunk_writer::diag_enabled() {
+            eprintln!(
+                "[DIAG-SCAN] leaf#{leaf_count} vpid={} key_count={kc} scanned={scanned} \
+                 upper={upper:?} start={start:?}",
+                guide.leaf_vpid
+            );
+        }
         crate::page_pool::recycle(leaf_bytes);
         // 回调 Break (limit) 或 前缀越界 → 全局结束
         if matches!(flow, ControlFlow::Break(())) {
@@ -423,6 +480,7 @@ pub async fn btree_insert(
         }
         Err(page::PageError::PageFull) => {
             // 4. PageFull: 走 split 传播
+            let orig_key_count = page::page_key_count(&leaf_bytes[..]);
             let mut right_bytes = leaf_new();
             let split_key = leaf_split(&mut leaf_bytes, &mut right_bytes)?;
             // 4a. 把触发的 key 插入到正确的 half:
@@ -436,6 +494,20 @@ pub async fn btree_insert(
                 page::leaf_insert(&mut right_bytes, key, value)?;
             } else {
                 page::leaf_insert(&mut *leaf_bytes, key, value)?;
+            }
+            // ⭐ DIAG: split 后 key 守恒校验
+            if crate::chunk_writer::diag_enabled() {
+                let left_count = page::page_key_count(&leaf_bytes[..]);
+                let right_count = page::page_key_count(&right_bytes[..]);
+                let total_after = left_count as u32 + right_count as u32;
+                let expected = orig_key_count as u32 + 1; // +1 for the triggering key
+                if total_after != expected {
+                    eprintln!(
+                        "[DIAG-SPLIT-LEAK] key count mismatch! before={orig_key_count} \
+                         after={total_after} (left={left_count} right={right_count}) \
+                         expected={expected} split_key={split_key:?}"
+                    );
+                }
             }
 
             // 4b. 创建 right vpid (含触发的 key)
@@ -451,6 +523,25 @@ pub async fn btree_insert(
             )
             .await?;
             batch.submit(pager).await?;
+            // ⭐ DIAG: split 后回查验证 — 确认 split_key 从根可达
+            if crate::chunk_writer::diag_enabled() {
+                let check_root = new_root.unwrap_or(root_vpid);
+                match btree_lookup(pager, check_root, &split_key).await {
+                    Ok(Some(_)) => {} // OK
+                    Ok(None) => {
+                        eprintln!(
+                            "[DIAG-SPLIT-LOST] split_key={split_key:?} NOT reachable after split! \
+                             root={check_root} leaf={leaf_vpid} right={right_vpid}"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[DIAG-SPLIT-ERR] split_key={split_key:?} lookup error: {e} \
+                             root={check_root} leaf={leaf_vpid} right={right_vpid}"
+                        );
+                    }
+                }
+            }
             Ok(new_root)
         }
         Err(e) => Err(BTreeError::Page(e)),

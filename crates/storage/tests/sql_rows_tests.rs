@@ -29,14 +29,14 @@ fn opts_for(tmp: &tempfile::TempDir) -> OpenOptions {
 fn demo_schema() -> TableSchema {
     TableSchema::new(
         vec![
-            Column { name: "id".into(), ty: ColType::I64, nullable: false },
-            Column { name: "name".into(), ty: ColType::Str, nullable: false },
-            Column { name: "score".into(), ty: ColType::F64, nullable: true },
-            Column { name: "note".into(), ty: ColType::Str, nullable: true },
+            Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+            Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
+            Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
+            Column { name: "note".into(), ty: ColType::Str, nullable: true, default: None },
         ],
         0,
         &[1, 2], // iid 0 = name, iid 1 = score
-        &[], &[])
+        &[], &[], &[], &[])
     .unwrap()
 }
 
@@ -426,12 +426,12 @@ fn unique_index_rejects_duplicates() {
         // email (col 1) 唯一索引
         let schema = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false },
-                Column { name: "email".into(), ty: ColType::Str, nullable: false },
+                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column { name: "email".into(), ty: ColType::Str, nullable: false, default: None },
             ],
             0,
             &[],
-            &[1], &[])
+            &[1], &[], &[], &[])
         .unwrap();
         e.set_schema("db1", "t1", &schema).await.unwrap();
         let row = |id: i64, em: &str| {

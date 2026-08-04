@@ -8,6 +8,7 @@ pub mod http;
 pub mod mysql;
 pub mod pg;
 pub mod resp;
+pub mod resp_cmd;
 pub mod sql;
 
 use thiserror::Error;

@@ -197,6 +197,9 @@ fn http_full_flow() {
     let text = String::from_utf8_lossy(&r.body).into_owned();
     assert!(text.contains("nexusdb_http_requests_total"), "{text}");
     assert!(text.contains("nexusdb_sql_queries_total"));
+    // ⭐ 方案 A (调优): EstimateRows 开销观测指标
+    assert!(text.contains("nexusdb_sql_join_est_rounds"), "{text}");
+    assert!(text.contains("nexusdb_sql_join_est_skipped"), "{text}");
     assert!(r.header("Content-Type").unwrap().starts_with("text/plain"));
     let r = c.request("GET", "/v1/debug/sql-cache", None, "");
     assert!(r.json()["worker_schemas"].as_u64().unwrap() >= 1);

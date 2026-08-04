@@ -59,6 +59,9 @@ pub struct IndexHint {
     pub iid: u32,
     pub lo: Option<ColValue>,
     pub hi: Option<ColValue>,
+    /// ⭐ PG 兼容 (范围查): 扫主键 B+Tree 区间 (非二级索引). 主键列范围谓词
+    /// (BETWEEN/>=/<=) 用此走主键索引, 避免全表扫.
+    pub pk: bool,
 }
 
 /// ⭐ F70 (JOIN): 键集合索引点查提示 — probe 侧只回 join 键 ∈ keys 的行.
@@ -156,6 +159,31 @@ pub fn index_val_bytes(ty: ColType, v: &ColValue) -> Option<Vec<u8>> {
     }
 }
 
+/// ⭐ PG 兼容 (FMT_VER 7): 索引 key 编码 — 多列索引拼接各列编码
+/// (长度前缀防碰撞: `[u16 len][enc]...`). 单列索引保持 `index_val_bytes`
+/// 原编码 (兼容存量索引行/bloom 键). 任一列为 NULL → None (不入索引).
+pub fn index_vals_bytes(
+    schema: &TableSchema,
+    idx: &crate::schema::IndexDef,
+    values: &[ColValue],
+) -> Option<Vec<u8>> {
+    if idx.cols.len() == 1 {
+        let c = idx.cols[0] as usize;
+        return index_val_bytes(schema.columns[c].ty, &values[c]);
+    }
+    // ⭐ 复合 key: `[IVAL_COMPOSITE][nseg][u16 len][enc]...` — 型别字节让
+    // split_index_val 正确切分 (长度前缀防碰撞, 型别字节防误判单值).
+    let mut out = Vec::with_capacity(16);
+    out.push(crate::keyspace::IVAL_COMPOSITE);
+    out.push(idx.cols.len() as u8);
+    for &c in &idx.cols {
+        let enc = index_val_bytes(schema.columns[c as usize].ty, &values[c as usize])?;
+        out.extend_from_slice(&(enc.len() as u16).to_le_bytes());
+        out.extend_from_slice(&enc);
+    }
+    Some(out)
+}
+
 impl StorageEngine {
     // =================================================================
     // ⭐ Q1: schema 持久化 + 常驻镜像
@@ -213,8 +241,7 @@ impl StorageEngine {
         old_ivals: &Option<Vec<(u32, Option<Vec<u8>>)>>,
     ) -> Result<(), RegistryError> {
         for idx in schema.indexes.iter().filter(|i| i.unique) {
-            let ty = schema.columns[idx.col as usize].ty;
-            let Some(nv) = index_val_bytes(ty, &values[idx.col as usize]) else {
+            let Some(nv) = index_vals_bytes(schema, idx, &values) else {
                 continue;
             };
             // 值未变 (同 pk 覆盖) 不必探测
@@ -241,10 +268,17 @@ impl StorageEngine {
             })
             .await?;
             if dup {
-                return Err(se(format!(
-                    "duplicate key on unique column '{}'",
-                    schema.columns[idx.col as usize].name
-                )));
+                // ⭐ PG 兼容: 复合唯一 → 列组名
+                let colnames = if idx.cols.len() == 1 {
+                    schema.columns[idx.cols[0] as usize].name.clone()
+                } else {
+                    idx.cols
+                        .iter()
+                        .map(|&c| schema.columns[c as usize].name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                return Err(se(format!("duplicate key on unique columns ({colnames})")));
             }
         }
         Ok(())
@@ -308,12 +342,18 @@ impl StorageEngine {
         self.check_unique(db, table, &schema, pk, values, &old_ivals).await?;
 
         // row 行
-        self.put_physical(db, table, &rk, &new_bytes).await?;
+        // ⭐ M3-1: SQL 用户行 → 行数 +1 (覆盖不加; 索引条目写不计行数)
+        let existed = self.put_physical(db, table, &rk, &new_bytes).await?;
+        if !existed {
+            *self
+                .row_counts
+                .entry((db.to_string(), table.to_string()))
+                .or_insert(0) += 1;
+        }
 
         // 索引行: 逐 IndexDef 对比新旧值, 只动变化的
         for idx in schema.indexes.clone() {
-            let ty = schema.columns[idx.col as usize].ty;
-            let new_iv = index_val_bytes(ty, &values[idx.col as usize]);
+            let new_iv = index_vals_bytes(&schema, &idx, &values);
             let old_iv = old_ivals
                 .as_ref()
                 .and_then(|m| m.iter().find(|(iid, _)| *iid == idx.iid))
@@ -329,7 +369,77 @@ impl StorageEngine {
                 self.put_physical(db, table, &ks::encode_index_entry(idx.iid, &nv, pk), &[])
                     .await?;
                 // ⭐ Y1: 喂 bloom (只增; 删/换值不摘除 → 只累积假阳性)
-                self.bloom_entry(db, table, idx.iid).insert(&nv);
+                let (db_s, tbl_s) = (db.to_string(), table.to_string());
+                let b = self.bloom_entry(db, table, idx.iid);
+                // ⭐ M3-4: 近似 distinct — bloom miss = 确定新值 → +1 (假阳性低估, 近似)
+                let is_new = !b.may_contain(&nv);
+                b.insert(&nv);
+                if is_new {
+                    *self
+                        .distinct_counts
+                        .entry((db_s.clone(), tbl_s.clone(), idx.iid))
+                        .or_insert(0) += 1;
+                }
+                // ⭐ M3-5: 索引列 min/max (有序字节比较 = 值序; 覆盖写同值不破坏)
+                let e = self
+                    .range_counts
+                    .entry((db_s, tbl_s, idx.iid))
+                    .or_insert_with(|| (nv.to_vec(), nv.to_vec()));
+                if nv.as_slice() < e.0.as_slice() {
+                    e.0 = nv.to_vec();
+                }
+                if nv.as_slice() > e.1.as_slice() {
+                    e.1 = nv.to_vec();
+                }
+            }
+        }
+        // ⭐ DIAG: 全操作回查 — 索引更新后确认行仍可达 (NLOG_DIAG=1)
+        if crate::chunk_writer::diag_enabled() {
+            match self.get_physical(db, table, &rk).await {
+                Ok(Some(_)) => {}
+                Ok(None) => eprintln!(
+                    "[DIAG-ROWPUT-LOST] pk={pk:?} lost after row_put (index updates done)! db={db} table={table}"
+                ),
+                Err(e) => eprintln!(
+                    "[DIAG-ROWPUT-ERR] pk={pk:?} verify error: {e} db={db} table={table}"
+                ),
+            }
+            // ⭐ DIAG canary: per-shard 追踪最近 64 个 pk, 每次插入后全部回查
+            {
+                thread_local! {
+                    static RECENT_PKS: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>> =
+                        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+                    static SHARD_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+                }
+                let n = SHARD_N.with(|c| { let v = c.get(); c.set(v + 1); v });
+                // 每 200 次插入做一次全量回查 (避免太慢)
+                if n > 0 && n % 500 == 0 {
+                    let pks: Vec<Vec<u8>> = RECENT_PKS.with(|r| r.borrow().iter().cloned().collect());
+                    let mut lost = 0;
+                    for prev_pk in &pks {
+                        let rk = ks::encode_string(prev_pk);
+                        match self.get_physical(db, table, &rk).await {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                lost += 1;
+                                if lost <= 3 {
+                                    eprintln!(
+                                        "[DIAG-CANARY-LOST] pk={prev_pk:?} lost at shard-insert #{n}! db={db} table={table}"
+                                    );
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    if lost > 0 {
+                        eprintln!("[DIAG-CANARY-SUMMARY] {lost}/{} keys lost at shard-insert #{n} db={db} table={table}", pks.len());
+                    }
+                }
+                RECENT_PKS.with(|r| {
+                    let mut r = r.borrow_mut();
+                    r.push_back(pk.to_vec());
+                    if r.len() > 4000 { r.pop_front(); }
+                });
             }
         }
         Ok(())
@@ -422,7 +532,7 @@ impl StorageEngine {
         self.ensure_table(db, table).await?;
         let key = ks::unique_slot_key(iid, enc_val);
         let val = Self::unique_slot_val(1, txn_id, pk);
-        self.put_physical(db, table, &key, &val).await
+        self.put_physical(db, table, &key, &val).await.map(|_| ())
     }
 
     /// ⭐ F65: PENDING→COMMITTED (写行成功后; 仅 txn+pk 匹配才转, 防误转).
@@ -501,7 +611,7 @@ impl StorageEngine {
         db: &str,
         table: &str,
         pk: &[u8],
-        sets: &[(u16, ColValue)],
+        sets: &[(u16, row::SetVal)],
     ) -> Result<bool, RegistryError> {
         let schema = self
             .get_schema(db, table)
@@ -511,12 +621,17 @@ impl StorageEngine {
             return Ok(false);
         };
         let mut values = row::decode_row(&schema, &old).map_err(se)?;
-        for (col, v) in sets {
+        for (col, sv) in sets {
             let i = *col as usize;
             if i >= values.len() || i == schema.pk_col as usize {
                 return Err(se(format!("bad update column {col}")));
             }
-            values[i] = v.clone();
+            // ⭐ PG 兼容: 表达式对旧行求值 (行内引用用已更新列的前序 set 结果 —
+            // PG 语义: 同一 SET 列表按书写序, 后续引用可见前序更新).
+            values[i] = match sv {
+                row::SetVal::Val(v) => v.clone(),
+                row::SetVal::Expr(e) => row::eval_row_expr(e, &values),
+            };
         }
         self.row_put(db, table, pk, &values).await?;
         Ok(true)
@@ -572,6 +687,99 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// ⭐ PG 兼容 (范围查): 主键 B+Tree 区间扫描 — 扫 `[KIND_STRING]` 段,
+    /// 起点 = `encode_string(pk_enc(lo))` (无 lo 从段头), 上界 = pk 编码
+    /// > pk_enc(hi) 即 Break (含界). 返回 (空 val, pk, row_bytes) 与
+    /// IndexEntry 同构; limit 0 = 不限. 主键列范围谓词避免全表扫.
+    pub async fn pk_scan_local(
+        &mut self,
+        db: &str,
+        table: &str,
+        lo: Option<&ColValue>,
+        hi: Option<&ColValue>,
+        limit: usize,
+        out: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), RegistryError> {
+        let Some(schema) = self.get_schema(db, table).await? else {
+            return Ok(());
+        };
+        let pk_ty = schema.columns[schema.pk_col as usize].ty;
+        // 主键保序编码界 — 与 worker `sql_pk_bytes` 同源 (数值 encode_idx/
+        // encode_f64_ordered/encode_i128_ordered, 字节串原样; 复合主键 v1 用
+        // 首列编码近似, 残余 preds 精确). ⭐ 不能用 index_val_bytes (带类型字节).
+        let enc_bound = |b: Option<&ColValue>| -> Result<Option<Vec<u8>>, RegistryError> {
+            let Some(v) = b else { return Ok(None) };
+            let enc = match (pk_ty, v) {
+                (ColType::I64, ColValue::I64(i)) => crate::keyspace::encode_idx(*i).to_vec(),
+                (ColType::F64, ColValue::F64(f)) => crate::keyspace::encode_f64_ordered(*f).to_vec(),
+                (ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp, ColValue::I64(i)) => {
+                    crate::keyspace::encode_idx(*i).to_vec()
+                }
+                (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b)) => {
+                    if b.is_empty() {
+                        return Err(se("bad pk bound (empty bytes)"));
+                    }
+                    b.clone()
+                }
+                (ColType::Decimal { .. }, ColValue::Decimal(x, _)) => {
+                    crate::keyspace::encode_i128_ordered(*x).to_vec()
+                }
+                _ => return Err(se("bad pk bound type")),
+            };
+            Ok(Some(crate::keyspace::encode_string(&enc)))
+        };
+        let lo_enc = enc_bound(lo)?;
+        let hi_enc = enc_bound(hi)?;
+        let root = self.open_table(db, table).await?.ok_or_else(|| {
+            RegistryError::TableNotFound(db.to_string(), table.to_string())
+        })?;
+        // 起点: 有 lo 用 encode_string(pk_enc(lo)) 精确定位; 无 lo 从 [S] 段头.
+        let start = lo_enc.clone().unwrap_or_else(|| vec![ks::KIND_STRING]);
+        // 段前缀: [S] 保证扫描不越入其他 kind (Hash/List/...)
+        let seg = vec![ks::KIND_STRING];
+        let mut n = 0usize;
+        crate::registry::table_scan_range(
+            self.pager_mut(),
+            root,
+            &start,
+            &seg,
+            &mut |k, _v| {
+                // 上界: 扫描越过 [KIND_STRING] 段 (非字符串 key) 或 pk 编码 > hi
+                if k.first() != Some(&ks::KIND_STRING) {
+                    return ControlFlow::Break(());
+                }
+                if let Some(h) = &hi_enc {
+                    // k = [S][klen][pk_enc], 与 [S][klen'][pk_enc(hi)] 整体比较
+                    if k > h.as_slice() {
+                        return ControlFlow::Break(());
+                    }
+                }
+                if let Some(pk) = ks::split_string(k) {
+                    out.push((Vec::new(), pk.to_vec(), Vec::new()));
+                    n += 1;
+                    if limit > 0 && n >= limit {
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        )
+        .await?;
+        // 回读行 (批量, 溢出展开)
+        let refs: Vec<&[u8]> = out.iter().map(|(_, pk, _)| pk.as_slice()).collect();
+        let rows = self.table_get_many(db, table, &refs).await?;
+        for ((_, _, rb), row) in out.iter_mut().zip(rows) {
+            if let Some(r) = row
+                && r.first() == Some(&row::TAG_ROW)
+            {
+                *rb = r;
+            } else {
+                *rb = Vec::new(); // 非 TAG_ROW → 过滤
+            }
+        }
+        Ok(())
+    }
+
     /// ⭐ F67/F68/F70 (JOIN): 带谓词+投影下推的本地扫. 行来源优先级:
     /// key_set (多键索引点查) > hint (单区间范围扫) > 全表扫; 三者都 decode 行
     /// → preds AND 过滤 (NULL 恒 false) → 按 proj 取列 → 收集. limit 0 = 不限.
@@ -594,10 +802,18 @@ impl StorageEngine {
         let raw_rows: Vec<Vec<u8>> = if let Some(ks) = key_set {
             self.index_multi_point_local(db, table, ks.iid, &ks.keys).await?
         } else if let Some(h) = hint {
-            let pairs = self
-                .index_scan_local(db, table, h.iid, h.lo.as_ref(), h.hi.as_ref(), 0)
-                .await?;
-            pairs.into_iter().map(|(_pk, rb)| rb).collect()
+            if h.pk {
+                // ⭐ PG 兼容: 主键区间扫描
+                let mut pairs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+                self.pk_scan_local(db, table, h.lo.as_ref(), h.hi.as_ref(), 0, &mut pairs)
+                    .await?;
+                pairs.into_iter().map(|(_v, _pk, rb)| rb).collect()
+            } else {
+                let pairs = self
+                    .index_scan_local(db, table, h.iid, h.lo.as_ref(), h.hi.as_ref(), 0)
+                    .await?;
+                pairs.into_iter().map(|(_pk, rb)| rb).collect()
+            }
         } else {
             let scan_limit = if preds.is_empty() { limit } else { 0 };
             let mut raw: Vec<IndexEntry> = Vec::new();
@@ -617,6 +833,37 @@ impl StorageEngine {
             out.push(projected);
             if limit > 0 && out.len() >= limit {
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// ⭐ 修复 (2026-08): DML phase1 范围扫 — 与 table_scan_filtered_local 同走
+    /// 索引/主键范围, 但返回完整 `(索引原值, pk, row_bytes)` 三元组, 供 worker
+    /// collect_dml_pks 提取 pk 执行 phase2. (ScanFiltered 只回投影列值, 无 pk.)
+    pub async fn table_scan_filtered_rows_local(
+        &mut self,
+        db: &str,
+        table: &str,
+        hint: Option<&IndexHint>,
+        limit: usize,
+        out: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), RegistryError> {
+        let Some(_schema) = self.get_schema(db, table).await? else {
+            return Ok(());
+        };
+        if let Some(h) = hint {
+            if h.pk {
+                // 主键区间扫描 → (v, pk, rb)
+                self.pk_scan_local(db, table, h.lo.as_ref(), h.hi.as_ref(), limit, out).await?;
+            } else {
+                // 二级索引范围 → (pk, rb), 转成 (v=pk, pk, rb) 满足三元组
+                let pairs = self
+                    .index_scan_local(db, table, h.iid, h.lo.as_ref(), h.hi.as_ref(), limit)
+                    .await?;
+                for (pk, rb) in pairs {
+                    out.push((pk.clone(), pk, rb));
+                }
             }
         }
         Ok(())
@@ -775,7 +1022,7 @@ impl StorageEngine {
             .indexes
             .iter()
             .find(|i| i.iid == iid)
-            .copied()
+            .cloned()
             .ok_or_else(|| se(format!("index {iid} not found")))?;
         let ty = schema.columns[idx.col as usize].ty;
         let enc_bound = |b: Option<&ColValue>| -> Result<Option<Vec<u8>>, RegistryError> {
@@ -832,9 +1079,26 @@ fn index_vals_of(
         .indexes
         .iter()
         .map(|idx| {
-            let ty = schema.columns[idx.col as usize].ty;
-            let v = row::read_col(schema, row_bytes, idx.col).map_err(se)?;
-            Ok((idx.iid, index_val_bytes(ty, &v)))
+            // ⭐ PG 兼容 (FMT_VER 7): 复合索引 → 拼接各列编码 (长度前缀)
+            if idx.cols.len() == 1 {
+                let c = idx.cols[0];
+                let v = row::read_col(schema, row_bytes, c).map_err(se)?;
+                return Ok((idx.iid, index_val_bytes(schema.columns[c as usize].ty, &v)));
+            }
+            let mut out = Vec::with_capacity(16);
+            out.push(crate::keyspace::IVAL_COMPOSITE);
+            out.push(idx.cols.len() as u8);
+            let mut any_null = false;
+            for &c in &idx.cols {
+                let v = row::read_col(schema, row_bytes, c).map_err(se)?;
+                let Some(e) = index_val_bytes(schema.columns[c as usize].ty, &v) else {
+                    any_null = true;
+                    break;
+                };
+                out.extend_from_slice(&(e.len() as u16).to_le_bytes());
+                out.extend_from_slice(&e);
+            }
+            Ok((idx.iid, if any_null { None } else { Some(out) }))
         })
         .collect()
 }

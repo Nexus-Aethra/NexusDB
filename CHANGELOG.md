@@ -10,6 +10,45 @@
 
 ---
 
+## 2026-08-03 会话二十 (Portal 存储引擎替换 — PG 门面实测打通 2 大阻塞 + 参数 OID 推断)
+
+目标: 用 NexusDB 替换 PostgreSQL 作为 Nexus-Portal 存储引擎。实测复现 portal 启动卡死, 用真实 pgx 客户端 (宿主机 + 容器双路径) + tcpdump 抓包定位并修复 2 大阻塞, portal 完整启动 (迁移 + JWT + admin 引导 + 登录) 且幂等重启稳定。
+
+### 阻塞 1 — multi-statement 执行后连接永久挂起 (portal 迁移 0001 后卡死)
+- **现象**: `conn.Exec(multi-statement)` 成功返回后, 同一连接的后续任何请求 (portal 迁移后的 `INSERT INTO schema_migrations`) 全部 HUNG。此前误判为"multi 推进到 dispatched=31 后没触发 multi_finish"。
+- **根因**: multi 子语句占用客户端 seq 区间 `[base, base+N)`, 但 `multi_finish` 只对 `orig` seq 回包 (合并 CommandComplete)。`resp_flush_ready` 按 `next_to_send` 顺序推进, 遇 base+1..base+N-1 这些**无 pending 包的空洞子 seq** 永久等待 → 连接卡死。
+- **修复** (`worker/mod.rs multi_finish`): 完成后把 `next_to_send` / `next_seq` 直接推进到 `base_sub_seq + dispatched`, 跳过空洞子 seq。error 分支同样处理。
+- **验证**: repro 复现 (multi 后 `plain INSERT` HUNG) → 修复后全 SUCCESS; portal 完整跑通。
+
+### 阻塞 2 — 扩展协议参数类型 OID 缺失 (pgx/sqlx INSERT 报错)
+- **现象** (依次暴露, 层层下钻):
+  1. `unable to encode 0 into text format for text (OID 25)` — pgx 端编码 int 失败
+  2. `unsupported binary parameter OID 1114` — NexusDB `decode_param` 不认识 timestamp
+  3. `unable to encode time.Time into text (OID 25)` — timestamp 回退 text 后 pgx 仍失败
+- **根因**: Parse 未声明参数类型时 `build_param_description` 一律按 text(25) 报告。真实 PG 会按目标列推断 (INSERT 的列类型), pgx 据此编码 int/bool/time。
+- **修复**:
+  - `worker/protocol_io.rs infer_param_oids`: 基于本地 schema 缓存 (`SqlWorkerCache.schemas`) 对 INSERT 参数按目标列类型推断 OID (int/float/bool/str/bytes/date/time/timestamp); json/uuid/decimal 保持 text (pgx 文本发送, 目标列转换)。
+  - `protocol/pg.rs decode_param`: 补支持 PG 二进制 **timestamp(1114) / date(1082) / time(1083)** 解码; 新增 `PG_EPOCH_OFFSET_MICROS` (PG 2000-01-01 → NexusDB 1970-01-01 微秒偏移 = 10957 天)。
+  - `type_oid` 提升为 `pub(crate)`。
+
+### 阻塞 3 — portal 代码 bug (JwtKey.RotatedAt 非指针, Nexus-Portal 项目)
+- **现象**: `SELECT * FROM jwt_keys` 扫描 NULL `rotated_at` 到非指针 `time.Time` 报 `unsupported Scan <nil> into *time.Time` → `loadOrCreate` 误判无 key → 重复创建 kid 冲突 (`23505`), portal 启动失败。
+- **根因**: `module.JwtKey.RotatedAt` 为非指针 `time.Time` (ModuleKey 已是指针)。真实 PG 同样会出此问题, 但首次启动表空走 ErrNoRows 被掩盖。
+- **修复**: `JwtKey.RotatedAt` 改 `*time.Time`; `RotateKey` 赋值改 `now := time.Now(); s.current.RotatedAt = &now`。重新构建 portal 镜像 (`portal:nexusdb-fix`)。
+
+### portal 端到端验证 (全通过)
+- 迁移: 0001 + 0002 `migrations completed`; 幂等重启 `all migrations applied, skip`。
+- JWT: 首次启动创建 `jwt_keys k0/0/active`, RSA 签名 token 生成。
+- admin 引导: `Default admin account created`; 重启 `already exists, skip bootstrap`。
+- 登录 API: `POST /api/v1/auth/login` → `OK` + 有效 JWT (kid=k0); `/health` 200。
+
+### 边界
+- 参数 OID 推断仅覆盖 INSERT 目标列 (parse 阶段同步、无异步 schema 加载); 未命中缓存回退 text (行为不变)。
+- PG 二进制时间戳按 microsecond 精度换算; date 按天、time 按当日微秒。
+- `SELECT 1` / `SELECT $1::int` (无 FROM) 仍报语法错误 (NexusDB 不支持), 非本次范围。
+
+---
+
 ## 2026-08-01 会话十九-D (F83 TLS 传输加密 — rustls STARTTLS, 安全 P0 收官)
 
 SQL 双门面传输加密, opt-in。全 workspace **862/862** (明文路径零回归), clippy 0, psycopg3(sslmode=require, ssl_in_use=True)/mysql-connector(ssl_disabled=False) 实机加密连接验证。
