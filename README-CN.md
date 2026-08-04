@@ -2,9 +2,21 @@
 
 > **语言 / Language**: [English](./README.md) | **简体中文**
 
-> 面向写密集/低延迟的单机数据库 —— Share-Nothing + per-core thread + io_uring + 自实现协程调度器, 多协议统一接入 (Redis 兼容 ✅, PG/MySQL/Mongo 设计路线中).
+[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-860%2B%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
-[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-862%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
+## 这是什么
+
+**NexusDB** 是一个基于 Rust 2024 编写的高性能**单机 KV + SQL 数据库引擎**, 面向**写密集、低延迟、高并发**的数据服务场景。它以**一套共享存储内核**对外提供五种协议接入, 让不同生态的工具与驱动直接连接同一份数据:
+
+| 协议门面 | 端口 | 说明 |
+|---|---|---|
+| RESP2 (Redis 兼容) | 6379 | 五大数据结构 + Geo + Bitmap |
+| HTTP REST (JSON) | 6778 | KV + SQL + Prometheus `/metrics` |
+| MySQL wire | 5434 | `mysql` CLI / 驱动直连 |
+| PostgreSQL wire | 5435 | `psql` / 驱动直连; 与 MySQL 门面**共内核同数据** |
+| Binary (内部) | 5433 | 仅测试 / 压测 |
+
+核心上它兼具**写密集友好的架构**(Share-Nothing + per-core thread + io_uring 异步 I/O + 自研协程调度器, 不依赖 tokio)、**完整的 SQL 子集**(JOIN / 子查询 / 聚合 / GROUP BY / 事务)与 **Redis 数据结构**并存, 以及**生产级可靠性**(崩溃恢复、WAL 持久、860+ 测试、clippy 0 警告)。
 
 > 设计架构见 [DESIGN.md](./DESIGN.md); 接手 / 进度 见 [AGENTS.md](./AGENTS.md); 修复历史 见 [CHANGELOG.md](./CHANGELOG.md).
 >
@@ -18,34 +30,45 @@
 
 ## 核心特性
 
-**协议层**
-- **五协议监听**: RESP2 6379 + **REST (HTTP/1.1 JSON + CORS + Bearer) 6778** + SQL 双门面 (MySQL wire 5434 / PostgreSQL wire 5435, 共内核) + Binary 5433 (内部), 均含 `KvLimits` 协议层长度拦截, TCP_NODELAY
-- **可观测性**: `/metrics` (Prometheus) + `/v1/status` + `/v1/debug/*` (进程级原子计数, 热路径零锁)
-- **SQL 能力**: CREATE/ALTER TABLE ADD COLUMN/INSERT 多行/SELECT (投影·列别名 AS·ORDER BY·聚合 COUNT/SUM/AVG/MIN/MAX 含表达式 SUM(a+b)·COUNT(DISTINCT)·SELECT DISTINCT·GROUP BY·HAVING·IN·BETWEEN·LIKE·WHERE 支持 OR/NOT/括号嵌套·全表扫·单表限定列 表.列·MySQL `LIMIT offset,count`·`db.table` 限定名)/UPDATE/DELETE/DROP/USE/DESCRIBE; 本地二级索引 + 双层布隆剪枝 + 覆盖索引/UNIQUE 早停 + GLOBAL UNIQUE (跨 shard 全局唯一); SQLAlchemy ORM 基础 CRUD/JOIN/分页/反射/迁移(ADD COLUMN)实机通; **PG 兼容**: multi-statement 整文件顺序执行 + simple/extended 双协议 (Parse/Bind/Describe/Execute/Sync) + `$n` 参数 + 按目标列推断参数类型 OID (pgx/sqlx 直连) + PG 二进制时间戳/日期/时间解码 + 列默认值 (uuid/NOW/字面量) + 复合唯一索引 + 外键级联/引用完整性 + UPDATE SET 表达式 (乐观锁/toggle); **Loom 迁移 9 表 + Portal 完整启动 (迁移/JWT/admin/登录) 实机通**
-- **子查询 (非关联 WHERE + FROM 派生表 + 单等值关联 EXISTS)**: `IN/NOT IN (SELECT..)` / `标量 x op (SELECT..)` / `[NOT] EXISTS (SELECT..)` — 内层先跑→折叠字面量/恒真恒假→外层走现有索引路径 (大 IN 上限 65536 + 同型集合二分求值), DELETE/UPDATE 同支持; `SELECT .. FROM (SELECT ..) t [WHERE/ORDER/LIMIT]` 且可参与 JOIN (内层物化预填, 含聚合/GROUP BY, 孤 COUNT(*)); 单等值关联 `EXISTS/NOT EXISTS` 自动去相关为 IN; mysql+pg 驱动实机一致 (关联 IN/标量ヽJOIN 右侧派生表后续)
-- **JOIN (多表等值)**: N 表左深 `INNER|LEFT|RIGHT|FULL|CROSS JOIN ... ON/USING` — worker 完成点 hash join (shard 只本地扫描, 零跨线程), 多条件 ON + 非等值残余, 谓词/投影下推 + 索引驱动 gather + probe 侧键集合索引点查 (前序表 join 键下推, ~6x 提速), 表别名/限定列/ORDER/LIMIT; mysql+pg 驱动实机一致 (子查询后续)
-- **系统表 / 内省 (GUI/ORM 反射)**: information_schema (tables/columns/key_column_usage/schemata) + pg_catalog flat 单表 + SHOW [FULL] TABLES/COLUMNS/CREATE TABLE/DATABASES + 反引号标识符 + `SELECT @@var` stub; SQLAlchemy `inspect()` 实机反射通 (psql `\d` 的 pg_catalog JOIN 留后)
-- **统一记录编码 + value type tag**: 网络门面写入统一附加 tag, storage 层不感知, 新协议接入零存储改动
-- **多 db / 多表物理隔离**: `{block_root}/{db_name}/shard_{N}/` 目录; db 切换走 MetaPage vpid 0 索引
+### 一览
+| 特性 | 说明 |
+|---|---|
+| **一套内核, 五协议接入** | Redis RESP2、HTTP REST、MySQL/PostgreSQL wire、内部 Binary 共享同一存储引擎与 SQL 规划器 |
+| **SQL + KV 兼得** | 完整 SQL 子集 (DDL/DML、JOIN、子查询、聚合、事务) 与 Redis 兼容数据结构并存 |
+| **写密集友好** | io_uring 异步落盘、热路径零锁、自研协程调度器, 写负载下保持低延迟 |
+| **面向生产** | 崩溃恢复、WAL 持久、多 db/多表物理隔离、TLS 与标准认证流程 |
 
-**IO 与调度**
-- **io_uring 落盘**: StdFs 后端 fallback, 生产路径走 `scheduler::io_ops` 直提交 SQE
-- **T18 零拷贝**: `IOSQE_FIXED_FILE` + `RegisteredBufPool` 双优化, 移除 SQE/FdPool 上的热路径 memcpy
-- **自实现协程调度**: `crates/scheduler` 单线程 park/unpark + 优先级分区 (`spawn_on_low` 给 GC/drain 让出前台 wave)
-- **异步落盘 + 有界背压**: `FlushBatch`/`MetaFlushBatch` 按 file 分组, write ×N + fsync ×1; `MAX_INFLIGHT_CHUNKS=8` 超限退化同步; 主循环零阻塞 fsync
+### 协议层
+- **五协议监听** — RESP2 (6379) / REST JSON (6778) / MySQL wire (5434) / PostgreSQL wire (5435) / Binary (5433), 协议层统一长度拦截 + TCP_NODELAY
+- **可观测性** — `/metrics` (Prometheus)、`/v1/status`、`/v1/debug/*`, 热路径零锁
+- **SQL 能力** — 完整 DDL/DML + SELECT (投影/别名/ORDER BY/聚合/表达式/去重/GROUP BY/HAVING/IN/BETWEEN/LIKE/复杂 WHERE/分页), 本地二级索引 + 布隆剪枝 + GLOBAL UNIQUE; SQLAlchemy ORM CRUD/JOIN/反射/迁移实机通
+- **PG 兼容** — multi-statement 顺序执行 + simple/extended 双协议 + `$n` 参数 + 按列推断 OID, 二进制时间戳解码, 外键级联/引用完整性, UPDATE SET 表达式; Loom 迁移 9 表 + Portal 完整启动实机通
+- **子查询** — 非关联 WHERE (`IN/scalar/EXISTS`) + FROM 派生表 (可参与 JOIN) + 单等值关联去相关为 IN, DELETE/UPDATE 同支持
+- **JOIN (多表等值)** — N 表左深 `INNER|LEFT|RIGHT|FULL|CROSS`, worker 完成点 hash join (零跨线程), 谓词/投影下推 + 索引驱动 gather (~6x 提速)
+- **系统表 / 内省** — information_schema + pg_catalog + SHOW 系列, 供 GUI/ORM 反射
+- **统一编码 + value tag** — 网络门面统一附加类型 tag, 新协议接入零存储改动
+- **多 db / 多表物理隔离** — `{block_root}/{db_name}/shard_{N}/` 目录, db 切换走 MetaPage vpid 0 索引
 
-**存储引擎**
-- **NowChunks 数组化 + 纯 COW**: 无 dirty 标记, 驻留即待写; 满 chunk swap 后同 chunk 内 vpid 走 alloc 新 pid
-- **全量平坦 meta 缓存**: `meta : data = 1 : 2048` (1TB 数据 ≈ 512MB meta/shard-db), open 整读 + 1MB dirty window 异步刷盘
-- **数据→meta→pid.state 刷盘顺序不变量**: meta window 仅在 data backlog 排空后入队, pid.state 仅在 meta window 确认后写
+### IO 与调度
+- **io_uring 异步落盘** — 生产路径直提交 SQE, StdFs 兜底
+- **零拷贝** — `IOSQE_FIXED_FILE` + `RegisteredBufPool`, 移除热路径 memcpy
+- **自研协程调度** — 单线程 park/unpark + 优先级分区 (GC/drain 让出前台)
+- **有界背压** — 按 file 分组批写 (write ×N + fsync ×1), 并发上限超限退化同步
 
-**空间与回收**
-- **GC compact (chunk 死槽填充 + 主动 block drain)**: 原位填充, 不开新 chunk; 半空 block 被逐轮排空并 unlink
-- **PID_FREED 墓碑 + 防复活**: 大 value 覆盖写释放旧链写墓碑, recover 不回填死页
-- **大 value 溢出页 (≤ 1MB)**: 超 inline 阈值 (~4KB) 自动切成 16KB 溢出页 + 13B 描述符, 0 拷贝到现有 GC
+### 存储引擎
+- **NowChunks + 纯 COW** — 无 dirty 标记, 满 chunk swap, 数据变更天然可恢复
+- **平坦 meta 缓存** — `meta : data = 1 : 2048`, open 整读 + 异步刷盘
+- **刷盘顺序不变量** — data → meta → pid.state, 崩溃一致性有保证
 
-**质量**
-- **700+ 单元/集成测试 (当前 784), `cargo clippy --all-targets` 0 警告**
+### 空间与回收
+- **GC compact** — chunk 死槽原位填充 + 半空 block 主动排空回收
+- **墓碑 + 防复活** — 覆盖写释放旧链, 恢复时不回填死页
+- **大 value 溢出页 (≤ 1MB)** — 超 ~4KB 自动切 16KB 溢出页, 0 拷贝并入 GC
+
+### 质量
+- **测试** — 860+ 单元/集成测试, `cargo clippy --all-targets` 0 警告
+- **代码模块化解耦 (2026-08)** — 大型单体按职责拆分, 全部源文件 ~1250 行以内
+- **大数据 SQL 端到端套件** — `sql_bigdata.rs` 2 万行负载验证 COUNT/过滤/聚合/GROUP BY/分页/JOIN/UPDATE/DELETE/重连持久化
 
 ---
 

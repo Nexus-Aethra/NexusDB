@@ -2,11 +2,23 @@
 
 > **语言 / Language**: **English** | [简体中文](./README-CN.md)
 
-> A single-node database for write-heavy / low-latency workloads — Share-Nothing + per-core thread + io_uring + a hand-written coroutine scheduler, with unified multi-protocol access (Redis-compatible ✅, PG/MySQL wire ✅, Mongo on the roadmap).
+[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-860%2B%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
-[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-862%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
+## What is NexusDB?
 
-> Architecture: [DESIGN.md](./DESIGN.md); handoff / progress: [AGENTS.md](./AGENTS.md); fix history: [CHANGELOG.md](./CHANGELOG.md).
+**NexusDB** is a high-performance **single-node KV + SQL database engine** written in Rust 2024, engineered for **write-heavy, low-latency, high-concurrency** data services. It exposes **five protocol facades over one shared storage kernel**, so tools and drivers from different ecosystems can access the same data directly:
+
+| Facade | Port | Notes |
+|---|---|---|
+| RESP2 (Redis-compatible) | 6379 | 5 data structures + Geo + Bitmap |
+| HTTP REST (JSON) | 6778 | KV + SQL + Prometheus `/metrics` |
+| MySQL wire | 5434 | `mysql` CLI / drivers direct-connect |
+| PostgreSQL wire | 5435 | `psql` / drivers direct-connect; shares kernel & data with MySQL |
+| Binary (internal) | 5433 | testing / benchmarking only |
+
+At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + per-core thread + io_uring async I/O + a hand-written coroutine scheduler, no tokio), a **complete SQL subset** (JOIN / subqueries / aggregation / GROUP BY / transactions) coexisting with **Redis data structures**, and **production-grade reliability** (crash recovery, WAL durability, 860+ tests, clippy 0 warnings).
+
+> Architecture: [DESIGN.md](./DESIGN.md) · handoff / progress: [AGENTS.md](./AGENTS.md) · fix history: [CHANGELOG.md](./CHANGELOG.md)
 >
 > 📖 **User getting-started guide (features + per-driver access + SQL/type/security examples + performance): [docs/GUIDE.md](./docs/GUIDE.md)**
 
@@ -18,34 +30,45 @@
 
 ## Core Features
 
-**Protocol layer**
-- **Five protocol listeners**: RESP2 (6379) + **REST (HTTP/1.1 JSON + CORS + Bearer) 6778** + dual SQL facades (MySQL wire 5434 / PostgreSQL wire 5435, shared kernel) + Binary 5433 (internal). All enforce `KvLimits` length checks at the protocol layer, with TCP_NODELAY.
-- **Observability**: `/metrics` (Prometheus) + `/v1/status` + `/v1/debug/*` (process-level atomic counters, lock-free on the hot path).
-- **SQL capabilities**: CREATE / ALTER TABLE ADD COLUMN / multi-row INSERT / SELECT (projection · column alias `AS` · ORDER BY · aggregates COUNT/SUM/AVG/MIN/MAX including expressions like `SUM(a+b)` · `COUNT(DISTINCT)` · `SELECT DISTINCT` · GROUP BY · HAVING · IN · BETWEEN · LIKE · WHERE with OR/NOT/parenthesized nesting · full-table scan · single-table qualified columns `table.col` · MySQL `LIMIT offset,count` · `db.table` qualified names) / UPDATE / DELETE / DROP / USE / DESCRIBE. Local secondary indexes + two-layer bloom pruning + covering-index / UNIQUE early stop + GLOBAL UNIQUE (cross-shard global uniqueness). SQLAlchemy ORM basic CRUD / JOIN / pagination / reflection / migration (ADD COLUMN) verified against real drivers.
-- **Subqueries (non-correlated WHERE + FROM derived tables + single-equality correlated EXISTS)**: `IN/NOT IN (SELECT..)` / `scalar x op (SELECT..)` / `[NOT] EXISTS (SELECT..)` — inner query runs first → folded into literals / always-true/false → outer query uses existing index paths (large IN cap 65536 + binary search over sorted homogeneous sets); DELETE/UPDATE supported too. `SELECT .. FROM (SELECT ..) t [WHERE/ORDER/LIMIT]` and can participate in JOIN (inner materialized & prefilled, incl. aggregate/GROUP BY, bare COUNT(*)); single-equality correlated `EXISTS/NOT EXISTS` auto-decorrelated to IN; MySQL + PG drivers behave consistently (correlated IN/scalar, JOIN-side derived tables are follow-ups).
-- **JOIN (multi-table equi-join)**: N-table left-deep `INNER|LEFT|RIGHT|FULL|CROSS JOIN ... ON/USING` — hash join at the worker completion point (shards only scan locally, zero cross-thread), multi-condition ON + non-equi residual, predicate/projection pushdown + index-driven gather + key-set index point lookup on the probe side (join keys of preceding tables pushed down, ~6x speedup), table aliases / qualified columns / ORDER / LIMIT; MySQL + PG drivers consistent.
-- **System tables / introspection (GUI/ORM reflection)**: information_schema (tables/columns/key_column_usage/schemata) + pg_catalog flat single-table + SHOW [FULL] TABLES/COLUMNS/CREATE TABLE/DATABASES + backtick identifiers + `SELECT @@var` stub; SQLAlchemy `inspect()` reflection verified (psql `\d`'s pg_catalog JOIN is a follow-up).
-- **Unified record encoding + value type tag**: network facades append a tag on write, transparent to the storage layer — new protocols need zero storage changes.
-- **Multi-db / multi-table physical isolation**: `{block_root}/{db_name}/shard_{N}/` directories; db switching goes through MetaPage vpid 0 index.
+### At a glance
+| Feature | What it gives you |
+|---|---|
+| **One kernel, five protocols** | Redis RESP2, HTTP REST, MySQL/PostgreSQL wire, and the internal binary protocol share one storage engine and SQL planner |
+| **SQL + KV in one engine** | A broad SQL subset (DDL/DML, JOIN, subqueries, aggregation, transactions) alongside Redis-compatible data structures |
+| **Write-friendly by design** | io_uring async flush, zero-lock hot paths, and a hand-written coroutine scheduler keep latency low under write load |
+| **Production-oriented** | Crash recovery, WAL durability, per-db/per-table physical isolation, TLS, and standard auth flows |
 
-**IO & scheduling**
-- **io_uring persistence**: StdFs backend as fallback; the production path submits SQEs directly via `scheduler::io_ops`.
-- **T18 zero-copy**: `IOSQE_FIXED_FILE` + `RegisteredBufPool` dual optimization, removing hot-path memcpy on SQE / FdPool.
-- **Hand-written coroutine scheduling**: `crates/scheduler` single-thread park/unpark + priority partitioning (`spawn_on_low` yields the foreground wave to GC/drain).
-- **Async flush + bounded backpressure**: `FlushBatch`/`MetaFlushBatch` grouped by file, write ×N + fsync ×1; `MAX_INFLIGHT_CHUNKS=8` degrades to sync when exceeded; the main loop never blocks on fsync.
+### Protocol layer
+- **Five protocol listeners** — RESP2 (6379) / REST JSON (6778) / MySQL wire (5434) / PostgreSQL wire (5435) / Binary (5433); unified protocol-level length checks + TCP_NODELAY
+- **Observability** — `/metrics` (Prometheus), `/v1/status`, `/v1/debug/*`; lock-free on the hot path
+- **SQL capabilities** — full DDL/DML + SELECT (projection/aliases/ORDER BY/aggregates/expressions/DISTINCT/GROUP BY/HAVING/IN/BETWEEN/LIKE/complex WHERE/pagination); local secondary indexes + bloom pruning + GLOBAL UNIQUE; SQLAlchemy ORM CRUD/JOIN/reflection/migration verified
+- **PostgreSQL compatibility** — multi-statement ordered execution + simple/extended dual protocol + `$n` params + per-column OID inference, binary timestamp decoding, FK cascade/referential integrity, UPDATE SET expressions; Loom migration (9 tables) + Portal full startup verified
+- **Subqueries** — non-correlated WHERE (`IN`/scalar/`EXISTS`) + FROM derived tables (joinable) + single-equality correlated decorrelation to `IN`; also in DELETE/UPDATE
+- **JOIN (multi-table equi-join)** — N-table left-deep `INNER|LEFT|RIGHT|FULL|CROSS`; hash join at the worker completion point (zero cross-thread); predicate/projection pushdown + index-driven gather (~6x speedup)
+- **System tables / introspection** — information_schema + pg_catalog + SHOW family, powering GUI/ORM reflection
+- **Unified encoding + value tag** — network facades append a type tag on write; new protocols need zero storage changes
+- **Multi-db / multi-table isolation** — `{block_root}/{db_name}/shard_{N}/` directories; db switch via MetaPage vpid 0 index
 
-**Storage engine**
-- **Array-based NowChunks + pure COW**: no dirty flag, resident means pending-write; after a full chunk swaps, in-chunk vpids allocate a new pid.
-- **Fully flat meta cache**: `meta : data = 1 : 2048` (1 TB data ≈ 512 MB meta/shard-db), full read on open + 1 MB dirty window async flush.
-- **data → meta → pid.state flush ordering invariant**: the meta window is only enqueued after the data backlog drains; pid.state is only written after the meta window is confirmed.
+### IO & scheduling
+- **io_uring async persistence** — submits SQEs directly on the production path; StdFs fallback
+- **Zero-copy** — `IOSQE_FIXED_FILE` + `RegisteredBufPool`, no hot-path memcpy
+- **Hand-written coroutine scheduler** — single-thread park/unpark + priority partitioning (GC/drain yield to the foreground)
+- **Bounded backpressure** — batched per-file writes (write ×N + fsync ×1); degrades to sync only when the in-flight cap is hit
 
-**Space & reclamation**
-- **GC compact (chunk dead-slot fill + active block drain)**: in-place fill, no new chunk; half-empty blocks are drained round by round and unlinked.
-- **PID_FREED tombstone + resurrection prevention**: large-value overwrite frees the old chain and writes a tombstone; recover does not refill dead pages.
-- **Large-value overflow pages (≤ 1 MB)**: values over the inline threshold (~4 KB) are automatically split into 16 KB overflow pages + a 13 B descriptor, 0-copy into existing GC.
+### Storage engine
+- **Array-based NowChunks + pure COW** — no dirty flag; full-chunk swap makes changes naturally recoverable
+- **Fully flat meta cache** — `meta : data = 1 : 2048`; full read on open + async flush
+- **data → meta → pid.state flush ordering** — guarantees crash consistency
 
-**Quality**
-- **700+ unit/integration tests (currently 862), `cargo clippy --all-targets` 0 warnings.**
+### Space & reclamation
+- **GC compact** — in-place fill of chunk dead slots + active reclamation of half-empty blocks
+- **Tombstone + resurrection prevention** — overwrites free the old chain; recover never refills dead pages
+- **Large-value overflow pages (≤ 1 MB)** — values over ~4 KB auto-split into 16 KB overflow pages, 0-copy into GC
+
+### Quality
+- **Testing** — 860+ unit/integration tests; `cargo clippy --all-targets` 0 warnings
+- **Codebase modularized (2026-08)** — large monoliths split by responsibility; every source file under ~1250 lines
+- **Big-data SQL e2e suite** — `sql_bigdata.rs` runs 20k-row workloads over COUNT/filter/aggregation/GROUP BY/pagination/JOIN/UPDATE/DELETE and post-reconnect durability
 
 ---
 
