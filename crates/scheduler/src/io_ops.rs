@@ -336,6 +336,16 @@ struct PollFd {
     user_data: Cell<Option<u64>>,
 }
 
+impl PollFd {
+    fn new(fd: RawFd, events: libc::c_short) -> Self {
+        Self {
+            fd,
+            events,
+            user_data: Cell::new(None),
+        }
+    }
+}
+
 /// 把 io_uring CQE result (mask) 转成 io::Result<u32>.
 fn map_result_poll(r: i32) -> io::Result<u32> {
     if r < 0 {
@@ -380,6 +390,44 @@ pub async fn poll(fd: RawFd, events: libc::c_short) -> io::Result<u32> {
         fd,
         events,
         user_data: Cell::new(None),
+    }
+    .await
+}
+
+/// ⭐ 组合等待 (协程 worker 多连接优化): socket 可读 (io_uring) 或 被 `unpark` 唤醒.
+///
+/// 返回: `1` = socket 可读 (POLLIN), `2` = 被 unpark (本协程的 reply 队列有新数据).
+///
+/// 实现: 同时驱动 `PollFd` (io_uring poll socket) 与 `ParkCurrent` (park 注册
+/// waker). 两者任一就绪即返回 — 免 per-conn eventfd 的 syscall (多连接场景瓶颈).
+pub async fn select_fd_or_unpark(fd: RawFd) -> io::Result<u8> {
+    struct FdOrUnpark {
+        fd_poll: PollFd,
+        park: crate::park::ParkCurrent,
+    }
+    impl Future for FdOrUnpark {
+        type Output = io::Result<u8>;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            // 1. socket 可读?
+            match Pin::new(&mut this.fd_poll).poll(cx) {
+                Poll::Ready(Ok(mask)) if mask & libc::POLLIN as u32 != 0 => {
+                    return Poll::Ready(Ok(1));
+                }
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+            // 2. 被 unpark? (park 第二次 poll → Ready)
+            if let Poll::Ready(()) = Pin::new(&mut this.park).poll(cx) {
+                return Poll::Ready(Ok(2));
+            }
+            Poll::Pending
+        }
+    }
+    FdOrUnpark {
+        fd_poll: PollFd::new(fd, libc::POLLIN),
+        park: crate::park::ParkCurrent::new(),
     }
     .await
 }

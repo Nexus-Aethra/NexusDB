@@ -598,3 +598,9 @@ pub(crate) fn clear_current_slot() {
 pub(crate) fn with_current_slot<R>(f: impl FnOnce(usize) -> R) -> Option<R> {
     CURRENT_SLOT.with(|c| c.get().map(f))
 }
+
+/// 当前协程的 slot_id (= task_id). 用于 `unpark` 唤醒本协程 (park 机制).
+/// 必须在调度线程上被 poll 的协程内调用 (即 spawn 出来的 task).
+pub fn current_task_id() -> usize {
+    with_current_slot(|id| id).expect("current_task_id() called outside scheduler poll context")
+}
