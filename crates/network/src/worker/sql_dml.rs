@@ -413,21 +413,22 @@ pub(crate) fn sql_run_dml(
                     );
                     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
                     for sid in 0..num_shards {
-                        // ⭐ PG 兼容 (范围查): 主键区间用 ScanFiltered(pk hint),
+                        // ⭐ PG 兼容 (范围查): 主键区间用 ScanFilteredRows(pk hint),
                         // 否则二级索引 IndexScan.
+                        // ⭐ 修复 (2026-08): 原 ScanFiltered 返回 ProjRows (仅投影列值, 无
+                        // pk/row_bytes), DML phase1 无法经 collect_dml_pks 提取 pk 执行 phase2,
+                        // 导致主键范围 UPDATE/DELETE 报 "unexpected reply". 改用返回完整
+                        // Rows (索引原值, pk, row_bytes) 的 ScanFilteredRows.
                         let op = if pk {
-                            BatchOp::ScanFiltered {
+                            BatchOp::ScanFilteredRows {
                                 db: db.clone(),
                                 table: table_arc.clone(),
-                                preds: Vec::new(),
-                                proj: Vec::new(),
                                 index_hint: Some(shard_manager::IndexHint {
                                     iid: 0,
                                     lo: lo.clone(),
                                     hi: hi.clone(),
                                     pk: true,
                                 }),
-                                key_set_hint: None,
                                 limit: 0,
                             }
                         } else {

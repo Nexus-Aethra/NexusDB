@@ -761,6 +761,9 @@ pub(crate) fn shard_thread_main(
                                 BatchOp::ScanFiltered { db, table, preds, proj, index_hint, key_set_hint, limit } => {
                                     exec_scan_filtered(e, &db, &table, &preds, &proj, index_hint.as_ref(), key_set_hint.as_ref(), limit)
                                 }
+                                BatchOp::ScanFilteredRows { db, table, index_hint, limit } => {
+                                    exec_scan_filtered_rows(e, &db, &table, index_hint.as_ref(), limit)
+                                }
                                 BatchOp::IndexScan { db, table, iid, lo, hi, limit, with_rows } => {
                                     exec_index_scan(
                                         e, &db, &table, iid, lo.as_ref(), hi.as_ref(), limit,

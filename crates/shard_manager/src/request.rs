@@ -317,6 +317,14 @@ pub enum BatchOp {
         key_set_hint: Option<storage::sql_rows::KeySetHint>,
         limit: u32,
     },
+    /// ⭐ 修复 (2026-08): DML phase1 范围扫 — 与 ScanFiltered 同走索引/主键范围,
+    /// 但返回完整 `Rows` (索引原值, pk, row_bytes) 供 collect_dml_pks 提取 pk 执行 phase2.
+    ScanFilteredRows {
+        db: std::sync::Arc<str>,
+        table: std::sync::Arc<str>,
+        index_hint: Option<storage::sql_rows::IndexHint>,
+        limit: u32,
+    },
     /// ⭐ 事务 v1 (F61): COMMIT 原子批 — worker 把 conn 层 write_set 按 shard
     /// 分组后每 shard 一个; shard 单线程保证批内无并发穿插 (先验后写 +
     /// wal_barrier 后回复). 组内 op 同 shard (worker 路由保证).
@@ -450,6 +458,8 @@ impl BatchOp {
             }
             // ⭐ F67 (JOIN): 广播 op, 不走 locator 路由 (兵底空 key)
             ScanFiltered { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
+            // ⭐ DML phase1 范围扫 (2026-08): 广播 op, 不走 locator 路由
+            ScanFilteredRows { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ M3-2: 行数估计广播 op, 不走路由 (空 key)
             EstimateRowCount { db, table } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ M3-4: distinct 估计广播 op, 不走路由
@@ -546,6 +556,7 @@ impl BatchOp {
             RowPut { .. } | RowGet { .. } | RowDelete { .. } | RowUpdate { .. }
             | IndexScan { .. } | DropTableOp { .. } | TableScan { .. } => None,
             ScanFiltered { .. } => None,
+            ScanFilteredRows { .. } => None,
             // ⭐ M3-2: 行数估计无 key (不参与 RESP 冒号选表)
             EstimateRowCount { .. } => None,
             // ⭐ M3-4: distinct 估计无 key

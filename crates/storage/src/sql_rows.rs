@@ -838,6 +838,37 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// ⭐ 修复 (2026-08): DML phase1 范围扫 — 与 table_scan_filtered_local 同走
+    /// 索引/主键范围, 但返回完整 `(索引原值, pk, row_bytes)` 三元组, 供 worker
+    /// collect_dml_pks 提取 pk 执行 phase2. (ScanFiltered 只回投影列值, 无 pk.)
+    pub async fn table_scan_filtered_rows_local(
+        &mut self,
+        db: &str,
+        table: &str,
+        hint: Option<&IndexHint>,
+        limit: usize,
+        out: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), RegistryError> {
+        let Some(_schema) = self.get_schema(db, table).await? else {
+            return Ok(());
+        };
+        if let Some(h) = hint {
+            if h.pk {
+                // 主键区间扫描 → (v, pk, rb)
+                self.pk_scan_local(db, table, h.lo.as_ref(), h.hi.as_ref(), limit, out).await?;
+            } else {
+                // 二级索引范围 → (pk, rb), 转成 (v=pk, pk, rb) 满足三元组
+                let pairs = self
+                    .index_scan_local(db, table, h.iid, h.lo.as_ref(), h.hi.as_ref(), limit)
+                    .await?;
+                for (pk, rb) in pairs {
+                    out.push((pk.clone(), pk, rb));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// ⭐ F70 (JOIN): 多键等值索引点查 — 对每键索引点查收 pk (bloom 短路免 travel),
     /// 去重后一次 table_get_many 批量回表. 返回命中行 row_bytes.
     pub async fn index_multi_point_local(

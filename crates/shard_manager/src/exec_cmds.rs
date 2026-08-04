@@ -713,6 +713,9 @@ pub(crate) fn exec_task_op(
         crate::request::BatchOp::ScanFiltered { ref db, ref table, ref preds, ref proj, ref index_hint, ref key_set_hint, limit } => {
             exec_scan_filtered(e, db, table, preds, proj, index_hint.as_ref(), key_set_hint.as_ref(), limit)
         }
+        crate::request::BatchOp::ScanFilteredRows { ref db, ref table, ref index_hint, limit } => {
+            exec_scan_filtered_rows(e, db, table, index_hint.as_ref(), limit)
+        }
         crate::request::BatchOp::IndexScan {
             ref db, ref table, iid, ref lo, ref hi, limit, with_rows,
         } => exec_index_scan(
@@ -808,6 +811,25 @@ pub(crate) fn exec_scan_filtered(
         db, table, preds, proj, index_hint, key_set_hint, limit as usize, &mut out,
     )) {
         Ok(()) => BatchResult::ProjRows(out),
+        Err(err) => BatchResult::Error(err.to_string()),
+    }
+}
+
+/// ⭐ 修复 (2026-08): DML phase1 范围扫 → 返回完整 Rows (含 pk/row_bytes).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exec_scan_filtered_rows(
+    e: &mut storage::StorageEngine,
+    db: &str,
+    table: &str,
+    index_hint: Option<&storage::sql_rows::IndexHint>,
+    limit: u32,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    let mut out: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+    match block_on_io(e.table_scan_filtered_rows_local(
+        db, table, index_hint, limit as usize, &mut out,
+    )) {
+        Ok(()) => BatchResult::Rows(out),
         Err(err) => BatchResult::Error(err.to_string()),
     }
 }
