@@ -477,6 +477,11 @@ impl SchedHandle {
             .expect("SchedHandle has multiple owners")
     }
 
+    /// ⭐ 协程 worker 用: 获取 StopHandle, 可被任意线程调 stop() 停止调度.
+    pub fn stop_handle(&self) -> StopHandle {
+        self.0.borrow().stop_handle()
+    }
+
     /// 跨线程驱动. SchedHandle 是 Send, 可 move 到新线程.
     ///
     /// 每次迭代**临时 borrow**, drive_once 完成后释放 borrow, 让 wrapper poll 时无冲突.

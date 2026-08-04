@@ -132,6 +132,9 @@ pub(crate) use worker_epoll::{
     encode_pairs, epoll_add, epoll_del, peek_req_id, process_binary_input, process_resp_input,
     remove_conn, worker_main_epoll,
 };
+/// ⭐ 协程化 2026-08: 协程 worker (每连接一协程 + io_uring, 替代 epoll).
+mod worker_coro;
+pub(crate) use worker_coro::worker_main_coro;
 
 /// 特殊 epoll token: reply bus eventfd.
 const REPLY_TOKEN: u64 = u64::MAX;
@@ -181,12 +184,22 @@ pub struct WorkerPool {
 impl WorkerPool {
     pub fn start(configs: Vec<WorkerConfig>) -> std::io::Result<Self> {
         let mut handles = Vec::with_capacity(configs.len());
+        // ⭐ 协程化开关 (2026-08): `NEXUS_CORO_WORKER=1` 启用协程 worker (每连接一协程 +
+        // io_uring), 否则用 epoll worker. 默认 epoll (可回退, 保证稳定).
+        let coro = std::env::var("NEXUS_CORO_WORKER").map(|v| v == "1").unwrap_or(false);
         for cfg in configs {
             let wid = cfg.worker_id;
+            let name = if coro { "network-worker-coro" } else { "network-worker" };
             let join = thread::Builder::new()
-                .name(format!("network-worker-{wid}"))
+                .name(format!("{name}-{wid}"))
                 .stack_size(4 * 1024 * 1024)
-                .spawn(move || worker_main_epoll(cfg))
+                .spawn(move || {
+                    if coro {
+                        worker_main_coro(cfg)
+                    } else {
+                        worker_main_epoll(cfg)
+                    }
+                })
                 .map_err(|e| std::io::Error::other(format!("spawn: {e}")))?;
             handles.push(join);
         }

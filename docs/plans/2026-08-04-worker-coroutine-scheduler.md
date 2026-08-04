@@ -126,6 +126,20 @@
 - [ ] **T1.3** 作为**可回退开关**接入 `server.rs` (env/配置切换协程 worker vs 旧 epoll worker), 旧路径完全保留
 - [ ] **验收**: 新协程 worker 单连接跑通真实 SQL; 旧 epoll worker 路径全绿 (network 测试无回归)
 
+### Phase 1b: 协议栈协程化 (方向 B — 用户选定, 一步到位)
+
+> **策略 (调研结论)**: 现有 `process_*_input` 是"纯解析→push→返回"事件驱动, 内部不等待 shard 回包 (回包走 REPLY_TOKEN 事件)。因此**无需 await 链**。改动集中在收发 IO + TLS + 一处 push 自旋。**关键**: 测试全部 `tls_config: None`, TLS 路径无测试覆盖, 可独立后续处理不阻塞核心。**架构**: 每 worker 单线程 executor (保留 `Rc<RefCell>` sql_cache) + 每连接一协程 + 回包事件驱动。
+
+- [ ] **T2.1** 底层 IO 原语: 封装 io_uring socket 异步读写 (复用 `io_ops::read/write` offset=u64::MAX, 已 T0.1 验证) — 提供 `async fn` 级别的 socket read/write
+- [ ] **T2.2** `recv`/`send_bytes` async 化 (worker_conn.rs): WouldBlock 自旋改 await io_uring; TLS 路径暂保留同步 fallback (测试未启用, 独立后续)
+- [ ] **T2.3** `resp_complete`/`resp_flush_ready`/`send_binary_response` async 化 (worker_conn.rs + 230+ 调用点加 await)
+- [ ] **T2.4** 五个 `process_*_input` async 化 + 内部 send_bytes/resp_complete 调用点加 await; 公共 `push_task`/`sql_dispatch_stmt` 适配
+- [ ] **T2.5** sql_dml 巨型 INSERT 的 push 自旋 (`drain_replies`+`yield_now`, sql_dml.rs:259-275) 改 async await
+- [ ] **T2.6** 新建 `worker_coro.rs`: 每连接一协程 + 协程 main loop (new_conn_loop + reply_loop), 接入 server (可回退开关 env `NEXUS_CORO_WORKER`)
+- [ ] **T2.7** 验证: 协程 worker 跑通真实 SQL 查询 (含 shard); 旧 epoll worker 全绿; 全量 network 测试回归
+- [ ] **T3** (原 Phase 3) 全局共享 worker 池 + 多协议 (协程 worker 天然支持)
+- [ ] **T4** (原 Phase 4) TLS 协程化 + 清理 + 文档
+
 ### Phase 2: 每连接一个协程 (替换 epoll 连接管理)
 
 > **目标**: 结构性重构 — worker 从 "epoll + conn_map" 改为 "Scheduler + 连接协程"。

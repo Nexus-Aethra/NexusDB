@@ -50,6 +50,8 @@ pub struct NetworkServer {
     worker_pool: WorkerPool,
     acceptor_handle: Option<thread::JoinHandle<()>>,
     worker_inboxes: Vec<Sender<NewConn>>,
+    /// ⭐ 协程 worker shutdown: per-worker 新连接通知 eventfd, shutdown 时写唤醒 worker.
+    worker_wakeups: Vec<RawFd>,
     acceptor_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -110,6 +112,9 @@ impl NetworkServer {
         // 4. 启动 acceptor 线程. Acceptor 不用 listener 而是用 bind 信息,所以我们把 listener 转入 acceptor.
         //    acceptor 内部 bind 会冲突,所以 listener 作为参数传入.
         //    这里做一个变通: 我们直接 spawn 一个 thread, accept 后用 worker_inboxes[idx] send.
+        // ⭐ 协程 worker shutdown: 保留 worker_wakeups 副本, shutdown 时写它们唤醒
+        // worker 的 new_conn_loop (检测 inbox 断开). acceptor 用 clone.
+        let worker_wakeups_server = worker_wakeups.clone();
         let acceptor_cfg = AcceptorConfig {
             listen_addr: local_addr,
             worker_queues: worker_inboxes.clone(),
@@ -134,6 +139,7 @@ impl NetworkServer {
             worker_pool,
             acceptor_handle: Some(acceptor_handle),
             worker_inboxes,
+            worker_wakeups: worker_wakeups_server,
             acceptor_stop: Some(acceptor_stop),
         })
     }
@@ -149,11 +155,21 @@ impl NetworkServer {
         }
         // 2. Drop worker senders so workers' inbox.recv() returns Err.
         self.worker_inboxes.clear();
-        // 3. Join acceptor (it will exit on next iter after stop_signal is set).
+        // 3. Join acceptor (it will exit on next iter after stop_signal is set, dropping
+        //    its sender clones). 必须等在 acceptor 退出后再唤醒 worker, 否则
+        //    worker 的 new_conn_loop 检测不到 inbox 断开 (acceptor 的 sender 还活着).
         if let Some(h) = self.acceptor_handle.take() {
             let _ = h.join();
         }
-        // 4. Join workers.
+        // 4. ⭐ 协程 worker: 写 wakeup eventfd 唤醒 worker 的 new_conn_loop,
+        //    使其检测到 inbox 断开并停止调度 (epoll worker 靠 inbox.recv 断开, 无需此步).
+        for &fd in &self.worker_wakeups {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(fd, &val as *const u64 as *const libc::c_void, 8);
+            }
+        }
+        // 5. Join workers.
         self.worker_pool.join()?;
         Ok(())
     }
