@@ -113,6 +113,7 @@ fn main() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     })
     .expect("NetworkServer::start");
     let addr = server.local_addr();

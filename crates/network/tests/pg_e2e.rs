@@ -39,6 +39,7 @@ fn start_pg_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>)
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     (server, mgr)
@@ -400,6 +401,7 @@ fn pg_mysql_cross_read() {
         worker_id_base: base,
         sql_shared: shared.clone(),
         tls_config: None,
+        shared_workers: None,
     };
     let pg_server = NetworkServer::start(mk(ProtocolKind::Pg, 0)).expect("pg server");
     let my_server = NetworkServer::start(mk(ProtocolKind::Sql, 1)).expect("mysql server");

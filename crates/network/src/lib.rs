@@ -89,5 +89,5 @@ pub use protocol::{
     RespCommand, Response, validate_request,
 };
 pub use reply_bus::{ReplyBusReceiver, ReplyBusSender, ReplyEnvelope};
-pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind};
+pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 pub use worker::{WorkerConfig, WorkerPool};

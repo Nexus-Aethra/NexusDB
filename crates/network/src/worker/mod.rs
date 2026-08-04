@@ -212,6 +212,14 @@ impl WorkerPool {
         }
         Ok(())
     }
+
+    /// ⭐ 共享池 (Phase 3/T3.1): join 引用 (不消费 self, 供 Drop 调用).
+    pub fn join_ref(&mut self) {
+        let mut handles = std::mem::take(&mut self.handles);
+        for h in handles.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 // =====================================================================

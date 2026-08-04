@@ -43,6 +43,7 @@ fn start_sql_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     (server, mgr)
@@ -1062,6 +1063,7 @@ fn start_sql_server_n(workers: usize) -> (NetworkServer, Arc<ShardManager>) {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     (NetworkServer::start(cfg).expect("start server"), mgr)
 }
@@ -1248,6 +1250,7 @@ fn mysql_txn_unique_single_shard() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
@@ -1672,6 +1675,7 @@ fn mysql_plain_unique_unchanged() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
@@ -1716,6 +1720,7 @@ fn mysql_composite_unique() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
@@ -1766,6 +1771,7 @@ fn mysql_foreign_key_cascade() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
@@ -1829,6 +1835,7 @@ fn mysql_update_set_expr() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
@@ -1892,6 +1899,7 @@ fn mysql_foreign_key_referential_integrity() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
@@ -1955,6 +1963,7 @@ fn mysql_pk_range_scan() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
@@ -2026,6 +2035,7 @@ fn mysql_huge_insert_no_deadlock() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");

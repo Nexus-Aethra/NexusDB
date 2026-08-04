@@ -51,6 +51,7 @@ fn start_sql_server() -> (NetworkServer, Arc<ShardManager>) {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     (server, mgr)

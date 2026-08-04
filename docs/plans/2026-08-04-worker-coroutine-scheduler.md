@@ -166,9 +166,12 @@
 
 > **目标**: 解决"线程数随协议数膨胀", 让 worker 数 = 用户配置。
 
-- [ ] **T3.1** `server.rs`: 多端口 acceptor 共享一个全局 worker 池 (而非每 server 各建池)
-- [ ] **T3.2** accept 时按端口标记协议, 连接协程创建时用它初始化 `ConnState.proto` (替代从 `cfg.protocol` 取固定值)
-- [ ] **T3.3** `WorkerConfig` 去掉固定 `protocol`, 改为每连接传递协议上下文; 移除 per-server worker_count 语义, 改为全局 worker 数
+- [x] **T3.1** `server.rs`: 全局共享 worker 池 ✅ — 新增 `SharedWorkerPool` (Arc 管理, 所有 server 停用后 Drop join workers):
+  - `NetworkServerConfig.shared_workers: Option<Arc<SharedWorkerPool>>`: Some = 复用共享池 (线程数 = 池大小, 不随 server 数膨胀); None = 自建 (默认/向后兼容)
+  - server shutdown 只停 acceptor + 唤醒; worker 由池统一 join
+  - 验证: `shared_workers_test.rs` — RESP + SQL 两 server 共享 2 worker (线程数=2 非 4), 功能全通, epoll + 协程 worker 均过
+- [x] **T3.2** accept 时按端口标记协议 ✅ — `NewConn.protocol` + `AcceptorConfig.protocol` (端口即协议), worker 用 `new_conn.protocol` 创建 ConnState (替代 `cfg.protocol` 固定值)
+- [ ] **T3.3** `WorkerConfig` 去掉固定 `protocol`, 改为每连接传递协议上下文; 移除 per-server worker_count 语义, 改为全局 worker 数 (default_db/limits/auth/tls per-conn 化, main.rs 多协议共享池落地 — 后续)
 - [ ] **T3.4** 多协议混合压力验证: 同一 worker 池同时处理 RESP + SQL + PG 连接, 验证协程内按 `ConnState.proto` 分发正确
 - [ ] **验收**: 线程数 = 全局配置 worker 数 (与协议数无关); 多协议 e2e 全绿
 

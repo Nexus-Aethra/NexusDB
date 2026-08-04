@@ -171,6 +171,7 @@ fn main() {
         worker_id_base: 0,
             sql_shared: sql_shared.clone(),
             tls_config: None,
+        shared_workers: None,
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -201,6 +202,7 @@ fn main() {
             worker_id_base: binary_workers as u32,
             sql_shared: sql_shared.clone(),
             tls_config: None,
+            shared_workers: None,
         }) {
             Ok(s) => {
                 nlog::info!("main", "RESP (Redis) listening on {}", s.local_addr());
@@ -239,6 +241,7 @@ fn main() {
             worker_id_base: (binary_workers + resp_workers) as u32,
             sql_shared: sql_shared.clone(),
             tls_config: tls_config.clone(),
+            shared_workers: None,
         }) {
             Ok(s) => {
                 nlog::info!("main", "SQL (MySQL wire) listening on {}", s.local_addr());
@@ -276,6 +279,7 @@ fn main() {
             worker_id_base: (binary_workers + resp_workers + sql_workers) as u32,
             sql_shared: sql_shared.clone(),
             tls_config: tls_config.clone(),
+            shared_workers: None,
         }) {
             Ok(s) => {
                 nlog::info!("main", "SQL (PostgreSQL wire) listening on {}", s.local_addr());
@@ -315,6 +319,7 @@ fn main() {
             worker_id_base: (binary_workers + resp_workers + sql_workers + pg_workers) as u32,
             sql_shared: sql_shared.clone(),
             tls_config: None,
+            shared_workers: None,
         }) {
             Ok(s) => {
                 nlog::info!("main", "REST (HTTP) listening on {}", s.local_addr());
