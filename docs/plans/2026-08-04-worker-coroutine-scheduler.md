@@ -179,6 +179,11 @@
   - 测试: `shared_worker_pool_per_conn_auth` — 共享池中 RESP 需 AUTH + SQL 免认证, 同一批 worker 按连接正确区分
 - [x] **T3.4** 多协议混合压力验证 ✅ — `shared_worker_pool_mixed_load`: 8 RESP + 8 SQL 并发连接 (每连接 10 次往返) 共享 2 worker, 所有操作正确无串扰 (epoll + 协程 worker 均过)
 - [x] **验收**: 线程数 = 全局配置 worker 数 (端到端验证 7→2); 多协议 e2e 全绿
+- [x] **验收 (性能/正确性, 2026-08-04)**:
+  - 正确性: 77 unit + 45 sql_e2e + 22 resp + 7 pg + 3 http + 11 binary + 168 storage + 27 shard + 大数据 5 全绿 (epoll + 协程)
+  - 性能 (release, stress 8 client/4 worker/pipeline 8/3 shard): **epoll 102,609 ops/s vs 协程 79,198 ops/s** (−23%)
+  - ⭐ 协程 worker 性能回归 −23% (io_uring + per-conn eventfd + reply_dispatch 中转 + 协程切换开销). 有优化空间 (per-conn eventfd 简化 / reply 直接投递 / drive 调度优化), 留待后续
+  - ⭐ 发现并修复 stress 工具 bug: reply_bus_count < num_workers 时 worker_id 取模碰撞导致回包错乱/卡住
 
 ### Phase 4: 清理与文档
 
