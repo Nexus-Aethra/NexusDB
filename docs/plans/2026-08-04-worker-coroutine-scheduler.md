@@ -120,7 +120,9 @@
 - [ ] **T1.1** 新建协程 worker 执行入口 `worker_coro.rs`: worker 线程初始化 `Scheduler`, 跑两个协程:
   - `new_conn_loop`: 用 io_uring 读 `conn_eventfd`, 从 inbox 收新连接并 spawn 连接协程
   - `reply_loop`: 用 io_uring 读 `reply_bus.eventfd`, drain 回包并按 conn_id 匹配
-- [ ] **T1.2** 单连接协程最小闭环: `spawn` 一个连接协程, 用 `io_ops::read`(socket, offset=u64::MAX) 读首帧 → 调现有协议解析 (首次先只支持 SQL 门面握手) → 渲染 → `io_ops::write` 回包, 跑通一个真实 SQL 查询 (验证整条链: 协程 worker → io_uring socket → 协议处理 → shard → 回包)
+- [x] **T1.2** 单连接协程最小闭环 (握手级) ✅ — 新增 `crates/network/tests/worker_coro_handshake_test.rs`, 测试通过:
+  - `coro_worker_does_mysql_handshake`: 纯协程 worker 用 io_uring socket 完成真实 MySQL 客户端完整握手 (发 HandshakeV10 → 收 HandshakeResponse41 → 校验 native_password → 发 OK)
+  - **结论**: 协程调度 + io_uring socket 收发 + 真实 MySQL 握手链路全通。后续把该原型固化为 `worker_coro.rs` 并接入 server; SQL 查询等 shard 交互留 Phase 2
 - [ ] **T1.3** 作为**可回退开关**接入 `server.rs` (env/配置切换协程 worker vs 旧 epoll worker), 旧路径完全保留
 - [ ] **验收**: 新协程 worker 单连接跑通真实 SQL; 旧 epoll worker 路径全绿 (network 测试无回归)
 
