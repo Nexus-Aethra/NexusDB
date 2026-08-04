@@ -106,9 +106,12 @@
 
 ### Phase 0: 准备与基线确认
 
-- [ ] **T0.1** 确认 scheduler 对 socket fd 的 io_uring 支持: 写一个最小示例, 用 `io_ops::read/write` 读写一个本地 TCP 连接, 验证 io_uring 对 socket 的可用性 (io_uring `Read/Write` opcode 对 socket 有效, 但需确认 `IOSQE_FIXED_FILE` 之外普通 fd 路径)
-- [ ] **T0.2** 建立基线: 记录当前 worker 层关键测试全绿 (跑 `cargo test -p network`), 记录当前线程模型描述, 作为改造前后对比
-- [ ] **T0.3** 明确 worker 与 server 的依赖边界: 梳理 `WorkerConfig` 字段, 为"去掉固定 protocol"做准备 (列出所有读 `cfg.protocol` 的地方: `worker_epoll.rs:36,59` 等)
+- [x] **T0.1** 确认 scheduler 对 socket fd 的 io_uring 支持 ✅ — 新增 `crates/scheduler/tests/socket_io_test.rs`, 两个测试通过:
+  - `socket_read_write_roundtrip`: 单协程 io_uring socket 读写往返正确
+  - `socket_concurrent_tasks`: 8 协程并发 socket 读写, 数据不串
+  - **结论**: io_uring `Read/Write` opcode 对 socket 用 `offset = u64::MAX` (-1, 当前位置) 完全可用。注意现有 `io_ops::read/write` 强制传 offset, worker 调用需传 `u64::MAX` (Phase 1 处理, 可考虑加 socket 专用封装)
+- [x] **T0.2** 建立基线 ✅ — network 测试全绿: 77 unit + 45 sql_e2e + 22 resp_e2e + 7 pg_e2e + bigdata 5
+- [x] **T0.3** 明确 worker 与 server 的依赖边界 ✅ — 关键发现: `WorkerConfig.protocol` 只在 `worker_epoll.rs:36` 读取一次, 用于初始化新连接 `ConnState.proto`; 而 `ConnState.proto` 在渲染/协议逻辑中被广泛使用 (120+ 处, `conn.proto`)。**协议信息本质是连接级的** — 全局 worker 池只需把 `ConnState::new` 的 `proto_kind` 从"worker 固定值"改为"按端口标记的连接协议", 那 120+ 处 `conn.proto` 用法无需改动。D4/D5 改造比预想容易
 
 ### Phase 1: 连接 IO 走 io_uring (保留 epoll + conn_map 结构)
 
