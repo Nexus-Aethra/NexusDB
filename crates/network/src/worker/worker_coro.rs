@@ -15,6 +15,11 @@
 //! (SQL/PG/HTTP 走 handle_resp_shard_result 聚合, RESP 走 process_resp_input,
 //! Binary 直发 batch 结果).
 //!
+//! **全局共享 worker 池 (Phase 3)**: 多协议 server 共享同一批 worker
+//! (`SharedWorkerPool`), 线程数 = 用户配置, 不随协议数膨胀. 协议与 per-conn
+//! 配置 (default_db/limits/auth/tls) 随 `NewConn` 传递, worker 按连接上下文
+//! 处理对应协议 (不再从 cfg 取固定值).
+//!
 //! **可回退**: 与 `worker_main_epoll` 并存, 通过 server.rs 的 env 开关选择.
 
 use std::collections::{HashMap, VecDeque};

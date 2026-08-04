@@ -436,11 +436,13 @@ redis-cli set counter 5              # 默认库, default 表
 listen_addr = "0.0.0.0:5433"     # Binary 协议
 redis_addr = "0.0.0.0:6379"      # RESP (空字符串 = 禁用)
 sql_addr = "0.0.0.0:5434"        # SQL 门面 MySQL wire (空字符串 = 禁用)
-sql_worker_count = 1             # MySQL/PG 门面 worker 数 (ORM 连接池场景调 2-8; 16 连接 4 worker ≈ 2.5x)
+sql_worker_count = 1             # ⭐ 共享池下作参考 (实际取 worker_count); 预留, 便于未来 per-protocol 池
 pg_addr = "0.0.0.0:5435"         # SQL 门面 PostgreSQL wire (空字符串 = 禁用)
 http_addr = "0.0.0.0:6778"       # REST 门面 (空字符串 = 禁用)
 http_cors_origin = ""            # CORS Allow-Origin ("*"/具体 origin, 空 = 不发)
 http_token = ""                  # REST Bearer token (空 = 免鉴权)
+worker_count = 2                 # ⭐ 全局共享 worker 池大小: 所有协议 server 共享, 线程数 = 此值
+```
 sql_password = ""                # SQL 登录密码, 两门面共用 (空 = 免密; 非空 PG 走 SCRAM-SHA-256)
 redis_password = ""              # AUTH 密码
 tls_cert = ""                    # ⭐ SQL/PG 门面 TLS 证书 PEM 路径 (空 = 明文; 两项均非空才启用)
@@ -477,7 +479,7 @@ stderr = true
 | [`crates/scheduler`](./crates/scheduler) | 单线程协程调度器 + io_uring 桥 (`SchedHandle`/`drive_until_idle`/`io_ops`/`FdPool`/`spawn_on_low`) | ✅ |
 | [`crates/page`](./crates/page) | LCB-Tree 页 (leaf/insert/split/delete/checkpoint/前缀压缩/`ItemKind` 编码) | ✅ |
 | [`crates/storage`](./crates/storage) | 物理持久化层: `Pager`/`MetaCache` v3 全量平坦 + dirty window/`NowChunks` 数组化/`ChunkList` LRU/`ChunkLiveness` + GC`/overflow` 大值溢出/`recover` 主源 + 墓碑防复活 | ✅ |
-| [`crates/network`](./crates/network) | 双协议门面 (`acceptor` + `epoll worker` + RESP2 + Binary + `KvLimits` + `value_codec`) | ✅ |
+| [`crates/network`](./crates/network) | 五协议门面 (Binary + RESP2 + MySQL wire + PostgreSQL wire + HTTP REST) + **全局共享 worker 池** (线程数=配置, 不随协议数膨胀; 每 worker 协程 Scheduler 或 epoll) + `KvLimits` | ✅ |
 | [`crates/shard_manager`](./crates/shard_manager) | 多 shard 控制器 (`ShardManager`/`Router`/`Inbox`/`TaskReplyBus`) + `latency_probe` 探针 + stress 基准 | ✅ |
 | [`crates/config`](./crates/config) | TOML 配置加载 | ✅ |
 | 根 `src/main.rs` | 服务器入口: `nexusdb --config nexusdb.toml`, 信号优雅退出 | ✅ |

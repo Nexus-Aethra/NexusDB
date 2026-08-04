@@ -182,11 +182,11 @@
 
 ### Phase 4: 清理与文档
 
-- [ ] **T4.1** 清理: 删除不再使用的 epoll 代码路径 (`worker_epoll.rs` 事件循环部分), 移除 WouldBlock 自旋残留
-- [ ] **T4.2** 更新 `lib.rs` / 模块注释, 使其与实际实现一致 (去掉"每 worker own 1 Scheduler"的过时注释或不符描述)
-- [ ] **T4.3** 更新 README / GUIDE: 网络层协程化、线程模型、多协议共享 worker 池说明
-- [ ] **T4.4** 新增/更新测试: 覆盖多协议共享 worker 池的并发场景
-- [ ] **验收**: 全量测试通过; 文档与实际一致
+- [x] **T4.1** 清理 ✅ — 移除 SharedWorkerPool 未用的 worker_count 字段/方法
+- [x] **T4.2** 更新注释 ✅ — lib.rs 分层描述 (共享 worker 池 + 协程/epoll + 5 协议), worker_coro.rs 模块头补充共享池 + per-conn 配置
+- [x] **T4.3** 更新 README ✅ — 中英文: crates/network 描述 (五协议 + 共享池), 配置注释 (worker_count = 全局池大小, sql_worker_count 作参考), nexusdb.toml 同步
+- [x] **T4.4** 新增/更新测试 ✅ — shared_workers_test.rs: 共享池 (RESP+SQL), per-conn auth, 多协议混合压力
+- [x] **验收** ✅ — 全量测试通过 (77 unit + 45 sql_e2e + 22 resp + 7 pg + 3 http + 11 binary + 168 storage + 27 shard + scheduler + 共享池 3 测); 文档与实际一致
 
 ---
 

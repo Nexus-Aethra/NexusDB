@@ -58,7 +58,6 @@ pub struct SharedWorkerPool {
     worker_pool: WorkerPool,
     worker_inboxes: Vec<Sender<NewConn>>,
     worker_wakeups: Vec<RawFd>,
-    worker_count: usize,
 }
 
 impl SharedWorkerPool {
@@ -108,7 +107,6 @@ impl SharedWorkerPool {
             worker_pool,
             worker_inboxes,
             worker_wakeups,
-            worker_count,
         }))
     }
 
@@ -120,10 +118,6 @@ impl SharedWorkerPool {
     /// shutdown 时唤醒 worker 的 eventfd 列表.
     pub(crate) fn wakeups(&self) -> Vec<RawFd> {
         self.worker_wakeups.clone()
-    }
-
-    pub(crate) fn worker_count(&self) -> usize {
-        self.worker_count
     }
 }
 
