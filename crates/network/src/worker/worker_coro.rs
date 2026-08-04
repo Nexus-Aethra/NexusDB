@@ -214,6 +214,8 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 let limits_c = nc.limits;
                 let sql_password_c = nc.auth_password.clone();
                 let tls_c = nc.tls_config.clone();
+                // ⭐ shutdown: 连接协程持有 worker 级 stop, select_read 返回后检查退出.
+                let stop_c = stop2.clone();
                 scheduler::spawn_on(&sched_conn, async move {
                     conn_coro(
                         state,
@@ -222,6 +224,7 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                         nc.fd,
                         pcefd,
                         reg_c,
+                        stop_c,
                         db_c,
                         table_c,
                         limits_c,
@@ -245,10 +248,32 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
         // 若 max_iters 过大 drive 会忙循环到上限 (1e6 次 ≈ 14s). 用小上限 + sleep 让出,
         // 避免卡死; 事件不因 sleep 丢失 (CQE 在 io_uring queue, 下轮 drive 处理).
         sched.clone().drive_until_idle(2048);
-        if stop.load(std::sync::atomic::Ordering::Acquire)
-            && active.load(std::sync::atomic::Ordering::Acquire) == 0
-        {
+        let stopped = stop.load(std::sync::atomic::Ordering::Acquire);
+        if stopped && active.load(std::sync::atomic::Ordering::Acquire) == 0 {
             break;
+        }
+        // ⭐ shutdown: worker 已停止但还有 idle 连接协程挂在 select_read 上
+        // (客户端未断开 → active 不归零). 写 per-conn eventfd 唤醒它们检查 stop 退出,
+        // 否则 server.shutdown 的 pool.join() 会无限等待.
+        if stopped {
+            let mut woke = false;
+            {
+                let reg = registry.lock().unwrap();
+                for entry in reg.values() {
+                    let val: u64 = 1;
+                    unsafe {
+                        libc::write(
+                            entry.eventfd,
+                            &val as *const u64 as *const libc::c_void,
+                            8,
+                        );
+                    }
+                    woke = true;
+                }
+            }
+            if woke {
+                continue; // 立即再 drive, 让连接协程处理 stop 退出
+            }
         }
         std::thread::sleep(Duration::from_micros(50));
     }
@@ -279,6 +304,7 @@ async fn conn_coro(
     fd: std::os::unix::io::RawFd,
     reply_eventfd: std::os::unix::io::RawFd,
     registry: ConnRegistry,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     db: std::sync::Arc<str>,
     table: std::sync::Arc<str>,
     limits: KvLimits,
@@ -294,6 +320,10 @@ async fn conn_coro(
             Ok(w) => w,
             Err(_) => break, // fd 关闭/错误 → 结束
         };
+        // ⭐ shutdown: worker 已停止 → 连接协程退出 (server.shutdown 不依赖客户端断开).
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
 
         if which == 1 {
             // socket 可读: 读数据 → 协议处理
