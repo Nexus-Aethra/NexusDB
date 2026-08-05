@@ -60,17 +60,23 @@ impl TaskReplyBus {
     /// ⭐ 防丢唤醒: 先重置 pending 再 pop —— store 之前的 push 必被本轮
     /// pop 到; store 之后的 push 看到 0 会重新写 eventfd.
     pub fn drain(&self) -> Vec<TaskResult> {
+        let mut results = Vec::with_capacity(64);
+        self.drain_into(&mut results);
+        results
+    }
+
+    /// Worker 端: drain 到调用方复用的缓冲，避免每次 eventfd 唤醒分配 Vec。
+    pub fn drain_into(&self, results: &mut Vec<TaskResult>) {
         // 先 read eventfd (消耗通知计数)
         let mut val: u64 = 0;
         unsafe {
             libc::read(self.eventfd, &mut val as *mut u64 as *mut libc::c_void, 8);
         }
         self.pending.store(0, Ordering::Release);
-        let mut results = Vec::with_capacity(64);
+        results.clear();
         while let Some(r) = self.ring.pop() {
             results.push(r);
         }
-        results
     }
 
     /// 非阻塞 drain (不 read eventfd, 用于 poll 模式).

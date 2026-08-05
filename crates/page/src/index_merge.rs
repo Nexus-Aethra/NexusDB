@@ -7,7 +7,7 @@ use crate::dprintln;
 
 use crate::error::PageError;
 use crate::header::{page_free_off, page_set_free_off};
-use crate::index::{PageIndex, Segment};
+use crate::index::PageIndex;
 use crate::item::{ItemKind, decode_item, encode_internal_item, encode_leaf_item};
 
 pub fn pre_merge_segment(idx: &mut PageIndex, seg_idx: usize) -> Result<bool, PageError> {
@@ -383,6 +383,7 @@ pub fn apply_pre_merge_steal(
 mod tests {
     use super::*;
     use crate::header::{PAGE_HEADER_SIZE, page_set_free_off, page_set_key_count};
+    use crate::index::Segment;
     use crate::item::encode_leaf_item;
     use crate::leaf::leaf_new;
 

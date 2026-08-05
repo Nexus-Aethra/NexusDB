@@ -198,17 +198,20 @@ impl PageIndex {
     /// 如果 key < segments[0].first_full_key (空), 返回 0.
     /// 如果 key >= 所有段的 first_full_key, 返回最后一个段.
     pub fn locate_segment(&self, key: &[u8]) -> usize {
-        let mut best = 0usize;
-        for i in 0..self.segments.len() {
-            let seg = &self.segments[i];
-            if seg.first_full_key.as_slice() <= key {
-                best = i;
+        // `partition_point` would express this directly, but keeping the
+        // search explicit avoids a version-dependent std API in this hot path.
+        // `lo` ends one past the last segment whose first key is <= `key`.
+        let mut lo = 0usize;
+        let mut hi = self.segments.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.segments[mid].first_full_key.as_slice() <= key {
+                lo = mid + 1;
             } else {
-                // 因为 segments 是按 key 顺序排列的, 后续都 > key
-                break;
+                hi = mid;
             }
         }
-        best
+        lo.saturating_sub(1)
     }
 
     /// 哨兵段引用 (segments[0])
@@ -411,4 +414,3 @@ pub fn pre_split_segment(
 
     Ok(())
 }
-

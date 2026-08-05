@@ -398,13 +398,56 @@ pub async fn table_put(
     key: &[u8],
     value: &[u8],
 ) -> Result<(Option<Vpid>, bool), RegistryError> {
-    use crate::btree::{btree_insert, travel_to_leaf_ro};
+    use crate::btree::{btree_insert_from_leaf, travel_to_leaf_with_path};
     use crate::overflow;
-    use page::{leaf_get_with, leaf_update};
+    use page::{leaf_get_with, leaf_update, leaf_update_with};
 
     // 1. ⭐ 单 travel: 直达 leaf, 同一份 leaf 字节完成 旧值窥视 + 原地更新
     //    (旧实现 lookup + update 各 travel 一次, 且旧值整值物化只为判存在).
-    let (leaf_vpid, mut leaf_bytes) = travel_to_leaf_ro(pager, table_root_vpid, key).await?;
+    let (leaf_vpid, mut leaf_bytes, mut path) =
+        travel_to_leaf_with_path(pager, table_root_vpid, key).await?;
+
+    // The overwhelmingly common RESP overwrite has an inline value.  Combine
+    // its old-value inspection and leaf update into one PageIndex load / item
+    // scan.  Overflow values retain the conservative path below because their
+    // new chain must be allocated asynchronously after inspecting the old one.
+    if !overflow::needs_overflow(key.len(), value.len()) {
+        let old_desc = leaf_update_with(&mut *leaf_bytes, key, value, |old| {
+            if overflow::is_indirect(old) {
+                let descriptor: [u8; overflow::DESCRIPTOR_LEN] =
+                    old.try_into().expect("13B descriptor");
+                Some(descriptor)
+            } else {
+                None
+            }
+        })?;
+        match old_desc {
+            Some(old_desc) => {
+                let mut batch = pager.new_write_batch();
+                batch.add(leaf_vpid, leaf_bytes);
+                if let Err(e) = batch.submit(pager).await {
+                    return Err(e.into());
+                }
+                if let Some(old) = old_desc {
+                    overflow::free_overflow(pager, &old).await?;
+                }
+                return Ok((None, true));
+            }
+            None => {
+                let new_root = btree_insert_from_leaf(
+                    pager,
+                    table_root_vpid,
+                    key,
+                    value,
+                    leaf_vpid,
+                    leaf_bytes,
+                    &mut path,
+                )
+                .await?;
+                return Ok((new_root, false));
+            }
+        }
+    }
 
     // 2. 旧值窥视: 只取存在性 + 溢出描述符 (13B), 不物化 inline 大值
     let old_desc: Option<Option<[u8; overflow::DESCRIPTOR_LEN]>> =
@@ -444,8 +487,16 @@ pub async fn table_put(
         }
     } else {
         // 不存在: insert (可能 split 传播, 低频路径, 复用现有 btree_insert)
-        crate::page_pool::recycle(leaf_bytes);
-        btree_insert(pager, table_root_vpid, key, stored).await
+        btree_insert_from_leaf(
+            pager,
+            table_root_vpid,
+            key,
+            stored,
+            leaf_vpid,
+            leaf_bytes,
+            &mut path,
+        )
+        .await
     };
     let new_root = match commit {
         Ok(r) => r,
@@ -483,6 +534,36 @@ pub async fn table_get(
         }
         other => Ok(other),
     }
+}
+
+/// ⭐ 零拷贝版 table_get: 命中时以 `&[u8]` 借用回调.
+///
+/// **注意**: 回调收到的是 leaf page 内的 stored value (可能为 13B 溢出描述符).
+/// 调用方需自行判断 `overflow::is_indirect` 并处理溢出链 (如需完整 value).
+/// 对于存在性判定 / 长度窥视 / 非 overflow 值的即时处理, 直接用回调零拷贝.
+pub async fn table_get_with<R>(
+    pager: &mut Pager,
+    table_root_vpid: Vpid,
+    key: &[u8],
+    f: impl FnOnce(&[u8]) -> R,
+) -> Result<Option<R>, RegistryError> {
+    use crate::btree::btree_lookup_with;
+    let result = btree_lookup_with(pager, table_root_vpid, key, f).await?;
+    Ok(result)
+}
+
+/// ⭐ 存在性判定: 仅检查 key 是否存在, 不物化 value (零 alloc).
+///
+/// **用途**: SETNX / MSETNX / EXISTS 等只需 Some/None 的场景.
+/// 比调用 `table_get` 然后丢弃 value 省一次 `to_vec` 分配.
+pub async fn table_exists(
+    pager: &mut Pager,
+    table_root_vpid: Vpid,
+    key: &[u8],
+) -> Result<bool, RegistryError> {
+    use crate::btree::btree_lookup_with;
+    let result = btree_lookup_with(pager, table_root_vpid, key, |_| ()).await?;
+    Ok(result.is_some())
 }
 
 /// 删除 key. 返回 true 表示 key 存在并删除, false 表示不存在.
@@ -584,7 +665,7 @@ pub async fn table_put_many(
 ) -> Result<Option<Vpid>, RegistryError> {
     use crate::btree::{LeafGuide, travel_to_leaf_guided};
     use crate::overflow;
-    use page::{PAGE_SIZE, leaf_get_with, leaf_insert, leaf_update};
+    use page::{PAGE_SIZE, leaf_get_with, leaf_insert, leaf_update, leaf_update_with};
 
     if pairs.is_empty() {
         return Ok(None);
@@ -659,17 +740,38 @@ pub async fn table_put_many(
         };
 
         let (_, leaf_bytes, dirty) = cur.as_mut().expect("cur filled above");
-        // 旧值窥视 (只物化 13B 描述符)
-        let old_desc: Option<Option<[u8; overflow::DESCRIPTOR_LEN]>> =
-            leaf_get_with(&leaf_bytes[..], key, |v| {
+        // Inline overwrite is the common SET case. Locate once and update the
+        // same item, rather than leaf_get_with + leaf_update doing two full
+        // PageIndex/segment walks. Indirect values keep the conservative
+        // inspect-then-write flow because their new overflow chain is created
+        // after inspection.
+        let (old_desc, already_updated) = if !overflow::is_indirect(stored) {
+            match leaf_update_with(&mut leaf_bytes[..], key, stored, |v| {
                 if overflow::is_indirect(v) {
                     Some(v.try_into().expect("13B descriptor"))
                 } else {
                     None
                 }
-            });
+            })? {
+                Some(old) => (Some(old), true),
+                None => (None, false),
+            }
+        } else {
+            (
+                leaf_get_with(&leaf_bytes[..], key, |v| {
+                    if overflow::is_indirect(v) {
+                        Some(v.try_into().expect("13B descriptor"))
+                    } else {
+                        None
+                    }
+                }),
+                false,
+            )
+        };
 
-        let apply = if old_desc.is_some() {
+        let apply = if already_updated {
+            Ok(())
+        } else if old_desc.is_some() {
             leaf_update(&mut leaf_bytes[..], key, stored).map(|_| ())
         } else {
             leaf_insert(&mut leaf_bytes[..], key, stored)

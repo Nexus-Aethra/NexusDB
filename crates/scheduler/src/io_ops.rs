@@ -62,6 +62,7 @@ macro_rules! poll_cqe {
 /// 主瓶颈). 正确性由两条路径兜底:
 ///   - 驱动循环: `drain_completions_*` 开头 flush_sq.
 ///   - 同步忙等 (block_on_io 不经过驱动循环): `poll_cqe` 扫描 CQ 前 flush_sq.
+///
 /// SQ 满时 push 失败 → 立即 sync + submit 腾空间重试.
 macro_rules! submit_sqe {
     ($entry:expr, $slot_id:expr, $cx:expr) => {{

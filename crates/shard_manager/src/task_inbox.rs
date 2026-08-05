@@ -60,6 +60,35 @@ impl TaskInbox {
         }
     }
 
+    /// Worker 端: 按同一 shard 的输入顺序批量投递 task。
+    ///
+    /// 与逐项 `push_spin` 相比，批量只进行一次 pending 原子累加和至多一次
+    /// eventfd 唤醒；每个 task 仍独立入无锁队列，因此队满时的背压与顺序语义不变。
+    pub fn push_batch_spin(&self, tasks: Vec<ShardTask>) {
+        if tasks.is_empty() {
+            return;
+        }
+        let count = tasks.len() as u64;
+        for task in tasks {
+            let mut task = task;
+            loop {
+                match self.ring.push(task) {
+                    Ok(()) => break,
+                    Err(rejected) => {
+                        task = rejected;
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+        if self.pending.fetch_add(count, Ordering::AcqRel) == 0 {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+            }
+        }
+    }
+
     /// Shard 端: drain 所有 pending tasks.
     ///
     /// **⭐ 丢唤醒修复 (2026-07-24)**: 必须**先重置 pending 再 pop**.

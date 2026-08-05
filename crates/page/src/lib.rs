@@ -82,6 +82,7 @@ pub use internal::{
 pub use item::{Item, ItemKind, decode_item, encode_internal_item, encode_leaf_item};
 pub use leaf::{
     leaf_delete, leaf_get, leaf_get_with, leaf_insert, leaf_new, leaf_push_back, leaf_scan_from, leaf_update,
+    leaf_update_with,
 };
 pub use leaf_split::leaf_split;
 pub use ptr::{InternalItemPtr, ItemPtr, LeafItemPtr};

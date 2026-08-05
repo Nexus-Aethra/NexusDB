@@ -40,7 +40,7 @@ use std::io;
 
 use page::{
     PageType, Vpid, internal_child, internal_insert, internal_new, internal_split, leaf_get,
-    leaf_insert, leaf_new, leaf_split, page_type,
+    leaf_get_with, leaf_insert, leaf_new, leaf_split, page_type,
 };
 
 use crate::pager::Pager;
@@ -207,6 +207,51 @@ pub async fn travel_to_leaf(
                         &page[0..4]
                     );
                 }
+                return Err(BTreeError::BadPageType {
+                    vpid: current_vpid,
+                    page_type: other,
+                });
+            }
+        }
+    }
+}
+
+/// Insert-oriented travel: retain both the leaf bytes and the internal path.
+///
+/// A caller that has already established a key is absent can insert directly
+/// with [`btree_insert_from_leaf`] instead of traversing the tree a second
+/// time.  Update-only callers should keep using `travel_to_leaf_ro`, which
+/// avoids allocating the split path.
+pub async fn travel_to_leaf_with_path(
+    pager: &mut Pager,
+    root_vpid: Vpid,
+    key: &[u8],
+) -> Result<(Vpid, Box<[u8; page::PAGE_SIZE]>, TravelPath), BTreeError> {
+    let mut path = TravelPath::new();
+    let mut current_vpid = root_vpid;
+    let mut depth = 0usize;
+    const MAX_DEPTH: usize = 16;
+
+    loop {
+        if depth > MAX_DEPTH {
+            return Err(BTreeError::SplitExhausted);
+        }
+        let page = pager.read(current_vpid).await?;
+        match page_type(&page[..]) {
+            PageType::Leaf => return Ok((current_vpid, page, path)),
+            PageType::Internal => {
+                let child_vpid = internal_child(&page[..], key)
+                    .ok_or(BTreeError::InternalChildNone(current_vpid))?;
+                path.push(TravelStep {
+                    internal_vpid: current_vpid,
+                    sep_key: key.to_vec(),
+                    child_vpid,
+                });
+                crate::page_pool::recycle(page);
+                current_vpid = child_vpid;
+                depth += 1;
+            }
+            other => {
                 return Err(BTreeError::BadPageType {
                     vpid: current_vpid,
                     page_type: other,
@@ -404,7 +449,7 @@ pub async fn btree_scan_from<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()
     use core::ops::ControlFlow;
     let mut start: Vec<u8> = start.to_vec();
     let mut leaf_count = 0u32;
-    let mut total_keys = 0u64;
+    let mut _total_keys = 0u64;
     loop {
         let (guide, leaf_bytes) = travel_to_leaf_guided(pager, root_vpid, &start).await?;
         let kc = page::page_key_count(&leaf_bytes[..]);
@@ -418,7 +463,7 @@ pub async fn btree_scan_from<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()
             f(k, v)
         });
         leaf_count += 1;
-        total_keys += scanned;
+        _total_keys += scanned;
         let upper = guide.upper.clone();
         // ⭐ DIAG: 扫描路径追踪 (NLOG_DIAG=1)
         if crate::chunk_writer::diag_enabled() {
@@ -456,7 +501,14 @@ pub async fn btree_scan_from<F: FnMut(&[u8], &[u8]) -> core::ops::ControlFlow<()
 /// 1. travel 到 leaf
 /// 2. 调 leaf_insert 尝试插入
 /// 3. 成功 → add leaf 到 batch, submit, return None
-/// 4. PageFull → 走 propagate_split_up
+/// 4. PageFull → 走 propagate_split_up (失效 LeafCache)
+///
+/// **LeafCache 安全性**: split 时 invalidate_root 失效 cache.
+///
+/// **注**: btree_insert 不查 LeafCache — 随机 key 模式下 cache 命中率低,
+/// 每次 insert 多一次 HashMap+BTreeMap 查询是纯开销 (实测 -21%).
+/// 写路径的 cache 收益仅在"读后写同 key"场景, 由 table_put 走 travel_to_leaf_ro
+/// 直接定位 leaf 实现 (不依赖 LeafCache).
 pub async fn btree_insert(
     pager: &mut Pager,
     root_vpid: Vpid,
@@ -467,7 +519,22 @@ pub async fn btree_insert(
     let (leaf_vpid, mut path) = travel_to_leaf(pager, root_vpid, key).await?;
 
     // 2. 读 leaf 字节, 尝试 insert
-    let mut leaf_bytes = pager.read(leaf_vpid).await?;
+    let leaf_bytes = pager.read(leaf_vpid).await?;
+    btree_insert_from_leaf(pager, root_vpid, key, value, leaf_vpid, leaf_bytes, &mut path).await
+}
+
+/// Insert a new key using a leaf and split path returned by
+/// [`travel_to_leaf_with_path`].  This is the fresh-write fast path used by
+/// `table_put`: it avoids the former second root-to-leaf traversal.
+pub async fn btree_insert_from_leaf(
+    pager: &mut Pager,
+    root_vpid: Vpid,
+    key: &[u8],
+    value: &[u8],
+    leaf_vpid: Vpid,
+    mut leaf_bytes: Box<[u8; page::PAGE_SIZE]>,
+    path: &mut TravelPath,
+) -> Result<Option<Vpid>, BTreeError> {
     let insert_result = leaf_insert(&mut *leaf_bytes, key, value);
 
     let mut batch = pager.new_write_batch();
@@ -480,6 +547,8 @@ pub async fn btree_insert(
         }
         Err(page::PageError::PageFull) => {
             // 4. PageFull: 走 split 传播
+            // ⭐ 失效 LeafCache: split 会改变 leaf 覆盖区间, 防止 stale guide.
+            pager.leaf_cache().invalidate_root(root_vpid);
             let orig_key_count = page::page_key_count(&leaf_bytes[..]);
             let mut right_bytes = leaf_new();
             let split_key = leaf_split(&mut leaf_bytes, &mut right_bytes)?;
@@ -519,7 +588,7 @@ pub async fn btree_insert(
             // 4d. propagate split up: 处理 parent insert (split_key, right_vpid)
             //     old_root_vpid 用来 root split 时作为新 root 的 first_child
             let new_root = propagate_split_up(
-                pager, &mut path, root_vpid, &split_key, right_vpid, &mut batch,
+                pager, path, root_vpid, &split_key, right_vpid, &mut batch,
             )
             .await?;
             batch.submit(pager).await?;
@@ -683,15 +752,54 @@ async fn create_new_root(
 // =====================================================================
 
 /// 在 root_vpid 指向的 BTree 中查找 key. 返回 Some(value) 或 None.
+///
+/// 走 `travel_to_leaf_guided` 直达 leaf, 用 `leaf_get_with` 回调零拷贝取值.
 pub async fn btree_lookup(
     pager: &mut Pager,
     root_vpid: Vpid,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, BTreeError> {
-    let (_leaf_vpid, leaf_bytes) = travel_to_leaf_ro(pager, root_vpid, key).await?;
-    let out = leaf_get(&leaf_bytes[..], key);
+    // 委托给 btree_lookup_with, 物化 value 为 Vec<u8>.
+    btree_lookup_with(pager, root_vpid, key, |v| v.to_vec()).await
+}
+
+/// ⭐ 零拷贝版 lookup: 命中时以 `&[u8]` 借用回调, 避免 value `to_vec` 物化.
+///
+/// **用途**: 存在性判定 (SETNX/MSETNX via table_exists) / 值窥视 / 直接编码进回复帧.
+/// 回调在 leaf page buffer 仍在 page_pool 期间执行, 返回后 buffer 归还池.
+///
+/// **零拷贝语义**: 回调收到的是 leaf page 内部的 value 切片, 无额外 alloc.
+pub async fn btree_lookup_with<R>(
+    pager: &mut Pager,
+    root_vpid: Vpid,
+    key: &[u8],
+    f: impl FnOnce(&[u8]) -> R,
+) -> Result<Option<R>, BTreeError> {
+    // The leaf guide cache is per-shard and invalidated on every split.  A
+    // hit skips all internal-page reads and route decoding; the leaf is still
+    // read through Pager so NowChunks/COW visibility is unchanged.  Set
+    // NEXUS_LEAF_CACHE=0 for an apples-to-apples rollback benchmark.
+    if leaf_cache_enabled()
+        && let Some(leaf_vpid) = pager.leaf_cache().lookup(root_vpid, key)
+    {
+        let leaf_bytes = pager.read(leaf_vpid).await?;
+        let out = leaf_get_with(&leaf_bytes[..], key, f);
+        crate::page_pool::recycle(leaf_bytes);
+        return Ok(out);
+    }
+
+    let (guide, leaf_bytes) = travel_to_leaf_guided(pager, root_vpid, key).await?;
+    let out = leaf_get_with(&leaf_bytes[..], key, f);
     crate::page_pool::recycle(leaf_bytes);
+    if leaf_cache_enabled() {
+        pager.leaf_cache().insert(root_vpid, guide);
+    }
     Ok(out)
+}
+
+fn leaf_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NEXUS_LEAF_CACHE").ok().as_deref() != Some("0"))
 }
 
 // =====================================================================
@@ -908,6 +1016,35 @@ mod tests {
         }
     }
 
+    /// ⭐ 零拷贝 lookup_with: 回调收到 value 切片, 不物化 Vec.
+    #[test]
+    fn btree_lookup_with_callback_zero_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut p, root) = test_pager(&tmp);
+        for i in 0..10 {
+            let key = format!("key_{:04}", i);
+            let val = format!("val_{:04}", i);
+            pollster::block_on(btree_insert(&mut p, root, key.as_bytes(), val.as_bytes())).unwrap();
+        }
+        // 回调版: 直接拿 &[u8], 不走 to_vec
+        for i in 0..10 {
+            let key = format!("key_{:04}", i);
+            let expected = format!("val_{:04}", i);
+            let got = pollster::block_on(btree_lookup_with(
+                &mut p,
+                root,
+                key.as_bytes(),
+                |v: &[u8]| v.len(), // 只取长度, 不物化
+            ))
+            .unwrap();
+            assert_eq!(got, Some(expected.len()));
+        }
+        // 不存在的 key
+        let got = pollster::block_on(btree_lookup_with(&mut p, root, b"missing", |v: &[u8]| v.len()))
+            .unwrap();
+        assert_eq!(got, None);
+    }
+
     #[test]
     fn btree_insert_triggers_leaf_split() {
         // 写 ~500 KV, 触发 leaf split
@@ -1084,5 +1221,183 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// ⭐ LeafCache 性能验证: 对比有 cache (btree_lookup) vs 无 cache
+    /// (travel_to_leaf_ro + leaf_get) 的 lookup 速度.
+    ///
+    /// 用 release 模式跑: `cargo test --release -p storage --lib btree_leaf_cache_benchmark -- --nocapture --ignored`
+    #[test]
+    #[ignore = "benchmark, release 模式手动跑"]
+    fn btree_leaf_cache_benchmark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut p, mut root) = test_pager(&tmp);
+        // 插入 5000 KV, 触发多层 BTree (depth >= 2)
+        for i in 0..5000u32 {
+            let key = format!("key_{:05}", i);
+            let val = format!("val_{:05}", i);
+            if let Some(new_root) =
+                pollster::block_on(btree_insert(&mut p, root, key.as_bytes(), val.as_bytes()))
+                    .unwrap()
+            {
+                root = new_root;
+            }
+        }
+
+        // 收集所有 key
+        let keys: Vec<Vec<u8>> = (0..5000u32)
+            .map(|i| format!("key_{:05}", i).into_bytes())
+            .collect();
+
+        // 1. 无 cache: 直接 travel_to_leaf_ro + leaf_get (绕过 btree_lookup 的 cache)
+        p.leaf_cache().clear();
+        let t0 = std::time::Instant::now();
+        let mut sum_nocache = 0u64;
+        for _round in 0..5 {
+            for k in &keys {
+                let (guide, leaf_bytes) =
+                    pollster::block_on(travel_to_leaf_guided(&mut p, root, k)).unwrap();
+                let _ = page::leaf_get(&leaf_bytes[..], k);
+                crate::page_pool::recycle(leaf_bytes);
+                // 不回填 cache, 模拟无 cache
+                let _ = guide;
+                sum_nocache += 1;
+            }
+        }
+        let nocache_dur = t0.elapsed();
+
+        // 2. 有 cache: btree_lookup (第 1 轮 miss + 回填, 后续轮次 hit)
+        p.leaf_cache().clear();
+        let t1 = std::time::Instant::now();
+        let mut sum_cache = 0u64;
+        for _round in 0..5 {
+            for k in &keys {
+                let got = pollster::block_on(btree_lookup(&mut p, root, k)).unwrap();
+                assert!(got.is_some());
+                sum_cache += 1;
+            }
+        }
+        let cache_dur = t1.elapsed();
+
+        let (hits, misses, invalidations) = p.leaf_cache().stats();
+        let speedup = nocache_dur.as_secs_f64() / cache_dur.as_secs_f64();
+
+        eprintln!(
+            "\n=== LeafCache Benchmark ===\n\
+             keys/round: {}, rounds: 5, total lookups: {}\n\
+             无 cache (travel): {:?} ({:.0} ns/lookup)\n\
+             有 cache (btree_lookup): {:?} ({:.0} ns/lookup)\n\
+             加速比: {:.2}x\n\
+             cache stats: hits={}, misses={}, invalidations={}\n\
+             hit rate: {:.1}%",
+            keys.len(),
+            sum_cache,
+            nocache_dur,
+            nocache_dur.as_nanos() as f64 / sum_nocache as f64,
+            cache_dur,
+            cache_dur.as_nanos() as f64 / sum_cache as f64,
+            speedup,
+            hits,
+            misses,
+            invalidations,
+            hits as f64 / (hits + misses) as f64 * 100.0
+        );
+
+        // 断言: cache 不应劣化 (微基准下所有页都在 chunk LRU 热缓存,
+        // 省 1 次 travel 的收益被 cache lookup 开销抵消, 加速比接近 1.0).
+        // 生产环境 (深树 + 冷 internal 页) 收益显著: 省 depth-1 次磁盘 IO.
+        assert!(
+            speedup >= 0.95,
+            "LeafCache 不应劣化性能: {:.2}x (期望 >= 0.95x)",
+            speedup
+        );
+        // 断言: misses > 0 (首轮每个 leaf 首次访问 miss 一次), <= key 数
+        assert!(
+            misses > 0 && misses <= keys.len() as u64,
+            "misses 应在 (0, {}] 范围, 实际 {}",
+            keys.len(),
+            misses
+        );
+        // 断言: hits + misses = 总 lookup 数 (5 轮 × key 数)
+        let total_lookups = keys.len() as u64 * 5;
+        assert_eq!(
+            hits + misses,
+            total_lookups,
+            "hits + misses 应等于总 lookup 数 {}, 实际 hits={} misses={}",
+            total_lookups,
+            hits,
+            misses
+        );
+        // 断言: 命中率应 > 99% (首轮 miss 少量 leaf, 后 4 轮全 hit)
+        let hit_rate = hits as f64 / total_lookups as f64;
+        assert!(
+            hit_rate > 0.99,
+            "命中率应 > 99%, 实际 {:.1}%",
+            hit_rate * 100.0
+        );
+    }
+
+    /// ⭐ btree_insert split 失效 LeafCache 验证: 插入触发 split 后, cache 应被失效,
+    /// 后续 lookup 仍正确 (不读 stale cache).
+    #[test]
+    fn btree_leaf_cache_invalidation_on_split() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut p, mut root) = test_pager(&tmp);
+        // 插入少量 key, 不 split
+        for i in 0..10u32 {
+            let key = format!("k{:03}", i);
+            let val = format!("v{:03}", i);
+            pollster::block_on(btree_insert(&mut p, root, key.as_bytes(), val.as_bytes()))
+                .unwrap();
+        }
+        // lookup 填充 cache
+        for i in 0..10u32 {
+            let key = format!("k{:03}", i);
+            let got = pollster::block_on(btree_lookup(&mut p, root, key.as_bytes())).unwrap();
+            assert_eq!(got, Some(format!("v{:03}", i).into_bytes()));
+        }
+        let (_, misses1, _) = p.leaf_cache().stats();
+        // 10 个 key 在同一 leaf (不 split), 首轮只 1 次 miss (回填后同 leaf 的 key 都 hit)
+        assert!(misses1 >= 1, "首轮应至少 1 次 miss, 实际 {}", misses1);
+
+        // 继续插入触发 split (大量 key)
+        for i in 10..2000u32 {
+            let key = format!("k{:05}", i);
+            let val = format!("v{:05}", i);
+            if let Some(new_root) =
+                pollster::block_on(btree_insert(&mut p, root, key.as_bytes(), val.as_bytes()))
+                    .unwrap()
+            {
+                root = new_root;
+            }
+        }
+        // split 应触发 invalidate_root
+        let (_, _, invalidations) = p.leaf_cache().stats();
+        assert!(
+            invalidations > 0,
+            "split 应触发 cache 失效, 实际 invalidations={}",
+            invalidations
+        );
+
+        // 再次 lookup 早期 key (cache 已失效, 应重新 travel + 回填)
+        for i in 0..10u32 {
+            let key = format!("k{:03}", i);
+            let got = pollster::block_on(btree_lookup(&mut p, root, key.as_bytes())).unwrap();
+            assert_eq!(
+                got,
+                Some(format!("v{:03}", i).into_bytes()),
+                "split 后 key {} lookup 错误 (stale cache?)",
+                i
+            );
+        }
+        // 再次 lookup 应全 hit
+        let (hits2, _, _) = p.leaf_cache().stats();
+        for i in 0..10u32 {
+            let key = format!("k{:03}", i);
+            let got = pollster::block_on(btree_lookup(&mut p, root, key.as_bytes())).unwrap();
+            assert_eq!(got, Some(format!("v{:03}", i).into_bytes()));
+        }
+        let (hits3, _, _) = p.leaf_cache().stats();
+        assert_eq!(hits3 - hits2, 10, "split 失效后回填的 key 应全 hit");
     }
 }

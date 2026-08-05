@@ -1,14 +1,30 @@
 // ⭐ 解耦 2026-08: shard 线程主循环 + 异步落盘驱动 (从 manager.rs 拆出).
 // 职责: 每 shard 独立线程的消息处理 (admin + KV ops), 异步落盘 (drive/drain).
-use crate::error::{ShardError, ShardResult};
 use crate::exec_cmds::*;
 use crate::manager::{block_on_io, FlushDone, FlushDoneSlot, ReplySink};
-use crate::request::{BatchOp, BatchResult, ShardErrorKind, ShardId, ShardReply, ShardRequest, ShardResponse};
+use crate::request::{BatchOp, BatchResult, ShardErrorKind, ShardReply, ShardRequest, ShardResponse};
 use crate::router::Router;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 use storage::{OpenOptions, StorageEngine};
+
+/// Upper bound for one shard-local ordinary SET micro-batch.
+///
+/// A RESP pipeline is normally much smaller (the benchmark uses 16), but the
+/// bound prevents a single busy connection from monopolising a shard loop or
+/// producing an unbounded temporary vector.  Only adjacent tasks for the same
+/// `(db, table)` are joined, so commands such as GET/DEL remain ordering
+/// barriers.
+const PUT_RUN_MAX: usize = 128;
+
+/// Metadata needed to return a result after the key/value payload has been
+/// handed to `StorageEngine::table_put_many`.
+struct PutReply {
+    conn_id: u64,
+    req_id: u64,
+    worker_id: u32,
+    group: u32,
+}
 
 pub(crate) fn drive_async_flush(
     engine: &std::rc::Rc<std::cell::RefCell<Option<StorageEngine>>>,
@@ -298,6 +314,13 @@ pub(crate) fn shard_thread_main(
 
     // ⭐ 异步落盘完成槽
     let flush_done: FlushDoneSlot = Rc::new(RefCell::new(Vec::new()));
+    // Experiment switch. Read once per shard so the normal hot path pays only
+    // one branch. The batch path is opt-in (`NEXUS_PUT_BATCH=1`) until a
+    // representative workload demonstrates a net gain.
+    let put_batching = std::env::var("NEXUS_PUT_BATCH")
+        .ok()
+        .as_deref()
+        == Some("1");
 
     // ⭐ 主循环: 同时 poll 两个 inbox (ShardRequest + ShardTask)
     //
@@ -817,36 +840,149 @@ pub(crate) fn shard_thread_main(
                 // 轮末一次 fsync 后统一 push (N 个写共享一次 fsync)
                 let strict = e.wal_mode() == storage::wal::WalMode::Strict;
                 let mut held: Vec<(u32, crate::request::TaskResult)> = Vec::new();
-                for task in tasks {
+                // A network pipeline reaches a shard as many independent
+                // `BatchOp::Put`s.  Execute adjacent writes for one table via
+                // the existing storage batch path: it sorts keys and reuses a
+                // LeafGuide/page write batch.  Non-Put commands are strict
+                // barriers, preserving the observable order of SET/GET/DEL.
+                let mut pending_tasks: VecDeque<_> = tasks.into();
+                while let Some(task) = pending_tasks.pop_front() {
+                    let crate::request::ShardTask {
+                        conn_id,
+                        req_id,
+                        worker_id,
+                        group,
+                        op,
+                    } = task;
+
+                    if put_batching
+                        && let crate::request::BatchOp::Put { db, table, key, val } = op
+                    {
+                        let mut replies = vec![PutReply {
+                            conn_id,
+                            req_id,
+                            worker_id,
+                            group,
+                        }];
+                        let mut pairs = vec![(key, val)];
+
+                        // Keep the run contiguous: an intervening operation
+                        // may observe or modify one of these keys.
+                        while pairs.len() < PUT_RUN_MAX {
+                            let same_table = matches!(
+                                pending_tasks.front(),
+                                Some(crate::request::ShardTask {
+                                    op: crate::request::BatchOp::Put { db: next_db, table: next_table, .. },
+                                    ..
+                                }) if next_db == &db && next_table == &table
+                            );
+                            if !same_table {
+                                break;
+                            }
+                            let next = pending_tasks.pop_front().expect("front checked above");
+                            let crate::request::ShardTask {
+                                conn_id,
+                                req_id,
+                                worker_id,
+                                group,
+                                op: crate::request::BatchOp::Put { key, val, .. },
+                            } = next else {
+                                unreachable!("front checked as Put")
+                            };
+                            replies.push(PutReply {
+                                conn_id,
+                                req_id,
+                                worker_id,
+                                group,
+                            });
+                            pairs.push((key, val));
+                        }
+
+                        // A one-item run keeps the old single-Put path.  This
+                        // avoids adding batch-vector/sort overhead for normal
+                        // unpipelined clients and keeps its exact row-count
+                        // accounting behaviour.
+                        if pairs.len() == 1 {
+                            let (key, val) = pairs.pop().expect("one pair");
+                            let reply = replies.pop().expect("one reply");
+                            let result = if let Err(err) = block_on_io(e.ensure_table(&db, &table)) {
+                                crate::request::BatchResult::Error(err.to_string())
+                            } else {
+                                exec_task_op(
+                                    e,
+                                    crate::request::BatchOp::Put { db, table, key, val },
+                                )
+                            };
+                            let tr = crate::request::TaskResult {
+                                conn_id: reply.conn_id,
+                                req_id: reply.req_id,
+                                group: reply.group,
+                                result,
+                            };
+                            if strict && e.wal_needs_sync() {
+                                held.push((reply.worker_id, tr));
+                            } else {
+                                reply_bus_set.get(reply.worker_id).push(tr);
+                            }
+                            continue;
+                        }
+
+                        let batch_result = match block_on_io(e.ensure_table(&db, &table)) {
+                            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            Ok(()) => match block_on_io(e.table_put_many(&db, &table, &pairs)) {
+                                Ok(()) => crate::request::BatchResult::PutOk,
+                                // A batch storage failure has no per-key
+                                // attribution.  Report the same error to every
+                                // original request rather than retrying a
+                                // partially-applied batch.
+                                Err(err) => crate::request::BatchResult::Error(err.to_string()),
+                            },
+                        };
+                        for reply in replies {
+                            let tr = crate::request::TaskResult {
+                                conn_id: reply.conn_id,
+                                req_id: reply.req_id,
+                                group: reply.group,
+                                result: batch_result.clone(),
+                            };
+                            if strict && e.wal_needs_sync() {
+                                held.push((reply.worker_id, tr));
+                            } else {
+                                reply_bus_set.get(reply.worker_id).push(tr);
+                            }
+                        }
+                        continue;
+                    }
+
                     // ⭐ T1: 惰性建表 (已存在 = registry 纯内存查表);
                     // ⭐ F66: CatalogDump 等无表名的元 op 跳过 (table 空)
                     {
-                        let (db, table, _) = task.op.locator();
+                        let (db, table, _) = op.locator();
                         if !table.is_empty()
                             && let Err(err) = block_on_io(e.ensure_table(db, table))
                         {
-                            reply_bus_set.get(task.worker_id).push(crate::request::TaskResult {
-                                conn_id: task.conn_id,
-                                req_id: task.req_id,
-                                group: task.group,
+                            reply_bus_set.get(worker_id).push(crate::request::TaskResult {
+                                conn_id,
+                                req_id,
+                                group,
                                 result: crate::request::BatchResult::Error(err.to_string()),
                             });
                             continue;
                         }
                     }
-                    let result = exec_task_op(e, task.op);
+                    let result = exec_task_op(e, op);
                     // ⭐ WAL (F60) strict: 本轮已有未持久化写 → 回复押到轮末
                     // barrier 后 (读 op 在无待 sync 内容时仍直发)
                     let tr = crate::request::TaskResult {
-                        conn_id: task.conn_id,
-                        req_id: task.req_id,
-                        group: task.group,
+                        conn_id,
+                        req_id,
+                        group,
                         result,
                     };
                     if strict && e.wal_needs_sync() {
-                        held.push((task.worker_id, tr));
+                        held.push((worker_id, tr));
                     } else {
-                        reply_bus_set.get(task.worker_id).push(tr);
+                        reply_bus_set.get(worker_id).push(tr);
                     }
                 }
                 if !held.is_empty() {

@@ -25,13 +25,18 @@ pub(crate) fn push_task(
         key.drain(..=pos);
     }
     let shard_id = hash_route_op(&op, num_shards);
-    shard_inboxes[shard_id].push_spin(ShardTask {
+    let task = ShardTask {
         conn_id,
         req_id,
         worker_id,
         group: 0,
         op,
-    });
+    };
+    if conn.proto == ProtocolKind::Resp {
+        conn.defer_resp_task(shard_id, task, shard_inboxes.len());
+    } else {
+        shard_inboxes[shard_id].push_spin(task);
+    }
 }
 
 /// ⭐ MGET/MSET: 定向 push 到指定 shard, 带组号 (聚合回填用).

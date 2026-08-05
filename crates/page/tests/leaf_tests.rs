@@ -3,7 +3,7 @@
 use page::{
     Checkpoint, CheckpointHeader, ItemKind, PAGE_HEADER_SIZE, PAGE_SIZE, PageIndex, PageType,
     leaf_delete, leaf_get, leaf_insert, leaf_new, leaf_push_back, leaf_split, page_free_off,
-    page_free_space, page_key_count, page_set_free_off, page_set_key_count, page_type,
+    page_free_space, page_key_count, page_set_free_off, page_set_key_count, page_type, leaf_update_with,
     write_checkpoint, write_checkpoint_header,
 };
 use page::{LeafItemPtr, decode_item, encode_leaf_item};
@@ -34,6 +34,38 @@ fn get_nonexistent_returns_none() {
     leaf_insert(&mut page, b"bravo", b"b").unwrap();
     leaf_insert(&mut page, b"charlie", b"c").unwrap();
     assert!(leaf_get(&page, b"delta").is_none());
+}
+
+#[test]
+fn update_with_returns_old_value_and_preserves_absent_key() {
+    let mut page = leaf_new();
+    leaf_insert(&mut page, b"alpha", b"before").unwrap();
+
+    let old = leaf_update_with(&mut page, b"alpha", b"after", |value| value.to_vec()).unwrap();
+    assert_eq!(old, Some(b"before".to_vec()));
+    assert_eq!(leaf_get(&page, b"alpha"), Some(b"after".to_vec()));
+
+    let absent = leaf_update_with(&mut page, b"missing", b"value", |value| value.to_vec()).unwrap();
+    assert_eq!(absent, None);
+    assert!(leaf_get(&page, b"missing").is_none());
+}
+
+#[test]
+fn page_index_locates_last_eligible_segment_with_binary_search() {
+    let index = PageIndex {
+        key_count: 0,
+        segments: vec![
+            page::Segment { first_item_off: 0, item_count: 1, first_full_key: vec![] },
+            page::Segment { first_item_off: 1, item_count: 1, first_full_key: b"cat".to_vec() },
+            page::Segment { first_item_off: 2, item_count: 1, first_full_key: b"mango".to_vec() },
+            page::Segment { first_item_off: 3, item_count: 1, first_full_key: b"zoo".to_vec() },
+        ],
+    };
+    assert_eq!(index.locate_segment(b"ant"), 0);
+    assert_eq!(index.locate_segment(b"cat"), 1);
+    assert_eq!(index.locate_segment(b"moon"), 2);
+    assert_eq!(index.locate_segment(b"zoo"), 3);
+    assert_eq!(index.locate_segment(b"zzzz"), 3);
 }
 
 #[test]

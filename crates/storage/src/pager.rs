@@ -26,13 +26,11 @@ use crate::chunk_lock::{AcquireResult, ChunkLockMap};
 use crate::chunk_lru::{ChunkKey, ChunkList};
 use crate::chunk_writer::{ChunkWriter, NowChunks, WriteQueue};
 use crate::meta_cache::MetaCache;
-use crate::meta_page::{META_PID, META_VPID};
 use crate::page_pool;
 pub use crate::pager_write::{MAX_BATCH_PAGES, PageWriteBatch};
 pub use crate::pager_tree::{TravelTree, TravelTreeGuard};
-use crate::pager_tree::chunk_offset;
 use crate::types::{
-    CHUNK_SIZE, CHUNKS_PER_BLOCK, DEFAULT_DB_ID, DEFAULT_DB_NAME, DEFAULT_SHARD_ID, PAGE_SIZE,
+    CHUNK_SIZE, CHUNKS_PER_BLOCK, DEFAULT_DB_NAME, DEFAULT_SHARD_ID, PAGE_SIZE,
     PAGES_PER_CHUNK, PageKey, PidLocation, ShardId,
 };
 
@@ -110,6 +108,9 @@ pub struct Pager {
     /// 状态机分片: 每轮只迁移一个 chunk (低优先级协程 + 节流),
     /// 天然多次让出运行时, 不长占 CPU.
     pub(crate) drain_block_target: Option<u32>,
+    /// ⭐ 读路径优化: LeafCache (key → leaf_vpid 缓存, 免重复 travel).
+    /// per-shard 单线程, 无锁. split 时 invalidate_root 失效.
+    pub(crate) leaf_cache: crate::leaf_cache::LeafCache,
 }
 
 /// ⭐ 异步落盘作业 (Phase C: 按 file_id 分组批量): 零 Pager 借用,
@@ -333,6 +334,7 @@ impl Pager {
                 .checked_sub(std::time::Duration::from_millis(COMPACT_MIN_INTERVAL_MS))
                 .unwrap_or_else(std::time::Instant::now),
             drain_block_target: None,
+            leaf_cache: crate::leaf_cache::LeafCache::default(),
         }
     }
 
@@ -418,6 +420,7 @@ impl Pager {
                 .checked_sub(std::time::Duration::from_millis(COMPACT_MIN_INTERVAL_MS))
                 .unwrap_or_else(std::time::Instant::now),
             drain_block_target: None,
+            leaf_cache: crate::leaf_cache::LeafCache::default(),
         }
     }
 
@@ -877,6 +880,11 @@ impl Pager {
         &mut self.writer
     }
 
+    /// ⭐ 暴露 leaf_cache (btree.rs 读路径优化用 + 测试).
+    pub fn leaf_cache(&mut self) -> &mut crate::leaf_cache::LeafCache {
+        &mut self.leaf_cache
+    }
+
     /// ⭐ 申请 chunk_lock (DESIGN §3.0). 同步版本立即返回结果.
     ///
     /// 调用场景: Pager 内部 read 流程 / 测试验证 chunk_lock 行为.
@@ -941,6 +949,7 @@ impl Pager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pager_tree::chunk_offset;
 
     #[test]
     fn page_write_batch_max_pages_limit() {

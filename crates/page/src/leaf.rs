@@ -845,7 +845,18 @@ pub fn leaf_push_back(
 /// - `prev_key` 不变 → shared_prefix_len 和 key_unshared 字节都不变
 /// - 只替换 vint(value_len) + value bytes
 /// - new_n != old_n 时, 后续 items 物理后移/前移, free_off 调整
-pub fn leaf_update(page: &mut [u8], key: &[u8], new_value: &[u8]) -> Result<bool, PageError> {
+///
+/// Update an existing key and return metadata derived from its old value.
+///
+/// This is the overwrite-write hot-path counterpart to [`leaf_get_with`]: it
+/// parses the page and finds the item once, exposes the old value to `f`, then
+/// updates that same located item.  `Ok(None)` means the key was absent.
+pub fn leaf_update_with<R>(
+    page: &mut [u8],
+    key: &[u8],
+    new_value: &[u8],
+    f: impl FnOnce(&[u8]) -> R,
+) -> Result<Option<R>, PageError> {
     if page_type(page) != PageType::Leaf {
         return Err(PageError::InvalidPageType {
             expected: PageType::Leaf,
@@ -858,7 +869,7 @@ pub fn leaf_update(page: &mut [u8], key: &[u8], new_value: &[u8]) -> Result<bool
         ));
     }
     if page_key_count(page) == 0 {
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut idx = PageIndex::load(page, ItemKind::Leaf)?;
@@ -876,7 +887,7 @@ pub fn leaf_update(page: &mut [u8], key: &[u8], new_value: &[u8]) -> Result<bool
             .map_err(|e| PageError::ItemDecode(format!("next: {e}")))?
         {
             Some(p) => p,
-            None => return Ok(false),
+            None => return Ok(None),
         };
     }
 
@@ -896,7 +907,7 @@ pub fn leaf_update(page: &mut [u8], key: &[u8], new_value: &[u8]) -> Result<bool
             .map_err(|e| PageError::ItemDecode(format!("next: {e}")))?
         {
             Some(p) => p,
-            None => return Ok(false),
+            None => return Ok(None),
         };
         ptr = cur;
     }
@@ -919,9 +930,14 @@ pub fn leaf_update(page: &mut [u8], key: &[u8], new_value: &[u8]) -> Result<bool
     let (old_item, _) = decode_item(page, old_off, ItemKind::Leaf)?;
     let key_end = old_off + 4 + old_item.key_unshared_len as usize;
     // 跳过 vint(value_len) 拿到 value 起始
-    let (_v_len, vint_size) = decode_varint(&page[key_end..])
+    let (v_len, vint_size) = decode_varint(&page[key_end..])
         .ok_or_else(|| PageError::ItemDecode("bad varint for value_len".into()))?;
-    let _value_off = key_end + vint_size;
+    let value_off = key_end + vint_size;
+    let value_end = value_off + v_len as usize;
+    if value_end > old_off + old_n {
+        return Err(PageError::ItemDecode("value exceeds leaf item".into()));
+    }
+    let old_value = f(&page[value_off..value_end]);
 
     // 计算 new_n (基于 prev_key)
     let mut new_buf = [0u8; 4096];
@@ -968,7 +984,15 @@ pub fn leaf_update(page: &mut [u8], key: &[u8], new_value: &[u8]) -> Result<bool
         idx.write_back(page)?;
     }
 
-    Ok(true)
+    Ok(Some(old_value))
+}
+
+/// 更新 leaf page 中 key 对应的 value. 返回 Ok(true) 表示成功, Ok(false) 表示 key 不存在.
+///
+/// 不需要旧值的调用者使用这个兼容包装；需要旧值元数据的覆盖写应调用
+/// [`leaf_update_with`]，避免额外的 `leaf_get_with` 全页扫描。
+pub fn leaf_update(page: &mut [u8], key: &[u8], new_value: &[u8]) -> Result<bool, PageError> {
+    Ok(leaf_update_with(page, key, new_value, |_| ())?.is_some())
 }
 
 // ===== 内部 helper =====
