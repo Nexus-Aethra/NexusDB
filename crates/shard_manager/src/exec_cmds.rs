@@ -1,9 +1,7 @@
 // ⭐ 解耦 2026-08: shard 命令执行 (从 manager.rs 拆出).
 // 职责: 各存储命令的 RMW/扫描/事务应用 (exec_incr/exec_append/exec_txn_apply/
 // exec_task_op 等), 操作 StorageEngine, 与 ShardManager 状态解耦.
-use crate::error::{ShardError, ShardResult};
 use crate::manager::block_on_io;
-use crate::request::{BatchOp, BatchResult, ShardErrorKind};
 use storage::StorageEngine;
 
 pub(crate) fn exec_incr(
@@ -116,6 +114,7 @@ pub(crate) fn exec_append(
 }
 
 /// ⭐ SETNX: 不存在才写. 返回 1=写入, 0=已存在.
+/// 使用 table_exists (零 value 物化) 代替 table_get.
 pub(crate) fn exec_setnx(
     e: &mut storage::StorageEngine,
     db: &str,
@@ -124,9 +123,9 @@ pub(crate) fn exec_setnx(
     val: &[u8],
 ) -> crate::request::BatchResult {
     use crate::request::BatchResult;
-    match block_on_io(e.table_get(db, table, key)) {
-        Ok(Some(_)) => BatchResult::Integer(0),
-        Ok(None) => match block_on_io(e.table_put(db, table, key, val)) {
+    match block_on_io(e.table_exists(db, table, key)) {
+        Ok(true) => BatchResult::Integer(0),
+        Ok(false) => match block_on_io(e.table_put(db, table, key, val)) {
             Ok(_) => BatchResult::Integer(1),
             Err(err) => BatchResult::Error(err.to_string()),
         },
@@ -875,6 +874,7 @@ pub(crate) fn exec_setrange(
 
 /// ⭐ MSETNX 分片: 本组全部 key 不存在才写. 返回 1=写入, 0=有 key 已存在.
 /// (跨 shard 非原子: 别组可能已写 — 已记为 gap.)
+/// 使用 table_exists (零 value 物化) 代替 table_get.
 pub(crate) fn exec_multiputnx(
     e: &mut storage::StorageEngine,
     db: &str,
@@ -883,9 +883,9 @@ pub(crate) fn exec_multiputnx(
 ) -> crate::request::BatchResult {
     use crate::request::BatchResult;
     for (k, _) in pairs {
-        match block_on_io(e.table_get(db, table, k)) {
-            Ok(Some(_)) => return BatchResult::Integer(0),
-            Ok(None) => {}
+        match block_on_io(e.table_exists(db, table, k)) {
+            Ok(true) => return BatchResult::Integer(0),
+            Ok(false) => {}
             Err(err) => return BatchResult::Error(err.to_string()),
         }
     }

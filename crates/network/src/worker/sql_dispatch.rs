@@ -6,7 +6,6 @@ use super::*;
 use super::sql_dml::*;
 use super::sql_join::*;
 use super::sql_sysquery::*;
-use super::sql_unique::*;
 
 pub(crate) fn sql_dispatch_stmt(
     conn: &mut ConnState,

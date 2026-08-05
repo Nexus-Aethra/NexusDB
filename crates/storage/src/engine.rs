@@ -27,7 +27,7 @@ use crate::chunk_lru::ChunkList;
 use crate::chunk_writer::{ChunkWriter, NowChunks};
 use crate::engine_io::init_meta_page;
 use crate::meta_cache::MetaCache;
-use crate::meta_page::{META_PID, META_VPID, MetaPage};
+use crate::meta_page::META_VPID;
 use crate::pager::Pager;
 use crate::pager_io::PagerIo;
 use crate::recover::{recover, recover_for_shard, shard_dir_path};

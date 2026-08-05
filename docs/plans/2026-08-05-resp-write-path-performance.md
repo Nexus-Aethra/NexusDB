@@ -230,6 +230,20 @@ p99.9 15.295ms；维护轮平均 29.8us，`backpressure_fallbacks=0`、in-flight
 - 仅将 meta admission 进一步推迟到无前台 backlog 的窗口；WAL tick 仍按 deadline 必达。
 - 将 compact read/write 移至独立低优先级 budget，避免与 data completion 同轮竞争。
 
+### M4 实验：FIFO 前台时间片轮换（默认关闭）
+
+- [x] `NEXUS_FAIR_TURN_BUDGET_US=N`（50--10000us）只在完整 `ShardTask` 的边界切轮；未执行的
+  FIFO 后缀保存在 shard 本地 deferred 队列，并且在下一轮优先服务，不允许新入队任务越过它。
+- [x] 记录 `task_turn_budget_cuts`。不在单个 task 中抢占，Put micro-batch 与 strict WAL barrier 仍保持
+  原子完成，因而不改变同 shard 的顺序或回复语义。
+- [x] 初步结果（off、10 秒 overwrite、三轮、500us）：182.4K/167.1K/120.3K ops/s，p99.9 为
+  14.015/10.879/16.127ms，轮换 82,955 次，TaskInbox 平均等待 0.682ms。相对未启用时间片的
+  191.1K/191.8K/131.3K ops/s，p99.9 14.271/11.903/19.327ms，队列等待虽下降但吞吐中位数约低
+  12.6%，p99.9 中位数没有确定改善。
+- [ ] 结论：暂不启用为默认。它证明长轮次可以在不重排 FIFO 的前提下被打散，但当前每次额外轮换都要
+  运行 maintenance/scheduler，收益被开销抵消。若后续需要回退，删除该环境开关和 deferred 队列即可；
+  默认值为关闭，不影响当前产品路径。
+
 ### 目标
 
 1. 在固定数据集的**覆盖写** workload 中，让 pipeline=16 的纯 SET 吞吐提升至少 20%，

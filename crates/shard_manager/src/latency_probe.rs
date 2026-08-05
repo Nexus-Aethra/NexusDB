@@ -101,6 +101,8 @@ pub struct Probe {
     pub task_window: Histogram,
     /// 单轮前台 task 服务耗时；自适应窗口以它作为本地 RTT 信号。
     pub task_round_ns: Histogram,
+    /// 前台时间片到期而在 task 边界主动切轮的次数。
+    pub task_turn_budget_cuts: AtomicU64,
     /// Shard 已完成的回复在 worker reply bus 中等待的时间。
     pub reply_bus_queue_ns: Histogram,
     pub flush_harvest_ns: Histogram,
@@ -131,6 +133,7 @@ impl Probe {
             task_queue_ns: Histogram::new(),
             task_window: Histogram::new(),
             task_round_ns: Histogram::new(),
+            task_turn_budget_cuts: AtomicU64::new(0),
             reply_bus_queue_ns: Histogram::new(),
             flush_harvest_ns: Histogram::new(),
             flush_data_admission_ns: Histogram::new(),
@@ -164,6 +167,10 @@ impl Probe {
         s.push_str(&self.task_queue_ns.dump("shard_task_queue_ns"));
         s.push_str(&self.task_window.dump("shard_task_window"));
         s.push_str(&self.task_round_ns.dump("shard_task_round_ns"));
+        s.push_str(&format!(
+            "task_turn_budget_cuts={}\n",
+            self.task_turn_budget_cuts.load(Ordering::Relaxed),
+        ));
         s.push_str(&self.reply_bus_queue_ns.dump("reply_bus_queue_ns"));
         s.push_str(&self.flush_harvest_ns.dump("flush_harvest_ns"));
         s.push_str(&self.flush_data_admission_ns.dump("flush_data_admission_ns"));

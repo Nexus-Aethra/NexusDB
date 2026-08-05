@@ -1,0 +1,20 @@
+# memtier benchmark 配置
+[server]
+listen_addr = "127.0.0.1:15433"
+worker_count = 4
+redis_addr = "127.0.0.1:6379"
+redis_password = ""
+
+[storage]
+block_root = "./bench_tmp/data"
+num_shards = 4
+io_backend = "io_uring"
+chunk_cache_size = 8
+wal_mode = "off"
+
+[log]
+level = "warn"
+dir = "./bench_tmp/logs"
+buffer_kb = 4
+flush_interval_ms = 1000
+stderr = false

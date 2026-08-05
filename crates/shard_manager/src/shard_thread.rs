@@ -86,6 +86,29 @@ struct AdaptiveTaskWindow {
     enabled: bool,
 }
 
+/// Optional, cooperative wall-clock bound for a foreground turn.  It never
+/// interrupts an operation or reorders the inbox: the remaining FIFO suffix
+/// is served first in the next turn.
+struct ForegroundTurnBudget {
+    budget_ns: Option<u64>,
+}
+
+impl ForegroundTurnBudget {
+    fn from_env() -> Self {
+        let budget_ns = std::env::var("NEXUS_FAIR_TURN_BUDGET_US")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|us| *us != 0)
+            .map(|us| us.clamp(50, 10_000).saturating_mul(1_000));
+        Self { budget_ns }
+    }
+
+    fn expired(&self, start: std::time::Instant) -> bool {
+        self.budget_ns
+            .is_some_and(|budget_ns| start.elapsed().as_nanos() >= budget_ns as u128)
+    }
+}
+
 impl AdaptiveTaskWindow {
     const MIN: usize = 32;
     const MAX: usize = 256;
@@ -492,13 +515,16 @@ pub(crate) fn shard_thread_main(
     // Limit a foreground service turn so a large TaskInbox burst cannot make
     // later requests wait behind an unbounded drain.
     let mut task_window = AdaptiveTaskWindow::from_env();
+    let turn_budget = ForegroundTurnBudget::from_env();
+    let mut deferred_tasks: VecDeque<crate::request::ShardTask> = VecDeque::new();
     const FOREGROUND_DATA_ADMISSION: usize = 2;
     nlog::info!(
         "shard",
-        "shard-{shard_id} adaptive task window: {} (enabled={}, target_us={})",
+        "shard-{shard_id} adaptive task window: {} (enabled={}, target_us={}, fair_turn_budget_us={})",
         task_window.limit(),
         task_window.enabled,
         task_window.target_round_ns / 1_000,
+        turn_budget.budget_ns.unwrap_or(0) / 1_000,
     );
 
     loop {
@@ -506,7 +532,13 @@ pub(crate) fn shard_thread_main(
         let mut spins = 0u32;
         let (batch, tasks) = loop {
             let b = inbox.drain();
-            let t = task_inbox.drain_up_to(task_window.limit());
+            let t = if deferred_tasks.is_empty() {
+                task_inbox.drain_up_to(task_window.limit())
+            } else {
+                deferred_tasks
+                    .drain(..deferred_tasks.len().min(task_window.limit()))
+                    .collect()
+            };
             if !b.is_empty() || !t.is_empty() {
                 break (b, t);
             }
@@ -548,7 +580,13 @@ pub(crate) fn shard_thread_main(
                     }
                 }
                 let b = inbox.drain();
-                let t = task_inbox.drain_up_to(task_window.limit());
+                let t = if deferred_tasks.is_empty() {
+                    task_inbox.drain_up_to(task_window.limit())
+                } else {
+                    deferred_tasks
+                        .drain(..deferred_tasks.len().min(task_window.limit()))
+                        .collect()
+                };
                 if !b.is_empty() || !t.is_empty() {
                     break (b, t);
                 }
@@ -567,7 +605,7 @@ pub(crate) fn shard_thread_main(
         // below runs, the inbox may already look empty even though servicing
         // it just consumed a full turn.
         let served_foreground = !tasks.is_empty();
-        let served_task_count = tasks.len();
+        let mut served_task_count = 0usize;
 
         rt.clone().drive_until_idle(0);
 
@@ -1026,7 +1064,19 @@ pub(crate) fn shard_thread_main(
                 // LeafGuide/page write batch.  Non-Put commands are strict
                 // barriers, preserving the observable order of SET/GET/DEL.
                 let mut pending_tasks: VecDeque<_> = tasks.into();
-                while let Some(task) = pending_tasks.pop_front() {
+                while !pending_tasks.is_empty() {
+                    if served_task_count != 0
+                        && !should_shutdown
+                        && task_round_start.is_some_and(|start| turn_budget.expired(start))
+                    {
+                        crate::PROBE
+                            .task_turn_budget_cuts
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        deferred_tasks.append(&mut pending_tasks);
+                        break;
+                    }
+                    let task = pending_tasks.pop_front().expect("checked non-empty");
+                    served_task_count += 1;
                     let task_start = crate::PROBE.is_enabled().then(std::time::Instant::now);
                     let crate::request::ShardTask {
                         conn_id,
@@ -1077,6 +1127,7 @@ pub(crate) fn shard_thread_main(
                                 group,
                             });
                             pairs.push((key, val));
+                            served_task_count += 1;
                         }
 
                         // A one-item run keeps the old single-Put path.  This

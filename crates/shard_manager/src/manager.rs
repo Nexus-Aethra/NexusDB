@@ -9,13 +9,11 @@ use std::sync::Mutex as StdMutex;
 use std::thread;
 
 use storage::OpenOptions;
-use storage::StorageEngine;
 
 use crate::coordinator::{TwoPhaseCoordinator, TxnOp};
 use crate::error::{ShardError, ShardResult};
-use crate::exec_cmds::*;
 use crate::reply::{block_on_v2, PendingReply};
-use crate::request::{BatchOp, BatchResult, ShardErrorKind, ShardId, ShardReply, ShardRequest, ShardResponse};
+use crate::request::{BatchOp, BatchResult, ShardId, ShardReply, ShardRequest, ShardResponse};
 use crate::router::{HashRouter, Router};
 use crate::shard_thread::shard_thread_main;
 

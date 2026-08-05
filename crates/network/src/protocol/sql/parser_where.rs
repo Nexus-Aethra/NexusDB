@@ -5,7 +5,6 @@ use super::parser::{P, Tok};
 use super::parser_select::{
     is_join_ahead, parse_join_from, parse_opt_alias, parse_select, parse_select_tail,
 };
-use storage::schema::{ColType, Column, TableSchema};
 
 pub(crate) fn parse_paren_subselect(p: &mut P) -> Result<Box<SqlStmt>, String> {
     p.expect(&Tok::LParen, "(")?;

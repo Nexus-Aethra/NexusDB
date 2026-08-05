@@ -7,7 +7,6 @@ use crate::protocol::sql::{self, Cond, Pred, SqlStmt};
 use storage::row::ColValue;
 use storage::schema::{ColType, TableSchema};
 use shard_manager::BatchOp;
-use super::{SysQuerySpec, MyPrepared, MysqlState};
 
 /// ⭐ 方案 A (调优): EstimateRows 小表阈值 — 双表 Inner JOIN 两表行数均 ≤ 此值
 /// → 跳过 distinct/ranges 统计收集, 直接按行数决策驱动表 (小表 JOIN 固定只 1 轮
@@ -144,6 +143,7 @@ pub struct MultiStmt {
 }
 
 /// ⭐ X3: SELECT pk 点查渲染上下文 (seq → 状态).
+#[allow(dead_code)]
 pub struct SqlRowCtx {
     pub schema: std::sync::Arc<TableSchema>,
     pub conds: Pred<Cond>,

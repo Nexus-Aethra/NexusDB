@@ -80,6 +80,7 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
     let sched_r = sched.clone();
     let stop_efd_r = stop_efd;
     scheduler::spawn_on(&sched_r, async move {
+        let mut reply_results = Vec::with_capacity(256);
         loop {
             // 等 reply_bus 有新回包 或 stop 信号.
             let w = match sio::select_read(reply_eventfd, stop_efd_r).await {
@@ -95,10 +96,10 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 libc::read(reply_eventfd, &mut v as *mut u64 as *mut libc::c_void, 8);
             }
             // drain 所有回包, 按 conn_id 路由到 per-conn 队列 + 写 per-conn eventfd
-            let results = reply_bus_r.drain();
-            if !results.is_empty() {
+            reply_bus_r.drain_into(&mut reply_results);
+            if !reply_results.is_empty() {
                 let mut reg = reg_r.lock().unwrap();
-                for r in results {
+                for r in reply_results.drain(..) {
                     if let Some(entry) = reg.get_mut(&r.conn_id) {
                         entry.queue.push_back(r);
                         // 精确唤醒该连接协程 (level-triggered eventfd)
@@ -123,14 +124,14 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
     let inbox2 = inbox.clone();
     let shard_inboxes2 = shard_inboxes.clone();
     let reply_bus2 = reply_bus.clone();
-    let db2 = db.clone();
-    let table2 = table.clone();
-    let limits2 = limits;
+    let _db2 = db.clone();
+    let _table2 = table.clone();
+    let _limits2 = limits;
     let sql_cache2 = sql_cache.clone();
     let sql_shared2 = sql_shared.clone();
     let db_view2 = db_view.clone();
-    let auth_required2 = auth_required;
-    let tls_config2 = tls_config.clone();
+    let _auth_required2 = auth_required;
+    let _tls_config2 = tls_config.clone();
     let sched3 = sched.clone();
     let worker_id2 = worker_id;
     let stop2 = stop.clone();

@@ -5,7 +5,6 @@
 
 use std::io;
 
-use crate::chunk_lru::ChunkKey;
 use crate::meta_page::{META_PID, META_VPID};
 use crate::page_pool;
 use crate::pager::{next_bump_chunk, Pager};

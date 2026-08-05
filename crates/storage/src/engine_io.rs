@@ -1,11 +1,10 @@
 // ⭐ 解耦 2026-08: StorageEngine 数据读写物理层 (从 engine.rs 拆出).
 // 职责: table_put/get/delete、物理页读写 (put_physical/get_physical)、批量读写.
-use super::engine::{StorageEngine, StorageError};
+use super::engine::StorageEngine;
 use crate::meta_cache::MetaCache;
 use crate::meta_page::{MetaPage, META_PID, META_VPID};
 use crate::registry::{DbRegistry, RegistryError};
 use crate::types::DbId;
-use crate::TableDirectory;
 use std::io;
 
 impl StorageEngine {
@@ -188,6 +187,23 @@ impl StorageEngine {
     ) -> Result<Option<Vec<u8>>, RegistryError> {
         let ek = crate::keyspace::encode_string(key);
         self.get_physical(db, table, &ek).await
+    }
+
+    /// ⭐ 存在性判定: 仅检查 key 是否存在, 不物化 value (零 alloc).
+    /// 用于 SETNX / MSETNX / EXISTS 等只需 Some/None 的场景.
+    pub async fn table_exists(
+        &mut self,
+        db: &str,
+        table: &str,
+        key: &[u8],
+    ) -> Result<bool, RegistryError> {
+        let ek = crate::keyspace::encode_string(key);
+        let db_handle = self.registry.open_db(db)?;
+        let table_vpid = db_handle
+            .open_table(&mut self.pager, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+        crate::registry::table_exists(&mut self.pager, table_vpid, &ek).await
     }
 
     /// ⭐ 批量读 (MGET): LeafGuide 区间复用, 结果按输入顺序.
