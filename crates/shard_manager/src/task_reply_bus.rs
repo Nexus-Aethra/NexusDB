@@ -15,9 +15,14 @@ use crate::request::TaskResult;
 /// 单个 worker 的回复队列容量.
 const REPLY_BUS_CAPACITY: usize = 8192;
 
+struct QueuedResult {
+    result: TaskResult,
+    enqueued_at: Option<std::time::Instant>,
+}
+
 /// 单个 worker 的回复 bus (shard push, worker drain).
 pub struct TaskReplyBus {
-    ring: ArrayQueue<TaskResult>,
+    ring: ArrayQueue<QueuedResult>,
     /// eventfd: shard push 后通知 worker 有回复可发.
     eventfd: std::os::unix::io::RawFd,
     /// ⭐ 通知合并: 自上次 drain 以来的 pending 计数.
@@ -39,11 +44,18 @@ impl TaskReplyBus {
 
     /// shard 端: push 一个 result + 合并通知 worker.
     pub fn push(&self, result: TaskResult) {
+        let mut queued = QueuedResult {
+            result,
+            enqueued_at: crate::PROBE.is_enabled().then(std::time::Instant::now),
+        };
         // 如果满了 spin retry (不太可能, 8192 容量)
         loop {
-            match self.ring.push(result.clone()) {
+            match self.ring.push(queued) {
                 Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
+                Err(rejected) => {
+                    queued = rejected;
+                    std::thread::yield_now();
+                }
             }
         }
         // ⭐ 合并通知: 首条才写 eventfd, 后续搭车
@@ -74,16 +86,26 @@ impl TaskReplyBus {
         }
         self.pending.store(0, Ordering::Release);
         results.clear();
-        while let Some(r) = self.ring.pop() {
-            results.push(r);
+        while let Some(queued) = self.ring.pop() {
+            if let Some(enqueued_at) = queued.enqueued_at {
+                crate::PROBE
+                    .reply_bus_queue_ns
+                    .record(enqueued_at.elapsed().as_nanos() as u64);
+            }
+            results.push(queued.result);
         }
     }
 
     /// 非阻塞 drain (不 read eventfd, 用于 poll 模式).
     pub fn try_drain(&self) -> Vec<TaskResult> {
         let mut results = Vec::with_capacity(64);
-        while let Some(r) = self.ring.pop() {
-            results.push(r);
+        while let Some(queued) = self.ring.pop() {
+            if let Some(enqueued_at) = queued.enqueued_at {
+                crate::PROBE
+                    .reply_bus_queue_ns
+                    .record(enqueued_at.elapsed().as_nanos() as u64);
+            }
+            results.push(queued.result);
         }
         results
     }

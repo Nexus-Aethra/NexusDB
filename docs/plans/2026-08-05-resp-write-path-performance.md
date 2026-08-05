@@ -135,6 +135,101 @@ RESP E2E 25/25、SQL E2E 通过。10 秒 read-heavy 同期 A/B 为：开启 **24
 **248.0K ops/s**，p99 均约 4.3ms；该时段整体性能低于早先快照，但开/关无差别，故归类为尾延迟
 与隔离保护，而非峰值吞吐收益。
 
+## 长尾延迟专项计划（2026-08-05）
+
+### 已验证根因
+
+覆盖写探针显示 shard task 执行平均约 24us、绝大多数低于 50us，而 TaskInbox 等待平均约
+1ms，且大量请求位于 2–5ms。同步 IO 与 async flush 背压不是主因（fallback=0，`block_on_io`
+99% 小于 1us）；少量 scheduler/flush 的 20ms+ 轮次会进一步放大 p99.9。因此首要问题是
+前台任务在无界 drain 与维护驱动之间的排队，而非单次 B+Tree 操作。
+
+### Phase L1：前台时间片（已完成，待多轮调参）
+
+1. TaskInbox 每轮最多 drain 128 个前台任务，避免大批任务使后到请求无限等待。
+2. 本轮处理过前台任务或 TaskInbox 仍有积压时，将异步 flush scheduler budget 从 256 降为 32；
+   仅在真正空闲时恢复 256，保持落盘进展。
+3. 维持每 shard FIFO、WAL/flush 契约和无任务时 10ms 周期维护，不创建第三级队列。
+
+**验收：** overwrite 的 TaskInbox queue-wait p99 降低至少 30%，memtier p99.9 不恶化；若
+flush backlog、恢复或周期持久化受损则立即回退。
+
+**首轮结果（同机、4 worker/4 shard、pipeline=16、10 秒 overwrite、`wal_mode=off`）：**
+基线为 114K ops/s、p99 9.279ms、p99.9 24.319ms；L1 为 **128.1K ops/s**、
+**p99 9.023ms**、**p99.9 13.951ms**。TaskInbox 平均等待由 1.038ms 降至
+0.837ms。该结果满足方向性验收；仍须按 L2 用多轮中位数和 `periodic` WAL 复验，不能把单轮
+数字当作最终发布结论。
+
+### Phase L2：量化与调参
+
+- [x] 用 `NLOG_PROBE=1` 同时采集 queue wait、task execution、drive/flush 直方图。
+- [x] 以 AIMD 自适应窗口替代固定 `TASKS_PER_ROUND`：每 shard 从 128 开始，范围 32–256；
+  打满窗口且仍有积压时乘以 0.75，连续 8 个无积压轮次后加 16。busy scheduler budget
+  随窗口在 16–32 间调整。`NEXUS_ADAPTIVE_TASK_WINDOW=0` 可回退固定 128。
+- [ ] 用三轮中位数比较自适应与固定 `64/128/256`，而不是仅以单轮数字选择默认值。
+- 在 `wal_mode=periodic` 重跑，确认前台优先不延迟 WAL 进展。
+
+**自适应 A/B（同机、同一 release 二进制、10 秒 overwrite）：** 开启为 **130.2K ops/s**、
+p99 **8.959ms**、p99.9 15.295ms；`NEXUS_ADAPTIVE_TASK_WINDOW=0` 固定 128 为
+122.3K ops/s、p99 10.175ms、p99.9 15.039ms。吞吐与 p99 均改善，p99.9 在单轮噪声范围内
+基本持平；因此保留默认开启，但仍以多轮中位数与 periodic WAL 为发布前门槛。
+
+窗口还会采集上一轮前台服务时间作为本地 RTT；默认目标 2ms，可由
+`NEXUS_TASK_WINDOW_TARGET_US` 在 500–10000us 内调节。3ms 探测得到 127.2K ops/s、
+p99 8.575ms、p99.9 11.263ms，但由于常规 pipeline 的实际 batch 通常小于窗口，尚不能将
+单轮收益完全归因于该参数，默认值暂不改动。
+
+### Phase L2.1：已排除的方向
+
+- [x] 添加 reply-bus 等待探针：平均约 20us，绝大多数小于 20us，非 p99.9 主因。
+- [x] 尝试“每 8 个前台轮次才运行一次完整维护驱动”：10 秒 overwrite 回归至 113.0K ops/s、
+  p99 14.783ms、p99.9 20.479ms。异步落盘 admission 被延后会积累写入工作，已立即回退；
+  不能用固定跳过维护替代有 deadline 的调度。
+
+### Phase L3：仅在 L1 不足时
+
+- 将 flush 分为有 deadline 的 WAL/metadata 与可延后 compact/GC；届时才评估三级优先队列。
+- 增加 reply-bus 到 worker 的排队时间，判断 p99.9 剩余部分是否在网络回包重排。
+
+## 长尾维护调度改造（执行中，2026-08-05）
+
+### 目标与证据
+
+TaskReplyBus 平均等待约 20us，单 task 执行约 24us；剩余尾部主要来自 shard 前台轮次之间的
+维护路径。`drive_async_flush` 目前一次性执行完成收割、所有 pending data flush admission、meta
+admission、compact admission、periodic WAL 检查和 scheduler drive。固定跳过整轮维护会使 flush
+积压，已实测回归，因此改造必须是**阶段化预算**，不是降低维护频率。
+
+### M1：前台 admission 预算
+
+- [x] `Pager::take_flush_batches_limited(max_chunks)`：最多从 write queue 取 N 个 chunk，保留顺序、
+  in-flight 和 data→meta 持久化语义；现有无上限 API 复用该实现。
+- [x] 前台 `drive_async_flush`：始终收割已完成 CQE；每轮最多 admission 2 个 data chunk；空闲、显式
+  FLUSH、shutdown 保持无上限。
+- [x] 前台负载下禁止启动低优先级 compact；只有空闲轮才启动。meta/WAL 周期检查不跳过。
+
+**M1 首轮验证：** `wal_mode=off`（10 秒 overwrite）为 143.2K ops/s、p99 8.255ms、
+p99.9 15.295ms；维护轮平均 29.8us，`backpressure_fallbacks=0`、in-flight 峰值 8。`periodic`
+为 120.2K ops/s、p99 9.279ms、p99.9 13.311ms，同样无 WAL 或 backpressure 错误。吞吐和 p99
+改善，但 p99.9 仍需多轮中位数确认，故 admission=2 先保留为当前默认。
+
+### M2：deadline 与观测
+
+- [x] 为 data admission、meta admission、compact admission、completion harvest 分别记录耗时。
+- [x] 以距上次 data admission 的时间定义 2ms deadline；正常前台预算为 2 chunk，deadline 到期时
+  临时提升至 8 chunk，成功 admission 或 backlog 清空后重置计时；该策略已在验收失败后回退。
+- [x] 验收（失败并回退）：4 worker/4 shard、32 client、pipeline=16、预载 100K key、10 秒 overwrite、
+  `NEXUS_TASK_WINDOW_TARGET_US=3000`。off 三轮为 191.1K/191.8K/131.3K ops/s，p99.9 为
+  14.271/11.903/19.327ms；periodic 三轮为 163.0K/156.0K/106.7K ops/s，p99.9 为
+  14.207/12.671/27.391ms。两组均 `backpressure_fallbacks=0`、in-flight 峰值 8，服务正常关闭；
+  但 periodic 第三轮 p99.9 明显越过 10% 门槛，故删除 deadline 到期时的 8-chunk 提升，恢复 M1
+  的固定前台 2-chunk admission。阶段耗时探针保留，供 M3 继续定位。
+
+### M3：后续（仅 M1/M2 不足时）
+
+- 仅将 meta admission 进一步推迟到无前台 backlog 的窗口；WAL tick 仍按 deadline 必达。
+- 将 compact read/write 移至独立低优先级 budget，避免与 data completion 同轮竞争。
+
 ### 目标
 
 1. 在固定数据集的**覆盖写** workload 中，让 pipeline=16 的纯 SET 吞吐提升至少 20%，

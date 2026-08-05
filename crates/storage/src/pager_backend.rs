@@ -16,17 +16,33 @@ use crate::types::{CHUNK_SIZE, PAGES_PER_CHUNK, PAGE_SIZE, PidLocation, PageKey}
 
 impl Pager {
     pub fn take_flush_batches(&mut self) -> Vec<FlushBatch> {
+        self.take_flush_batches_limited(usize::MAX)
+    }
+
+    /// Take at most `max_chunks` pending data snapshots for asynchronous
+    /// admission.  Limiting admission does not change ordering or durability:
+    /// unselected keys stay in `write_queue`, and selected keys still move to
+    /// `in_flight` before their coroutine is spawned.
+    pub fn take_flush_batches_limited(&mut self, max_chunks: usize) -> Vec<FlushBatch> {
+        if max_chunks == 0 {
+            return Vec::new();
+        }
         let pending_keys = self.write_queue.pending_keys();
         // 按 file_id 分组 (保持 key 顺序; 单 shard 通常只有 1 个 file)
         type FileGroup = (u32, Vec<(PageKey, Rc<Vec<u8>>)>);
         let mut batches: Vec<FileGroup> = Vec::new();
+        let mut admitted = 0usize;
         for key in pending_keys {
+            if admitted >= max_chunks {
+                break;
+            }
             if self.in_flight.contains_key(&key) {
                 continue; // 同 key 在写, 新快照等下轮
             }
             if let Some(bytes) = self.write_queue.take_pending(key) {
                 let rc = Rc::new(bytes);
                 self.in_flight.insert(key, rc.clone());
+                admitted += 1;
                 match batches.iter_mut().find(|(fid, _)| *fid == key.file_id) {
                     Some((_, items)) => items.push((key, rc)),
                     None => batches.push((key.file_id, vec![(key, rc)])),

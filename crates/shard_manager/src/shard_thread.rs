@@ -26,10 +26,144 @@ struct PutReply {
     group: u32,
 }
 
+#[cfg(test)]
+mod adaptive_window_tests {
+    use super::AdaptiveTaskWindow;
+
+    fn window(current: usize) -> AdaptiveTaskWindow {
+        AdaptiveTaskWindow {
+            current,
+            calm_rounds: 0,
+            target_round_ns: AdaptiveTaskWindow::TARGET_FOREGROUND_ROUND_NS,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn full_round_with_backlog_multiplicatively_reduces_window() {
+        let mut w = window(128);
+        assert!(w.observe(128, true, 1));
+        assert_eq!(w.limit(), 96);
+        assert_eq!(w.busy_drive_budget(), 24);
+    }
+
+    #[test]
+    fn calm_rounds_additively_recover_window() {
+        let mut w = window(64);
+        for _ in 0..7 {
+            assert!(!w.observe(8, false, 1));
+        }
+        assert!(w.observe(8, false, 1));
+        assert_eq!(w.limit(), 80);
+    }
+
+    #[test]
+    fn window_obeys_bounds_and_disable_switch() {
+        let mut w = window(AdaptiveTaskWindow::MIN);
+        assert!(!w.observe(AdaptiveTaskWindow::MIN, true, 1));
+        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
+
+        w.enabled = false;
+        assert!(!w.observe(usize::MAX, true, 1));
+        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
+    }
+
+    #[test]
+    fn slow_round_reduces_window_without_residual_backlog() {
+        let mut w = window(128);
+        assert!(w.observe(8, false, w.target_round_ns));
+        assert_eq!(w.limit(), 96);
+    }
+}
+
+/// Per-shard adaptive foreground quantum.  This is deliberately an AIMD
+/// controller rather than a global queue: a hot shard should yield sooner
+/// without reducing service capacity of unrelated shards.
+struct AdaptiveTaskWindow {
+    current: usize,
+    calm_rounds: u8,
+    target_round_ns: u64,
+    enabled: bool,
+}
+
+impl AdaptiveTaskWindow {
+    const MIN: usize = 32;
+    const MAX: usize = 256;
+    const INITIAL: usize = 128;
+    const ADDITIVE_STEP: usize = 16;
+    const CALM_ROUNDS_BEFORE_INCREASE: u8 = 8;
+    /// Keep one foreground event-loop turn beneath this bound.  It is the
+    /// local analogue of an RTT target: a queue can be empty yet a too-large
+    /// turn still delays requests arriving just after the drain.
+    const TARGET_FOREGROUND_ROUND_NS: u64 = 2_000_000;
+    const MIN_TARGET_FOREGROUND_ROUND_NS: u64 = 500_000;
+    const MAX_TARGET_FOREGROUND_ROUND_NS: u64 = 10_000_000;
+
+    fn from_env() -> Self {
+        let target_round_ns = std::env::var("NEXUS_TASK_WINDOW_TARGET_US")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|us| us.saturating_mul(1_000))
+            .unwrap_or(Self::TARGET_FOREGROUND_ROUND_NS)
+            .clamp(
+                Self::MIN_TARGET_FOREGROUND_ROUND_NS,
+                Self::MAX_TARGET_FOREGROUND_ROUND_NS,
+            );
+        Self {
+            current: Self::INITIAL,
+            calm_rounds: 0,
+            target_round_ns,
+            enabled: std::env::var("NEXUS_ADAPTIVE_TASK_WINDOW")
+                .ok()
+                .as_deref()
+                != Some("0"),
+        }
+    }
+
+    fn limit(&self) -> usize {
+        self.current
+    }
+
+    /// A full service turn followed by residual work is the scheduler's
+    /// equivalent of congestion: later requests are already waiting behind
+    /// this quantum.  Shrink immediately; grow only after several calm turns
+    /// so short bursts do not make the controller oscillate.
+    fn observe(&mut self, served: usize, backlog_after: bool, round_ns: u64) -> bool {
+        if !self.enabled || served == 0 {
+            return false;
+        }
+        let before = self.current;
+        let saturated = backlog_after && served >= self.current;
+        let slow_round = round_ns >= self.target_round_ns;
+        if saturated || slow_round {
+            self.current = (self.current * 3 / 4).max(Self::MIN);
+            self.calm_rounds = 0;
+        } else if !backlog_after {
+            self.calm_rounds = self.calm_rounds.saturating_add(1);
+            if self.calm_rounds >= Self::CALM_ROUNDS_BEFORE_INCREASE {
+                self.current = (self.current + Self::ADDITIVE_STEP).min(Self::MAX);
+                self.calm_rounds = 0;
+            }
+        } else {
+            self.calm_rounds = 0;
+        }
+        before != self.current
+    }
+
+    fn busy_drive_budget(&self) -> usize {
+        // With a smaller foreground quantum, maintenance must yield sooner as
+        // well.  The floor keeps async IO completion progressing under load.
+        (self.current / 4).clamp(16, 32)
+    }
+}
+
 pub(crate) fn drive_async_flush(
     engine: &std::rc::Rc<std::cell::RefCell<Option<StorageEngine>>>,
     rt: &scheduler::SchedHandle,
     flush_done: &FlushDoneSlot,
+    drive_budget: usize,
+    max_data_admission: usize,
+    allow_compact: bool,
 ) {
     // ⭐ DIAG: NLOG_NO_FLUSH=1 禁用异步落盘 (定位数据丢失根因)
     if std::env::var("NLOG_NO_FLUSH").is_ok_and(|v| v == "1") {
@@ -41,6 +175,7 @@ pub(crate) fn drive_async_flush(
         if let Some(e) = e_borrow.as_mut() {
             // a. 收割上轮完成的落盘 (data: 成功入 chunk_list, 失败回 pending;
             //    meta: 清 in-flight, 全部确认后 persist pid.state)
+            let harvest_start = crate::PROBE.is_enabled().then(std::time::Instant::now);
             for done in flush_done.borrow_mut().drain(..) {
                 let cor_start = std::time::Instant::now();
                 match done {
@@ -89,9 +224,17 @@ pub(crate) fn drive_async_flush(
                         .record(cor_start.elapsed().as_nanos() as u64);
                 }
             }
+            if let Some(start) = harvest_start {
+                crate::PROBE
+                    .flush_harvest_ns
+                    .record(start.elapsed().as_nanos() as u64);
+            }
             // b. 提交新作业: 同步入队 + spawn 协程 (SQE 在首次 poll 时提交)
             // Phase C: 按 file 成批, 每批 write ×N + fsync ×1 (长尾对症)
-            let batches = e.pager_mut().take_flush_batches();
+            let data_admission_start = crate::PROBE.is_enabled().then(std::time::Instant::now);
+            let batches = e
+                .pager_mut()
+                .take_flush_batches_limited(max_data_admission);
             if crate::PROBE.is_enabled() && !batches.is_empty() {
                 let inflight = e.pager_mut().flush_backlog();
                 crate::PROBE
@@ -131,8 +274,14 @@ pub(crate) fn drive_async_flush(
                     }),
                 );
             }
+            if let Some(start) = data_admission_start {
+                crate::PROBE
+                    .flush_data_admission_ns
+                    .record(start.elapsed().as_nanos() as u64);
+            }
             // b2. ⭐ Phase M3: meta window 异步刷盘 (data backlog 排空后才取得到批,
             // data→meta 顺序不变; fsync 在协程里, 主循环零阻塞)
+            let meta_admission_start = crate::PROBE.is_enabled().then(std::time::Instant::now);
             if let Some(mb) = e.pager_mut().take_meta_flush_batch() {
                 let done = flush_done.clone();
                 scheduler::spawn_on(
@@ -165,10 +314,17 @@ pub(crate) fn drive_async_flush(
                     }),
                 );
             }
+            if let Some(start) = meta_admission_start {
+                crate::PROBE
+                    .flush_meta_admission_ns
+                    .record(start.elapsed().as_nanos() as u64);
+            }
             // b3. ⭐ G2: 空闲段发起 chunk compact (低优先级协程读 dst+src 字节;
             // 判活用 header 候选 + meta 点查, 零全扫).
             // 触发条件: data backlog == 0; start_compact 内部节流 + 至多 1 个在飞.
-            if e.pager_mut().flush_backlog() == 0
+            let compact_admission_start = crate::PROBE.is_enabled().then(std::time::Instant::now);
+            if allow_compact
+                && e.pager_mut().flush_backlog() == 0
                 && let Some(rj) = e.pager_mut().start_compact()
             {
                 let done = flush_done.clone();
@@ -196,6 +352,11 @@ pub(crate) fn drive_async_flush(
                     }),
                 );
             }
+            if let Some(start) = compact_admission_start {
+                crate::PROBE
+                    .flush_compact_admission_ns
+                    .record(start.elapsed().as_nanos() as u64);
+            }
             // c. 周期/计数刷盘 (内部守卫: 有 in-flight/pending 时自动推迟)
             let pf_start = std::time::Instant::now();
             let pf = block_on_io(e.pager_mut().maybe_periodic_flush());
@@ -217,7 +378,7 @@ pub(crate) fn drive_async_flush(
     }
     // d. 推进落盘协程 (提交 SQE / 收割 CQE / 完成时 push 完成槽)
     let di_start = std::time::Instant::now();
-    rt.clone().drive_until_idle(256);
+    rt.clone().drive_until_idle(drive_budget);
     if crate::PROBE.is_enabled() {
         crate::PROBE
             .drive_until_idle_ns
@@ -235,7 +396,7 @@ pub(crate) fn drain_async_flush(
     flush_done: &FlushDoneSlot,
 ) {
     loop {
-        drive_async_flush(engine, rt, flush_done);
+        let _ = drive_async_flush(engine, rt, flush_done, 256, usize::MAX, true);
         let drained = {
             let mut e_borrow = engine.borrow_mut();
             match e_borrow.as_mut() {
@@ -328,13 +489,24 @@ pub(crate) fn shard_thread_main(
     // 前提是 drain() 已修复丢唤醒竞态 (先重置 pending 再 pop),
     // 否则睡眠后可能永久错过通知. 10ms timeout 兑底驱动周期刷盘.
     const SPIN_ROUNDS_BEFORE_PARK: u32 = 1024;
+    // Limit a foreground service turn so a large TaskInbox burst cannot make
+    // later requests wait behind an unbounded drain.
+    let mut task_window = AdaptiveTaskWindow::from_env();
+    const FOREGROUND_DATA_ADMISSION: usize = 2;
+    nlog::info!(
+        "shard",
+        "shard-{shard_id} adaptive task window: {} (enabled={}, target_us={})",
+        task_window.limit(),
+        task_window.enabled,
+        task_window.target_round_ns / 1_000,
+    );
 
     loop {
         // spin poll 两个 inbox, 任一有数据就退出 spin
         let mut spins = 0u32;
         let (batch, tasks) = loop {
             let b = inbox.drain();
-            let t = task_inbox.drain();
+            let t = task_inbox.drain_up_to(task_window.limit());
             if !b.is_empty() || !t.is_empty() {
                 break (b, t);
             }
@@ -376,12 +548,12 @@ pub(crate) fn shard_thread_main(
                     }
                 }
                 let b = inbox.drain();
-                let t = task_inbox.drain();
+                let t = task_inbox.drain_up_to(task_window.limit());
                 if !b.is_empty() || !t.is_empty() {
                     break (b, t);
                 }
                 // timeout 醒来无数据: 驱动异步落盘 + 周期刷盘后继续睡
-                drive_async_flush(&engine, &rt, &flush_done);
+                let _ = drive_async_flush(&engine, &rt, &flush_done, 256, usize::MAX, true);
                 spins = 0;
                 continue;
             }
@@ -389,6 +561,13 @@ pub(crate) fn shard_thread_main(
                 std::hint::spin_loop();
             }
         };
+
+        // A foreground batch means a client is waiting for its reply.  Keep
+        // this fact through the round: by the time the maintenance decision
+        // below runs, the inbox may already look empty even though servicing
+        // it just consumed a full turn.
+        let served_foreground = !tasks.is_empty();
+        let served_task_count = tasks.len();
 
         rt.clone().drive_until_idle(0);
 
@@ -833,6 +1012,7 @@ pub(crate) fn shard_thread_main(
         // tasks 先执行并回复, 不静默丢弃 (break 在下方 tasks 块之后).
 
         // ⭐ 处理 ShardTask (从 spin loop 中一起取到的)
+        let task_round_start = served_foreground.then(std::time::Instant::now);
         if !tasks.is_empty() {
             let mut e_borrow = engine.borrow_mut();
             if let Some(e) = e_borrow.as_mut() {
@@ -847,6 +1027,7 @@ pub(crate) fn shard_thread_main(
                 // barriers, preserving the observable order of SET/GET/DEL.
                 let mut pending_tasks: VecDeque<_> = tasks.into();
                 while let Some(task) = pending_tasks.pop_front() {
+                    let task_start = crate::PROBE.is_enabled().then(std::time::Instant::now);
                     let crate::request::ShardTask {
                         conn_id,
                         req_id,
@@ -971,6 +1152,11 @@ pub(crate) fn shard_thread_main(
                         }
                     }
                     let result = exec_task_op(e, op);
+                    if let Some(start) = task_start {
+                        crate::PROBE
+                            .task_exec_ns
+                            .record(start.elapsed().as_nanos() as u64);
+                    }
                     // ⭐ WAL (F60) strict: 本轮已有未持久化写 → 回复押到轮末
                     // barrier 后 (读 op 在无待 sync 内容时仍直发)
                     let tr = crate::request::TaskResult {
@@ -1003,7 +1189,43 @@ pub(crate) fn shard_thread_main(
 
         // ⭐ 每轮循环末尾: 驱动异步落盘 (收割/spawn/周期检查/drive).
         // 磁盘 IO 在协程里并发进行, 不阻塞下一轮请求处理.
-        drive_async_flush(&engine, &rt, &flush_done);
+        let task_round_ns = task_round_start
+            .map(|start| start.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
+        if crate::PROBE.is_enabled() && served_foreground {
+            crate::PROBE.task_round_ns.record(task_round_ns);
+        }
+        let backlog_after = !task_inbox.is_empty();
+        if task_window.observe(served_task_count, backlog_after, task_round_ns) {
+            nlog::debug!(
+                "shard",
+                "shard-{shard_id} adaptive task window adjusted to {} (served={served_task_count}, backlog={backlog_after}, round_ns={task_round_ns})",
+                task_window.limit(),
+            );
+        }
+        if crate::PROBE.is_enabled() && served_foreground {
+            crate::PROBE.task_window.record(task_window.limit() as u64);
+        }
+        let (drive_budget, max_data_admission, allow_compact) = if served_foreground || backlog_after {
+            // Completion harvest and WAL checks still run every round.  Only
+            // new data-write admission is capped, and compact waits for an
+            // idle turn so it cannot extend a client-facing service cycle.
+            (
+                task_window.busy_drive_budget(),
+                FOREGROUND_DATA_ADMISSION,
+                false,
+            )
+        } else {
+            (256, usize::MAX, true)
+        };
+        drive_async_flush(
+            &engine,
+            &rt,
+            &flush_done,
+            drive_budget,
+            max_data_admission,
+            allow_compact,
+        );
     }
 
     // ⭐ 退出完整性: 先排空异步落盘 backlog, 再 final close (flush 契约).
@@ -1025,6 +1247,9 @@ pub(crate) fn shard_thread_main(
             rt.clone().drive_until_idle(1000);
         }
         nlog::info!("shard", "shard-{shard_id} closed (final flush done)");
+    }
+    if crate::PROBE.is_enabled() {
+        nlog::info!("shard", "shard-{shard_id} latency probe:\n{}", crate::PROBE.dump_all());
     }
 }
 

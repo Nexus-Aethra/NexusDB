@@ -93,6 +93,20 @@ pub struct Probe {
     pub sync_write_coroutine_ns: Histogram,
     /// ⭐ 怀疑点 6: block_on_io_ns — block_on_io 单次调用耗时 (凡是用到的位置)
     pub block_on_io_ns: Histogram,
+    /// ShardTask 从开始执行到生成结果的总耗时（含 ensure_table 与 storage op）。
+    pub task_exec_ns: Histogram,
+    /// Task 在 MPSC inbox 中等待 shard drain 的时间。
+    pub task_queue_ns: Histogram,
+    /// 每轮反馈后 shard 前台服务窗口的大小。
+    pub task_window: Histogram,
+    /// 单轮前台 task 服务耗时；自适应窗口以它作为本地 RTT 信号。
+    pub task_round_ns: Histogram,
+    /// Shard 已完成的回复在 worker reply bus 中等待的时间。
+    pub reply_bus_queue_ns: Histogram,
+    pub flush_harvest_ns: Histogram,
+    pub flush_data_admission_ns: Histogram,
+    pub flush_meta_admission_ns: Histogram,
+    pub flush_compact_admission_ns: Histogram,
     pub backpressure_fallbacks: AtomicU64,
     pub in_flight_peak: AtomicU64,
 }
@@ -113,6 +127,15 @@ impl Probe {
             drive_until_idle_ns: Histogram::new(),
             sync_write_coroutine_ns: Histogram::new(),
             block_on_io_ns: Histogram::new(),
+            task_exec_ns: Histogram::new(),
+            task_queue_ns: Histogram::new(),
+            task_window: Histogram::new(),
+            task_round_ns: Histogram::new(),
+            reply_bus_queue_ns: Histogram::new(),
+            flush_harvest_ns: Histogram::new(),
+            flush_data_admission_ns: Histogram::new(),
+            flush_meta_admission_ns: Histogram::new(),
+            flush_compact_admission_ns: Histogram::new(),
             backpressure_fallbacks: AtomicU64::new(0),
             in_flight_peak: AtomicU64::new(0),
         }
@@ -137,6 +160,15 @@ impl Probe {
         s.push_str(&self.drive_until_idle_ns.dump("drive_until_idle_ns"));
         s.push_str(&self.sync_write_coroutine_ns.dump("flush_coroutine_total_ns"));
         s.push_str(&self.block_on_io_ns.dump("block_on_io_ns"));
+        s.push_str(&self.task_exec_ns.dump("shard_task_exec_ns"));
+        s.push_str(&self.task_queue_ns.dump("shard_task_queue_ns"));
+        s.push_str(&self.task_window.dump("shard_task_window"));
+        s.push_str(&self.task_round_ns.dump("shard_task_round_ns"));
+        s.push_str(&self.reply_bus_queue_ns.dump("reply_bus_queue_ns"));
+        s.push_str(&self.flush_harvest_ns.dump("flush_harvest_ns"));
+        s.push_str(&self.flush_data_admission_ns.dump("flush_data_admission_ns"));
+        s.push_str(&self.flush_meta_admission_ns.dump("flush_meta_admission_ns"));
+        s.push_str(&self.flush_compact_admission_ns.dump("flush_compact_admission_ns"));
         s.push_str(&format!(
             "backpressure_fallbacks={}\nin_flight_peak={}\n",
             self.backpressure_fallbacks.load(Ordering::Relaxed),

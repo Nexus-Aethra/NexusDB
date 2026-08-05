@@ -16,6 +16,7 @@ put_batch=0
 leaf_cache=1
 probe=0
 workload=all
+log_level=warn
 
 usage() {
     cat <<'EOF'
@@ -57,6 +58,10 @@ while (($#)); do
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if ((probe)); then
+    log_level=info
+fi
 
 case "$wal_mode" in off|periodic|strict) ;; *) echo "invalid --wal-mode: $wal_mode" >&2; exit 2 ;; esac
 case "$workload" in overwrite|fresh-write|mixed|read-heavy|hot-read|all) ;; *) echo "invalid --workload: $workload" >&2; exit 2 ;; esac
@@ -111,7 +116,7 @@ chunk_cache_size = 8
 wal_mode = "$wal_mode"
 
 [log]
-level = "warn"
+level = "$log_level"
 dir = "$bench_dir/logs"
 stderr = false
 EOF

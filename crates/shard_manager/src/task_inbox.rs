@@ -12,9 +12,14 @@ use crate::request::ShardTask;
 
 const TASK_INBOX_CAPACITY: usize = 8192;
 
+struct QueuedTask {
+    task: ShardTask,
+    enqueued_at: Option<std::time::Instant>,
+}
+
 /// Task 专用 inbox: worker push, shard drain.
 pub struct TaskInbox {
-    ring: ArrayQueue<ShardTask>,
+    ring: ArrayQueue<QueuedTask>,
     eventfd: std::os::unix::io::RawFd,
     pending: AtomicU64,
 }
@@ -36,7 +41,13 @@ impl TaskInbox {
     /// 装箱会波及全链路分配, 且退还是罕见路径, 尺寸 lint 不适用.
     #[allow(clippy::result_large_err)]
     pub fn push(&self, task: ShardTask) -> Result<(), ShardTask> {
-        self.ring.push(task)?;
+        let queued = QueuedTask {
+            task,
+            enqueued_at: crate::PROBE.is_enabled().then(std::time::Instant::now),
+        };
+        if let Err(rejected) = self.ring.push(queued) {
+            return Err(rejected.task);
+        }
         if self.pending.fetch_add(1, Ordering::AcqRel) == 0 {
             let val: u64 = 1;
             unsafe {
@@ -70,7 +81,10 @@ impl TaskInbox {
         }
         let count = tasks.len() as u64;
         for task in tasks {
-            let mut task = task;
+            let mut task = QueuedTask {
+                task,
+                enqueued_at: crate::PROBE.is_enabled().then(std::time::Instant::now),
+            };
             loop {
                 match self.ring.push(task) {
                     Ok(()) => break,
@@ -98,10 +112,26 @@ impl TaskInbox {
     /// - store 之前的 push 一定被本轮 pop 到 (Release/Acquire 序)
     /// - store 之后的 push 一定看到 pending=0 并写 eventfd
     pub fn drain(&self) -> Vec<ShardTask> {
+        self.drain_up_to(usize::MAX)
+    }
+
+    /// Shard 端: 最多取出 `limit` 个 pending task。
+    ///
+    /// 有界 drain 用于高负载前台时间片：保留 ring 内剩余任务不会丢失唤醒，
+    /// 因为主循环在队列非空时会立即进行下一轮 drain，而不会进入 poll 睡眠。
+    pub fn drain_up_to(&self, limit: usize) -> Vec<ShardTask> {
         self.pending.store(0, Ordering::Release);
-        let mut batch = Vec::with_capacity(128);
-        while let Some(task) = self.ring.pop() {
-            batch.push(task);
+        let mut batch = Vec::with_capacity(limit.min(128));
+        while let Some(queued) = self.ring.pop() {
+            if let Some(enqueued_at) = queued.enqueued_at {
+                crate::PROBE
+                    .task_queue_ns
+                    .record(enqueued_at.elapsed().as_nanos() as u64);
+            }
+            batch.push(queued.task);
+            if batch.len() == limit {
+                break;
+            }
         }
         batch
     }
@@ -146,4 +176,42 @@ pub type SharedTaskInbox = Arc<TaskInbox>;
 
 pub fn new_shared_task_inbox() -> SharedTaskInbox {
     Arc::new(TaskInbox::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::TaskInbox;
+    use crate::request::{BatchOp, ShardTask};
+
+    fn task(req_id: u64) -> ShardTask {
+        ShardTask {
+            conn_id: 1,
+            req_id,
+            worker_id: 0,
+            group: 0,
+            op: BatchOp::Get {
+                db: Arc::from("default"),
+                table: Arc::from("default"),
+                key: req_id.to_be_bytes().to_vec(),
+            },
+        }
+    }
+
+    #[test]
+    fn bounded_drain_preserves_fifo_remainder() {
+        let inbox = TaskInbox::new();
+        for req_id in 0..3 {
+            inbox.push(task(req_id)).unwrap();
+        }
+
+        let first = inbox.drain_up_to(2);
+        assert_eq!(first.iter().map(|task| task.req_id).collect::<Vec<_>>(), [0, 1]);
+        assert!(!inbox.is_empty(), "unserved task must remain visible to next turn");
+
+        let second = inbox.drain_up_to(2);
+        assert_eq!(second.iter().map(|task| task.req_id).collect::<Vec<_>>(), [2]);
+        assert!(inbox.is_empty());
+    }
 }

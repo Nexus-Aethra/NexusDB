@@ -242,15 +242,39 @@ impl PageIndex {
     /// 找最后一个 `first_item_off <= off` 的段.
     /// 确保 off 落在该段的 item 范围内.
     pub fn find_segment_by_offset(&self, off: usize) -> usize {
-        let mut best = 0usize;
-        for i in 0..self.segments.len() {
-            if (self.segments[i].first_item_off as usize) <= off {
-                best = i;
+        let mut lo = 0usize;
+        let mut hi = self.segments.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.segments[mid].first_item_off as usize <= off {
+                lo = mid + 1;
             } else {
-                break;
+                hi = mid;
             }
         }
-        best
+        lo.saturating_sub(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PageIndex, Segment};
+
+    #[test]
+    fn find_segment_by_offset_is_upper_bound_binary_search() {
+        let idx = PageIndex {
+            segments: vec![
+                Segment { first_item_off: 32, item_count: 1, first_full_key: vec![] },
+                Segment { first_item_off: 96, item_count: 1, first_full_key: b"a".to_vec() },
+                Segment { first_item_off: 192, item_count: 1, first_full_key: b"b".to_vec() },
+                Segment { first_item_off: 384, item_count: 1, first_full_key: b"c".to_vec() },
+            ],
+            key_count: 4,
+        };
+        assert_eq!(idx.find_segment_by_offset(0), 0);
+        assert_eq!(idx.find_segment_by_offset(96), 1);
+        assert_eq!(idx.find_segment_by_offset(191), 1);
+        assert_eq!(idx.find_segment_by_offset(999), 3);
     }
 }
 
