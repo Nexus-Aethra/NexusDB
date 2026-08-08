@@ -825,7 +825,7 @@ pub(crate) fn sql_run_dml(
                     push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
                 }
             }
-            Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc, pk: true }) => {
+            Ok(SqlPlan::Index { iid: _, lo, hi, limit_push, eq_enc: _, pk: true }) => {
                 // ⭐ PG 兼容 (范围查): 主键区间扫描 — 全 shard 广播 ScanFiltered
                 // (index_hint { pk: true } 走主键 B+Tree 区间). 无覆盖/路由剪枝
                 // (主键范围); 行经残余过滤 (preds 完整下推).

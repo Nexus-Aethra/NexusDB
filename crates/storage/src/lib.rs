@@ -38,6 +38,7 @@ pub mod engine_io;
 pub mod keyspace;
 pub mod geo;
 pub mod index_bloom;
+pub mod leaf_cache;
 pub mod meta_cache;
 pub mod meta_page;
 pub mod overflow;

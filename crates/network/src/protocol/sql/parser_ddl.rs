@@ -2,7 +2,7 @@
 // 职责: CREATE TABLE 的列清单/类型/默认值/外键动作解析.
 use super::ast::*;
 use super::parser::{P, Tok};
-use storage::schema::{ColType, Column, FkAction, ColDefault, TableSchema};
+use storage::schema::{ColType, Column, TableSchema};
 
 pub(crate) fn read_col_list(p: &mut P) -> Result<Vec<String>, String> {
     p.expect(&Tok::LParen, "(")?;

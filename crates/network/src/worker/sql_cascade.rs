@@ -91,7 +91,7 @@ pub fn cascade_job_done(
     db_view: &std::sync::Arc<DbDirView>,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
-    affected: u64,
+    _affected: u64,
     error: Option<String>,
     job: &CascadeJob,
 ) {
@@ -103,7 +103,7 @@ pub fn cascade_job_done(
         .map(|r| r.db.clone())
         .unwrap_or_default();
     {
-        let mut root = conn
+        let root = conn
             .cascade_roots
             .get_mut(&root_seq)
             .expect("cascade root 必存在");
@@ -163,7 +163,7 @@ fn spawn_job(
     // SetNull 更新引用行不删行 → 不过滤 (父章被多引用时每引用各置空一次).
     let fresh: Vec<Vec<u8>> = if incoming.action == FkAction::Cascade {
         let mut f = Vec::with_capacity(pks.len());
-        let mut root = conn
+        let root = conn
             .cascade_roots
             .get_mut(&root_seq)
             .expect("root 必在");

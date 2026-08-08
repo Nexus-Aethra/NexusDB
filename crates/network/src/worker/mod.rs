@@ -52,7 +52,7 @@ pub use sql_routes::{new_sql_shared, FkIncoming, SqlSharedRoutes};
 mod resp_agg;
 pub(crate) use resp_agg::{
     BitCtx, DelAgg, ExistsAgg, GeoCtx, GetKind, MembersKind, MGetAgg, MSetAgg, MSetNxAgg,
-    PairsKind, ScoredMembers, SetAlgAgg, StoreFinishAgg, ZStoreAgg,
+    PairsKind, SetAlgAgg, StoreFinishAgg, ZStoreAgg,
 };
 /// ⭐ 解耦 2026-08: SQL 规划/执行状态结构体 (事务/聚合/JOIN/规划/schema 缓存).
 mod sql_state;
@@ -68,7 +68,7 @@ pub(crate) use resp_shard::handle_resp_shard_result;
 /// ⭐ 解耦 2026-08: 协议 wire 入口 (HTTP 处理).
 mod protocol_io;
 pub(crate) use protocol_io::{
-    handle_http_request, mysql_err_packet, process_http_input, process_pg_input,
+    mysql_err_packet, process_http_input, process_pg_input,
     process_sql_input,
 };
 pub(crate) use sql_state::{
@@ -96,15 +96,15 @@ pub(crate) use sql_dispatch::{sql_dispatch_stmt, sql_plan_select};
 pub(crate) use sql_dml::sql_run_dml;
 pub(crate) use sql_join::{sql_join_drive, sql_join_kickoff};
 pub(crate) use sql_sysquery::{
-    coltype_sql_name, sbytes, sysq_exists, sysq_finish, sysq_render_catalog, sysq_render_dblist,
+    coltype_sql_name, sysq_render_catalog,
     SysQuerySpec,
 };
 pub(crate) use sql_unique::{
-    push_unique_op, row_global_unique_encs, schema_global_unique, sql_unique_drive,
+    sql_unique_drive,
     sql_unique_ins_start,
 };
 pub(crate) use sql_eval::{
-    col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq, is_auto_pk,
+    col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq,
     project_output_row, render_sql_count, render_sql_rows, scalar_fn_const_row, sql_build_row,
     sql_cmp, sql_dml_op, sql_err_bytes, sql_ok_bytes, sql_order_cmp, sql_pk_bytes,
     sql_rows_bytes, sql_to_col, visible_cols, HIDDEN_ROWID,
@@ -121,7 +121,7 @@ pub(crate) use sql_encode::{
 /// ⭐ 解耦 2026-08: SQL derived table (子查询) 物化与渲染 (拆自 mod.rs).
 mod worker_derived;
 pub(crate) use worker_derived::{
-    derived_capture_rowctx, derived_render, finish_derived, finish_derived_join, sql_subq_advance,
+    derived_capture_rowctx, finish_derived, sql_subq_advance,
     sql_subq_start,
 };
 /// ⭐ 解耦 2026-08: ConnState 核心方法 (拆自 mod.rs). impl 方法无需 re-export.
@@ -129,9 +129,11 @@ mod worker_conn;
 /// ⭐ 解耦 2026-08: worker 主循环 + epoll IO 处理 (拆自 mod.rs).
 mod worker_epoll;
 pub(crate) use worker_epoll::{
-    encode_pairs, epoll_add, epoll_del, peek_req_id, process_binary_input, process_resp_input,
-    remove_conn, worker_main_epoll,
+    encode_pairs, process_binary_input, process_resp_input, worker_main_epoll,
 };
+/// ⭐ 协程化 2026-08: 协程 worker (每连接一协程 + io_uring, 替代 epoll).
+mod worker_coro;
+pub(crate) use worker_coro::worker_main_coro;
 
 /// 特殊 epoll token: reply bus eventfd.
 const REPLY_TOKEN: u64 = u64::MAX;
@@ -181,12 +183,22 @@ pub struct WorkerPool {
 impl WorkerPool {
     pub fn start(configs: Vec<WorkerConfig>) -> std::io::Result<Self> {
         let mut handles = Vec::with_capacity(configs.len());
+        // ⭐ 协程化开关 (2026-08): `NEXUS_CORO_WORKER=1` 启用协程 worker (每连接一协程 +
+        // io_uring), 否则用 epoll worker. 默认 epoll (可回退, 保证稳定).
+        let coro = std::env::var("NEXUS_CORO_WORKER").map(|v| v == "1").unwrap_or(false);
         for cfg in configs {
             let wid = cfg.worker_id;
+            let name = if coro { "network-worker-coro" } else { "network-worker" };
             let join = thread::Builder::new()
-                .name(format!("network-worker-{wid}"))
+                .name(format!("{name}-{wid}"))
                 .stack_size(4 * 1024 * 1024)
-                .spawn(move || worker_main_epoll(cfg))
+                .spawn(move || {
+                    if coro {
+                        worker_main_coro(cfg)
+                    } else {
+                        worker_main_epoll(cfg)
+                    }
+                })
                 .map_err(|e| std::io::Error::other(format!("spawn: {e}")))?;
             handles.push(join);
         }
@@ -199,6 +211,14 @@ impl WorkerPool {
         }
         Ok(())
     }
+
+    /// ⭐ 共享池 (Phase 3/T3.1): join 引用 (不消费 self, 供 Drop 调用).
+    pub fn join_ref(&mut self) {
+        let mut handles = std::mem::take(&mut self.handles);
+        for h in handles.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 // =====================================================================
@@ -206,7 +226,7 @@ impl WorkerPool {
 // =====================================================================
 
 /// CREATE TABLE: SetSchemaOp 广播聚合 (N shard 各一份 PutOk).
-struct SqlDdlAgg {
+pub(crate) struct SqlDdlAgg {
     remaining: usize,
     error: Option<String>,
     /// 成功后填 worker schema 缓存的 key/值.
@@ -218,7 +238,7 @@ struct SqlDdlAgg {
 
 /// SELECT 索引路径: IndexScan 广播聚合.
 /// 完成时: (val, pk) 排序 → decode row → 全条件残余过滤 → LIMIT → 渲染.
-struct SqlSelectAgg {
+pub(crate) struct SqlSelectAgg {
     remaining: usize,
     error: Option<String>,
     rows: Vec<storage::sql_rows::IndexEntry>,
@@ -266,7 +286,7 @@ struct SqlSelectAgg {
 /// ⭐ PG 兼容: Update 的 sets 支持值或表达式 (SetVal), 表达式由 shard 端
 /// `row_update` 读旧行后求值 (原子读改写).
 #[derive(Clone)]
-enum SqlDmlAction {
+pub(crate) enum SqlDmlAction {
     Delete,
     Update(Vec<(u16, storage::row::SetVal)>),
 }
@@ -340,7 +360,24 @@ pub(crate) struct ConnState {
     /// ⭐ F83: TLS 会话 (None = 明文; Some = 已 STARTTLS 升级, recv/send 走 rustls).
     pub(crate) tls: Option<Box<rustls::ServerConnection>>,
     pub(crate) read_buf: Vec<u8>,
+    /// epoll worker 的非 TLS 输出缓冲。写端拥塞时等待 EPOLLOUT，避免占用
+    /// worker 自旋；协程 worker 保持原有路径，不启用此缓冲。
+    pub(crate) write_buf: Vec<u8>,
+    pub(crate) write_pos: usize,
+    pub(crate) epoll_write_buffering: bool,
+    /// 当前 epoll 是否已注册 EPOLLOUT；仅状态切换时 EPOLL_CTL_MOD，避免每条
+    /// 回包额外 syscall。
+    pub(crate) epoll_write_armed: bool,
+    pub(crate) output_overflowed: bool,
     pub(crate) proto: ProtocolKind,
+    /// ⭐ 解耦 (Phase 3/T3.3): per-conn 默认表 (共享 worker 池按连接取).
+    pub(crate) default_table: std::sync::Arc<str>,
+    /// ⭐ 解耦 (Phase 3/T3.3): per-conn 协议长度限制 (共享 worker 池按连接取).
+    pub(crate) limits: crate::protocol::KvLimits,
+    /// ⭐ 解耦 (Phase 3/T3.3): per-conn 认证密码 (共享 worker 池按连接取).
+    pub(crate) auth_password: Option<String>,
+    /// ⭐ 解耦 (Phase 3/T3.3): per-conn TLS 配置 (共享 worker 池按连接取).
+    pub(crate) tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// RESP: 是否已通过 AUTH (无密码配置时恒 true).
     pub(crate) authenticated: bool,
     /// RESP: 下一条命令分配的 seq (作为 ShardTask.req_id).
@@ -349,6 +386,9 @@ pub(crate) struct ConnState {
     pub(crate) next_to_send: u64,
     /// RESP: 已就绪但前面还有洞的回复字节.
     pub(crate) pending: BTreeMap<u64, Vec<u8>>,
+    /// RESP 单次输入解析期间按 shard 暂存的单任务。循环结束或遇到直接分组任务前
+    /// 批量投递，保留同 shard FIFO，同时合并 pending/eventfd 原子操作。
+    pub(crate) resp_task_batches: Vec<Vec<ShardTask>>,
     /// RESP: DEL 多 key 聚合 (seq → 状态).
     pub(crate) del_agg: HashMap<u64, DelAgg>,
     /// RESP: MGET 聚合 (seq → 状态).
@@ -500,7 +540,7 @@ struct PgPrepared {
 /// ⭐ P3 (portal): Parse 时目标表 schema 未入 worker 缓存 → 挂起的 prepared.
 /// 待 GetSchemaOp 拉回 schema 后推断参数 OID, 再插入 pg_stmts 并续跑批次.
 struct PgPendingPrepare {
-    name: String,
+    _name: String,
     stmt: SqlStmt,
     params: u16,
     oids: Vec<u32>,
@@ -959,4 +999,3 @@ fn mysql_gen_salt(conn_id: u64, worker_id: u32) -> [u8; 20] {
     }
     salt
 }
-

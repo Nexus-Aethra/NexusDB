@@ -1,11 +1,10 @@
 // ⭐ 解耦 2026-08: StorageEngine 数据读写物理层 (从 engine.rs 拆出).
 // 职责: table_put/get/delete、物理页读写 (put_physical/get_physical)、批量读写.
-use super::engine::{StorageEngine, StorageError};
+use super::engine::StorageEngine;
 use crate::meta_cache::MetaCache;
 use crate::meta_page::{MetaPage, META_PID, META_VPID};
 use crate::registry::{DbRegistry, RegistryError};
 use crate::types::DbId;
-use crate::TableDirectory;
 use std::io;
 
 impl StorageEngine {
@@ -24,6 +23,7 @@ impl StorageEngine {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), RegistryError> {
+        let total_start = self.put_trace_enabled.then(std::time::Instant::now);
         // ⭐ Phase K: user key 统一编码为 [S][klen][key]
         // ⭐ U2: SET 覆盖异类旧值 — 若 key 当前是复合类型先 purge (Redis 语义).
         // ⭐ PERF (F49): 表内从未写过复合类型 → 不可能有旧复合行, 跳过探测.
@@ -39,6 +39,10 @@ impl StorageEngine {
                 .row_counts
                 .entry((db.to_string(), table.to_string()))
                 .or_insert(0) += 1;
+        }
+        if let (Some(start), Some(mut trace)) = (total_start, self.last_put_trace.take()) {
+            trace.total_ns = start.elapsed().as_nanos() as u64;
+            self.last_put_trace = Some(trace);
         }
         Ok(())
     }
@@ -57,21 +61,37 @@ impl StorageEngine {
         pkey: &[u8],
         value: &[u8],
     ) -> Result<bool, RegistryError> {
+        let trace_enabled = self.put_trace_enabled;
+        let open_start = trace_enabled.then(std::time::Instant::now);
         let db_handle = self.registry.open_db(db)?;
         let table_vpid = db_handle
             .open_table(&mut self.pager, table)
             .await?
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+        let open_table_ns = open_start
+            .map(|start| start.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
 
+        self.pager.begin_path_trace();
+        let btree_start = trace_enabled.then(std::time::Instant::now);
         let (new_root, existed) =
             crate::registry::table_put(&mut self.pager, table_vpid, pkey, value).await?;
+        let btree_ns = btree_start
+            .map(|start| start.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
 
         // ⭐ WAL (F60): 成功路径记录结果态 (重放幂等)
+        let wal_start = trace_enabled.then(std::time::Instant::now);
         if let Some(w) = self.wal.as_mut() {
             w.append_put(db, table, pkey, value);
         }
+        let wal_ns = wal_start
+            .map(|start| start.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
 
         // ⭐ T15: root split 时同步 TableDirectory BTree + 缓存
+        let root_split = new_root.is_some();
+        let root_update_start = trace_enabled.then(std::time::Instant::now);
         if let Some(new_root) = new_root {
             let db_handle = self.registry.open_db(db)?;
             db_handle
@@ -81,6 +101,20 @@ impl StorageEngine {
                 .map_err(RegistryError::from)?;
             let db_handle = self.registry.open_db(db)?;
             db_handle.update_table_root(table, new_root);
+        }
+        if trace_enabled {
+            self.last_put_trace = Some(crate::engine::PutPathTrace {
+                open_table_ns,
+                btree_ns,
+                wal_ns,
+                root_update_ns: root_update_start
+                    .expect("trace start exists")
+                    .elapsed()
+                    .as_nanos() as u64,
+                root_split,
+                total_ns: 0,
+                pager: self.pager.take_path_trace().unwrap_or_default(),
+            });
         }
         Ok(existed)
     }
@@ -188,6 +222,23 @@ impl StorageEngine {
     ) -> Result<Option<Vec<u8>>, RegistryError> {
         let ek = crate::keyspace::encode_string(key);
         self.get_physical(db, table, &ek).await
+    }
+
+    /// ⭐ 存在性判定: 仅检查 key 是否存在, 不物化 value (零 alloc).
+    /// 用于 SETNX / MSETNX / EXISTS 等只需 Some/None 的场景.
+    pub async fn table_exists(
+        &mut self,
+        db: &str,
+        table: &str,
+        key: &[u8],
+    ) -> Result<bool, RegistryError> {
+        let ek = crate::keyspace::encode_string(key);
+        let db_handle = self.registry.open_db(db)?;
+        let table_vpid = db_handle
+            .open_table(&mut self.pager, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+        crate::registry::table_exists(&mut self.pager, table_vpid, &ek).await
     }
 
     /// ⭐ 批量读 (MGET): LeafGuide 区间复用, 结果按输入顺序.

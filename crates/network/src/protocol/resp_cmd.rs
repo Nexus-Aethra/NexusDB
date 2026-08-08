@@ -1,7 +1,7 @@
 // ⭐ 解耦 2026-08: RESP 命令参数解析 (从 resp.rs 拆出).
 // 职责: RESP2 数组参数 → RespCommand (args_to_command + 命令族辅助).
 use super::resp::{
-    parse_f64, parse_i64, parse_int_line, parse_score_bound, RespCommand, SetAlgOp,
+    parse_f64, parse_i64, parse_score_bound, RespCommand, SetAlgOp,
 };
 
 pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespCommand {

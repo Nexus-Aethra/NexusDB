@@ -7,13 +7,16 @@
 //!
 //! - `protocol` — Presentation Layer: 字节 ↔ KV 转换 (无 shard 知识)
 //! - `kv_to_shard` — Application Layer: KV ↔ ShardManager API 转换
-//! - `acceptor` — 1 个 acceptor 线程, accept 新 conn + LB
-//! - `worker` — N 个 worker 线程, 每个 own 1 个 Scheduler
+//! - `acceptor` — 每协议一个 acceptor 线程, accept 新 conn + 按端口打标协议 + LB
+//! - `worker` — 全局共享 worker 池 (线程数 = 用户配置, 不随协议数膨胀);
+//!   每 worker 一个 Scheduler (协程 worker) 或 epoll 事件循环 (epoll worker),
+//!   按连接上下文 (NewConn.protocol + per-conn 配置) 处理对应协议
 //! - `reply_bus` — ShardManager → Worker 的 reply 通道 (crossbeam mpmc)
 //!
 //! ## 范围
 //!
-//! 自家二进制协议 + RESP2 (Redis 兼容, 含 AUTH) + KV 路由. TLS 不在范围.
+//! 五种协议门面 (自家二进制 + RESP2 + MySQL wire + PostgreSQL wire + HTTP REST)
+//! 共享同一批 worker 与存储内核. TLS 支持 SQL/PG 门面 (STARTTLS).
 
 pub mod acceptor;
 pub mod kv_to_shard;
@@ -89,5 +92,5 @@ pub use protocol::{
     RespCommand, Response, validate_request,
 };
 pub use reply_bus::{ReplyBusReceiver, ReplyBusSender, ReplyEnvelope};
-pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind};
+pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 pub use worker::{WorkerConfig, WorkerPool};

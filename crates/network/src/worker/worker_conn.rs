@@ -4,6 +4,7 @@
 //! PG 扩展协议 schema 恢复, 分表路由辅助.
 
 use super::*;
+use std::os::fd::AsRawFd;
 
 impl ConnState {
     pub(crate) fn new(
@@ -11,6 +12,7 @@ impl ConnState {
         proto: ProtocolKind,
         auth_required: bool,
         default_db: std::sync::Arc<str>,
+        default_table: std::sync::Arc<str>,
         sql_cache: SharedSqlCache,
         sql_shared: std::sync::Arc<SqlSharedRoutes>,
         reply_bus: SharedTaskReplyBus,
@@ -18,6 +20,9 @@ impl ConnState {
         worker_id: u32,
         num_shards: usize,
         shard_inboxes: Vec<SharedTaskInbox>,
+        limits: crate::protocol::KvLimits,
+        auth_password: Option<String>,
+        tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     ) -> Self {
         let stream = unsafe { TcpStream::from_raw_fd(fd) };
         stream.set_nonblocking(true).ok();
@@ -27,12 +32,22 @@ impl ConnState {
             fd,
             stream,
             tls: None,
+            default_table,
+            limits,
+            auth_password,
+            tls_config,
             read_buf: Vec::with_capacity(4096),
+            write_buf: Vec::new(),
+            write_pos: 0,
+            epoll_write_buffering: false,
+            epoll_write_armed: false,
+            output_overflowed: false,
             proto,
             authenticated: !auth_required,
             next_seq: 0,
             next_to_send: 0,
             pending: BTreeMap::new(),
+            resp_task_batches: Vec::new(),
             del_agg: HashMap::new(),
             mget_agg: HashMap::new(),
             mset_agg: HashMap::new(),
@@ -98,10 +113,80 @@ impl ConnState {
         }
     }
 
-    /// 从连接 recv 数据, 追加到 read_buf.
+    /// epoll worker 启用 EPOLLOUT 驱动的输出缓冲；协程 worker 不调用此方法。
+    pub(crate) fn enable_epoll_write_buffering(&mut self) {
+        self.epoll_write_buffering = true;
+    }
+
+    pub(crate) fn has_pending_output(&self) -> bool {
+        self.write_pos < self.write_buf.len()
+    }
+
+    /// EPOLLOUT 到达时续写缓存。返回 false 表示连接已不可用。
+    pub(crate) fn flush_pending_output(&mut self) -> bool {
+        if !self.epoll_write_buffering || self.tls.is_some() {
+            return true;
+        }
+        while self.write_pos < self.write_buf.len() {
+            match self.stream.write(&self.write_buf[self.write_pos..]) {
+                Ok(0) => return false,
+                Ok(n) => self.write_pos += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
+        self.write_buf.clear();
+        self.write_pos = 0;
+        true
+    }
+
+    fn queue_output(&mut self, bytes: &[u8]) {
+        // 过大的慢客户端积压不再无限吃掉 worker 内存。关闭该连接是比丢弃
+        // 任意中间回复更可预测的背压策略；worker 发现标志后立即回收连接。
+        const MAX_OUTPUT_BUFFER: usize = 4 * 1024 * 1024;
+        let pending = self.write_buf.len().saturating_sub(self.write_pos);
+        if pending.saturating_add(bytes.len()) > MAX_OUTPUT_BUFFER {
+            self.output_overflowed = true;
+            return;
+        }
+        if self.write_pos == self.write_buf.len() {
+            self.write_buf.clear();
+            self.write_pos = 0;
+        }
+        self.write_buf.extend_from_slice(bytes);
+    }
+
+    /// 暂存 RESP 单 key 任务，直到本次输入解析结束再按 shard 批量投递。
+    ///
+    /// 同一 shard 的 Vec 保持 parser 输入顺序；跨 shard 仍沿用既有并行语义。
+    pub(crate) fn defer_resp_task(&mut self, shard_id: usize, task: ShardTask, shard_count: usize) {
+        if self.resp_task_batches.len() != shard_count {
+            debug_assert!(self.resp_task_batches.is_empty());
+            self.resp_task_batches.resize_with(shard_count, Vec::new);
+        }
+        self.resp_task_batches[shard_id].push(task);
+    }
+
+    /// 将暂存的 RESP 单任务批量交给各 shard。
+    ///
+    /// 聚合命令会在直接投递自己的 group task 前调用此函数，作为严格的 shard
+    /// 顺序屏障；因此 deferred task 不会越过 MGET/MSET 等多任务命令。
+    pub(crate) fn flush_resp_tasks(&mut self, shard_inboxes: &[SharedTaskInbox]) {
+        debug_assert!(
+            self.resp_task_batches.is_empty()
+                || self.resp_task_batches.len() == shard_inboxes.len()
+        );
+        for (inbox, tasks) in shard_inboxes.iter().zip(&mut self.resp_task_batches) {
+            inbox.push_batch_spin(std::mem::take(tasks));
+        }
+    }
+
+    /// 从连接 recv 数据, 追加到 read_buf. (epoll worker 用, 同步)
     /// 返回 Ok(true) = 有数据, Ok(false) = 连接关闭, Err = 错误.
+    /// TLS 路径读密文喂 rustls → 冲刷握手 → 读明文入 read_buf; 明文路径直接读.
     pub(crate) fn recv(&mut self) -> std::io::Result<bool> {
-        // ⭐ F83: TLS 路径 — 读密文喂 rustls → 冲刷握手待写 → 读明文入 read_buf.
+        // ⭐ F83: TLS 路径
         if let Some(tls) = self.tls.as_mut() {
             let mut eof = false;
             loop {
@@ -120,7 +205,6 @@ impl ConnState {
                     Err(e) => return Err(e),
                 }
             }
-            // 冲刷握手/告警等待写字节 (spin, 同明文 send 语义)
             while tls.wants_write() {
                 match tls.write_tls(&mut self.stream) {
                     Ok(0) => break,
@@ -132,7 +216,6 @@ impl ConnState {
                     Err(_) => break,
                 }
             }
-            // 读明文
             let before = self.read_buf.len();
             let mut tmp = [0u8; 4096];
             loop {
@@ -144,9 +227,9 @@ impl ConnState {
                 }
             }
             let got_plain = self.read_buf.len() > before;
-            // EOF 且本轮无新明文 → 连接关闭
             return Ok(!(eof && !got_plain));
         }
+        // 明文路径
         let mut tmp = [0u8; 4096];
         loop {
             match self.stream.read(&mut tmp) {
@@ -165,6 +248,31 @@ impl ConnState {
         }
     }
 
+    /// 协程 worker 用: 从连接 recv 数据 (io_uring async), 追加到 read_buf.
+    /// 返回 Ok(true) = 有数据, Ok(false) = 连接关闭, Err = 错误.
+    /// ⭐ 协程化 (2026-08): 用 scheduler::io_ops::read 替代同步 read + WouldBlock 自旋.
+    /// 仅在协程上下文 (Scheduler 线程) 中调用. 暂只支持非 TLS 明文路径
+    /// (测试未启用 TLS, TLS 协程化独立后续).
+    pub(crate) async fn recv_async(&mut self) -> std::io::Result<bool> {
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = match scheduler::io_ops::read(self.stream.as_raw_fd(), &mut tmp, u64::MAX).await
+            {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if n == 0 {
+                return Ok(false); // EOF
+            }
+            self.read_buf.extend_from_slice(&tmp[..n]);
+            if n < tmp.len() {
+                return Ok(true); // 读完了本次可用数据
+            }
+            // 可能还有更多, 继续 read
+        }
+    }
+
     /// ⭐ F83: 就地把明文连接升级为 TLS (STARTTLS). 握手在后续 recv 泵中完成.
     pub(crate) fn start_tls(&mut self, config: std::sync::Arc<rustls::ServerConfig>) -> bool {
         match rustls::ServerConnection::new(config) {
@@ -176,8 +284,8 @@ impl ConnState {
         }
     }
 
-    /// 发送原始字节. non-blocking socket 遇 WouldBlock 时 spin retry
-    /// (回复帧小, 正常情况下 send buffer 不会满太久).
+    /// 发送原始字节。epoll worker 在 WouldBlock 时将剩余字节放进有界缓冲，
+    /// 等 EPOLLOUT 续写；协程/TLS 保留既有路径。
     pub(crate) fn send_bytes(&mut self, bytes: &[u8]) {
         // ⭐ F83: TLS 路径 — 明文写入 rustls writer, 再泵密文到 socket.
         if let Some(tls) = self.tls.as_mut() {
@@ -193,6 +301,26 @@ impl ConnState {
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
+                }
+            }
+            return;
+        }
+        if self.epoll_write_buffering {
+            if self.has_pending_output() {
+                self.queue_output(bytes);
+                return;
+            }
+            let mut written = 0usize;
+            while written < bytes.len() {
+                match self.stream.write(&bytes[written..]) {
+                    Ok(0) => return,
+                    Ok(n) => written += n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        self.queue_output(&bytes[written..]);
+                        return;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
                 }
             }
             return;
@@ -301,7 +429,10 @@ impl ConnState {
 
     /// RESP: 是否可以关闭 (QUIT/协议错误 且回复已全部发出).
     pub(crate) fn resp_should_close(&self) -> bool {
-        self.close_after_flush && self.pending.is_empty() && self.next_seq == self.next_to_send
+        self.close_after_flush
+            && self.pending.is_empty()
+            && self.next_seq == self.next_to_send
+            && !self.has_pending_output()
     }
 
     /// ⭐ PG 兼容 (multi-statement): 顺序执行一条语句. 解析后 dispatch,
@@ -383,7 +514,7 @@ impl ConnState {
                 done = true;
             }
         }
-        if let Some(e) = error {
+        if let Some(_e) = error {
             self.multi_sub_seq.remove(&sub_seq);
             self.multi_finish(orig);
             return;
@@ -438,6 +569,7 @@ impl ConnState {
     }
 
     /// ⭐ P3 (portal): 清理挂起批次的残留状态 (清空 pg_batch, 复位等待标志).
+    #[allow(dead_code)]
     pub(crate) fn clear_pg_waiting_schema(&mut self) {
         self.pg_waiting_schema = false;
         self.pg_waiting_schema_seq = 0;
@@ -551,4 +683,3 @@ impl ConnState {
         Some(tbl)
     }
 }
-

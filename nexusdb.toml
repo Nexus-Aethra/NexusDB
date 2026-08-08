@@ -5,7 +5,7 @@ listen_addr = "0.0.0.0:5433"
 worker_count = 2
 redis_addr = "0.0.0.0:6379"     # RESP (Redis 兼容) 监听地址, 空 = 禁用
 sql_addr = "0.0.0.0:5434"       # SQL 门面 (MySQL wire) 监听地址, 空 = 禁用
-sql_worker_count = 1            # MySQL/PG 门面 worker 数 (ORM 连接池并发场景可调 2-8)
+sql_worker_count = 1            # ⭐ 共享 worker 池下作参考 (实际线程数 = worker_count); 预留, 便于未来 per-protocol 池
 pg_addr = "0.0.0.0:5435"        # SQL 门面 (PostgreSQL wire) 监听地址, 空 = 禁用
 http_addr = "0.0.0.0:6778"      # REST 门面 (HTTP/1.1 JSON) 监听地址, 空 = 禁用
 http_cors_origin = ""           # CORS Allow-Origin ("*" 或具体 origin, 空 = 不发 CORS 头)

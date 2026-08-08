@@ -5,7 +5,6 @@ use super::ast::*;
 use super::parser_ddl::*;
 use super::parser_select::*;
 use super::parser_where::*;
-use storage::schema::{ColType, Column, TableSchema};
 
 // tokenizer
 // =====================================================================

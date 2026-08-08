@@ -3,7 +3,6 @@
 use super::ast::*;
 use super::parser::{P, Tok, parse_scalar_expr};
 use super::parser_where::{parse_derived, parse_paren_subselect, parse_where};
-use storage::schema::{ColType, Column, TableSchema};
 
 pub(crate) fn split_system_table(name: &str) -> Option<(String, String)> {
     let (cat, tbl) = name.split_once('.')?;

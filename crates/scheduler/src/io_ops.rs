@@ -26,6 +26,9 @@ use crate::scheduler::with_current_slot;
 macro_rules! poll_cqe {
     ($ud:expr, $cx:expr, $cancel_code:expr) => {{
         with_current(|s| {
+            // ⭐ 批量提交: 扫描 CQ 前先提交攒下的 SQE, 否则 CQE 永不出现
+            // (block_on_io 同步忙等路径不经过驱动循环, 靠这里保证正确性).
+            s.flush_sq();
             let mut cq = s.ring.completion();
             cq.sync();
             // 也扫 CQ, 把任何还没 mark 的 CQE 都 mark 进 registry (drain_completions 可能还没跑).
@@ -51,18 +54,40 @@ macro_rules! poll_cqe {
     }};
 }
 
-/// 公共逻辑: 首次 poll → 注册 + push SQE + submit.
+/// 公共逻辑: 首次 poll → 注册 + push SQE.
+///
+/// ⭐ 批量提交 (2026-08): push 后**不立即 submit**, 只置 `sq_pending` 标志.
+/// 驱动循环在每轮 Phase C / CQ 扫描前统一 `flush_sq()` 一次 submit 提交全部 —
+/// 把 N 次 io_uring_enter 合并为 1 次 (协程 worker 每请求 ~20 次 syscall 的
+/// 主瓶颈). 正确性由两条路径兜底:
+///   - 驱动循环: `drain_completions_*` 开头 flush_sq.
+///   - 同步忙等 (block_on_io 不经过驱动循环): `poll_cqe` 扫描 CQ 前 flush_sq.
+///
+/// SQ 满时 push 失败 → 立即 sync + submit 腾空间重试.
 macro_rules! submit_sqe {
     ($entry:expr, $slot_id:expr, $cx:expr) => {{
         let ud = with_current(|s| {
             let ud = s.registry.register($slot_id, $cx.waker().clone());
-            let mut sq = s.ring.submission();
-            unsafe {
-                let _ = sq.push(&$entry.user_data(ud));
+            let e = $entry.user_data(ud);
+            let mut pushed = false;
+            while !pushed {
+                let mut sq = s.ring.submission();
+                match unsafe { sq.push(&e) } {
+                    Ok(()) => {
+                        drop(sq);
+                        pushed = true;
+                    }
+                    Err(_) => {
+                        // SQ 满: sync tail + submit 腾空间后重试 (io_uring 0.6:
+                        // push 失败不会更新 tail, 需显式 sync).
+                        sq.sync();
+                        drop(sq);
+                        s.ring.submit().expect("io_uring submit (sq full flush)");
+                    }
+                }
             }
-            drop(sq);
-            s.ring.submit().expect("io_uring submit");
-            crate::trace!("io_ops submit_sqe ud={} slot={}", ud, $slot_id);
+            s.mark_sq_pending();
+            crate::trace!("io_ops submit_sqe(batch) ud={} slot={}", ud, $slot_id);
             ud
         })
         .expect("no current scheduler");
@@ -326,6 +351,175 @@ impl Future for Close {
         this.user_data.set(Some(ud));
         Poll::Pending
     }
+}
+
+// ---------- PollFd (协程 worker: 监听 socket / eventfd 可读) ----------
+
+struct PollFd {
+    fd: RawFd,
+    events: libc::c_short,
+    user_data: Cell<Option<u64>>,
+}
+
+impl PollFd {
+    fn new(fd: RawFd, events: libc::c_short) -> Self {
+        Self {
+            fd,
+            events,
+            user_data: Cell::new(None),
+        }
+    }
+}
+
+/// 把 io_uring CQE result (mask) 转成 io::Result<u32>.
+fn map_result_poll(r: i32) -> io::Result<u32> {
+    if r < 0 {
+        Err(io::Error::from_raw_os_error(-r))
+    } else {
+        Ok(r as u32)
+    }
+}
+
+impl Future for PollFd {
+    type Output = io::Result<u32>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if let Some(ud) = this.user_data.get() {
+            if let Some(code) = poll_cqe!(ud, cx, map_result_poll) {
+                this.user_data.set(None);
+                return Poll::Ready(code);
+            }
+            return Poll::Pending;
+        }
+
+        let slot_id = with_current_slot(|id| id).unwrap_or(0);
+        // IORING_OP_POLL_ADD: 注册对 fd 的事件监听, 返回触发的事件 mask.
+        let entry = io_uring::opcode::PollAdd::new(
+            io_uring::types::Fd(this.fd),
+            this.events as u32,
+        )
+        .build();
+        let ud = submit_sqe!(entry, slot_id, cx);
+        this.user_data.set(Some(ud));
+        Poll::Pending
+    }
+}
+
+/// 公开 API: 等待 fd 上指定的 poll 事件 (如 libc::POLLIN).
+/// ⭐ 协程 worker 用: 监听 socket 可读 / reply eventfd 可读, 替代 epoll 的等待.
+/// 返回触发的事件 mask. 若 fd 已关闭则返回 error.
+pub async fn poll(fd: RawFd, events: libc::c_short) -> io::Result<u32> {
+    PollFd {
+        fd,
+        events,
+        user_data: Cell::new(None),
+    }
+    .await
+}
+
+/// ⭐ 组合等待 (协程 worker 多连接优化): socket 可读 (io_uring) 或 被 `unpark` 唤醒.
+///
+/// 返回: `1` = socket 可读 (POLLIN), `2` = 被 unpark (本协程的 reply 队列有新数据).
+///
+/// 实现: 同时驱动 `PollFd` (io_uring poll socket) 与 `ParkCurrent` (park 注册
+/// waker). 两者任一就绪即返回 — 免 per-conn eventfd 的 syscall (多连接场景瓶颈).
+pub async fn select_fd_or_unpark(fd: RawFd) -> io::Result<u8> {
+    struct FdOrUnpark {
+        fd_poll: PollFd,
+        park: crate::park::ParkCurrent,
+    }
+    impl Future for FdOrUnpark {
+        type Output = io::Result<u8>;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            // 1. socket 可读?
+            match Pin::new(&mut this.fd_poll).poll(cx) {
+                Poll::Ready(Ok(mask)) if mask & libc::POLLIN as u32 != 0 => {
+                    return Poll::Ready(Ok(1));
+                }
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+            // 2. 被 unpark? (park 第二次 poll → Ready)
+            if let Poll::Ready(()) = Pin::new(&mut this.park).poll(cx) {
+                return Poll::Ready(Ok(2));
+            }
+            Poll::Pending
+        }
+    }
+    FdOrUnpark {
+        fd_poll: PollFd::new(fd, libc::POLLIN),
+        park: crate::park::ParkCurrent::new(),
+    }
+    .await
+}
+
+// ---------- SelectRead (协程 worker: 同时等待两个 fd 可读) ----------
+
+/// 组合 future: 同时监听 fd1 / fd2 的可读 (POLLIN), 返回哪个先就绪 (1 or 2).
+///
+/// 内部常驻两个 PollFd (不重建): 每次 poll 重新驱动两者 — 已完成的自动重新 submit,
+/// pending 的保持注册. 任一触发时, 其余 PollFd 的残留 CQE 会被 registry 忽略
+/// (cancel_slot), 下次 select 重新注册, 无 SQE 累积.
+pub struct SelectRead {
+    f1: Pin<Box<PollFd>>,
+    f2: Pin<Box<PollFd>>,
+    done1: bool,
+    done2: bool,
+}
+
+impl SelectRead {
+    pub(crate) fn new(fd1: RawFd, fd2: RawFd) -> Self {
+        Self {
+            f1: Box::pin(PollFd { fd: fd1, events: libc::POLLIN, user_data: Cell::new(None) }),
+            f2: Box::pin(PollFd { fd: fd2, events: libc::POLLIN, user_data: Cell::new(None) }),
+            done1: false,
+            done2: false,
+        }
+    }
+}
+
+impl Future for SelectRead {
+    type Output = io::Result<u8>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        // 驱动 fd1
+        if !this.done1 {
+            match this.f1.as_mut().poll(cx) {
+                Poll::Ready(Ok(mask)) if mask & libc::POLLIN as u32 != 0 => {
+                    this.done1 = true;
+                    return Poll::Ready(Ok(1));
+                }
+                Poll::Ready(Ok(_)) => {} // POLLIN 未置位 (如 HUP), 继续等
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+        }
+        // 驱动 fd2
+        if !this.done2 {
+            match this.f2.as_mut().poll(cx) {
+                Poll::Ready(Ok(mask)) if mask & libc::POLLIN as u32 != 0 => {
+                    this.done2 = true;
+                    return Poll::Ready(Ok(2));
+                }
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+        }
+        Poll::Pending
+    }
+}
+
+/// 公开 API: 同时等待 fd1 / fd2 可读, 返回哪个先就绪 (1 or 2).
+/// ⭐ 协程 worker 用: 连接协程同时监听 socket (fd1) 与 reply eventfd (fd2).
+pub async fn select_read(fd1: RawFd, fd2: RawFd) -> io::Result<u8> {
+    SelectRead::new(fd1, fd2).await
 }
 
 // ---------- ReadFixed (T18a) ----------

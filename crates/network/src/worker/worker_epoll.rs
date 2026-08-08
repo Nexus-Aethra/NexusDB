@@ -22,7 +22,7 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
     let worker_id = cfg.worker_id;
     // ⭐ 热路径优化: db/table 一次性转 Arc<str>, 每 op 仅引用计数 clone
     let db: std::sync::Arc<str> = std::sync::Arc::from(cfg.default_db.as_str());
-    let table: std::sync::Arc<str> = std::sync::Arc::from(cfg.default_table.as_str());
+    let _table: std::sync::Arc<str> = std::sync::Arc::from(cfg.default_table.as_str());
     // ⭐ W1: SQL worker 级共享缓存 (schema + 索引路由; 单线程 Rc<RefCell>)
     let sql_cache: SharedSqlCache = std::rc::Rc::new(std::cell::RefCell::new(
         SqlWorkerCache::default(),
@@ -33,17 +33,19 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
     let db_view = cfg.db_view;
     let inbox = cfg.inbox;
     let conn_eventfd = cfg.conn_eventfd;
-    let proto_kind = cfg.protocol;
-    let limits = cfg.limits;
+    let _limits = cfg.limits;
     let auth_password = cfg.auth_password;
-    let auth_required = auth_password.is_some();
-    let tls_config = cfg.tls_config; // ⭐ F83: None = 明文门面
+    let _auth_required = auth_password.is_some();
+    let _tls_config = cfg.tls_config; // ⭐ F83: None = 明文门面
     let num_shards = shard_inboxes.len();
 
     let mut events = vec![
         libc::epoll_event { events: 0, u64: 0 };
         256
     ];
+    // Reused reply buffer: TaskReplyBus can wake the worker many times per
+    // second under pipelines, so allocating one Vec per wake is avoidable.
+    let mut reply_results = Vec::with_capacity(256);
 
     loop {
         // 检查新连接 (非阻塞; eventfd 另有精确唤醒, 这里是兑底)
@@ -54,14 +56,36 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                 Ok(new_conn) => {
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone(), reply_bus.clone(), db_view.clone(), worker_id, num_shards, shard_inboxes.clone());
+                    // ⭐ 解耦 (Phase 3): 协议随连接传递 (acceptor 按端口打标), worker 不再用固定 proto_kind.
+                    let proto = new_conn.protocol;
+                    // ⭐ 解耦 (T3.3): per-conn 配置 (limits/auth/tls) 从 NewConn 取.
+                    let mut state = ConnState::new(
+                        new_conn.fd,
+                        proto,
+                        new_conn.auth_password.is_some(),
+                        new_conn.default_db.clone(),
+                        new_conn.default_table.clone(),
+                        sql_cache.clone(),
+                        sql_shared.clone(),
+                        reply_bus.clone(),
+                        db_view.clone(),
+                        worker_id,
+                        num_shards,
+                        shard_inboxes.clone(),
+                        new_conn.limits,
+                        new_conn.auth_password.clone(),
+                        new_conn.tls_config.clone(),
+                    );
                     // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
-                    if proto_kind == ProtocolKind::Sql {
+                    if proto == ProtocolKind::Sql {
                         let salt = mysql_gen_salt(id, worker_id);
                         state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
-                            &salt, id as u32, tls_config.is_some(),
+                            &salt, id as u32, new_conn.tls_config.is_some(),
                         ));
                         state.mysql = Some(MysqlState { salt, phase: 0, pending_db: None });
+                    }
+                    if std::env::var("NEXUS_EPOLL_WRITE_BUFFER").ok().as_deref() != Some("0") {
+                        state.enable_epoll_write_buffering();
                     }
                     epoll_add(epoll_fd, state.fd, id);
                     conn_map.insert(id, state);
@@ -98,8 +122,8 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
 
             if token == REPLY_TOKEN {
                 // shard 有回复: drain bus, 按协议分发
-                let results = reply_bus.drain();
-                for r in results {
+                reply_bus.drain_into(&mut reply_results);
+                for r in reply_results.drain(..) {
                     let mut close_conn = false;
                     if let Some(conn) = conn_map.get_mut(&r.conn_id) {
                         match conn.proto {
@@ -127,6 +151,11 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                                 close_conn = conn.resp_should_close();
                             }
                         }
+                        if conn.output_overflowed {
+                            close_conn = true;
+                        } else {
+                            refresh_conn_interest(epoll_fd, r.conn_id, conn);
+                        }
                     }
                     if close_conn {
                         remove_conn(epoll_fd, &mut conn_map, r.conn_id, worker_id);
@@ -141,66 +170,118 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                 while let Ok(new_conn) = inbox.try_recv() {
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let mut state = ConnState::new(new_conn.fd, proto_kind, auth_required, db.clone(), sql_cache.clone(), sql_shared.clone(), reply_bus.clone(), db_view.clone(), worker_id, num_shards, shard_inboxes.clone());
+                    let proto = new_conn.protocol;
+                    // ⭐ 解耦 (T3.3): per-conn 配置 (limits/auth/tls) 从 NewConn 取.
+                    let mut state = ConnState::new(
+                        new_conn.fd,
+                        proto,
+                        new_conn.auth_password.is_some(),
+                        new_conn.default_db.clone(),
+                        new_conn.default_table.clone(),
+                        sql_cache.clone(),
+                        sql_shared.clone(),
+                        reply_bus.clone(),
+                        db_view.clone(),
+                        worker_id,
+                        num_shards,
+                        shard_inboxes.clone(),
+                        new_conn.limits,
+                        new_conn.auth_password.clone(),
+                        new_conn.tls_config.clone(),
+                    );
                     // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
-                    if proto_kind == ProtocolKind::Sql {
+                    if proto == ProtocolKind::Sql {
                         let salt = mysql_gen_salt(id, worker_id);
                         state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
-                            &salt, id as u32, tls_config.is_some(),
+                            &salt, id as u32, new_conn.tls_config.is_some(),
                         ));
                         state.mysql = Some(MysqlState { salt, phase: 0, pending_db: None });
+                    }
+                    if std::env::var("NEXUS_EPOLL_WRITE_BUFFER").ok().as_deref() != Some("0") {
+                        state.enable_epoll_write_buffering();
                     }
                     epoll_add(epoll_fd, state.fd, id);
                     conn_map.insert(id, state);
                     nlog::debug!("worker", "worker-{worker_id} conn {id} from {}", new_conn.peer);
                 }
             } else {
-                // conn 可读: recv + parse + 校验 + route + push
+                // conn 可读/可写: read drives requests; EPOLLOUT drains a slow
+                // client's buffered replies without spinning this worker.
                 let conn_id = token;
                 let mut should_remove = false;
                 if let Some(conn) = conn_map.get_mut(&conn_id) {
+                    let flags = ev.events as i32;
+                    if flags & (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) != 0 {
+                        should_remove = true;
+                    }
+                    if !should_remove && flags & libc::EPOLLOUT != 0 {
+                        should_remove = !conn.flush_pending_output();
+                    }
+                    if !should_remove && flags & libc::EPOLLIN != 0 {
                     match conn.recv() {
-                        Ok(true) => match conn.proto {
+                        Ok(true) => {
+                            // ⭐ 解耦 (T3.3): per-conn 配置 (auth/db/table/limits/tls) 克隆后使用,
+                            // 避免 &conn 与 &mut conn 同时借用 (process_*_input 需要两者).
+                            let (auth_pw, d_db, d_tbl, lim, tls) = (
+                                conn.auth_password.clone(),
+                                conn.reply_default_db.clone(),
+                                conn.default_table.clone(),
+                                conn.limits,
+                                conn.tls_config.clone(),
+                            );
+                            match conn.proto {
                             ProtocolKind::Binary => {
                                 process_binary_input(
-                                    conn, conn_id, worker_id, &db, &table, &limits,
+                                    conn, conn_id, worker_id, &d_db,
+                                    &d_tbl, &lim,
                                     &shard_inboxes, num_shards,
                                 );
                             }
                             ProtocolKind::Resp => {
                                 process_resp_input(
-                                    conn, conn_id, worker_id, &db_view, &table, &limits,
-                                    &auth_password, &shard_inboxes, num_shards,
+                                    conn, conn_id, worker_id, &db_view, &d_tbl,
+                                    &lim, &auth_pw, &shard_inboxes, num_shards,
                                 );
                                 should_remove = conn.resp_should_close();
                             }
                             ProtocolKind::Sql => {
                                 // ⭐ Z2: MySQL wire 帧循环
                                 process_sql_input(
-                                    conn, conn_id, worker_id, &auth_password, &db, &db_view,
-                                    &shard_inboxes, num_shards, &tls_config,
+                                    conn, conn_id, worker_id, &auth_pw,
+                                    &d_db, &db_view,
+                                    &shard_inboxes, num_shards, &tls,
                                 );
                                 should_remove = conn.resp_should_close();
                             }
                             ProtocolKind::Pg => {
                                 // ⭐ S4: PostgreSQL wire 帧循环
                                 process_pg_input(
-                                    conn, conn_id, worker_id, &auth_password, &db, &db_view,
-                                    &shard_inboxes, num_shards, &tls_config,
+                                    conn, conn_id, worker_id, &auth_pw,
+                                    &d_db, &db_view,
+                                    &shard_inboxes, num_shards, &tls,
                                 );
                                 should_remove = conn.resp_should_close();
                             }
                             ProtocolKind::Http => {
                                 // ⭐ H1: HTTP/1.1 REST 帧循环 (token = auth_password)
                                 process_http_input(
-                                    conn, conn_id, worker_id, &auth_password, &db, &db_view,
-                                    &limits, num_shards, &shard_inboxes, num_shards,
+                                    conn, conn_id, worker_id, &auth_pw,
+                                    &d_db, &db_view,
+                                    &lim, num_shards, &shard_inboxes, num_shards,
                                 );
                                 should_remove = conn.resp_should_close();
+                            }
                             }
                         },
                         Ok(false) => should_remove = true, // EOF
                         Err(_) => should_remove = true,
+                    }
+                    }
+                    if conn.output_overflowed {
+                        should_remove = true;
+                    }
+                    if !should_remove {
+                        refresh_conn_interest(epoll_fd, conn_id, conn);
                     }
                 }
                 if should_remove {
@@ -242,6 +323,10 @@ pub(crate) fn process_binary_input(
     num_shards: usize,
 ) {
     let proto = BinaryProtocol::new();
+    // A recv buffer often contains a Binary pipeline.  Preserve per-shard
+    // input order while submitting each shard's group through one inbox wakeup
+    // after parsing, rather than paying an atomic pending increment per frame.
+    let mut task_batches: Vec<Vec<ShardTask>> = (0..num_shards).map(|_| Vec::new()).collect();
     // ⭐ 热路径优化: 游标推进, 循环末一次 drain — 消 pipeline 下
     // 每帧 memmove 尾部字节的 O(n²).
     let mut cursor = 0usize;
@@ -257,7 +342,7 @@ pub(crate) fn process_binary_input(
                 }
                 let op = request_to_batch_op(value, db, table);
                 let shard_id = hash_route_op(&op, num_shards);
-                shard_inboxes[shard_id].push_spin(ShardTask {
+                task_batches[shard_id].push(ShardTask {
                     conn_id,
                     req_id,
                     worker_id,
@@ -277,6 +362,9 @@ pub(crate) fn process_binary_input(
     }
     if cursor > 0 {
         conn.read_buf.drain(..cursor);
+    }
+    for (inbox, tasks) in shard_inboxes.iter().zip(task_batches) {
+        inbox.push_batch_spin(tasks);
     }
 }
 
@@ -331,6 +419,9 @@ pub(crate) fn process_resp_input(
     if cursor > 0 {
         conn.read_buf.drain(..cursor);
     }
+    // 单 key 命令在本次 recv 内按 shard 合并投递；若输入里有 MGET/MSET 等
+    // 分组命令，dispatcher 已在其直接投递前先调用同一 flush 作为顺序屏障。
+    conn.flush_resp_tasks(shard_inboxes);
 }
 
 
@@ -387,6 +478,27 @@ pub(crate) fn epoll_add(epoll_fd: RawFd, fd: RawFd, token: u64) {
     }
 }
 
+/// 切换连接是否监听 EPOLLOUT；EPOLLIN 始终保留，避免读取/发送相互饿死。
+pub(crate) fn epoll_set_conn_interest(epoll_fd: RawFd, fd: RawFd, token: u64, write_ready: bool) {
+    let mut event = libc::epoll_event {
+        events: (libc::EPOLLIN | if write_ready { libc::EPOLLOUT } else { 0 }) as u32,
+        u64: token,
+    };
+    unsafe {
+        libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event);
+    }
+}
+
+/// 仅在写缓冲从空变非空或反向切换时修改 epoll 掩码。正常小回复直写成功时，
+/// 这条路径零 syscall。
+fn refresh_conn_interest(epoll_fd: RawFd, conn_id: u64, conn: &mut ConnState) {
+    let want_write = conn.has_pending_output();
+    if conn.epoll_write_armed != want_write {
+        epoll_set_conn_interest(epoll_fd, conn.fd, conn_id, want_write);
+        conn.epoll_write_armed = want_write;
+    }
+}
+
 pub(crate) fn epoll_del(epoll_fd: RawFd, fd: RawFd) {
     unsafe {
         libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
@@ -399,4 +511,3 @@ pub(crate) fn peek_req_id(frame: &[u8]) -> u64 {
     }
     u64::from_be_bytes(frame[4..12].try_into().unwrap())
 }
-

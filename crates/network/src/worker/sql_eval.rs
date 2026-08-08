@@ -80,7 +80,7 @@ pub(crate) const HIDDEN_ROWID: &str = "__rowid";
 static AUTO_ROWID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 pub(crate) fn next_auto_rowid() -> i64 {
-    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
     let now = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

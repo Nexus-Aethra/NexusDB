@@ -9,13 +9,11 @@ use std::sync::Mutex as StdMutex;
 use std::thread;
 
 use storage::OpenOptions;
-use storage::StorageEngine;
 
 use crate::coordinator::{TwoPhaseCoordinator, TxnOp};
 use crate::error::{ShardError, ShardResult};
-use crate::exec_cmds::*;
-use crate::reply::{block_on_v2, PendingReply};
-use crate::request::{BatchOp, BatchResult, ShardErrorKind, ShardId, ShardReply, ShardRequest, ShardResponse};
+use crate::reply::{PendingReply, block_on_v2};
+use crate::request::{BatchOp, BatchResult, ShardId, ShardReply, ShardRequest, ShardResponse};
 use crate::router::{HashRouter, Router};
 use crate::shard_thread::shard_thread_main;
 
@@ -130,17 +128,33 @@ struct DbDirInner {
 impl DbDirView {
     /// id → name (RESP SELECT n 翻译). Arc 克隆, 零拷贝.
     pub fn name_of(&self, id: u32) -> Option<Arc<str>> {
-        self.inner.read().expect("db_view lock").by_id.get(&id).cloned()
+        self.inner
+            .read()
+            .expect("db_view lock")
+            .by_id
+            .get(&id)
+            .cloned()
     }
 
     /// name → id (SQL 门面 / 管理面用).
     pub fn id_of(&self, name: &str) -> Option<u32> {
-        self.inner.read().expect("db_view lock").by_name.get(name).copied()
+        self.inner
+            .read()
+            .expect("db_view lock")
+            .by_name
+            .get(name)
+            .copied()
     }
 
     /// ⭐ F66: 全部 db 名 (information_schema.schemata / pg_namespace 合成).
     pub fn all_names(&self) -> Vec<Arc<str>> {
-        self.inner.read().expect("db_view lock").by_id.values().cloned().collect()
+        self.inner
+            .read()
+            .expect("db_view lock")
+            .by_id
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// 当前库数 (测试/诊断).
@@ -191,8 +205,8 @@ impl ShardManager {
 
         // ⭐ 独立服务架构: 创建 reply bus set (默认 num_shards 个 worker bus)
         let reply_bus_set = Arc::new(crate::task_reply_bus::ReplyBusSet::new(
-                    opts.reply_bus_count.unwrap_or(num_shards).max(1),
-                ));
+            opts.reply_bus_count.unwrap_or(num_shards).max(1),
+        ));
 
         for shard_id in 0..num_shards {
             // 每 shard 独立 block_dir
@@ -225,7 +239,17 @@ impl ShardManager {
             let join = thread::Builder::new()
                 .name(format!("shard-{shard_id}"))
                 .stack_size(4 * 1024 * 1024)
-                .spawn(move || shard_thread_main(shard_id, storage_opts, router, inbox, task_inbox, reply_sink_clone, reply_bus_clone))
+                .spawn(move || {
+                    shard_thread_main(
+                        shard_id,
+                        storage_opts,
+                        router,
+                        inbox,
+                        task_inbox,
+                        reply_sink_clone,
+                        reply_bus_clone,
+                    )
+                })
                 .map_err(ShardError::Io)?;
             threads.push(join);
         }
@@ -305,16 +329,14 @@ impl ShardManager {
     ) -> ShardResult<()> {
         let shard_id = self.route_db_table_key(db, table, key);
         let (tx, fut) = PendingReply::new();
-        self.shards[shard_id]
-            .inbox
-            .push_spin(ShardRequest::Put {
-                db: db.to_string(),
-                table: table.to_string(),
-                key: key.to_vec(),
-                val: val.to_vec(),
-                req_id,
-                reply: tx,
-            });
+        self.shards[shard_id].inbox.push_spin(ShardRequest::Put {
+            db: db.to_string(),
+            table: table.to_string(),
+            key: key.to_vec(),
+            val: val.to_vec(),
+            req_id,
+            reply: tx,
+        });
         let response = block_on_v2(fut);
         match response {
             Ok(ShardReply::PutOk) => Ok(()),
@@ -335,15 +357,13 @@ impl ShardManager {
     ) -> ShardResult<Option<Vec<u8>>> {
         let shard_id = self.route_db_table_key(db, table, key);
         let (tx, fut) = PendingReply::new();
-        self.shards[shard_id]
-            .inbox
-            .push_spin(ShardRequest::Get {
-                db: db.to_string(),
-                table: table.to_string(),
-                key: key.to_vec(),
-                req_id,
-                reply: tx,
-            });
+        self.shards[shard_id].inbox.push_spin(ShardRequest::Get {
+            db: db.to_string(),
+            table: table.to_string(),
+            key: key.to_vec(),
+            req_id,
+            reply: tx,
+        });
         let response = block_on_v2(fut);
         match response {
             Ok(ShardReply::GetValue(v)) => Ok(v),
@@ -355,24 +375,16 @@ impl ShardManager {
     }
 
     /// Delete.
-    pub fn delete(
-        &self,
-        db: &str,
-        table: &str,
-        key: &[u8],
-        req_id: u64,
-    ) -> ShardResult<bool> {
+    pub fn delete(&self, db: &str, table: &str, key: &[u8], req_id: u64) -> ShardResult<bool> {
         let shard_id = self.route_db_table_key(db, table, key);
         let (tx, fut) = PendingReply::new();
-        self.shards[shard_id]
-            .inbox
-            .push_spin(ShardRequest::Delete {
-                db: db.to_string(),
-                table: table.to_string(),
-                key: key.to_vec(),
-                req_id,
-                reply: tx,
-            });
+        self.shards[shard_id].inbox.push_spin(ShardRequest::Delete {
+            db: db.to_string(),
+            table: table.to_string(),
+            key: key.to_vec(),
+            req_id,
+            reply: tx,
+        });
         let response = block_on_v2(fut);
         match response {
             Ok(ShardReply::DeleteExisted(b)) => Ok(b),
@@ -651,16 +663,14 @@ impl ShardManager {
     ) -> ShardResult<impl Future<Output = ShardResult<()>>> {
         let shard_id = self.route_db_table_key(db, table, key);
         let (tx, fut) = PendingReply::new();
-        self.shards[shard_id]
-            .inbox
-            .push_spin(ShardRequest::Put {
-                db: db.to_string(),
-                table: table.to_string(),
-                key: key.to_vec(),
-                val: val.to_vec(),
-                req_id,
-                reply: tx,
-            });
+        self.shards[shard_id].inbox.push_spin(ShardRequest::Put {
+            db: db.to_string(),
+            table: table.to_string(),
+            key: key.to_vec(),
+            val: val.to_vec(),
+            req_id,
+            reply: tx,
+        });
         Ok(async move {
             match fut.await {
                 Ok(ShardReply::PutOk) => Ok(()),
@@ -682,15 +692,13 @@ impl ShardManager {
     ) -> ShardResult<impl Future<Output = ShardResult<Option<Vec<u8>>>>> {
         let shard_id = self.route_db_table_key(db, table, key);
         let (tx, fut) = PendingReply::new();
-        self.shards[shard_id]
-            .inbox
-            .push_spin(ShardRequest::Get {
-                db: db.to_string(),
-                table: table.to_string(),
-                key: key.to_vec(),
-                req_id,
-                reply: tx,
-            });
+        self.shards[shard_id].inbox.push_spin(ShardRequest::Get {
+            db: db.to_string(),
+            table: table.to_string(),
+            key: key.to_vec(),
+            req_id,
+            reply: tx,
+        });
         Ok(async move {
             match fut.await {
                 Ok(ShardReply::GetValue(v)) => Ok(v),
@@ -712,15 +720,13 @@ impl ShardManager {
     ) -> ShardResult<impl Future<Output = ShardResult<bool>>> {
         let shard_id = self.route_db_table_key(db, table, key);
         let (tx, fut) = PendingReply::new();
-        self.shards[shard_id]
-            .inbox
-            .push_spin(ShardRequest::Delete {
-                db: db.to_string(),
-                table: table.to_string(),
-                key: key.to_vec(),
-                req_id,
-                reply: tx,
-            });
+        self.shards[shard_id].inbox.push_spin(ShardRequest::Delete {
+            db: db.to_string(),
+            table: table.to_string(),
+            key: key.to_vec(),
+            req_id,
+            reply: tx,
+        });
         Ok(async move {
             match fut.await {
                 Ok(ShardReply::DeleteExisted(b)) => Ok(b),
@@ -1179,9 +1185,7 @@ impl ShardManager {
     pub fn flush_all(&self) -> ShardResult<()> {
         for shard in &self.shards {
             let (tx, fut) = PendingReply::new();
-            shard.inbox.push_spin(ShardRequest::Flush {
-                reply: tx,
-            });
+            shard.inbox.push_spin(ShardRequest::Flush { reply: tx });
             if block_on_v2(fut).is_err() {
                 return Err(ShardError::ChannelClosed);
             }
@@ -1237,8 +1241,9 @@ pub(crate) enum FlushDone {
         Vec<(u64, storage::PidLocation, u8)>,
         std::io::Result<()>,
     ),
+    /// Low-priority read-ahead triggered by repeated page-tier misses.
+    ChunkPromotion(storage::PageKey, std::io::Result<Vec<u8>>),
 }
 
 /// ⭐ 异步落盘完成槽: 落盘协程 push 完成事件, 主循环收割 (单线程 Rc, 无锁).
 pub(crate) type FlushDoneSlot = std::rc::Rc<std::cell::RefCell<Vec<FlushDone>>>;
-

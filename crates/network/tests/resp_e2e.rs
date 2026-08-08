@@ -45,6 +45,7 @@ fn start_server(auth_password: Option<&str>) -> (NetworkServer, Arc<ShardManager
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     };
     let server = NetworkServer::start(cfg).expect("start server");
     (server, mgr)
@@ -250,6 +251,90 @@ fn resp_pipeline_replies_in_order() {
         let expect = format!("$4\r\npv{i:02}\r\n").into_bytes();
         assert_eq!(replies[i * 2 + 1], expect, "GET reply {i}");
     }
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// 连续 SET 会在同一 shard drain 内走 Put micro-batch；回复数和顺序仍必须与
+/// Redis pipeline 一致，随后 GET 验证每个值均已可见。
+#[test]
+fn resp_contiguous_set_pipeline_is_ordered_and_visible() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    let mut batch = Vec::new();
+    for i in 0..48 {
+        let key = format!("batch-key-{i:02}");
+        let value = format!("batch-value-{i:02}");
+        batch.extend_from_slice(&cmd(&[b"SET", key.as_bytes(), value.as_bytes()]));
+    }
+    for i in 0..48 {
+        let key = format!("batch-key-{i:02}");
+        batch.extend_from_slice(&cmd(&[b"GET", key.as_bytes()]));
+    }
+    s.write_all(&batch).unwrap();
+
+    let replies = read_replies(&mut s, 96);
+    for i in 0..48 {
+        assert_eq!(replies[i], b"+OK\r\n", "SET reply {i}");
+    }
+    for i in 0..48 {
+        let value = format!("batch-value-{i:02}");
+        let expected = format!("${}\r\n{}\r\n", value.len(), value).into_bytes();
+        assert_eq!(replies[48 + i], expected, "GET reply {i}");
+    }
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// 同 key 的连续 SET 也允许进入一个 Put micro-batch；稳定排序必须维持
+/// 后写覆盖前写的 Redis 语义，且每条 SET 仍各自得到一个回复。
+#[test]
+fn resp_contiguous_set_same_key_keeps_last_write() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    let mut batch = Vec::new();
+    batch.extend_from_slice(&cmd(&[b"SET", b"same-key", b"first"]));
+    batch.extend_from_slice(&cmd(&[b"SET", b"same-key", b"second"]));
+    batch.extend_from_slice(&cmd(&[b"SET", b"same-key", b"third"]));
+    batch.extend_from_slice(&cmd(&[b"GET", b"same-key"]));
+    s.write_all(&batch).unwrap();
+
+    let replies = read_replies(&mut s, 4);
+    assert_eq!(replies[0], b"+OK\r\n");
+    assert_eq!(replies[1], b"+OK\r\n");
+    assert_eq!(replies[2], b"+OK\r\n");
+    assert_eq!(replies[3], b"$5\r\nthird\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// 单 key 延迟投递不得越过 MGET 的直接分组任务。该边界覆盖 RESP dispatcher
+/// batch flush：MGET 必须观察到前一条 SET，后一条 SET 则只能在 MGET 之后执行。
+#[test]
+fn resp_deferred_single_task_flushes_before_mget() {
+    let (server, mgr) = start_server(None);
+    let mut s = connect(&server);
+
+    let mut batch = Vec::new();
+    batch.extend_from_slice(&cmd(&[b"SET", b"barrier-key", b"before"]));
+    batch.extend_from_slice(&cmd(&[b"MGET", b"barrier-key"]));
+    batch.extend_from_slice(&cmd(&[b"SET", b"barrier-key", b"after"]));
+    batch.extend_from_slice(&cmd(&[b"GET", b"barrier-key"]));
+    s.write_all(&batch).unwrap();
+
+    let replies = read_replies(&mut s, 4);
+    assert_eq!(replies[0], b"+OK\r\n");
+    assert_eq!(replies[1], b"*1\r\n$6\r\nbefore\r\n");
+    assert_eq!(replies[2], b"+OK\r\n");
+    assert_eq!(replies[3], b"$5\r\nafter\r\n");
 
     drop(s);
     server.shutdown().unwrap();

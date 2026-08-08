@@ -86,7 +86,9 @@ fn main() {
         io_backend: IoBackend::IoUring,
         io_config: IoBackendConfig::default(),
         chunk_cache_size: 16,
-        reply_bus_count: None,
+        // ⭐ 必须有 >= num_workers 的 reply bus, 否则多 worker 的 worker_id 取模碰撞
+        // (worker_id % buses.len()) 导致两个 worker 抢同一 bus, 回包路由错乱/卡住.
+        reply_bus_count: Some(num_workers.max(num_shards)),
         wal_mode: Default::default(),
     };
 
@@ -113,6 +115,7 @@ fn main() {
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
         tls_config: None,
+        shared_workers: None,
     })
     .expect("NetworkServer::start");
     let addr = server.local_addr();

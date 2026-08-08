@@ -93,6 +93,35 @@ pub struct Probe {
     pub sync_write_coroutine_ns: Histogram,
     /// ⭐ 怀疑点 6: block_on_io_ns — block_on_io 单次调用耗时 (凡是用到的位置)
     pub block_on_io_ns: Histogram,
+    /// ShardTask 从开始执行到生成结果的总耗时（含 ensure_table 与 storage op）。
+    pub task_exec_ns: Histogram,
+    /// 连续 Put 微批的端到端执行耗时；用于辨别真正应分段的批任务。
+    pub put_run_exec_ns: Histogram,
+    pub put_open_table_ns: Histogram,
+    pub put_btree_ns: Histogram,
+    pub put_wal_ns: Histogram,
+    pub put_root_update_ns: Histogram,
+    pub put_root_splits: AtomicU64,
+    pub put_pager_nowchunk_hits: AtomicU64,
+    pub put_pager_write_queue_hits: AtomicU64,
+    pub put_pager_lru_hits: AtomicU64,
+    pub put_pager_disk_misses: AtomicU64,
+    pub put_pager_write_residency_loads: AtomicU64,
+    pub put_pager_disk_read_ns: AtomicU64,
+    /// Task 在 MPSC inbox 中等待 shard drain 的时间。
+    pub task_queue_ns: Histogram,
+    /// 每轮反馈后 shard 前台服务窗口的大小。
+    pub task_window: Histogram,
+    /// 单轮前台 task 服务耗时；自适应窗口以它作为本地 RTT 信号。
+    pub task_round_ns: Histogram,
+    /// 前台时间片到期而在 task 边界主动切轮的次数。
+    pub task_turn_budget_cuts: AtomicU64,
+    /// Shard 已完成的回复在 worker reply bus 中等待的时间。
+    pub reply_bus_queue_ns: Histogram,
+    pub flush_harvest_ns: Histogram,
+    pub flush_data_admission_ns: Histogram,
+    pub flush_meta_admission_ns: Histogram,
+    pub flush_compact_admission_ns: Histogram,
     pub backpressure_fallbacks: AtomicU64,
     pub in_flight_peak: AtomicU64,
 }
@@ -113,6 +142,28 @@ impl Probe {
             drive_until_idle_ns: Histogram::new(),
             sync_write_coroutine_ns: Histogram::new(),
             block_on_io_ns: Histogram::new(),
+            task_exec_ns: Histogram::new(),
+            put_run_exec_ns: Histogram::new(),
+            put_open_table_ns: Histogram::new(),
+            put_btree_ns: Histogram::new(),
+            put_wal_ns: Histogram::new(),
+            put_root_update_ns: Histogram::new(),
+            put_root_splits: AtomicU64::new(0),
+            put_pager_nowchunk_hits: AtomicU64::new(0),
+            put_pager_write_queue_hits: AtomicU64::new(0),
+            put_pager_lru_hits: AtomicU64::new(0),
+            put_pager_disk_misses: AtomicU64::new(0),
+            put_pager_write_residency_loads: AtomicU64::new(0),
+            put_pager_disk_read_ns: AtomicU64::new(0),
+            task_queue_ns: Histogram::new(),
+            task_window: Histogram::new(),
+            task_round_ns: Histogram::new(),
+            task_turn_budget_cuts: AtomicU64::new(0),
+            reply_bus_queue_ns: Histogram::new(),
+            flush_harvest_ns: Histogram::new(),
+            flush_data_admission_ns: Histogram::new(),
+            flush_meta_admission_ns: Histogram::new(),
+            flush_compact_admission_ns: Histogram::new(),
             backpressure_fallbacks: AtomicU64::new(0),
             in_flight_peak: AtomicU64::new(0),
         }
@@ -137,6 +188,34 @@ impl Probe {
         s.push_str(&self.drive_until_idle_ns.dump("drive_until_idle_ns"));
         s.push_str(&self.sync_write_coroutine_ns.dump("flush_coroutine_total_ns"));
         s.push_str(&self.block_on_io_ns.dump("block_on_io_ns"));
+        s.push_str(&self.task_exec_ns.dump("shard_task_exec_ns"));
+        s.push_str(&self.put_run_exec_ns.dump("shard_put_run_exec_ns"));
+        s.push_str(&self.put_open_table_ns.dump("put_open_table_ns"));
+        s.push_str(&self.put_btree_ns.dump("put_btree_ns"));
+        s.push_str(&self.put_wal_ns.dump("put_wal_ns"));
+        s.push_str(&self.put_root_update_ns.dump("put_root_update_ns"));
+        s.push_str(&format!(
+            "put_root_splits={}\nput_pager_nowchunk_hits={}\nput_pager_write_queue_hits={}\nput_pager_lru_hits={}\nput_pager_disk_misses={}\nput_pager_write_residency_loads={}\nput_pager_disk_read_ns={}\n",
+            self.put_root_splits.load(Ordering::Relaxed),
+            self.put_pager_nowchunk_hits.load(Ordering::Relaxed),
+            self.put_pager_write_queue_hits.load(Ordering::Relaxed),
+            self.put_pager_lru_hits.load(Ordering::Relaxed),
+            self.put_pager_disk_misses.load(Ordering::Relaxed),
+            self.put_pager_write_residency_loads.load(Ordering::Relaxed),
+            self.put_pager_disk_read_ns.load(Ordering::Relaxed),
+        ));
+        s.push_str(&self.task_queue_ns.dump("shard_task_queue_ns"));
+        s.push_str(&self.task_window.dump("shard_task_window"));
+        s.push_str(&self.task_round_ns.dump("shard_task_round_ns"));
+        s.push_str(&format!(
+            "task_turn_budget_cuts={}\n",
+            self.task_turn_budget_cuts.load(Ordering::Relaxed),
+        ));
+        s.push_str(&self.reply_bus_queue_ns.dump("reply_bus_queue_ns"));
+        s.push_str(&self.flush_harvest_ns.dump("flush_harvest_ns"));
+        s.push_str(&self.flush_data_admission_ns.dump("flush_data_admission_ns"));
+        s.push_str(&self.flush_meta_admission_ns.dump("flush_meta_admission_ns"));
+        s.push_str(&self.flush_compact_admission_ns.dump("flush_compact_admission_ns"));
         s.push_str(&format!(
             "backpressure_fallbacks={}\nin_flight_peak={}\n",
             self.backpressure_fallbacks.load(Ordering::Relaxed),

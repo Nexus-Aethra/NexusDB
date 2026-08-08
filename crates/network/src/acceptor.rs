@@ -9,11 +9,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_channel::Sender;
 
-/// 待处理的新连接 (含 fd + peer addr).
+/// 待处理的新连接 (含 fd + peer addr + 协议门面 + per-conn server 配置).
+///
+/// ⭐ 解耦 (Phase 3): 协议与 per-conn 配置随连接传递 (acceptor 投递时打标),
+/// 使共享 worker 池能按连接使用正确的配置 (default_db/limits/auth/tls),
+/// 多协议 server 共享同一批 worker 的前提.
 #[derive(Debug)]
 pub struct NewConn {
     pub fd: RawFd,
     pub peer: SocketAddr,
+    pub protocol: crate::worker::ProtocolKind,
+    /// per-conn 默认 db (server 级).
+    pub default_db: std::sync::Arc<str>,
+    /// per-conn 默认表 (server 级, RESP/Binary 用).
+    pub default_table: std::sync::Arc<str>,
+    /// per-conn 协议长度限制 (server 级).
+    pub limits: crate::protocol::KvLimits,
+    /// per-conn 认证密码 (server 级; None = 免认证).
+    pub auth_password: Option<String>,
+    /// per-conn TLS 配置 (server 级; None = 明文).
+    pub tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +46,18 @@ pub struct AcceptorConfig {
     /// 精确唤醒 worker 的 epoll (空 = 不通知, 兼容旧行为).
     pub worker_wakeups: Vec<RawFd>,
     pub lb_strategy: LbStrategy,
+    /// ⭐ 解耦 (Phase 3): 本 acceptor 服务的协议门面 (端口即协议), 投递连接时打标.
+    pub protocol: crate::worker::ProtocolKind,
+    /// per-conn 默认 db (server 级, 投递连接时打标).
+    pub default_db: std::sync::Arc<str>,
+    /// per-conn 默认表 (server 级).
+    pub default_table: std::sync::Arc<str>,
+    /// per-conn 协议长度限制 (server 级).
+    pub limits: crate::protocol::KvLimits,
+    /// per-conn 认证密码 (server 级).
+    pub auth_password: Option<String>,
+    /// per-conn TLS 配置 (server 级).
+    pub tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
 }
 
 pub struct Acceptor;
@@ -78,7 +105,16 @@ impl Acceptor {
                 }
             };
 
-            let new_conn = NewConn { fd, peer };
+            let new_conn = NewConn {
+                fd,
+                peer,
+                protocol: config.protocol,
+                default_db: config.default_db.clone(),
+                default_table: config.default_table.clone(),
+                limits: config.limits,
+                auth_password: config.auth_password.clone(),
+                tls_config: config.tls_config.clone(),
+            };
             if config.worker_queues[idx].send(new_conn).is_err() {
                 // 关闭 fd (没人会重建这个连接)
                 // SAFETY: fd 是合法 owned fd, drop 时 close.

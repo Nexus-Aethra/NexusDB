@@ -21,7 +21,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::page_pool::RegisteredBufPool;
-use crate::types::{CHUNK_SIZE, IoBackend, IoBackendConfig, PageKey};
+use crate::types::{CHUNK_SIZE, IoBackend, IoBackendConfig, PAGE_SIZE, PageKey};
 
 /// ⭐ Pager 异步 IO 抽象 (T17).
 ///
@@ -37,6 +37,10 @@ use crate::types::{CHUNK_SIZE, IoBackend, IoBackendConfig, PageKey};
 pub trait PagerIoBackend: std::fmt::Debug {
     /// 读 1MB chunk 从 `path[off..off+CHUNK_SIZE]`. 返回填充的 vec.
     async fn read_chunk(&self, path: &Path, off: u64) -> io::Result<Vec<u8>>;
+
+    /// Read a single 16KiB page.  Point reads use this to avoid allocating and
+    /// copying a whole 1MiB chunk on a clean-cache miss.
+    async fn read_page(&self, path: &Path, off: u64) -> io::Result<Vec<u8>>;
 
     /// 写 1MB chunk 到 `path[off..off+data.len()]`.
     async fn write_chunk(&self, path: &Path, off: u64, data: &[u8]) -> io::Result<()>;
@@ -60,6 +64,13 @@ impl PagerIoBackend for StdFsBackend {
     async fn read_chunk(&self, path: &Path, off: u64) -> io::Result<Vec<u8>> {
         let f = File::open(path)?;
         let mut buf = vec![0u8; CHUNK_SIZE];
+        f.read_exact_at(&mut buf, off)?;
+        Ok(buf)
+    }
+
+    async fn read_page(&self, path: &Path, off: u64) -> io::Result<Vec<u8>> {
+        let f = File::open(path)?;
+        let mut buf = vec![0u8; PAGE_SIZE];
         f.read_exact_at(&mut buf, off)?;
         Ok(buf)
     }
@@ -149,7 +160,7 @@ impl IoUringBackend {
 
     /// 分配 O_DIRECT 兼容的 1MB buffer (512B 对齐).
     fn alloc_direct_buffer() -> Vec<u8> {
-        use std::alloc::{alloc, Layout};
+        use std::alloc::{Layout, alloc};
         let layout = Layout::from_size_align(CHUNK_SIZE, 512).expect("CHUNK_SIZE % 512 == 0");
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
@@ -278,9 +289,7 @@ impl PagerIoBackend for IoUringBackend {
                     let result = {
                         let mut bp = self.buf_pool.borrow_mut();
                         if let Some(pool) = bp.as_mut() {
-                            let data = unsafe {
-                                std::slice::from_raw_parts(buf_ptr, n as usize)
-                            };
+                            let data = unsafe { std::slice::from_raw_parts(buf_ptr, n as usize) };
                             let vec = data.to_vec();
                             pool.recycle(buf_slot);
                             vec
@@ -303,16 +312,17 @@ impl PagerIoBackend for IoUringBackend {
         // 尝试 fixed file 路径 (T18a)
         let mut buf = self.alloc_chunk_buffer();
         if self.use_fixed_file
-            && let Some(slot) = self.acquire_file_slot(path) {
-                let n = scheduler::io_ops::read_fixed(slot, &mut buf, off).await?;
-                if n != CHUNK_SIZE {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!("io_uring read_fixed short: {} of {}", n, CHUNK_SIZE),
-                    ));
-                }
-                return Ok(buf);
+            && let Some(slot) = self.acquire_file_slot(path)
+        {
+            let n = scheduler::io_ops::read_fixed(slot, &mut buf, off).await?;
+            if n != CHUNK_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("io_uring read_fixed short: {} of {}", n, CHUNK_SIZE),
+                ));
             }
+            return Ok(buf);
+        }
 
         // fallback: 普通 fd (O_DIRECT 时会自动添加)
         let f = self.open_file(path, false)?;
@@ -326,6 +336,28 @@ impl PagerIoBackend for IoUringBackend {
             ));
         }
 
+        Ok(buf)
+    }
+
+    async fn read_page(&self, path: &Path, off: u64) -> io::Result<Vec<u8>> {
+        // The registered buffers are 1MiB and O_DIRECT requires stricter
+        // alignment.  Keep those configurations on the established chunk
+        // path; ordinary io_uring point reads use a compact 16KiB buffer.
+        if self.o_direct {
+            let chunk_off = off / CHUNK_SIZE as u64 * CHUNK_SIZE as u64;
+            let page_off = (off - chunk_off) as usize;
+            let chunk = self.read_chunk(path, chunk_off).await?;
+            return Ok(chunk[page_off..page_off + PAGE_SIZE].to_vec());
+        }
+        let f = self.open_file(path, false)?;
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let n = scheduler::io_ops::read(f.as_raw_fd(), &mut buf, off).await?;
+        if n != PAGE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("io_uring page read short: {} of {}", n, PAGE_SIZE),
+            ));
+        }
         Ok(buf)
     }
 
@@ -378,31 +410,36 @@ impl PagerIoBackend for IoUringBackend {
 
         // 尝试 fixed file 路径 (T18a)
         if self.use_fixed_file
-            && let Some(slot) = self.acquire_file_slot(path) {
-                // O_DIRECT 需要 buffer 512B 对齐, 对齐后拷贝
-                if self.o_direct {
-                    let mut aligned = Self::alloc_direct_buffer();
-                    aligned[..data.len()].copy_from_slice(data);
-                    let n = scheduler::io_ops::write_fixed(slot, &aligned[..data.len()], off).await?;
-                    scheduler::io_ops::fsync_fixed(slot).await?;
-                    if n != data.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            format!("io_uring write_fixed+odirect short: {} of {}", n, data.len()),
-                        ));
-                    }
-                } else {
-                    let n = scheduler::io_ops::write_fixed(slot, data, off).await?;
-                    scheduler::io_ops::fsync_fixed(slot).await?;
-                    if n != data.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            format!("io_uring write_fixed short: {} of {}", n, data.len()),
-                        ));
-                    }
+            && let Some(slot) = self.acquire_file_slot(path)
+        {
+            // O_DIRECT 需要 buffer 512B 对齐, 对齐后拷贝
+            if self.o_direct {
+                let mut aligned = Self::alloc_direct_buffer();
+                aligned[..data.len()].copy_from_slice(data);
+                let n = scheduler::io_ops::write_fixed(slot, &aligned[..data.len()], off).await?;
+                scheduler::io_ops::fsync_fixed(slot).await?;
+                if n != data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!(
+                            "io_uring write_fixed+odirect short: {} of {}",
+                            n,
+                            data.len()
+                        ),
+                    ));
                 }
-                return Ok(());
+            } else {
+                let n = scheduler::io_ops::write_fixed(slot, data, off).await?;
+                scheduler::io_ops::fsync_fixed(slot).await?;
+                if n != data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!("io_uring write_fixed short: {} of {}", n, data.len()),
+                    ));
+                }
             }
+            return Ok(());
+        }
 
         // fallback: 普通 fd (O_DIRECT 时会自动添加)
         let f = self.open_file(path, true)?;
@@ -437,9 +474,10 @@ impl PagerIoBackend for IoUringBackend {
     async fn fsync(&self, path: &Path) -> io::Result<()> {
         // 尝试 fixed file 路径 (T18a)
         if self.use_fixed_file
-            && let Some(slot) = self.acquire_file_slot(path) {
-                return scheduler::io_ops::fsync_fixed(slot).await;
-            }
+            && let Some(slot) = self.acquire_file_slot(path)
+        {
+            return scheduler::io_ops::fsync_fixed(slot).await;
+        }
 
         // fallback: 普通 fd (O_DIRECT 时会自动添加)
         let f = self.open_file(path, false)?;
@@ -571,6 +609,21 @@ impl PagerIo {
         match self {
             PagerIo::StdFs(b) => b.read_chunk(&path, off).await,
             PagerIo::IoUring(b) => b.read_chunk(&path, off).await,
+        }
+    }
+
+    /// Read one physical page by chunk key and page index.
+    pub async fn read_page(
+        &self,
+        block_dir: &Path,
+        key: PageKey,
+        page_idx: u8,
+    ) -> io::Result<Vec<u8>> {
+        let path = self.block_path(block_dir, key.file_id);
+        let off = key.chunk_idx as u64 * CHUNK_SIZE as u64 + page_idx as u64 * PAGE_SIZE as u64;
+        match self {
+            PagerIo::StdFs(b) => b.read_page(&path, off).await,
+            PagerIo::IoUring(b) => b.read_page(&path, off).await,
         }
     }
 

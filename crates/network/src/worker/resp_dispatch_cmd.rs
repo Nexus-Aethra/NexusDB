@@ -35,6 +35,22 @@ pub(crate) fn dispatch_resp_command(
         return;
     }
 
+    // These commands push their own shard-grouped tasks directly.  Drain any
+    // preceding deferred single-key tasks first, otherwise a same-shard group
+    // could overtake an earlier SET/GET from this RESP pipeline.
+    if matches!(
+        &cmd,
+        RespCommand::MGet { .. }
+            | RespCommand::MSet { .. }
+            | RespCommand::MSetNx { .. }
+            | RespCommand::SInterCard { .. }
+            | RespCommand::SetAlg { .. }
+            | RespCommand::SetAlgStore { .. }
+            | RespCommand::ZSetStore { .. }
+    ) {
+        conn.flush_resp_tasks(shard_inboxes);
+    }
+
     match cmd {
         RespCommand::Set { key, value } => {
             // ⭐ value 已是 [TAG_RAW][payload] 布局 (decode 时预置),
@@ -1148,4 +1164,3 @@ pub(crate) fn dispatch_resp_command(
         }
     }
 }
-

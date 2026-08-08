@@ -15,9 +15,14 @@ use crate::request::TaskResult;
 /// 单个 worker 的回复队列容量.
 const REPLY_BUS_CAPACITY: usize = 8192;
 
+struct QueuedResult {
+    result: TaskResult,
+    enqueued_at: Option<std::time::Instant>,
+}
+
 /// 单个 worker 的回复 bus (shard push, worker drain).
 pub struct TaskReplyBus {
-    ring: ArrayQueue<TaskResult>,
+    ring: ArrayQueue<QueuedResult>,
     /// eventfd: shard push 后通知 worker 有回复可发.
     eventfd: std::os::unix::io::RawFd,
     /// ⭐ 通知合并: 自上次 drain 以来的 pending 计数.
@@ -39,11 +44,18 @@ impl TaskReplyBus {
 
     /// shard 端: push 一个 result + 合并通知 worker.
     pub fn push(&self, result: TaskResult) {
+        let mut queued = QueuedResult {
+            result,
+            enqueued_at: crate::PROBE.is_enabled().then(std::time::Instant::now),
+        };
         // 如果满了 spin retry (不太可能, 8192 容量)
         loop {
-            match self.ring.push(result.clone()) {
+            match self.ring.push(queued) {
                 Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
+                Err(rejected) => {
+                    queued = rejected;
+                    std::thread::yield_now();
+                }
             }
         }
         // ⭐ 合并通知: 首条才写 eventfd, 后续搭车
@@ -60,24 +72,40 @@ impl TaskReplyBus {
     /// ⭐ 防丢唤醒: 先重置 pending 再 pop —— store 之前的 push 必被本轮
     /// pop 到; store 之后的 push 看到 0 会重新写 eventfd.
     pub fn drain(&self) -> Vec<TaskResult> {
+        let mut results = Vec::with_capacity(64);
+        self.drain_into(&mut results);
+        results
+    }
+
+    /// Worker 端: drain 到调用方复用的缓冲，避免每次 eventfd 唤醒分配 Vec。
+    pub fn drain_into(&self, results: &mut Vec<TaskResult>) {
         // 先 read eventfd (消耗通知计数)
         let mut val: u64 = 0;
         unsafe {
             libc::read(self.eventfd, &mut val as *mut u64 as *mut libc::c_void, 8);
         }
         self.pending.store(0, Ordering::Release);
-        let mut results = Vec::with_capacity(64);
-        while let Some(r) = self.ring.pop() {
-            results.push(r);
+        results.clear();
+        while let Some(queued) = self.ring.pop() {
+            if let Some(enqueued_at) = queued.enqueued_at {
+                crate::PROBE
+                    .reply_bus_queue_ns
+                    .record(enqueued_at.elapsed().as_nanos() as u64);
+            }
+            results.push(queued.result);
         }
-        results
     }
 
     /// 非阻塞 drain (不 read eventfd, 用于 poll 模式).
     pub fn try_drain(&self) -> Vec<TaskResult> {
         let mut results = Vec::with_capacity(64);
-        while let Some(r) = self.ring.pop() {
-            results.push(r);
+        while let Some(queued) = self.ring.pop() {
+            if let Some(enqueued_at) = queued.enqueued_at {
+                crate::PROBE
+                    .reply_bus_queue_ns
+                    .record(enqueued_at.elapsed().as_nanos() as u64);
+            }
+            results.push(queued.result);
         }
         results
     }

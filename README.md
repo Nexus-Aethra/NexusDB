@@ -431,9 +431,10 @@ Full field comments in [`nexusdb.toml`](./nexusdb.toml). Key sections:
 listen_addr = "0.0.0.0:5433"     # Binary protocol
 redis_addr = "0.0.0.0:6379"      # RESP (empty string = disable)
 sql_addr = "0.0.0.0:5434"        # SQL facade MySQL wire (empty = disable)
-sql_worker_count = 1             # MySQL/PG facade worker count (2-8 for ORM pools; 16 conns 4 workers ≈ 2.5x)
+sql_worker_count = 1             # ⭐ reference only under shared pool (actual = worker_count); reserved for future per-protocol pools
 pg_addr = "0.0.0.0:5435"         # SQL facade PostgreSQL wire (empty = disable)
 http_addr = "0.0.0.0:6778"       # REST facade (empty = disable)
+worker_count = 2                 # ⭐ global shared worker-pool size: all protocol facades share it; thread count = this value
 http_cors_origin = ""            # CORS Allow-Origin ("*"/specific origin, empty = none)
 http_token = ""                  # REST Bearer token (empty = no auth)
 sql_password = ""                # SQL login password, shared by both facades (empty = no auth; non-empty → PG uses SCRAM-SHA-256)
@@ -472,12 +473,12 @@ stderr = true
 | [`crates/scheduler`](./crates/scheduler) | single-thread coroutine scheduler + io_uring bridge (`SchedHandle`/`drive_until_idle`/`io_ops`/`FdPool`/`spawn_on_low`) | ✅ |
 | [`crates/page`](./crates/page) | LCB-Tree pages (leaf/insert/split/delete/checkpoint/prefix compression/`ItemKind` encoding) | ✅ |
 | [`crates/storage`](./crates/storage) | physical persistence layer: `Pager`/`MetaCache` v3 fully flat + dirty window/`NowChunks` array-based/`ChunkList` LRU/`ChunkLiveness` + GC/`overflow` large values/`recover` primary source + tombstone resurrection prevention | ✅ |
-| [`crates/network`](./crates/network) | multi-protocol facades (`acceptor` + `epoll worker` + RESP2 + MySQL/PG/HTTP + Binary + `KvLimits` + `value_codec` + `tls`) | ✅ |
+| [`crates/network`](./crates/network) | five-protocol facades (Binary + RESP2 + MySQL/PG wire + HTTP REST) + **global shared worker pool** (thread count = config, not multiplied by protocols; per-worker coroutine Scheduler or epoll) + `KvLimits` + `tls` | ✅ |
 | [`crates/shard_manager`](./crates/shard_manager) | multi-shard controller (`ShardManager`/`Router`/`Inbox`/`TaskReplyBus`) + `latency_probe` + stress bench | ✅ |
 | [`crates/config`](./crates/config) | TOML config loading | ✅ |
 | root `src/main.rs` | server entry: `nexusdb --config nexusdb.toml`, graceful shutdown on signal | ✅ |
 
-Per-crate implementation details: [`docs/plans/`](./docs/plans/) (plan index in each file header).
+Active plans, incident reports, and archived implementation records: [docs index](./docs/README.md).
 
 ---
 
@@ -555,7 +556,7 @@ Start with `NLOG_PROBE=1` → on SIGTERM, a 16-bucket histogram is dumped to std
 | Architecture | [DESIGN.md](./DESIGN.md) (10 sections) |
 | Development handoff (progress / gotchas / TODO) | [AGENTS.md](./AGENTS.md) |
 | Fix history (F1-F…) | [CHANGELOG.md](./CHANGELOG.md) |
-| Per-crate phased plans | [`docs/plans/`](./docs/plans/), [`docs/specs/`](./docs/specs/) |
+| Active plans, incident reports, and historical records | [docs index](./docs/README.md) |
 | Bug root-cause investigation example | [`docs/bug-report-btree-split-routing.md`](./docs/bug-report-btree-split-routing.md) |
 
 ---

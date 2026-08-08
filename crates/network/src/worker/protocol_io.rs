@@ -2,8 +2,6 @@
 //! process_http_input / handle_http_request — HTTP 请求 → KV/SQL 分发.
 
 use super::*;
-use crate::protocol::http as h;
-use std::sync::atomic::Ordering::Relaxed;
 
 pub(crate) fn process_http_input(
     conn: &mut ConnState,
@@ -815,7 +813,7 @@ pub(crate) fn process_pg_input(
                                     conn.pg_pending_prepares.insert(
                                         name.clone(),
                                         PgPendingPrepare {
-                                            name: name.clone(),
+                                            _name: name.clone(),
                                             stmt,
                                             params,
                                             oids,
