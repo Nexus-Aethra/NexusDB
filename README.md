@@ -478,7 +478,7 @@ stderr = true
 | [`crates/config`](./crates/config) | TOML config loading | ✅ |
 | root `src/main.rs` | server entry: `nexusdb --config nexusdb.toml`, graceful shutdown on signal | ✅ |
 
-Per-crate implementation details: [`docs/plans/`](./docs/plans/) (plan index in each file header).
+Active plans, incident reports, and archived implementation records: [docs index](./docs/README.md).
 
 ---
 
@@ -556,7 +556,7 @@ Start with `NLOG_PROBE=1` → on SIGTERM, a 16-bucket histogram is dumped to std
 | Architecture | [DESIGN.md](./DESIGN.md) (10 sections) |
 | Development handoff (progress / gotchas / TODO) | [AGENTS.md](./AGENTS.md) |
 | Fix history (F1-F…) | [CHANGELOG.md](./CHANGELOG.md) |
-| Per-crate phased plans | [`docs/plans/`](./docs/plans/), [`docs/specs/`](./docs/specs/) |
+| Active plans, incident reports, and historical records | [docs index](./docs/README.md) |
 | Bug root-cause investigation example | [`docs/bug-report-btree-split-routing.md`](./docs/bug-report-btree-split-routing.md) |
 
 ---

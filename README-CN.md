@@ -484,7 +484,7 @@ stderr = true
 | [`crates/config`](./crates/config) | TOML 配置加载 | ✅ |
 | 根 `src/main.rs` | 服务器入口: `nexusdb --config nexusdb.toml`, 信号优雅退出 | ✅ |
 
-各 crate 实施细节: [`docs/plans/`](./docs/plans/) (plan 索引见各文件头部).
+活跃计划、故障报告与历史实施记录见[文档索引](./docs/README.md)。
 
 ---
 
@@ -562,7 +562,7 @@ redis-cli -p 6379 GET bigkey                     # 字节一致回
 | 架构理解 | [DESIGN.md](./DESIGN.md) (10 节) |
 | 接手开发 (进度 / gotchas / 待办) | [AGENTS.md](./AGENTS.md) |
 | 修复历史 (F1-F…) | [CHANGELOG.md](./CHANGELOG.md) |
-| 各 crate 分阶段实施 plan | [`docs/plans/`](./docs/plans/), [`docs/specs/`](./docs/specs/) |
+| 活跃计划、故障报告与历史实施记录 | [文档索引](./docs/README.md) |
 | Bug 根因调查示例 | [`docs/bug-report-btree-split-routing.md`](./docs/bug-report-btree-split-routing.md) |
 
 ---

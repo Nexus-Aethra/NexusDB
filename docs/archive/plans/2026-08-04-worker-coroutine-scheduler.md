@@ -21,7 +21,7 @@
 - 每 shard 单线程 + **自研协程调度器** (`Scheduler`) + io_uring 异步落盘 (`shard_thread.rs:253-280`)
 - 这是**唯一真正使用协程调度的地方**
 
-**初始设计**: `docs/plans/2026-07-25-async-network-stack.md` 明确规划了 "1 Acceptor + N Workers, **每 worker 拥有 1 个 Scheduler, task pool 每个 task 是一个连接 handle**" — 即协程化网络层。当前 epoll 实现是**偏离该设计的落地折中**, 本次改造即回归并完成该设计。
+**初始设计**: `2026-07-25-async-network-stack.md` 明确规划了 "1 Acceptor + N Workers, **每 worker 拥有 1 个 Scheduler, task pool 每个 task 是一个连接 handle**" — 即协程化网络层。当前 epoll 实现是**偏离该设计的落地折中**, 本次改造即回归并完成该设计。
 
 ### 问题 (用户提出)
 
@@ -234,7 +234,7 @@
 
 ## 8. 关联文档
 
-- 初始设计: `docs/plans/2026-07-25-async-network-stack.md` (协程化网络层的最初规划, 本次回归该设计)
+- 初始设计: `2026-07-25-async-network-stack.md` (协程化网络层的最初规划, 本次回归该设计)
 - scheduler crate: `crates/scheduler/src/` (`scheduler.rs`, `io_ops.rs`, `park.rs`)
 - 当前 worker: `crates/network/src/worker/` (`worker_epoll.rs`, `worker_conn.rs`, `resp_*.rs`, `sql_*.rs`)
 - 存储层参考实现: `crates/shard_manager/src/shard_thread.rs` (每 shard 一协程调度的成熟范例)

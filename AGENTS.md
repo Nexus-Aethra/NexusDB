@@ -5,7 +5,7 @@
 > **配套文档**:
 > - [`CHANGELOG.md`](./CHANGELOG.md) — 修复历史 (F1-F41) + 测试进度快照 + gotchas + 测试文件清单
 > - [`DESIGN.md`](./DESIGN.md) — 项目总设计 (10 节)
-> - [`docs/superpowers/plans/`](./docs/superpowers/plans/) — 各 crate 实施 plan
+> - [`docs/README.md`](./docs/README.md) — 文档导航（活跃计划、事故报告和归档）
 > - [`docs/bug-report-btree-split-routing.md`](./docs/bug-report-btree-split-routing.md) — stress 丢 key 根因调查报告
 
 ## 项目是什么

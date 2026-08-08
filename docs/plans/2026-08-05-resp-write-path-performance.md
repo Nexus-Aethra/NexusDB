@@ -304,7 +304,7 @@ RESP parser → push_spin(每条一个 ShardTask) → TaskInbox
 ## 2. 非目标与约束
 
 - 不启用或默认切换 `NEXUS_CORO_WORKER`；其当前性能仍低于 epoll，见
-  `docs/2026-08-04-coro-worker-status-report.md`。
+  `docs/archive/reports/2026-08-04-coro-worker-status-report.md`。
 - LeafCache 已完成正确性回归与读路径 A/B，默认启用；写入与 split 仍须按既有根失效规则
   维护，不能将 cache 用于 insert 路径。
 - 不改变跨 shard 的执行顺序；每个 shard 内只允许优化可证明等价的 SET 子集。
