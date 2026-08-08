@@ -1,8 +1,10 @@
 // ⭐ 解耦 2026-08: shard 线程主循环 + 异步落盘驱动 (从 manager.rs 拆出).
 // 职责: 每 shard 独立线程的消息处理 (admin + KV ops), 异步落盘 (drive/drain).
 use crate::exec_cmds::*;
-use crate::manager::{block_on_io, FlushDone, FlushDoneSlot, ReplySink};
-use crate::request::{BatchOp, BatchResult, ShardErrorKind, ShardReply, ShardRequest, ShardResponse};
+use crate::manager::{FlushDone, FlushDoneSlot, ReplySink, block_on_io};
+use crate::request::{
+    BatchOp, BatchResult, ShardErrorKind, ShardReply, ShardRequest, ShardResponse,
+};
 use crate::router::Router;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -86,9 +88,9 @@ struct AdaptiveTaskWindow {
     enabled: bool,
 }
 
-/// Optional, cooperative wall-clock bound for a foreground turn.  It never
-/// interrupts an operation or reorders the inbox: the remaining FIFO suffix
-/// is served first in the next turn.
+/// Optional threshold for detecting one genuinely slow foreground task.  It
+/// never interrupts an operation or reorders the inbox: after a slow task,
+/// only the remaining FIFO suffix is served in the next turn.
 struct ForegroundTurnBudget {
     budget_ns: Option<u64>,
 }
@@ -103,9 +105,13 @@ impl ForegroundTurnBudget {
         Self { budget_ns }
     }
 
-    fn expired(&self, start: std::time::Instant) -> bool {
+    fn enabled(&self) -> bool {
+        self.budget_ns.is_some()
+    }
+
+    fn task_is_long(&self, elapsed_ns: u64) -> bool {
         self.budget_ns
-            .is_some_and(|budget_ns| start.elapsed().as_nanos() >= budget_ns as u128)
+            .is_some_and(|budget_ns| elapsed_ns >= budget_ns)
     }
 }
 
@@ -136,10 +142,7 @@ impl AdaptiveTaskWindow {
             current: Self::INITIAL,
             calm_rounds: 0,
             target_round_ns,
-            enabled: std::env::var("NEXUS_ADAPTIVE_TASK_WINDOW")
-                .ok()
-                .as_deref()
-                != Some("0"),
+            enabled: std::env::var("NEXUS_ADAPTIVE_TASK_WINDOW").ok().as_deref() != Some("0"),
         }
     }
 
@@ -209,7 +212,10 @@ pub(crate) fn drive_async_flush(
                     }
                     FlushDone::Meta(window_idx, result) => {
                         if let Err(ref err) = result {
-                            nlog::error!("shard", "meta window {window_idx} flush failed (will retry): {err}");
+                            nlog::error!(
+                                "shard",
+                                "meta window {window_idx} flush failed (will retry): {err}"
+                            );
                         }
                         e.pager_mut().complete_meta_flush(window_idx, result);
                         // ⭐ WAL (F60): meta 全部持久化 → sealed 段可删
@@ -218,7 +224,8 @@ pub(crate) fn drive_async_flush(
                     // ⭐ G2 阶段 2 (同步): meta 判活 → 组装写作业 → 低优先级协程写盘
                     FlushDone::CompactRead(dst, src, dst_fresh, read_result) => {
                         if let Some(wj) =
-                            e.pager_mut().analyze_compact_read(dst, src, dst_fresh, read_result)
+                            e.pager_mut()
+                                .analyze_compact_read(dst, src, dst_fresh, read_result)
                         {
                             let done = flush_done.clone();
                             scheduler::spawn_on_low(
@@ -226,9 +233,8 @@ pub(crate) fn drive_async_flush(
                                 Box::pin(async move {
                                     // fresh dst 整 chunk 写 / 常规 dst 死槽批写
                                     let r = wj.execute().await;
-                                    done.borrow_mut().push(FlushDone::CompactWrite(
-                                        wj.dst, wj.src, wj.moves, r,
-                                    ));
+                                    done.borrow_mut()
+                                        .push(FlushDone::CompactWrite(wj.dst, wj.src, wj.moves, r));
                                 }),
                             );
                         }
@@ -239,6 +245,9 @@ pub(crate) fn drive_async_flush(
                             nlog::warn!("shard", "compact write failed (will retry): {err}");
                         }
                         e.pager_mut().complete_compact(dst, src, moves, result);
+                    }
+                    FlushDone::ChunkPromotion(key, result) => {
+                        e.pager_mut().complete_chunk_promotion(key, result);
                     }
                 }
                 if crate::PROBE.is_enabled() {
@@ -255,9 +264,7 @@ pub(crate) fn drive_async_flush(
             // b. 提交新作业: 同步入队 + spawn 协程 (SQE 在首次 poll 时提交)
             // Phase C: 按 file 成批, 每批 write ×N + fsync ×1 (长尾对症)
             let data_admission_start = crate::PROBE.is_enabled().then(std::time::Instant::now);
-            let batches = e
-                .pager_mut()
-                .take_flush_batches_limited(max_data_admission);
+            let batches = e.pager_mut().take_flush_batches_limited(max_data_admission);
             if crate::PROBE.is_enabled() && !batches.is_empty() {
                 let inflight = e.pager_mut().flush_backlog();
                 crate::PROBE
@@ -310,11 +317,8 @@ pub(crate) fn drive_async_flush(
                 scheduler::spawn_on(
                     rt,
                     Box::pin(async move {
-                        let items: Vec<(u32, &[u8])> = mb
-                            .windows
-                            .iter()
-                            .map(|(w, b)| (*w, b.as_slice()))
-                            .collect();
+                        let items: Vec<(u32, &[u8])> =
+                            mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
                         let r = mb.io.write_mate_windows(&mb.mate_path, &items).await;
                         drop(items);
                         let mut slot = done.borrow_mut();
@@ -370,7 +374,10 @@ pub(crate) fn drive_async_flush(
                             Err(e) => Err(e),
                         };
                         done.borrow_mut().push(FlushDone::CompactRead(
-                            rj.dst, rj.src, rj.dst_fresh, r,
+                            rj.dst,
+                            rj.src,
+                            rj.dst_fresh,
+                            r,
                         ));
                     }),
                 );
@@ -379,6 +386,24 @@ pub(crate) fn drive_async_flush(
                 crate::PROBE
                     .flush_compact_admission_ns
                     .record(start.elapsed().as_nanos() as u64);
+            }
+            // Page misses request promotion through the unified cache.  Once
+            // locality is established the read is submitted immediately, but
+            // no client task awaits it.  There is at most one promotion per
+            // shard, so it cannot become an unbounded competing IO stream.
+            if let Some(job) = e.pager_mut().take_chunk_promotion() {
+                let done = flush_done.clone();
+                scheduler::spawn_on(
+                    rt,
+                    Box::pin(async move {
+                        let result = job.io.read_page_chunk(&job.dir, job.key).await;
+                        // Publishing is a short in-memory operation.  Put it
+                        // ahead of ordinary maintenance so requests in the
+                        // next service turn can use the freshly cached chunk.
+                        done.borrow_mut()
+                            .insert(0, FlushDone::ChunkPromotion(job.key, result));
+                    }),
+                );
             }
             // c. 周期/计数刷盘 (内部守卫: 有 in-flight/pending 时自动推迟)
             let pf_start = std::time::Instant::now();
@@ -483,8 +508,17 @@ pub(crate) fn shard_thread_main(
         rt.clone().drive_until_idle(1000);
     }
     if init_result.borrow().as_ref().unwrap().is_err() {
-        let err = init_result.borrow().as_ref().unwrap().as_ref().err().map(|e| format!("{e:?}"));
-        nlog::error!("shard", "shard-{shard_id} engine init failed: {err:?}, exiting");
+        let err = init_result
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .err()
+            .map(|e| format!("{e:?}"));
+        nlog::error!(
+            "shard",
+            "shard-{shard_id} engine init failed: {err:?}, exiting"
+        );
         return;
     }
     drop(init_result);
@@ -501,10 +535,7 @@ pub(crate) fn shard_thread_main(
     // Experiment switch. Read once per shard so the normal hot path pays only
     // one branch. The batch path is opt-in (`NEXUS_PUT_BATCH=1`) until a
     // representative workload demonstrates a net gain.
-    let put_batching = std::env::var("NEXUS_PUT_BATCH")
-        .ok()
-        .as_deref()
-        == Some("1");
+    let put_batching = std::env::var("NEXUS_PUT_BATCH").ok().as_deref() == Some("1");
 
     // ⭐ 主循环: 同时 poll 两个 inbox (ShardRequest + ShardTask)
     //
@@ -627,9 +658,8 @@ pub(crate) fn shard_thread_main(
                             Err(err) => Err(ShardErrorKind::from_storage_display(&err)),
                         });
                     } else {
-                        let _ = reply.send(Err(ShardErrorKind::StorageError(
-                            "engine not init".into(),
-                        )));
+                        let _ =
+                            reply.send(Err(ShardErrorKind::StorageError("engine not init".into())));
                     }
                 }
                 ShardRequest::Batch { ops, req_id, reply } => {
@@ -647,16 +677,20 @@ pub(crate) fn shard_thread_main(
                             }
                             let r = match op {
                                 // ⭐ 事务批 (管理面 Batch 兼容臂; 热路径走 ShardTask)
-                                BatchOp::TxnApply { ops, read_set } => exec_txn_apply(e, ops, read_set),
-                                // ⭐ M3-2: 行数估计 (只读, 表不存在=0)
-                                BatchOp::EstimateRowCount { db, table } => {
-                                    BatchResult::RowCount(e.estimate_row_count(&db, &table).unwrap_or(0))
+                                BatchOp::TxnApply { ops, read_set } => {
+                                    exec_txn_apply(e, ops, read_set)
                                 }
+                                // ⭐ M3-2: 行数估计 (只读, 表不存在=0)
+                                BatchOp::EstimateRowCount { db, table } => BatchResult::RowCount(
+                                    e.estimate_row_count(&db, &table).unwrap_or(0),
+                                ),
                                 // ⭐ M3-4: distinct 估计 (只读)
                                 BatchOp::EstimateDistinct { db, table, iids } => {
                                     BatchResult::DistinctCounts(
                                         iids.iter()
-                                            .map(|iid| e.estimate_distinct(&db, &table, *iid).unwrap_or(0))
+                                            .map(|iid| {
+                                                e.estimate_distinct(&db, &table, *iid).unwrap_or(0)
+                                            })
                                             .collect(),
                                     )
                                 }
@@ -678,12 +712,15 @@ pub(crate) fn shard_thread_main(
                                 | BatchOp::ConfirmUnique { .. }
                                 | BatchOp::ReleaseUnique { .. }
                                 | BatchOp::CatalogDump { .. }) => exec_task_op(e, op),
-                                BatchOp::Put { db, table, key, val } => {
-                                    match block_on_io(e.table_put(&db, &table, &key, &val)) {
-                                        Ok(_) => BatchResult::PutOk,
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
+                                BatchOp::Put {
+                                    db,
+                                    table,
+                                    key,
+                                    val,
+                                } => match block_on_io(e.table_put(&db, &table, &key, &val)) {
+                                    Ok(_) => BatchResult::PutOk,
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
                                 BatchOp::Get { db, table, key } => {
                                     // ⭐ Phase H: 类型感知 (hash key → WRONGTYPE)
                                     match block_on_io(e.table_get_typed(&db, &table, &key)) {
@@ -715,57 +752,98 @@ pub(crate) fn shard_thread_main(
                                 BatchOp::MultiPutNx { db, table, pairs } => {
                                     exec_multiputnx(e, &db, &table, &pairs)
                                 }
-                                BatchOp::Incr { db, table, key, delta } => {
-                                    exec_incr(e, &db, &table, &key, delta)
-                                }
-                                BatchOp::IncrFloat { db, table, key, delta } => {
-                                    exec_incr_float(e, &db, &table, &key, delta)
-                                }
-                                BatchOp::Append { db, table, key, suffix } => {
-                                    exec_append(e, &db, &table, &key, &suffix)
-                                }
-                                BatchOp::SetNx { db, table, key, val } => {
-                                    exec_setnx(e, &db, &table, &key, &val)
-                                }
+                                BatchOp::Incr {
+                                    db,
+                                    table,
+                                    key,
+                                    delta,
+                                } => exec_incr(e, &db, &table, &key, delta),
+                                BatchOp::IncrFloat {
+                                    db,
+                                    table,
+                                    key,
+                                    delta,
+                                } => exec_incr_float(e, &db, &table, &key, delta),
+                                BatchOp::Append {
+                                    db,
+                                    table,
+                                    key,
+                                    suffix,
+                                } => exec_append(e, &db, &table, &key, &suffix),
+                                BatchOp::SetNx {
+                                    db,
+                                    table,
+                                    key,
+                                    val,
+                                } => exec_setnx(e, &db, &table, &key, &val),
                                 BatchOp::GetDel { db, table, key } => {
                                     exec_getdel(e, &db, &table, &key)
                                 }
-                                BatchOp::GetSet { db, table, key, val } => {
-                                    exec_getset(e, &db, &table, &key, &val)
-                                }
-                                BatchOp::SetRange { db, table, key, offset, data } => {
-                                    exec_setrange(e, &db, &table, &key, offset, &data)
-                                }
-                                BatchOp::HSet { db, table, key, pairs } => {
-                                    match block_on_io(e.hash_set(&db, &table, &key, &pairs)) {
+                                BatchOp::GetSet {
+                                    db,
+                                    table,
+                                    key,
+                                    val,
+                                } => exec_getset(e, &db, &table, &key, &val),
+                                BatchOp::SetRange {
+                                    db,
+                                    table,
+                                    key,
+                                    offset,
+                                    data,
+                                } => exec_setrange(e, &db, &table, &key, offset, &data),
+                                BatchOp::HSet {
+                                    db,
+                                    table,
+                                    key,
+                                    pairs,
+                                } => match block_on_io(e.hash_set(&db, &table, &key, &pairs)) {
+                                    Ok(n) => BatchResult::Integer(n),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::HSetNx {
+                                    db,
+                                    table,
+                                    key,
+                                    field,
+                                    val,
+                                } => {
+                                    match block_on_io(
+                                        e.hash_set_nx(&db, &table, &key, &field, &val),
+                                    ) {
                                         Ok(n) => BatchResult::Integer(n),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::HSetNx { db, table, key, field, val } => {
-                                    match block_on_io(e.hash_set_nx(&db, &table, &key, &field, &val)) {
-                                        Ok(n) => BatchResult::Integer(n),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
-                                BatchOp::HGet { db, table, key, field } => {
-                                    match block_on_io(e.hash_get(&db, &table, &key, &field)) {
-                                        Ok(v) => BatchResult::GetValue(v),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
-                                BatchOp::HMGet { db, table, key, fields } => {
+                                BatchOp::HGet {
+                                    db,
+                                    table,
+                                    key,
+                                    field,
+                                } => match block_on_io(e.hash_get(&db, &table, &key, &field)) {
+                                    Ok(v) => BatchResult::GetValue(v),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::HMGet {
+                                    db,
+                                    table,
+                                    key,
+                                    fields,
+                                } => {
                                     match block_on_io(e.hash_get_many(&db, &table, &key, &fields)) {
                                         Ok(vs) => BatchResult::Values(vs),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::HDel { db, table, key, fields } => {
-                                    match block_on_io(e.hash_del(&db, &table, &key, &fields)) {
-                                        Ok(n) => BatchResult::Integer(n),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
+                                BatchOp::HDel {
+                                    db,
+                                    table,
+                                    key,
+                                    fields,
+                                } => match block_on_io(e.hash_del(&db, &table, &key, &fields)) {
+                                    Ok(n) => BatchResult::Integer(n),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
                                 BatchOp::HLen { db, table, key } => {
                                     match block_on_io(e.hash_len(&db, &table, &key)) {
                                         Ok(n) => BatchResult::Integer(n),
@@ -778,25 +856,44 @@ pub(crate) fn shard_thread_main(
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::HIncrBy { db, table, key, field, delta } => {
-                                    exec_hincrby(e, &db, &table, &key, &field, delta)
-                                }
-                                BatchOp::HIncrByFloat { db, table, key, field, delta } => {
-                                    exec_hincrbyfloat(e, &db, &table, &key, &field, delta)
-                                }
-                                BatchOp::SAdd { db, table, key, members } => {
-                                    match block_on_io(e.set_add(&db, &table, &key, &members)) {
-                                        Ok(n) => BatchResult::Integer(n),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
-                                BatchOp::SRem { db, table, key, members } => {
-                                    match block_on_io(e.set_rem(&db, &table, &key, &members)) {
-                                        Ok(n) => BatchResult::Integer(n),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
-                                BatchOp::SIsMember { db, table, key, member } => {
+                                BatchOp::HIncrBy {
+                                    db,
+                                    table,
+                                    key,
+                                    field,
+                                    delta,
+                                } => exec_hincrby(e, &db, &table, &key, &field, delta),
+                                BatchOp::HIncrByFloat {
+                                    db,
+                                    table,
+                                    key,
+                                    field,
+                                    delta,
+                                } => exec_hincrbyfloat(e, &db, &table, &key, &field, delta),
+                                BatchOp::SAdd {
+                                    db,
+                                    table,
+                                    key,
+                                    members,
+                                } => match block_on_io(e.set_add(&db, &table, &key, &members)) {
+                                    Ok(n) => BatchResult::Integer(n),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::SRem {
+                                    db,
+                                    table,
+                                    key,
+                                    members,
+                                } => match block_on_io(e.set_rem(&db, &table, &key, &members)) {
+                                    Ok(n) => BatchResult::Integer(n),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::SIsMember {
+                                    db,
+                                    table,
+                                    key,
+                                    member,
+                                } => {
                                     match block_on_io(e.set_is_member(&db, &table, &key, &member)) {
                                         Ok(b) => BatchResult::Integer(i64::from(b)),
                                         Err(err) => BatchResult::Error(err.to_string()),
@@ -821,89 +918,171 @@ pub(crate) fn shard_thread_main(
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::LPush { db, table, key, values, left } => {
-                                    match block_on_io(e.list_push(&db, &table, &key, &values, left)) {
+                                BatchOp::LPush {
+                                    db,
+                                    table,
+                                    key,
+                                    values,
+                                    left,
+                                } => {
+                                    match block_on_io(e.list_push(&db, &table, &key, &values, left))
+                                    {
                                         Ok(n) => BatchResult::Integer(n),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::LPop { db, table, key, left, count } => {
-                                    exec_lpop(e, &db, &table, &key, left, count as usize)
-                                }
+                                BatchOp::LPop {
+                                    db,
+                                    table,
+                                    key,
+                                    left,
+                                    count,
+                                } => exec_lpop(e, &db, &table, &key, left, count as usize),
                                 BatchOp::LLen { db, table, key } => {
                                     match block_on_io(e.list_len(&db, &table, &key)) {
                                         Ok(n) => BatchResult::Integer(n),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::LRange { db, table, key, start, end } => {
-                                    exec_lrange(e, &db, &table, &key, start, end)
-                                }
-                                BatchOp::LIndex { db, table, key, idx } => {
-                                    match block_on_io(e.list_index(&db, &table, &key, idx)) {
-                                        Ok(v) => BatchResult::GetValue(v),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
-                                BatchOp::LSet { db, table, key, idx, val } => {
-                                    exec_lset(e, &db, &table, &key, idx, &val)
-                                }
-                                BatchOp::ZAdd { db, table, key, pairs } => {
-                                    match block_on_io(e.zset_add(&db, &table, &key, &pairs)) {
-                                        Ok(n) => BatchResult::Integer(n),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
-                                BatchOp::ZRem { db, table, key, members } => {
-                                    match block_on_io(e.zset_rem(&db, &table, &key, &members)) {
-                                        Ok(n) => BatchResult::Integer(n),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
-                                BatchOp::ZScore { db, table, key, member } => {
-                                    match block_on_io(e.zset_score(&db, &table, &key, &member)) {
-                                        Ok(s) => BatchResult::OptMember(s.map(fmt_score)),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
+                                BatchOp::LRange {
+                                    db,
+                                    table,
+                                    key,
+                                    start,
+                                    end,
+                                } => exec_lrange(e, &db, &table, &key, start, end),
+                                BatchOp::LIndex {
+                                    db,
+                                    table,
+                                    key,
+                                    idx,
+                                } => match block_on_io(e.list_index(&db, &table, &key, idx)) {
+                                    Ok(v) => BatchResult::GetValue(v),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::LSet {
+                                    db,
+                                    table,
+                                    key,
+                                    idx,
+                                    val,
+                                } => exec_lset(e, &db, &table, &key, idx, &val),
+                                BatchOp::ZAdd {
+                                    db,
+                                    table,
+                                    key,
+                                    pairs,
+                                } => match block_on_io(e.zset_add(&db, &table, &key, &pairs)) {
+                                    Ok(n) => BatchResult::Integer(n),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::ZRem {
+                                    db,
+                                    table,
+                                    key,
+                                    members,
+                                } => match block_on_io(e.zset_rem(&db, &table, &key, &members)) {
+                                    Ok(n) => BatchResult::Integer(n),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::ZScore {
+                                    db,
+                                    table,
+                                    key,
+                                    member,
+                                } => match block_on_io(e.zset_score(&db, &table, &key, &member)) {
+                                    Ok(s) => BatchResult::OptMember(s.map(fmt_score)),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
                                 BatchOp::ZCard { db, table, key } => {
                                     match block_on_io(e.zset_card(&db, &table, &key)) {
                                         Ok(n) => BatchResult::Integer(n),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::ZIncrBy { db, table, key, delta, member } => {
-                                    match block_on_io(e.zset_incr(&db, &table, &key, delta, &member)) {
+                                BatchOp::ZIncrBy {
+                                    db,
+                                    table,
+                                    key,
+                                    delta,
+                                    member,
+                                } => {
+                                    match block_on_io(
+                                        e.zset_incr(&db, &table, &key, delta, &member),
+                                    ) {
                                         Ok(s) => BatchResult::Double(s),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::ZRange { db, table, key, start, end, rev, withscores } => {
-                                    match block_on_io(e.zset_range(&db, &table, &key, start, end, rev)) {
-                                        Ok(rows) => BatchResult::Members(zrows_to_members(rows, withscores)),
+                                BatchOp::ZRange {
+                                    db,
+                                    table,
+                                    key,
+                                    start,
+                                    end,
+                                    rev,
+                                    withscores,
+                                } => {
+                                    match block_on_io(
+                                        e.zset_range(&db, &table, &key, start, end, rev),
+                                    ) {
+                                        Ok(rows) => {
+                                            BatchResult::Members(zrows_to_members(rows, withscores))
+                                        }
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::ZRangeByScore { db, table, key, min, max, withscores } => {
-                                    match block_on_io(e.zset_range_by_score(&db, &table, &key, min, max)) {
-                                        Ok(rows) => BatchResult::Members(zrows_to_members(rows, withscores)),
+                                BatchOp::ZRangeByScore {
+                                    db,
+                                    table,
+                                    key,
+                                    min,
+                                    max,
+                                    withscores,
+                                } => {
+                                    match block_on_io(
+                                        e.zset_range_by_score(&db, &table, &key, min, max),
+                                    ) {
+                                        Ok(rows) => {
+                                            BatchResult::Members(zrows_to_members(rows, withscores))
+                                        }
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::ZRank { db, table, key, member, rev } => {
-                                    match block_on_io(e.zset_rank(&db, &table, &key, &member, rev)) {
+                                BatchOp::ZRank {
+                                    db,
+                                    table,
+                                    key,
+                                    member,
+                                    rev,
+                                } => {
+                                    match block_on_io(e.zset_rank(&db, &table, &key, &member, rev))
+                                    {
                                         Ok(Some(r)) => BatchResult::Integer(r),
                                         Ok(None) => BatchResult::OptMember(None),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::ZCount { db, table, key, min, max } => {
-                                    match block_on_io(e.zset_range_by_score(&db, &table, &key, min, max)) {
+                                BatchOp::ZCount {
+                                    db,
+                                    table,
+                                    key,
+                                    min,
+                                    max,
+                                } => {
+                                    match block_on_io(
+                                        e.zset_range_by_score(&db, &table, &key, min, max),
+                                    ) {
                                         Ok(rows) => BatchResult::Integer(rows.len() as i64),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::ZMScore { db, table, key, members } => {
+                                BatchOp::ZMScore {
+                                    db,
+                                    table,
+                                    key,
+                                    members,
+                                } => {
                                     match block_on_io(e.zset_mscore(&db, &table, &key, &members)) {
                                         Ok(scores) => BatchResult::Values(
                                             scores.into_iter().map(|s| s.map(fmt_score)).collect(),
@@ -911,66 +1090,150 @@ pub(crate) fn shard_thread_main(
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::ZPop { db, table, key, rev, count } => {
-                                    match block_on_io(e.zset_pop(&db, &table, &key, rev, count as usize)) {
-                                        Ok(rows) => BatchResult::Members(zrows_to_members(rows, true)),
+                                BatchOp::ZPop {
+                                    db,
+                                    table,
+                                    key,
+                                    rev,
+                                    count,
+                                } => {
+                                    match block_on_io(e.zset_pop(
+                                        &db,
+                                        &table,
+                                        &key,
+                                        rev,
+                                        count as usize,
+                                    )) {
+                                        Ok(rows) => {
+                                            BatchResult::Members(zrows_to_members(rows, true))
+                                        }
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::SMisMember { db, table, key, members } => {
-                                    match block_on_io(e.set_mismember(&db, &table, &key, &members)) {
+                                BatchOp::SMisMember {
+                                    db,
+                                    table,
+                                    key,
+                                    members,
+                                } => {
+                                    match block_on_io(e.set_mismember(&db, &table, &key, &members))
+                                    {
                                         Ok(bs) => BatchResult::IntList(
                                             bs.into_iter().map(i64::from).collect(),
                                         ),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::SPopN { db, table, key, count } => {
-                                    match block_on_io(e.set_pop_n(&db, &table, &key, count as usize)) {
+                                BatchOp::SPopN {
+                                    db,
+                                    table,
+                                    key,
+                                    count,
+                                } => {
+                                    match block_on_io(e.set_pop_n(
+                                        &db,
+                                        &table,
+                                        &key,
+                                        count as usize,
+                                    )) {
                                         Ok(ms) => BatchResult::Members(ms),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::SRandCount { db, table, key, count } => {
-                                    match block_on_io(e.set_rand_n(&db, &table, &key, count as usize)) {
+                                BatchOp::SRandCount {
+                                    db,
+                                    table,
+                                    key,
+                                    count,
+                                } => {
+                                    match block_on_io(e.set_rand_n(
+                                        &db,
+                                        &table,
+                                        &key,
+                                        count as usize,
+                                    )) {
                                         Ok(ms) => BatchResult::Members(ms),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::HRandField { db, table, key, count, .. } => {
-                                    match block_on_io(e.hash_rand(&db, &table, &key, count as usize)) {
+                                BatchOp::HRandField {
+                                    db,
+                                    table,
+                                    key,
+                                    count,
+                                    ..
+                                } => {
+                                    match block_on_io(e.hash_rand(
+                                        &db,
+                                        &table,
+                                        &key,
+                                        count as usize,
+                                    )) {
                                         Ok(ps) => BatchResult::Pairs(ps),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::LRem { db, table, key, count, val } => {
+                                BatchOp::LRem {
+                                    db,
+                                    table,
+                                    key,
+                                    count,
+                                    val,
+                                } => {
                                     match block_on_io(e.list_rem(&db, &table, &key, count, &val)) {
                                         Ok(n) => BatchResult::Integer(n),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::LTrim { db, table, key, start, stop } => {
+                                BatchOp::LTrim {
+                                    db,
+                                    table,
+                                    key,
+                                    start,
+                                    stop,
+                                } => {
                                     match block_on_io(e.list_trim(&db, &table, &key, start, stop)) {
                                         Ok(()) => BatchResult::Integer(1),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::LPos { db, table, key, val, rank, count } => {
-                                    exec_lpos(e, &db, &table, &key, &val, rank, count)
-                                }
-                                BatchOp::LInsert { db, table, key, before, pivot, val } => {
-                                    match block_on_io(e.list_insert(&db, &table, &key, before, &pivot, &val)) {
+                                BatchOp::LPos {
+                                    db,
+                                    table,
+                                    key,
+                                    val,
+                                    rank,
+                                    count,
+                                } => exec_lpos(e, &db, &table, &key, &val, rank, count),
+                                BatchOp::LInsert {
+                                    db,
+                                    table,
+                                    key,
+                                    before,
+                                    pivot,
+                                    val,
+                                } => {
+                                    match block_on_io(
+                                        e.list_insert(&db, &table, &key, before, &pivot, &val),
+                                    ) {
                                         Ok(n) => BatchResult::Integer(n),
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::SetBit { db, table, key, offset, bit } => {
-                                    exec_setbit(e, &db, &table, &key, offset, bit)
-                                }
+                                BatchOp::SetBit {
+                                    db,
+                                    table,
+                                    key,
+                                    offset,
+                                    bit,
+                                } => exec_setbit(e, &db, &table, &key, offset, bit),
                                 // ---- ⭐ Q5: SQL row 表 ----
-                                BatchOp::RowPut { db, table, pk, values } => {
-                                    exec_row_put(e, &db, &table, &pk, &values)
-                                }
+                                BatchOp::RowPut {
+                                    db,
+                                    table,
+                                    pk,
+                                    values,
+                                } => exec_row_put(e, &db, &table, &pk, &values),
                                 BatchOp::RowGet { db, table, pk } => {
                                     match block_on_io(e.row_get(&db, &table, &pk)) {
                                         Ok(v) => BatchResult::GetValue(v),
@@ -983,12 +1246,15 @@ pub(crate) fn shard_thread_main(
                                         Err(err) => BatchResult::Error(err.to_string()),
                                     }
                                 }
-                                BatchOp::RowUpdate { db, table, pk, sets } => {
-                                    match block_on_io(e.row_update(&db, &table, &pk, &sets)) {
-                                        Ok(updated) => BatchResult::DeleteExisted(updated),
-                                        Err(err) => BatchResult::Error(err.to_string()),
-                                    }
-                                }
+                                BatchOp::RowUpdate {
+                                    db,
+                                    table,
+                                    pk,
+                                    sets,
+                                } => match block_on_io(e.row_update(&db, &table, &pk, &sets)) {
+                                    Ok(updated) => BatchResult::DeleteExisted(updated),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
                                 BatchOp::DropTableOp { db, table } => {
                                     match block_on_io(e.drop_table_sql(&db, &table)) {
                                         Ok(_) => BatchResult::PutOk,
@@ -998,18 +1264,54 @@ pub(crate) fn shard_thread_main(
                                 BatchOp::TableScan { db, table, limit } => {
                                     exec_table_scan(e, &db, &table, limit)
                                 }
-                                BatchOp::ScanFiltered { db, table, preds, proj, index_hint, key_set_hint, limit } => {
-                                    exec_scan_filtered(e, &db, &table, &preds, &proj, index_hint.as_ref(), key_set_hint.as_ref(), limit)
-                                }
-                                BatchOp::ScanFilteredRows { db, table, index_hint, limit } => {
-                                    exec_scan_filtered_rows(e, &db, &table, index_hint.as_ref(), limit)
-                                }
-                                BatchOp::IndexScan { db, table, iid, lo, hi, limit, with_rows } => {
-                                    exec_index_scan(
-                                        e, &db, &table, iid, lo.as_ref(), hi.as_ref(), limit,
-                                        with_rows,
-                                    )
-                                }
+                                BatchOp::ScanFiltered {
+                                    db,
+                                    table,
+                                    preds,
+                                    proj,
+                                    index_hint,
+                                    key_set_hint,
+                                    limit,
+                                } => exec_scan_filtered(
+                                    e,
+                                    &db,
+                                    &table,
+                                    &preds,
+                                    &proj,
+                                    index_hint.as_ref(),
+                                    key_set_hint.as_ref(),
+                                    limit,
+                                ),
+                                BatchOp::ScanFilteredRows {
+                                    db,
+                                    table,
+                                    index_hint,
+                                    limit,
+                                } => exec_scan_filtered_rows(
+                                    e,
+                                    &db,
+                                    &table,
+                                    index_hint.as_ref(),
+                                    limit,
+                                ),
+                                BatchOp::IndexScan {
+                                    db,
+                                    table,
+                                    iid,
+                                    lo,
+                                    hi,
+                                    limit,
+                                    with_rows,
+                                } => exec_index_scan(
+                                    e,
+                                    &db,
+                                    &table,
+                                    iid,
+                                    lo.as_ref(),
+                                    hi.as_ref(),
+                                    limit,
+                                    with_rows,
+                                ),
                                 BatchOp::SetSchemaOp { db, table, bytes } => {
                                     exec_set_schema(e, &db, &table, &bytes)
                                 }
@@ -1036,9 +1338,8 @@ pub(crate) fn shard_thread_main(
                             }
                         }
                     } else {
-                        let _ = reply.send(Err(ShardErrorKind::StorageError(
-                            "engine not init".into(),
-                        )));
+                        let _ =
+                            reply.send(Err(ShardErrorKind::StorageError("engine not init".into())));
                     }
                 }
                 req => {
@@ -1064,11 +1365,9 @@ pub(crate) fn shard_thread_main(
                 // LeafGuide/page write batch.  Non-Put commands are strict
                 // barriers, preserving the observable order of SET/GET/DEL.
                 let mut pending_tasks: VecDeque<_> = tasks.into();
+                let mut previous_task_was_long = false;
                 while !pending_tasks.is_empty() {
-                    if served_task_count != 0
-                        && !should_shutdown
-                        && task_round_start.is_some_and(|start| turn_budget.expired(start))
-                    {
+                    if previous_task_was_long && !should_shutdown {
                         crate::PROBE
                             .task_turn_budget_cuts
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1077,7 +1376,8 @@ pub(crate) fn shard_thread_main(
                     }
                     let task = pending_tasks.pop_front().expect("checked non-empty");
                     served_task_count += 1;
-                    let task_start = crate::PROBE.is_enabled().then(std::time::Instant::now);
+                    let task_start = (crate::PROBE.is_enabled() || turn_budget.enabled())
+                        .then(std::time::Instant::now);
                     let crate::request::ShardTask {
                         conn_id,
                         req_id,
@@ -1087,7 +1387,12 @@ pub(crate) fn shard_thread_main(
                     } = task;
 
                     if put_batching
-                        && let crate::request::BatchOp::Put { db, table, key, val } = op
+                        && let crate::request::BatchOp::Put {
+                            db,
+                            table,
+                            key,
+                            val,
+                        } = op
                     {
                         let mut replies = vec![PutReply {
                             conn_id,
@@ -1117,7 +1422,8 @@ pub(crate) fn shard_thread_main(
                                 worker_id,
                                 group,
                                 op: crate::request::BatchOp::Put { key, val, .. },
-                            } = next else {
+                            } = next
+                            else {
                                 unreachable!("front checked as Put")
                             };
                             replies.push(PutReply {
@@ -1137,12 +1443,18 @@ pub(crate) fn shard_thread_main(
                         if pairs.len() == 1 {
                             let (key, val) = pairs.pop().expect("one pair");
                             let reply = replies.pop().expect("one reply");
-                            let result = if let Err(err) = block_on_io(e.ensure_table(&db, &table)) {
+                            let result = if let Err(err) = block_on_io(e.ensure_table(&db, &table))
+                            {
                                 crate::request::BatchResult::Error(err.to_string())
                             } else {
                                 exec_task_op(
                                     e,
-                                    crate::request::BatchOp::Put { db, table, key, val },
+                                    crate::request::BatchOp::Put {
+                                        db,
+                                        table,
+                                        key,
+                                        val,
+                                    },
                                 )
                             };
                             let tr = crate::request::TaskResult {
@@ -1155,6 +1467,13 @@ pub(crate) fn shard_thread_main(
                                 held.push((reply.worker_id, tr));
                             } else {
                                 reply_bus_set.get(reply.worker_id).push(tr);
+                            }
+                            if let Some(start) = task_start {
+                                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                                if crate::PROBE.is_enabled() {
+                                    crate::PROBE.task_exec_ns.record(elapsed_ns);
+                                }
+                                previous_task_was_long = turn_budget.task_is_long(elapsed_ns);
                             }
                             continue;
                         }
@@ -1183,6 +1502,13 @@ pub(crate) fn shard_thread_main(
                                 reply_bus_set.get(reply.worker_id).push(tr);
                             }
                         }
+                        if let Some(start) = task_start {
+                            let elapsed_ns = start.elapsed().as_nanos() as u64;
+                            if crate::PROBE.is_enabled() {
+                                crate::PROBE.put_run_exec_ns.record(elapsed_ns);
+                            }
+                            previous_task_was_long = turn_budget.task_is_long(elapsed_ns);
+                        }
                         continue;
                     }
 
@@ -1193,20 +1519,69 @@ pub(crate) fn shard_thread_main(
                         if !table.is_empty()
                             && let Err(err) = block_on_io(e.ensure_table(db, table))
                         {
-                            reply_bus_set.get(worker_id).push(crate::request::TaskResult {
-                                conn_id,
-                                req_id,
-                                group,
-                                result: crate::request::BatchResult::Error(err.to_string()),
-                            });
+                            reply_bus_set
+                                .get(worker_id)
+                                .push(crate::request::TaskResult {
+                                    conn_id,
+                                    req_id,
+                                    group,
+                                    result: crate::request::BatchResult::Error(err.to_string()),
+                                });
+                            if let Some(start) = task_start {
+                                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                                if crate::PROBE.is_enabled() {
+                                    crate::PROBE.task_exec_ns.record(elapsed_ns);
+                                }
+                                previous_task_was_long = turn_budget.task_is_long(elapsed_ns);
+                            }
                             continue;
                         }
                     }
+                    let is_put = matches!(&op, crate::request::BatchOp::Put { .. });
                     let result = exec_task_op(e, op);
-                    if let Some(start) = task_start {
+                    if is_put
+                        && crate::PROBE.is_enabled()
+                        && let Some(trace) = e.take_last_put_trace()
+                    {
+                        crate::PROBE.put_open_table_ns.record(trace.open_table_ns);
+                        crate::PROBE.put_btree_ns.record(trace.btree_ns);
+                        crate::PROBE.put_wal_ns.record(trace.wal_ns);
+                        crate::PROBE.put_root_update_ns.record(trace.root_update_ns);
+                        if trace.root_split {
+                            crate::PROBE
+                                .put_root_splits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        crate::PROBE.put_pager_nowchunk_hits.fetch_add(
+                            trace.pager.nowchunk_hits,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        crate::PROBE.put_pager_write_queue_hits.fetch_add(
+                            trace.pager.write_queue_hits,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         crate::PROBE
-                            .task_exec_ns
-                            .record(start.elapsed().as_nanos() as u64);
+                            .put_pager_lru_hits
+                            .fetch_add(trace.pager.lru_hits, std::sync::atomic::Ordering::Relaxed);
+                        crate::PROBE.put_pager_disk_misses.fetch_add(
+                            trace.pager.disk_misses,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        crate::PROBE.put_pager_write_residency_loads.fetch_add(
+                            trace.pager.write_residency_disk_loads,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        crate::PROBE.put_pager_disk_read_ns.fetch_add(
+                            trace.pager.disk_read_ns,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    if let Some(start) = task_start {
+                        let elapsed_ns = start.elapsed().as_nanos() as u64;
+                        if crate::PROBE.is_enabled() {
+                            crate::PROBE.task_exec_ns.record(elapsed_ns);
+                        }
+                        previous_task_was_long = turn_budget.task_is_long(elapsed_ns);
                     }
                     // ⭐ WAL (F60) strict: 本轮已有未持久化写 → 回复押到轮末
                     // barrier 后 (读 op 在无待 sync 内容时仍直发)
@@ -1257,18 +1632,19 @@ pub(crate) fn shard_thread_main(
         if crate::PROBE.is_enabled() && served_foreground {
             crate::PROBE.task_window.record(task_window.limit() as u64);
         }
-        let (drive_budget, max_data_admission, allow_compact) = if served_foreground || backlog_after {
-            // Completion harvest and WAL checks still run every round.  Only
-            // new data-write admission is capped, and compact waits for an
-            // idle turn so it cannot extend a client-facing service cycle.
-            (
-                task_window.busy_drive_budget(),
-                FOREGROUND_DATA_ADMISSION,
-                false,
-            )
-        } else {
-            (256, usize::MAX, true)
-        };
+        let (drive_budget, max_data_admission, allow_compact) =
+            if served_foreground || backlog_after {
+                // Completion harvest and WAL checks still run every round.  Only
+                // new data-write admission is capped, and compact waits for an
+                // idle turn so it cannot extend a client-facing service cycle.
+                (
+                    task_window.busy_drive_budget(),
+                    FOREGROUND_DATA_ADMISSION,
+                    false,
+                )
+            } else {
+                (256, usize::MAX, true)
+            };
         drive_async_flush(
             &engine,
             &rt,
@@ -1300,7 +1676,11 @@ pub(crate) fn shard_thread_main(
         nlog::info!("shard", "shard-{shard_id} closed (final flush done)");
     }
     if crate::PROBE.is_enabled() {
-        nlog::info!("shard", "shard-{shard_id} latency probe:\n{}", crate::PROBE.dump_all());
+        nlog::info!(
+            "shard",
+            "shard-{shard_id} latency probe:\n{}",
+            crate::PROBE.dump_all()
+        );
     }
 }
 
@@ -1442,7 +1822,9 @@ pub(crate) fn handle_request_blocking(
             // ⭐ D2 (分库): resolver (id, name) 全表 — DbDirView 初始化/刷新
             let _ = reply.send(Ok(ShardReply::DbList(e.list_dbs_with_ids())));
         }
-        ShardRequest::SetSchema { db, table, bytes, .. } => {
+        ShardRequest::SetSchema {
+            db, table, bytes, ..
+        } => {
             // ⭐ Q5: 反序列化校验后落 [$] 行 + 常驻镜像 (幂等)
             let r = storage::schema::TableSchema::decode(&bytes)
                 .map_err(|err| ShardErrorKind::StorageError(err.to_string()))

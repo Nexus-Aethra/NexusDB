@@ -163,6 +163,21 @@ pub struct StorageEngine {
     pub(crate) range_counts: std::collections::HashMap<(String, String, u32), (Vec<u8>, Vec<u8>)>,
     /// ⭐ M3-1b: CBO 统计持久化文件 (block_dir/stats.bin; 崩溃不保证, 近似统计可接受).
     pub(crate) stats_path: std::path::PathBuf,
+    /// Opt-in per-Put path timings for shard latency diagnosis.  Kept inside
+    /// the single-threaded engine so normal hot-path operation pays nothing.
+    pub(crate) put_trace_enabled: bool,
+    pub(crate) last_put_trace: Option<PutPathTrace>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PutPathTrace {
+    pub total_ns: u64,
+    pub open_table_ns: u64,
+    pub btree_ns: u64,
+    pub wal_ns: u64,
+    pub root_update_ns: u64,
+    pub root_split: bool,
+    pub pager: crate::pager::PagerPathTrace,
 }
 
 /// ⭐ Q1: schema 镜像槽别名 (None = 已确认无 schema 的纯 KV 表).
@@ -360,6 +375,8 @@ impl StorageEngine {
             distinct_counts: std::collections::HashMap::new(),
             range_counts: std::collections::HashMap::new(),
             stats_path,
+            put_trace_enabled: std::env::var("NLOG_PROBE").is_ok_and(|value| value == "1"),
+            last_put_trace: None,
         };
         // ⭐ M3-1b: 加载持久化统计 (缺失/损坏 → 空统计, 无碍)
         engine.load_stats();
@@ -390,6 +407,10 @@ impl StorageEngine {
             );
         }
         Ok(engine)
+    }
+
+    pub fn take_last_put_trace(&mut self) -> Option<PutPathTrace> {
+        self.last_put_trace.take()
     }
 
     /// ⭐ WAL (F60): 按段序逐条重放 (幂等: 结果态 put / delete).

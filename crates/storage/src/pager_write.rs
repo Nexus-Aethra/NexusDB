@@ -7,7 +7,7 @@ use std::io;
 
 use crate::meta_page::{META_PID, META_VPID};
 use crate::page_pool;
-use crate::pager::{next_bump_chunk, Pager};
+use crate::pager::{Pager, next_bump_chunk};
 use crate::types::{CHUNK_SIZE, PAGE_SIZE, PageKey, PidLocation};
 
 pub struct PageWriteBatch {
@@ -76,10 +76,13 @@ impl PageWriteBatch {
                 }
                 META_PID
             } else if let Some(old_pid) = pager.meta.read(vpid)
-                && pager.nowchunks.peek_chunk(PageKey {
-                    file_id: old_pid.file_id(),
-                    chunk_idx: old_pid.chunk_idx(),
-                }).is_some()
+                && pager
+                    .nowchunks
+                    .peek_chunk(PageKey {
+                        file_id: old_pid.file_id(),
+                        chunk_idx: old_pid.chunk_idx(),
+                    })
+                    .is_some()
             {
                 // 复用原 pid (chunk 还在内存, 原位覆盖同一 page_idx)
                 old_pid
@@ -141,8 +144,16 @@ impl PageWriteBatch {
                 } else if pager.chunk_list.contains(&ck) {
                     pager.chunk_list.peek(&ck).unwrap().to_vec()
                 } else {
+                    let disk_start = pager.path_trace_enabled().then(std::time::Instant::now);
                     match pager.io.read_page_chunk(&pager.block_dir, key).await {
-                        Ok(b) => b,
+                        Ok(b) => {
+                            if let Some(start) = disk_start {
+                                pager.trace_write_residency_disk_load(
+                                    start.elapsed().as_nanos() as u64
+                                );
+                            }
+                            b
+                        }
                         Err(_) => vec![0u8; CHUNK_SIZE],
                     }
                 };
@@ -151,6 +162,18 @@ impl PageWriteBatch {
             pager
                 .nowchunks
                 .write_page_with_vpid(key, page_idx, vpid, &data);
+            let chunk = pager
+                .nowchunks
+                .peek_chunk(key)
+                .expect("page was just written into nowchunks");
+            let page_off = page_idx as usize * PAGE_SIZE;
+            // PageCache is read-admitted.  Updating only an already-hot page
+            // preserves coherence without copying every cold random write.
+            pager.chunk_list.refresh_page_if_present(
+                key,
+                page_idx,
+                &chunk[page_off..page_off + PAGE_SIZE],
+            );
             // ⭐ 热路径优化: page 字节已 memcpy 进 nowchunks, Box 归还页池
             // (闭合 page_pool 循环: read alloc → submit 消费 → recycle).
             page_pool::recycle(data);

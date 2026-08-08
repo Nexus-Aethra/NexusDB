@@ -14,9 +14,9 @@
 //! **单线程使用**: per-shard thread, 与 scheduler crate 契约一致.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::io;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::pager_io::PagerIo;
 
@@ -27,11 +27,11 @@ use crate::chunk_lru::{ChunkKey, ChunkList};
 use crate::chunk_writer::{ChunkWriter, NowChunks, WriteQueue};
 use crate::meta_cache::MetaCache;
 use crate::page_pool;
-pub use crate::pager_write::{MAX_BATCH_PAGES, PageWriteBatch};
 pub use crate::pager_tree::{TravelTree, TravelTreeGuard};
+pub use crate::pager_write::{MAX_BATCH_PAGES, PageWriteBatch};
 use crate::types::{
-    CHUNK_SIZE, CHUNKS_PER_BLOCK, DEFAULT_DB_NAME, DEFAULT_SHARD_ID, PAGE_SIZE,
-    PAGES_PER_CHUNK, PageKey, PidLocation, ShardId,
+    CHUNK_SIZE, CHUNKS_PER_BLOCK, DEFAULT_DB_NAME, DEFAULT_SHARD_ID, PAGE_SIZE, PAGES_PER_CHUNK,
+    PageKey, PidLocation, ShardId,
 };
 
 // =====================================================================
@@ -111,6 +111,18 @@ pub struct Pager {
     /// ⭐ 读路径优化: LeafCache (key → leaf_vpid 缓存, 免重复 travel).
     /// per-shard 单线程, 无锁. split 时 invalidate_root 失效.
     pub(crate) leaf_cache: crate::leaf_cache::LeafCache,
+    path_trace_enabled: bool,
+    path_trace: PagerPathTrace,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PagerPathTrace {
+    pub nowchunk_hits: u64,
+    pub write_queue_hits: u64,
+    pub lru_hits: u64,
+    pub disk_misses: u64,
+    pub write_residency_disk_loads: u64,
+    pub disk_read_ns: u64,
 }
 
 /// ⭐ 异步落盘作业 (Phase C: 按 file_id 分组批量): 零 Pager 借用,
@@ -141,6 +153,14 @@ pub struct CompactReadJob {
     pub io: Rc<PagerIo>,
 }
 
+/// Low-priority read-ahead for a chunk that has accumulated page misses.  It
+/// carries no Pager borrow, so the foreground shard can continue serving.
+pub struct ChunkPromotionJob {
+    pub key: PageKey,
+    pub dir: PathBuf,
+    pub io: Rc<PagerIo>,
+}
+
 /// ⭐ G2: compact 写作业 (阶段 2 → 3): 协程把 src 活页写进 dst 死槽.
 pub struct CompactWriteJob {
     pub dst: PageKey,
@@ -167,7 +187,9 @@ impl CompactWriteJob {
                 let off = *slot as usize * PAGE_SIZE;
                 buf[off..off + PAGE_SIZE].copy_from_slice(bytes);
             }
-            self.io.write_page_chunk_slice(&self.dir, self.dst, &buf).await
+            self.io
+                .write_page_chunk_slice(&self.dir, self.dst, &buf)
+                .await
         } else {
             let items: Vec<(u8, &[u8])> =
                 self.items.iter().map(|(p, d)| (*p, d.as_slice())).collect();
@@ -335,6 +357,8 @@ impl Pager {
                 .unwrap_or_else(std::time::Instant::now),
             drain_block_target: None,
             leaf_cache: crate::leaf_cache::LeafCache::default(),
+            path_trace_enabled: std::env::var("NLOG_PROBE").is_ok_and(|value| value == "1"),
+            path_trace: PagerPathTrace::default(),
         }
     }
 
@@ -421,12 +445,36 @@ impl Pager {
                 .unwrap_or_else(std::time::Instant::now),
             drain_block_target: None,
             leaf_cache: crate::leaf_cache::LeafCache::default(),
+            path_trace_enabled: std::env::var("NLOG_PROBE").is_ok_and(|value| value == "1"),
+            path_trace: PagerPathTrace::default(),
         }
     }
 
     /// ⭐ G1: 从全量平坦 meta 反推重建活性统计 (open/recover 后调一次).
     pub fn rebuild_liveness(&mut self) {
         self.liveness.rebuild_from_meta(&self.meta);
+    }
+
+    pub fn begin_path_trace(&mut self) {
+        if self.path_trace_enabled {
+            self.path_trace = PagerPathTrace::default();
+        }
+    }
+
+    pub fn take_path_trace(&mut self) -> Option<PagerPathTrace> {
+        self.path_trace_enabled
+            .then(|| std::mem::take(&mut self.path_trace))
+    }
+
+    pub(crate) fn trace_write_residency_disk_load(&mut self, elapsed_ns: u64) {
+        if self.path_trace_enabled {
+            self.path_trace.write_residency_disk_loads += 1;
+            self.path_trace.disk_read_ns += elapsed_ns;
+        }
+    }
+
+    pub(crate) fn path_trace_enabled(&self) -> bool {
+        self.path_trace_enabled
     }
 
     /// G1: 活性统计只读访问 (测试/观测).
@@ -450,6 +498,13 @@ impl Pager {
         if let Some(pid) = self.meta.peek(vpid) {
             self.liveness.on_page_dead(pid);
             self.meta.free_slot(vpid);
+            self.chunk_list.invalidate_page(
+                PageKey {
+                    file_id: pid.file_id(),
+                    chunk_idx: pid.chunk_idx(),
+                },
+                pid.page_idx() as u8,
+            );
             self.meta_flush_due = true;
         }
     }
@@ -487,6 +542,9 @@ impl Pager {
 
         // 2. nowchunks 优先 (有最新未 flush 数据)
         if let Some(chunk_bytes) = self.nowchunks.peek_chunk(key) {
+            if self.path_trace_enabled {
+                self.path_trace.nowchunk_hits += 1;
+            }
             let mut out = page_pool::alloc();
             let off = page_idx as usize * PAGE_SIZE;
             out.copy_from_slice(&chunk_bytes[off..off + PAGE_SIZE]);
@@ -499,8 +557,11 @@ impl Pager {
                     "[DIAG-BADPAGE-NOWCHUNKS] vpid={vpid} pid=({},{},{}) \
                      magic={:02X?} page_type={} hdr_vpid={} key={key:?} \
                      chunk_page_count={}",
-                    pid.file_id(), pid.chunk_idx(), pid.page_idx(),
-                    &out[0..4], out[4],
+                    pid.file_id(),
+                    pid.chunk_idx(),
+                    pid.page_idx(),
+                    &out[0..4],
+                    out[4],
                     u64::from_le_bytes(out[0x18..0x20].try_into().unwrap_or_default()),
                     self.nowchunks.chunk_page_count(key)
                 );
@@ -509,12 +570,18 @@ impl Pager {
         }
         // 3. WriteQueue 检索: pending 或 completed 中的 chunk 对读路径可见
         if let Some(chunk_bytes) = self.write_queue.peek_chunk_pending(key) {
+            if self.path_trace_enabled {
+                self.path_trace.write_queue_hits += 1;
+            }
             let mut out = page_pool::alloc();
             let off = page_idx as usize * PAGE_SIZE;
             out.copy_from_slice(&chunk_bytes[off..off + PAGE_SIZE]);
             return Ok(out);
         }
         if let Some(chunk_bytes) = self.write_queue.peek_chunk_completed(key) {
+            if self.path_trace_enabled {
+                self.path_trace.write_queue_hits += 1;
+            }
             let mut out = page_pool::alloc();
             let off = page_idx as usize * PAGE_SIZE;
             out.copy_from_slice(&chunk_bytes[off..off + PAGE_SIZE]);
@@ -522,18 +589,34 @@ impl Pager {
         }
         // 3b. ⭐ 异步落盘: 写盘中的 in-flight 快照对读可见
         if let Some(bytes) = self.in_flight.get(&key) {
+            if self.path_trace_enabled {
+                self.path_trace.write_queue_hits += 1;
+            }
             let mut out = page_pool::alloc();
             let off = page_idx as usize * PAGE_SIZE;
             out.copy_from_slice(&bytes[off..off + PAGE_SIZE]);
             return Ok(out);
         }
+        // Clean page cache deliberately comes after every newer write source.
+        // A cache entry can never mask nowchunks/write_queue/in-flight data.
+        if let Some(cached) = self.chunk_list.peek_page(key, page_idx) {
+            let mut out = page_pool::alloc();
+            out.copy_from_slice(&cached[..]);
+            return Ok(out);
+        }
         // 4. chunk_list 命中 (peek 走 LRU 访问)
         let chunk_arc = if self.chunk_list.contains(&key.into()) {
+            if self.path_trace_enabled {
+                self.path_trace.lru_hits += 1;
+            }
             // hit: peek 把 key 移到 front
             self.chunk_list
                 .peek(&key.into())
                 .expect("just checked contains")
         } else {
+            if self.path_trace_enabled {
+                self.path_trace.disk_misses += 1;
+            }
             // miss: 同步读盘
             // ⭐ DIAG: 从磁盘读页 (最后手段) — 对最近写入的页是异常的
             if crate::chunk_writer::diag_enabled() {
@@ -542,9 +625,16 @@ impl Pager {
                      — page not in nowchunks/write_queue/in_flight/chunk_list, reading from disk"
                 );
             }
-            let bytes = self.load_chunk_from_disk(key).await?;
-            self.chunk_list.insert(key.into(), bytes);
-            self.chunk_list.peek(&key.into()).expect("just inserted")
+            let disk_start = self.path_trace_enabled.then(std::time::Instant::now);
+            let bytes = self.io.read_page(&self.block_dir, key, page_idx).await?;
+            if let Some(start) = disk_start {
+                self.path_trace.disk_read_ns += start.elapsed().as_nanos() as u64;
+            }
+            self.chunk_list.admit_page(key, page_idx, &bytes);
+            self.chunk_list.note_page_miss(key, page_idx);
+            let mut out = page_pool::alloc();
+            out.copy_from_slice(&bytes);
+            return Ok(out);
         };
 
         // 5. 切片: chunk 内 page_idx 偏移
@@ -595,14 +685,21 @@ impl Pager {
             return Ok(());
         }
 
+        if let Some(cached) = self.chunk_list.peek_page(key, page_idx) {
+            buf.copy_from_slice(cached);
+            return Ok(());
+        }
+
         let chunk_arc = if self.chunk_list.contains(&key.into()) {
             self.chunk_list
                 .peek(&key.into())
                 .expect("just checked contains")
         } else {
-            let bytes = self.load_chunk_from_disk(key).await?;
-            self.chunk_list.insert(key.into(), bytes);
-            self.chunk_list.peek(&key.into()).expect("just inserted")
+            let bytes = self.io.read_page(&self.block_dir, key, page_idx).await?;
+            self.chunk_list.admit_page(key, page_idx, &bytes);
+            self.chunk_list.note_page_miss(key, page_idx);
+            buf.copy_from_slice(&bytes);
+            return Ok(());
         };
 
         buf.copy_from_slice(&chunk_arc[off..off + PAGE_SIZE]);
@@ -614,6 +711,30 @@ impl Pager {
     /// 内部: read 已经返回 Box, 直接转发.
     pub async fn take_page_for_write(&mut self, vpid: u64) -> io::Result<Box<[u8; PAGE_SIZE]>> {
         self.read(vpid).await
+    }
+
+    /// Yield one background chunk-promotion request, if repeated page misses
+    /// have established locality.  Scheduling and IO completion stay outside
+    /// Pager so this function never blocks a foreground task.
+    pub fn take_chunk_promotion(&mut self) -> Option<ChunkPromotionJob> {
+        self.chunk_list
+            .take_promotion()
+            .map(|key| ChunkPromotionJob {
+                key,
+                dir: self.block_dir.clone(),
+                io: self.io.clone(),
+            })
+    }
+
+    /// Publish a promotion only when no newer write source exists.  Otherwise
+    /// the disk snapshot is stale and must be discarded.
+    pub fn complete_chunk_promotion(&mut self, key: PageKey, result: io::Result<Vec<u8>>) {
+        let has_newer = self.nowchunks.peek_chunk(key).is_some()
+            || self.write_queue.peek_chunk_pending(key).is_some()
+            || self.write_queue.peek_chunk_completed(key).is_some()
+            || self.in_flight.contains_key(&key);
+        self.chunk_list
+            .complete_promotion(key, (!has_newer).then(|| result.ok()).flatten());
     }
 
     /// 创建新 page. 分配 vpid + 走 nowchunks (单 page 也走 batch).
@@ -743,7 +864,8 @@ impl Pager {
                     let off = pidx * PAGE_SIZE;
                     eprintln!(
                         "[DIAG-SWAP-CHECK] page_idx={pidx} magic={:02X?} type={}",
-                        &chunk[off..off+4], chunk[off+4]
+                        &chunk[off..off + 4],
+                        chunk[off + 4]
                     );
                 }
             }
@@ -759,9 +881,7 @@ impl Pager {
         // 旧快照 (缺少后续写入的页) → 全零页 → bad page type.
         self.chunk_list.invalidate(&key.into());
 
-        if self.write_queue.pending_keys().len() + self.in_flight.len()
-            >= MAX_INFLIGHT_CHUNKS
-        {
+        if self.write_queue.pending_keys().len() + self.in_flight.len() >= MAX_INFLIGHT_CHUNKS {
             // 背压: 同步落盘 (不入队). 同 key 若在 in-flight 则仍入队
             // (不能并发写同 offset), 由后续 take_flush_batches 去重处理.
             if self.in_flight.contains_key(&key) {
@@ -781,7 +901,10 @@ impl Pager {
             // 无 shard_manager 反向依赖. shard 端 manager.rs 的
             // maybe_periodic_flush block_on_io_ns 也会捕获到这一步的等待.
             if page::debug::DEBUG_PAGE && page::debug::DEBUG_PAGE_PROBE {
-                eprintln!("[pager_probe] backpressure_sync_write_ns={bp_ns} key={:?}", key);
+                eprintln!(
+                    "[pager_probe] backpressure_sync_write_ns={bp_ns} key={:?}",
+                    key
+                );
             }
             // 旧快照作废 (本次写盘版本 ⊇ pending 旧快照)
             self.write_queue.remove_pending(key);

@@ -13,12 +13,13 @@
 //!
 //! **单线程使用**: per-shard thread, 同 scheduler crate 契约.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crate::types::{DEFAULT_DB_ID, DbId, PageKey};
+use crate::types::{DEFAULT_DB_ID, DbId, PAGE_SIZE, PageKey};
 
 // =====================================================================
 // ChunkKey: (db, file_id, chunk_idx) 标识一个 chunk (T12.9 per-db)
@@ -85,6 +86,167 @@ pub struct ChunkList {
     map: HashMap<ChunkKey, Arc<Vec<u8>>>,
     /// LRU order: front = 最新访问, back = 最旧访问.
     order: VecDeque<ChunkKey>,
+    /// The page tier belongs to the same cache owner as the chunk tier.  A
+    /// page is keyed by physical location, so a COW remap cannot reuse an old
+    /// vpid entry accidentally.
+    pages: PageLru,
+    /// Per-chunk page-miss counters drive asynchronous promotion.  They live
+    /// with both cache tiers so the policy sees page and chunk residency.
+    promotion_misses: HashMap<ChunkKey, PromotionCandidate>,
+    promotion_pending: HashSet<ChunkKey>,
+    promotion_queue: VecDeque<ChunkKey>,
+    last_promotion_start: Option<Instant>,
+    page_miss_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PageCacheKey {
+    chunk: ChunkKey,
+    page_idx: u8,
+}
+
+struct PageEntry {
+    bytes: Box<[u8]>,
+    prev: Option<PageCacheKey>,
+    next: Option<PageCacheKey>,
+}
+
+/// Evidence that a chunk has short-lived spatial locality.  Counting distinct
+/// page slots avoids promoting a chunk merely because one hot page was briefly
+/// evicted from the page tier.
+struct PromotionCandidate {
+    seen_pages: u64,
+    last_seen_epoch: u64,
+}
+
+/// O(1) true LRU for the 16KiB tier.  Keeping this intrusive list here avoids
+/// a second cache owner and avoids `VecDeque::retain` on every page hit.
+struct PageLru {
+    entries: HashMap<PageCacheKey, PageEntry>,
+    most_recent: Option<PageCacheKey>,
+    least_recent: Option<PageCacheKey>,
+    capacity: usize,
+}
+
+impl PageLru {
+    const DEFAULT_PAGES: usize = 2048; // 32MiB per shard
+    const MIN_PAGES: usize = 64;
+    const MAX_PAGES: usize = 16_384;
+
+    fn from_env() -> Self {
+        let requested = std::env::var("NEXUS_PAGE_CACHE_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(Self::DEFAULT_PAGES);
+        // Zero is a supported A/B and emergency-disable setting.  It is also
+        // useful while tuning the unified cache without changing its callers.
+        let capacity = if requested == 0 {
+            0
+        } else {
+            requested.clamp(Self::MIN_PAGES, Self::MAX_PAGES)
+        };
+        Self::new(capacity)
+    }
+
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            most_recent: None,
+            least_recent: None,
+            capacity,
+        }
+    }
+
+    fn get(&mut self, key: PageCacheKey) -> Option<&[u8]> {
+        if !self.entries.contains_key(&key) {
+            return None;
+        }
+        self.promote(key);
+        Some(&self.entries.get(&key).expect("page exists").bytes)
+    }
+
+    fn insert(&mut self, key: PageCacheKey, bytes: &[u8]) {
+        debug_assert_eq!(bytes.len(), PAGE_SIZE);
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.bytes.copy_from_slice(bytes);
+            self.promote(key);
+            return;
+        }
+        if self.entries.len() >= self.capacity {
+            if let Some(victim) = self.least_recent {
+                self.remove(victim);
+            }
+        }
+        let mut cached = vec![0u8; PAGE_SIZE].into_boxed_slice();
+        cached.copy_from_slice(bytes);
+        let old_head = self.most_recent;
+        self.entries.insert(
+            key,
+            PageEntry {
+                bytes: cached,
+                prev: None,
+                next: old_head,
+            },
+        );
+        if let Some(head) = old_head {
+            self.entries.get_mut(&head).expect("head exists").prev = Some(key);
+        } else {
+            self.least_recent = Some(key);
+        }
+        self.most_recent = Some(key);
+    }
+
+    fn remove(&mut self, key: PageCacheKey) {
+        let Some(entry) = self.entries.remove(&key) else {
+            return;
+        };
+        if let Some(prev) = entry.prev {
+            self.entries.get_mut(&prev).expect("prev exists").next = entry.next;
+        } else {
+            self.most_recent = entry.next;
+        }
+        if let Some(next) = entry.next {
+            self.entries.get_mut(&next).expect("next exists").prev = entry.prev;
+        } else {
+            self.least_recent = entry.prev;
+        }
+    }
+
+    fn promote(&mut self, key: PageCacheKey) {
+        if self.most_recent == Some(key) {
+            return;
+        }
+        let (prev, next) = {
+            let entry = self.entries.get(&key).expect("page exists");
+            (entry.prev, entry.next)
+        };
+        if let Some(prev) = prev {
+            self.entries.get_mut(&prev).expect("prev exists").next = next;
+        }
+        if let Some(next) = next {
+            self.entries.get_mut(&next).expect("next exists").prev = prev;
+        } else {
+            self.least_recent = prev;
+        }
+        let old_head = self.most_recent;
+        self.entries.get_mut(&key).expect("page exists").prev = None;
+        self.entries.get_mut(&key).expect("page exists").next = old_head;
+        if let Some(head) = old_head {
+            self.entries.get_mut(&head).expect("head exists").prev = Some(key);
+        }
+        self.most_recent = Some(key);
+    }
+
+    fn remove_chunk(&mut self, chunk: ChunkKey) {
+        // A chunk has exactly 64 pages; bounded invalidation keeps the cache
+        // coherent when a newer stable chunk replaces the old one.
+        for page_idx in 0..64 {
+            self.remove(PageCacheKey { chunk, page_idx });
+        }
+    }
 }
 
 impl ChunkList {
@@ -93,6 +255,132 @@ impl ChunkList {
             capacity,
             map: HashMap::new(),
             order: VecDeque::new(),
+            pages: PageLru::from_env(),
+            promotion_misses: HashMap::new(),
+            promotion_pending: HashSet::new(),
+            promotion_queue: VecDeque::new(),
+            last_promotion_start: None,
+            page_miss_epoch: 0,
+        }
+    }
+
+    /// Page-tier lookup.  The chunk and page tiers share one owner but have
+    /// independent LRU chains because their eviction units differ by 64x.
+    pub fn peek_page(&mut self, key: PageKey, page_idx: u8) -> Option<&[u8]> {
+        self.pages.get(PageCacheKey {
+            chunk: key.into(),
+            page_idx,
+        })
+    }
+
+    /// Admit a page that paid a disk miss.  We do not promote every page from
+    /// a chunk hit: that would turn scans into 16KiB allocations.
+    pub fn admit_page(&mut self, key: PageKey, page_idx: u8, bytes: &[u8]) {
+        self.pages.insert(
+            PageCacheKey {
+                chunk: key.into(),
+                page_idx,
+            },
+            bytes,
+        );
+    }
+
+    /// Update a resident page after an in-place nowchunk overwrite.  Returns
+    /// false for cold pages so random writes do not allocate cache frames.
+    pub fn refresh_page_if_present(&mut self, key: PageKey, page_idx: u8, bytes: &[u8]) -> bool {
+        let page = PageCacheKey {
+            chunk: key.into(),
+            page_idx,
+        };
+        if self.pages.entries.contains_key(&page) {
+            self.pages.insert(page, bytes);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn invalidate_page(&mut self, key: PageKey, page_idx: u8) {
+        self.pages.remove(PageCacheKey {
+            chunk: key.into(),
+            page_idx,
+        });
+    }
+
+    /// Record a page-tier miss.  Candidate age is measured in intervening
+    /// misses rather than wall time: an idle shard keeps useful locality
+    /// evidence, while a busy random workload naturally ages it out.
+    pub fn note_page_miss(&mut self, key: PageKey, page_idx: u8) {
+        let chunk: ChunkKey = key.into();
+        if self.map.contains_key(&chunk) || self.promotion_pending.contains(&chunk) {
+            return;
+        }
+        const MAX_CANDIDATES: usize = 256;
+        let threshold = std::env::var("NEXUS_CHUNK_PROMOTE_MISSES")
+            .ok()
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(4)
+            .clamp(2, 16);
+        let max_gap = std::env::var("NEXUS_CHUNK_PROMOTE_MISS_GAP")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(512)
+            .clamp(32, 65_536);
+        self.page_miss_epoch = self.page_miss_epoch.wrapping_add(1);
+        let epoch = self.page_miss_epoch;
+        if self.promotion_misses.len() >= MAX_CANDIDATES
+            && !self.promotion_misses.contains_key(&chunk)
+        {
+            // Candidates are hints only.  Bounded memory is more important
+            // than retaining ancient random-access history.
+            self.promotion_misses.clear();
+        }
+        let candidate = self
+            .promotion_misses
+            .entry(chunk)
+            .or_insert(PromotionCandidate {
+                seen_pages: 0,
+                last_seen_epoch: epoch,
+            });
+        if epoch.wrapping_sub(candidate.last_seen_epoch) > max_gap {
+            candidate.seen_pages = 0;
+        }
+        candidate.seen_pages |= 1u64 << page_idx;
+        candidate.last_seen_epoch = epoch;
+        if candidate.seen_pages.count_ones() >= threshold as u32 {
+            self.promotion_misses.remove(&chunk);
+            self.promotion_pending.insert(chunk);
+            self.promotion_queue.push_back(chunk);
+        }
+    }
+
+    pub fn take_promotion(&mut self) -> Option<PageKey> {
+        let min_interval = Duration::from_millis(
+            std::env::var("NEXUS_CHUNK_PROMOTE_MIN_INTERVAL_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(25)
+                .clamp(1, 1_000),
+        );
+        if self
+            .last_promotion_start
+            .is_some_and(|last| last.elapsed() < min_interval)
+        {
+            return None;
+        }
+        let key = self.promotion_queue.pop_front()?;
+        self.last_promotion_start = Some(Instant::now());
+        Some(key.into())
+    }
+
+    pub fn complete_promotion(&mut self, key: PageKey, chunk: Option<Vec<u8>>) {
+        let chunk_key: ChunkKey = key.into();
+        self.promotion_pending.remove(&chunk_key);
+        if self.map.contains_key(&chunk_key) {
+            return;
+        }
+        if let Some(bytes) = chunk {
+            self.insert(chunk_key, bytes);
         }
     }
 
@@ -160,6 +448,8 @@ impl ChunkList {
             self.map.remove(&victim);
         }
         self.map.insert(key, Arc::new(chunk));
+        self.promotion_misses.remove(&key);
+        self.promotion_pending.remove(&key);
         self.order.push_front(key);
     }
 
@@ -178,6 +468,7 @@ impl ChunkList {
         // 强制覆盖: 不论 key 是否已存在, 都替换为新 chunk 字节
         if let std::collections::hash_map::Entry::Occupied(mut e) = self.map.entry(ck) {
             e.insert(Arc::new(chunk));
+            self.pages.remove_chunk(ck);
             self.order.retain(|k| k != &ck);
             self.order.push_front(ck);
             return;
@@ -189,6 +480,9 @@ impl ChunkList {
             self.map.remove(&victim);
         }
         self.map.insert(ck, Arc::new(chunk));
+        self.promotion_misses.remove(&ck);
+        self.promotion_pending.remove(&ck);
+        self.pages.remove_chunk(ck);
         self.order.push_front(ck);
     }
 
@@ -234,6 +528,9 @@ impl ChunkList {
     pub fn invalidate(&mut self, key: &ChunkKey) {
         self.map.remove(key);
         self.order.retain(|k| k != key);
+        self.pages.remove_chunk(*key);
+        self.promotion_misses.remove(key);
+        self.promotion_pending.remove(key);
     }
 }
 
@@ -263,6 +560,43 @@ mod tests {
         assert_eq!(pk.chunk_idx, 3);
         let ck2: ChunkKey = pk.into();
         assert_eq!(ck, ck2);
+    }
+
+    #[test]
+    fn page_tier_promotes_hot_page_and_evicts_lru() {
+        let mut pages = PageLru::new(2);
+        let a = PageCacheKey {
+            chunk: PageKey {
+                file_id: 1,
+                chunk_idx: 0,
+            }
+            .into(),
+            page_idx: 0,
+        };
+        let b = PageCacheKey {
+            chunk: PageKey {
+                file_id: 2,
+                chunk_idx: 0,
+            }
+            .into(),
+            page_idx: 0,
+        };
+        let c = PageCacheKey {
+            chunk: PageKey {
+                file_id: 3,
+                chunk_idx: 0,
+            }
+            .into(),
+            page_idx: 0,
+        };
+        let page = vec![7u8; PAGE_SIZE];
+        pages.insert(a, &page);
+        pages.insert(b, &page);
+        assert!(pages.get(a).is_some());
+        pages.insert(c, &page);
+        assert!(pages.get(a).is_some());
+        assert!(pages.get(b).is_none());
+        assert!(pages.get(c).is_some());
     }
 
     #[test]

@@ -230,19 +230,53 @@ p99.9 15.295ms；维护轮平均 29.8us，`backpressure_fallbacks=0`、in-flight
 - 仅将 meta admission 进一步推迟到无前台 backlog 的窗口；WAL tick 仍按 deadline 必达。
 - 将 compact read/write 移至独立低优先级 budget，避免与 data completion 同轮竞争。
 
-### M4 实验：FIFO 前台时间片轮换（默认关闭）
+### M4 实验：仅慢 task 的 FIFO 轮换（默认关闭）
 
-- [x] `NEXUS_FAIR_TURN_BUDGET_US=N`（50--10000us）只在完整 `ShardTask` 的边界切轮；未执行的
-  FIFO 后缀保存在 shard 本地 deferred 队列，并且在下一轮优先服务，不允许新入队任务越过它。
+- [x] `NEXUS_FAIR_TURN_BUDGET_US=N`（50--10000us）仅在**上一项 task 自身**超过 N 后、下一个
+  `ShardTask` 的边界切轮；未执行的 FIFO 后缀保存在 shard 本地 deferred 队列，并且在下一轮优先
+  服务，不允许新入队任务越过它。多个正常小 task 的累计时间不再触发轮换。
 - [x] 记录 `task_turn_budget_cuts`。不在单个 task 中抢占，Put micro-batch 与 strict WAL barrier 仍保持
   原子完成，因而不改变同 shard 的顺序或回复语义。
 - [x] 初步结果（off、10 秒 overwrite、三轮、500us）：182.4K/167.1K/120.3K ops/s，p99.9 为
   14.015/10.879/16.127ms，轮换 82,955 次，TaskInbox 平均等待 0.682ms。相对未启用时间片的
   191.1K/191.8K/131.3K ops/s，p99.9 14.271/11.903/19.327ms，队列等待虽下降但吞吐中位数约低
   12.6%，p99.9 中位数没有确定改善。
-- [ ] 结论：暂不启用为默认。它证明长轮次可以在不重排 FIFO 的前提下被打散，但当前每次额外轮换都要
-  运行 maintenance/scheduler，收益被开销抵消。若后续需要回退，删除该环境开关和 deferred 队列即可；
+- [ ] 当前结论：暂不启用为默认。原始按轮累计时间片会频繁运行 maintenance/scheduler，收益被开销
+  抵消；现改为仅慢 task 触发，并增加 `shard_put_run_exec_ns` 辨别连续 PUT 微批是否为真实长任务。
   默认值为关闭，不影响当前产品路径。
+- [x] 仅慢 task 复测（同口径、500us）：189.2K/172.1K/116.8K ops/s，p99.9 为
+  14.911/11.263/17.279ms，轮换仅 760 次（原累计时间片为 82,955 次）。轮换开销已消除，但
+  p99.9 中位数未优于对照；`shard_put_run_exec_ns` 无样本，说明标准 overwrite 没有启用 PUT
+  微批。结论是该机制只能在慢 task **之后**保护其 FIFO 后缀，不能减少慢 task 自身的执行时间；
+  真正的下一步应为可恢复的范围扫描/批量复合命令分段，而不是继续调时间阈值。
+
+### M5 诊断：慢 Put 路径分解
+
+- [x] `NLOG_PROBE=1` 下将单 Put 分为 open-table、B-tree、WAL append、root-update 四段。
+  4 worker/4 shard、100K 预载、10 秒 overwrite 的一次复现为 183.7K ops/s、p99.9 12.607ms。
+- [x] 结论：1,937,107 个 Put 中，open-table 平均 104ns、WAL 28ns、root-update 28ns；仅 4 次
+  root split。B-tree 平均 15.250us，却包含全部 task 的 10--50ms 尾部（37 次超过 10ms、2 次
+  超过 50ms）。因此慢 task 是 B-tree 读改写路径，而非 flush admission、WAL 或目录更新。
+- [ ] 下一层：把 B-tree 再拆为寻叶、leaf update/index、PageWriteBatch/Chunk 驻留加载；尤其验证
+  随机覆盖在 8-chunk LRU 下的 chunk cache miss 是否让 `block_on_io` 在 shard 单线程内等待整块读取。
+
+### M6 诊断结论：随机覆盖的整 chunk 驻留 miss
+
+- [x] 页来源探针确认上述假设。10 秒、100K 预载、随机 overwrite 中，1,238,898 个 Put 产生
+  1,224,187 次 LRU hit、862,992 次 nowchunks hit、372,997 次 write-queue hit，另有 **17,534 次
+  disk miss** 和 36 次写入时的 chunk 驻留重建读取；累计整 chunk 读取耗时 **2.049s**。
+- [x] 根因：Pager 的 miss 以 1MB chunk 为单位加载。随机覆盖的 B-tree 寻叶跨越的叶页工作集大于
+  8-chunk LRU，miss 在 `block_on_io(table_put)` 的 shard 单线程内完成；单次 miss 即使命中 OS
+  page cache，仍要读取/分配/拷贝整块，偶发慢读会让该 shard 后续 FIFO 请求整体排队。
+- [x] 优化：实现统一读缓存（物理页的 O(1) LRU + chunk LRU）。clean page miss 先读取 16KB
+  并填页层；同一 chunk 累积 4 次 miss 后，调度器在低优先级空闲轮异步读取 1MB chunk 并提升到
+  chunk 层。写缓冲仍优先；提升完成时若 nowchunks/WriteQueue/in-flight 已有新版本则丢弃旧快照。
+- [x] 首轮验收（4 worker/4 shard、100K 预载、pipeline=16、10 秒 overwrite、wal=off）：
+  **201.4K ops/s**、p99 **6.143ms**、p99.9 **13.631ms**。相对页缓存 A/B 前的约 109--120K
+  ops/s，吞吐提升 68--85%；证明随机 miss 的 1MB 读放大是主要可优化成本。
+- [x] 混合复验（同配置、SET:GET=1:1、10 秒）：**234.8K ops/s**（SET/GET 各约 117.4K），
+  p99 **8.127ms**、p99.9 **27.519ms**。吞吐符合历史方向性基线；混合 p99.9 仍需以三轮中位数
+  与 page-cache-disabled 对照确认，不能用单轮结果宣称长尾已完全解决。
 
 ### 目标
 
