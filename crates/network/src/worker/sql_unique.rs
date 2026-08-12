@@ -72,7 +72,12 @@ pub(crate) fn sql_unique_ins_start(
         push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
         conn.sql_dml_agg.insert(
             seq,
-            SqlDmlAgg { remaining: 1, affected: 0, error: None, drop_key: None },
+            SqlDmlAgg {
+                remaining: 1,
+                affected: 0,
+                error: None,
+                drop_key: None,
+            },
         );
         return;
     }
@@ -100,7 +105,17 @@ pub(crate) fn sql_unique_ins_start(
         pk,
         txn_id,
     };
-    push_unique_op(conn_id, seq, worker_id, db, &tbl, op, &first.1, num_shards, shard_inboxes);
+    push_unique_op(
+        conn_id,
+        seq,
+        worker_id,
+        db,
+        &tbl,
+        op,
+        &first.1,
+        num_shards,
+        shard_inboxes,
+    );
 }
 
 /// ⭐ F65: 占坑状态机推进 (在 handle_resp_shard_result 内命中 seq 时调).
@@ -159,7 +174,17 @@ pub(crate) fn sql_unique_drive(
                         pk,
                         txn_id: txn,
                     };
-                    push_unique_op(conn_id, seq, worker_id, &db, &tbl, op, &enc, num_shards, shard_inboxes);
+                    push_unique_op(
+                        conn_id,
+                        seq,
+                        worker_id,
+                        &db,
+                        &tbl,
+                        op,
+                        &enc,
+                        num_shards,
+                        shard_inboxes,
+                    );
                 } else {
                     // 全部 reserve 完→写行
                     st.phase = UniquePhase::Write;
@@ -174,7 +199,9 @@ pub(crate) fn sql_unique_drive(
                     push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
                 }
             }
-            BatchResult::ReserveConflict { state, holder_pk, .. } => {
+            BatchResult::ReserveConflict {
+                state, holder_pk, ..
+            } => {
                 if *state == 2 {
                     // COMMITTED 冲突 → Verify: 回查持有者行是否真存在
                     st.phase = UniquePhase::Verify;
@@ -217,7 +244,17 @@ pub(crate) fn sql_unique_drive(
                     pk,
                     txn_id: txn,
                 };
-                push_unique_op(conn_id, seq, worker_id, &db, &tbl, op, &enc, num_shards, shard_inboxes);
+                push_unique_op(
+                    conn_id,
+                    seq,
+                    worker_id,
+                    &db,
+                    &tbl,
+                    op,
+                    &enc,
+                    num_shards,
+                    shard_inboxes,
+                );
             }
         }
         UniquePhase::Write => match result {
@@ -237,7 +274,17 @@ pub(crate) fn sql_unique_drive(
                     pk,
                     txn_id: txn,
                 };
-                push_unique_op(conn_id, seq, worker_id, &db, &tbl, op, &enc, num_shards, shard_inboxes);
+                push_unique_op(
+                    conn_id,
+                    seq,
+                    worker_id,
+                    &db,
+                    &tbl,
+                    op,
+                    &enc,
+                    num_shards,
+                    shard_inboxes,
+                );
             }
             BatchResult::Error(e) => rollback_and_err(conn, &st, e.clone()),
             _ => rollback_and_err(conn, &st, "unexpected rowput reply".into()),
@@ -258,7 +305,17 @@ pub(crate) fn sql_unique_drive(
                     pk,
                     txn_id: txn,
                 };
-                push_unique_op(conn_id, seq, worker_id, &db, &tbl, op, &enc, num_shards, shard_inboxes);
+                push_unique_op(
+                    conn_id,
+                    seq,
+                    worker_id,
+                    &db,
+                    &tbl,
+                    op,
+                    &enc,
+                    num_shards,
+                    shard_inboxes,
+                );
             } else {
                 let bin = conn.mysql_binary.remove(&seq);
                 let _ = bin;
@@ -270,11 +327,20 @@ pub(crate) fn sql_unique_drive(
 }
 
 /// ⭐ F65: 判断 row 字节的指定 iid 列值是否等于 enc_val (Verify 用).
-pub(crate) fn row_has_index_val(schema: &TableSchema, row: &[u8], iid: u32, enc_val: &[u8]) -> bool {
+pub(crate) fn row_has_index_val(
+    schema: &TableSchema,
+    row: &[u8],
+    iid: u32,
+    enc_val: &[u8],
+) -> bool {
     let Ok(values) = storage::row::decode_row(schema, row) else {
         return false;
     };
-    schema.indexes.iter().find(|i| i.iid == iid).is_some_and(|idx| {
-        storage::sql_rows::index_vals_bytes(schema, idx, &values).is_some_and(|e| e == enc_val)
-    })
+    schema
+        .indexes
+        .iter()
+        .find(|i| i.iid == iid)
+        .is_some_and(|idx| {
+            storage::sql_rows::index_vals_bytes(schema, idx, &values).is_some_and(|e| e == enc_val)
+        })
 }

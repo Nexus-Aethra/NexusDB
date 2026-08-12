@@ -559,6 +559,19 @@ pub(crate) fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
     p.kw("ALTER")?;
     p.kw("TABLE")?;
     let table = p.table_ident()?;
+    if p.try_kw("SET") {
+        p.kw("RESP")?;
+        p.kw("ADAPTER")?;
+        let enabled = if p.try_kw("ON") {
+            true
+        } else if p.try_kw("OFF") {
+            false
+        } else {
+            return Err("ALTER TABLE ... SET RESP ADAPTER requires ON or OFF".into());
+        };
+        p.done()?;
+        return Ok(SqlStmt::SetRespRowAdapter { table, enabled });
+    }
     if p.try_kw("DROP") {
         p.try_kw("COLUMN"); // 可选
         let name = p.ident()?;

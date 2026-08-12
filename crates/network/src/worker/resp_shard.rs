@@ -18,6 +18,322 @@ pub(crate) fn handle_resp_shard_result(
     num_shards: usize,
 ) {
     let codec = RespCodec::new();
+    // RESP→SQL 行适配的 schema miss 续跑。未建 schema / 非 SQL 表必须原样
+    // 回落到 Hash op，而不是把普通 `table:key:subkey` 误判成错误。
+    if let Some(pending) = conn.resp_sql_pending_hget.remove(&seq) {
+        match result {
+            BatchResult::GetValue(Some(bytes)) => match TableSchema::decode(bytes) {
+                Ok(schema) => {
+                    let schema = std::sync::Arc::new(schema);
+                    conn.sql_cache.borrow_mut().schemas.insert(
+                        (pending.db.to_string(), pending.table.clone()),
+                        schema.clone(),
+                    );
+                    resp_sql_hget_with_schema(
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        pending.db,
+                        pending.table,
+                        pending.pk_literal,
+                        pending.fields,
+                        pending.mode,
+                        pending.fallback,
+                        schema,
+                        shard_inboxes,
+                        num_shards,
+                    );
+                    // 当前处在 reply 回调而非 socket read 尾部；若续跑产生了
+                    // RowGet/fallback，需立即冲刷 RESP 的延迟投递队列。
+                    conn.flush_resp_tasks(shard_inboxes);
+                }
+                Err(e) => {
+                    conn.resp_complete(seq, codec.encode_error(&format!("bad SQL schema: {e}")))
+                }
+            },
+            // 无 schema = 原生 KV 表；保留既有 Hash 语义。
+            BatchResult::GetValue(None) => {
+                push_task(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    pending.fallback,
+                    shard_inboxes,
+                    num_shards,
+                );
+                conn.flush_resp_tasks(shard_inboxes);
+            }
+            BatchResult::Error(e) => conn.resp_complete(seq, codec.encode_error(e)),
+            _ => conn.resp_complete(seq, codec.encode_error("unexpected schema reply")),
+        }
+        return;
+    }
+    if let Some(pending) = conn.resp_sql_pending_hset.remove(&seq) {
+        match result {
+            BatchResult::GetValue(Some(bytes)) => match TableSchema::decode(bytes) {
+                Ok(schema) => {
+                    let schema = std::sync::Arc::new(schema);
+                    conn.sql_cache.borrow_mut().schemas.insert(
+                        (pending.db.to_string(), pending.table.clone()),
+                        schema.clone(),
+                    );
+                    resp_sql_hset_with_schema(
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        pending.db,
+                        pending.table,
+                        pending.pk_literal,
+                        pending.pairs,
+                        pending.reply_ok,
+                        pending.fallback,
+                        schema,
+                        shard_inboxes,
+                        num_shards,
+                    );
+                    conn.flush_resp_tasks(shard_inboxes);
+                }
+                Err(e) => {
+                    conn.resp_complete(seq, codec.encode_error(&format!("bad SQL schema: {e}")))
+                }
+            },
+            BatchResult::GetValue(None) => {
+                push_task(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    pending.fallback,
+                    shard_inboxes,
+                    num_shards,
+                );
+                conn.flush_resp_tasks(shard_inboxes);
+            }
+            BatchResult::Error(e) => conn.resp_complete(seq, codec.encode_error(e)),
+            _ => conn.resp_complete(seq, codec.encode_error("unexpected schema reply")),
+        }
+        return;
+    }
+    if let Some(pending) = conn.resp_sql_pending_hdel.remove(&seq) {
+        match result {
+            BatchResult::GetValue(Some(bytes)) => match TableSchema::decode(bytes) {
+                Ok(schema) => {
+                    let schema = std::sync::Arc::new(schema);
+                    conn.sql_cache.borrow_mut().schemas.insert(
+                        (pending.db.to_string(), pending.table.clone()),
+                        schema.clone(),
+                    );
+                    resp_sql_hdel_with_schema(
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        pending.db,
+                        pending.table,
+                        pending.pk_literal,
+                        pending.fields,
+                        pending.fallback,
+                        schema,
+                        shard_inboxes,
+                        num_shards,
+                    );
+                    conn.flush_resp_tasks(shard_inboxes);
+                }
+                Err(e) => {
+                    conn.resp_complete(seq, codec.encode_error(&format!("bad SQL schema: {e}")))
+                }
+            },
+            BatchResult::GetValue(None) => {
+                push_task(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    pending.fallback,
+                    shard_inboxes,
+                    num_shards,
+                );
+                conn.flush_resp_tasks(shard_inboxes);
+            }
+            BatchResult::Error(e) => conn.resp_complete(seq, codec.encode_error(e)),
+            _ => conn.resp_complete(seq, codec.encode_error("unexpected schema reply")),
+        }
+        return;
+    }
+    if let Some(pending) = conn.resp_sql_pending_hsetnx.remove(&seq) {
+        match result {
+            BatchResult::GetValue(Some(bytes)) => match TableSchema::decode(bytes) {
+                Ok(schema) => {
+                    let schema = std::sync::Arc::new(schema);
+                    conn.sql_cache.borrow_mut().schemas.insert(
+                        (pending.db.to_string(), pending.table.clone()),
+                        schema.clone(),
+                    );
+                    resp_sql_hsetnx_with_schema(
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        pending.db,
+                        pending.table,
+                        pending.pk_literal,
+                        pending.field,
+                        pending.value,
+                        pending.fallback,
+                        schema,
+                        shard_inboxes,
+                        num_shards,
+                    );
+                    conn.flush_resp_tasks(shard_inboxes);
+                }
+                Err(e) => {
+                    conn.resp_complete(seq, codec.encode_error(&format!("bad SQL schema: {e}")))
+                }
+            },
+            BatchResult::GetValue(None) => {
+                push_task(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    pending.fallback,
+                    shard_inboxes,
+                    num_shards,
+                );
+                conn.flush_resp_tasks(shard_inboxes);
+            }
+            BatchResult::Error(e) => conn.resp_complete(seq, codec.encode_error(e)),
+            _ => conn.resp_complete(seq, codec.encode_error("unexpected schema reply")),
+        }
+        return;
+    }
+    if let Some(pending) = conn.resp_sql_pending_delete.remove(&seq) {
+        match result {
+            BatchResult::GetValue(Some(bytes)) => match TableSchema::decode(bytes) {
+                Ok(schema) => {
+                    let schema = std::sync::Arc::new(schema);
+                    conn.sql_cache.borrow_mut().schemas.insert(
+                        (pending.db.to_string(), pending.table.clone()),
+                        schema.clone(),
+                    );
+                    resp_sql_delete_with_schema(
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        pending.db,
+                        pending.table,
+                        pending.pk_literal,
+                        pending.fallback,
+                        schema,
+                        shard_inboxes,
+                        num_shards,
+                    );
+                    conn.flush_resp_tasks(shard_inboxes);
+                }
+                Err(e) => {
+                    conn.resp_complete(seq, codec.encode_error(&format!("bad SQL schema: {e}")))
+                }
+            },
+            BatchResult::GetValue(None) => {
+                push_task(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    pending.fallback,
+                    shard_inboxes,
+                    num_shards,
+                );
+                conn.flush_resp_tasks(shard_inboxes);
+            }
+            BatchResult::Error(e) => conn.resp_complete(seq, codec.encode_error(e)),
+            _ => conn.resp_complete(seq, codec.encode_error("unexpected schema reply")),
+        }
+        return;
+    }
+    if let Some(pending) = conn.resp_sql_pending_incr.remove(&seq) {
+        match result {
+            BatchResult::GetValue(Some(bytes)) => match TableSchema::decode(bytes) {
+                Ok(schema) => {
+                    let schema = std::sync::Arc::new(schema);
+                    conn.sql_cache.borrow_mut().schemas.insert(
+                        (pending.db.to_string(), pending.table.clone()),
+                        schema.clone(),
+                    );
+                    resp_sql_incr_with_schema(
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        pending.db,
+                        pending.table,
+                        pending.pk_literal,
+                        pending.field,
+                        pending.delta,
+                        pending.fallback,
+                        schema,
+                        shard_inboxes,
+                        num_shards,
+                    );
+                    conn.flush_resp_tasks(shard_inboxes);
+                }
+                Err(e) => {
+                    conn.resp_complete(seq, codec.encode_error(&format!("bad SQL schema: {e}")))
+                }
+            },
+            BatchResult::GetValue(None) => {
+                push_task(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    pending.fallback,
+                    shard_inboxes,
+                    num_shards,
+                );
+                conn.flush_resp_tasks(shard_inboxes);
+            }
+            BatchResult::Error(e) => conn.resp_complete(seq, codec.encode_error(e)),
+            _ => conn.resp_complete(seq, codec.encode_error("unexpected schema reply")),
+        }
+        return;
+    }
+    // SQL RowGet 回包 → RESP HGET 的 field 投影。此处不走 SQL wire 渲染，
+    // 避免额外结果集编码/解析，也保持 nil 与 Redis 一致。
+    if let Some(ctx) = conn.resp_sql_hget.remove(&seq) {
+        let bytes = match result {
+            BatchResult::GetValue(Some(row)) => match storage::row::decode_row(&ctx.schema, row) {
+                Ok(values) => {
+                    resp_sql_project_reply(&codec, &ctx.schema, &values, &ctx.fields, ctx.mode)
+                }
+                Err(e) => codec.encode_error(&e.to_string()),
+            },
+            BatchResult::GetValue(None) => resp_sql_missing_reply(&codec, &ctx),
+            BatchResult::Error(e) => codec.encode_error(e),
+            _ => codec.encode_error("unexpected SQL row reply"),
+        };
+        conn.resp_complete(seq, bytes);
+        return;
+    }
+    if let Some(ctx) = conn.resp_sql_hset.remove(&seq) {
+        let bytes = match result {
+            BatchResult::Integer(added) => {
+                if ctx.reply_ok {
+                    codec.encode_ok()
+                } else {
+                    codec.encode_integer(*added)
+                }
+            }
+            BatchResult::Error(e) => codec.encode_error(e),
+            _ => codec.encode_error("unexpected SQL row patch reply"),
+        };
+        conn.resp_complete(seq, bytes);
+        return;
+    }
     // ⭐ H2: HTTP KV 回包渲染 (seq 簿记, 与 SQL 钩子互斥)
     if let Some(ctx) = conn.http_ctx.remove(&seq) {
         use crate::protocol::http as h;
@@ -41,8 +357,8 @@ pub(crate) fn handle_resp_shard_result(
                         }),
                     },
                 };
-                let body = serde_json::to_vec(&serde_json::json!({ "value": val }))
-                    .unwrap_or_default();
+                let body =
+                    serde_json::to_vec(&serde_json::json!({ "value": val })).unwrap_or_default();
                 h::build_response(200, &body, cors, ctx.keep_alive)
             }
             (HttpKvOp::Get, BatchResult::GetValue(None)) => {
@@ -52,13 +368,12 @@ pub(crate) fn handle_resp_shard_result(
                 h::build_response(200, br#"{"ok":true}"#, cors, ctx.keep_alive)
             }
             (HttpKvOp::Delete, BatchResult::DeleteExisted(b)) => {
-                let body = serde_json::to_vec(&serde_json::json!({ "deleted": b }))
-                    .unwrap_or_default();
+                let body =
+                    serde_json::to_vec(&serde_json::json!({ "deleted": b })).unwrap_or_default();
                 h::build_response(200, &body, cors, ctx.keep_alive)
             }
             (_, BatchResult::Error(e)) => {
-                crate::metrics::HTTP_ERRORS
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::HTTP_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 h::build_response(500, &h::error_body(e), cors, ctx.keep_alive)
             }
             _ => h::build_response(
@@ -72,7 +387,15 @@ pub(crate) fn handle_resp_shard_result(
         return;
     }
     // ⭐ F65: 全局 UNIQUE 占坑状态机推进 (优先于其他聚合器)
-    if sql_unique_drive(conn, conn_id, seq, worker_id, result, shard_inboxes, num_shards) {
+    if sql_unique_drive(
+        conn,
+        conn_id,
+        seq,
+        worker_id,
+        result,
+        shard_inboxes,
+        num_shards,
+    ) {
         return;
     }
     // ⭐ F66: 系统表 CatalogDump 回调 → 合成虚拟表
@@ -83,9 +406,7 @@ pub(crate) fn handle_resp_shard_result(
                 // decode schema 字节 (跳过坏的)
                 let decoded: Vec<(String, TableSchema)> = entries
                     .iter()
-                    .filter_map(|(t, b)| {
-                        TableSchema::decode(b).ok().map(|s| (t.clone(), s))
-                    })
+                    .filter_map(|(t, b)| TableSchema::decode(b).ok().map(|s| (t.clone(), s)))
                     .collect();
                 sysq_render_catalog(conn.proto, bin, &spec, &conn.current_db.clone(), &decoded)
             }
@@ -96,7 +417,16 @@ pub(crate) fn handle_resp_shard_result(
         return;
     }
     // ⭐ F67 (JOIN): 两表 hash join 状态机推进 (schema 拉取 / 两轮 gather / 完成点)
-    if sql_join_drive(conn, conn_id, seq, worker_id, group, result, shard_inboxes, num_shards) {
+    if sql_join_drive(
+        conn,
+        conn_id,
+        seq,
+        worker_id,
+        group,
+        result,
+        shard_inboxes,
+        num_shards,
+    ) {
         return;
     }
     // ⭐ portal: PG 扩展协议 Parse 挂起 (等 schema) 的续跑 — GetSchemaOp 回包到达后
@@ -136,8 +466,15 @@ pub(crate) fn handle_resp_shard_result(
                         .schemas
                         .insert((pending.db.to_string(), pending.table), schema.clone());
                     sql_run_dml(
-                        conn, conn_id, seq, worker_id, &pending.db, shard_inboxes, num_shards,
-                        schema, pending.stmt,
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        &pending.db,
+                        shard_inboxes,
+                        num_shards,
+                        schema,
+                        pending.stmt,
                     );
                 }
                 Err(e) => {
@@ -145,15 +482,25 @@ pub(crate) fn handle_resp_shard_result(
                 }
             },
             BatchResult::GetValue(None) => {
+                if conn.resp_hquery.remove(&seq).is_some() {
+                    conn.resp_complete(seq, codec.encode_error("HQUERY table has no SQL schema"));
+                    return;
+                }
                 conn.resp_complete(
                     seq,
-                    sql_err_bytes(conn.proto, &format!(
-                        "table '{}' has no schema (not a SQL table)",
-                        pending.table
-                    )),
+                    sql_err_bytes(
+                        conn.proto,
+                        &format!("table '{}' has no schema (not a SQL table)", pending.table),
+                    ),
                 );
             }
+            BatchResult::Error(e) if conn.resp_hquery.remove(&seq).is_some() => {
+                conn.resp_complete(seq, codec.encode_error(e))
+            }
             BatchResult::Error(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, e)),
+            _ if conn.resp_hquery.remove(&seq).is_some() => {
+                conn.resp_complete(seq, codec.encode_error("unexpected HQUERY schema reply"))
+            }
             _ => conn.resp_complete(seq, sql_err_bytes(conn.proto, "unexpected schema reply")),
         }
         return;
@@ -181,7 +528,9 @@ pub(crate) fn handle_resp_shard_result(
                         for (ci, sv) in &ctx.ryow_overlay {
                             let nv = match sv {
                                 storage::row::SetVal::Val(cv) => cv.clone(),
-                                storage::row::SetVal::Expr(e) => storage::row::eval_row_expr(e, &values),
+                                storage::row::SetVal::Expr(e) => {
+                                    storage::row::eval_row_expr(e, &values)
+                                }
                             };
                             if let Some(slot) = values.get_mut(*ci as usize) {
                                 *slot = nv;
@@ -195,11 +544,23 @@ pub(crate) fn handle_resp_shard_result(
                             } else if ctx.count {
                                 vec![vec![ColValue::I64(1)]]
                             } else {
-                                vec![ctx.proj.iter().map(|&i| values[i as usize].clone()).collect()]
+                                vec![
+                                    ctx.proj
+                                        .iter()
+                                        .map(|&i| values[i as usize].clone())
+                                        .collect(),
+                                ]
                             };
                             sql_subq_advance(
-                                conn, conn_id, seq, worker_id, default_db, db_view,
-                                shard_inboxes, num_shards, captured,
+                                conn,
+                                conn_id,
+                                seq,
+                                worker_id,
+                                default_db,
+                                db_view,
+                                shard_inboxes,
+                                num_shards,
+                                captured,
                             );
                             return;
                         }
@@ -207,21 +568,64 @@ pub(crate) fn handle_resp_shard_result(
                         if conn.sql_derived.contains_key(&seq) {
                             let (cols, captured) = derived_capture_rowctx(&ctx, hit, &values);
                             finish_derived(
-                                conn, conn_id, seq, worker_id, bin, shard_inboxes, num_shards,
-                                cols, captured,
+                                conn,
+                                conn_id,
+                                seq,
+                                worker_id,
+                                bin,
+                                shard_inboxes,
+                                num_shards,
+                                cols,
+                                captured,
                             );
+                            return;
+                        }
+                        if conn.resp_hquery.remove(&seq).is_some() {
+                            let rows = if hit {
+                                vec![
+                                    ctx.proj
+                                        .iter()
+                                        .map(|&i| values[i as usize].clone())
+                                        .collect(),
+                                ]
+                            } else {
+                                Vec::new()
+                            };
+                            let cols: Vec<(String, ColType)> = ctx
+                                .proj
+                                .iter()
+                                .map(|&i| {
+                                    let c = &ctx.schema.columns[i as usize];
+                                    (c.name.clone(), c.ty)
+                                })
+                                .collect();
+                            conn.resp_complete(seq, resp_hquery_rows(&codec, &cols, &rows));
                             return;
                         }
                         if hit {
                             if ctx.count {
                                 render_sql_count(conn.proto, bin, 1)
                             } else {
-                                render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &ctx.out_names, &[values])
+                                render_sql_rows(
+                                    conn.proto,
+                                    bin,
+                                    &ctx.schema,
+                                    &ctx.proj,
+                                    &ctx.out_names,
+                                    &[values],
+                                )
                             }
                         } else if ctx.count {
                             render_sql_count(conn.proto, bin, 0)
                         } else {
-                            render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &ctx.out_names, &[])
+                            render_sql_rows(
+                                conn.proto,
+                                bin,
+                                &ctx.schema,
+                                &ctx.proj,
+                                &ctx.out_names,
+                                &[],
+                            )
                         }
                     }
                     Err(e) => sql_err_bytes(conn.proto, &e.to_string()),
@@ -229,11 +633,21 @@ pub(crate) fn handle_resp_shard_result(
             }
             BatchResult::GetValue(None) if conn.sql_subq.contains_key(&seq) => {
                 // ⭐ F71: 内层子查询空结果
-                let captured: Vec<Vec<ColValue>> =
-                    if ctx.count { vec![vec![ColValue::I64(0)]] } else { vec![] };
+                let captured: Vec<Vec<ColValue>> = if ctx.count {
+                    vec![vec![ColValue::I64(0)]]
+                } else {
+                    vec![]
+                };
                 sql_subq_advance(
-                    conn, conn_id, seq, worker_id, default_db, db_view, shard_inboxes,
-                    num_shards, captured,
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    captured,
                 );
                 return;
             }
@@ -241,12 +655,25 @@ pub(crate) fn handle_resp_shard_result(
                 // ⭐ F72: 派生表内层空结果
                 let (cols, captured) = derived_capture_rowctx(&ctx, false, &[]);
                 finish_derived(
-                    conn, conn_id, seq, worker_id, bin, shard_inboxes, num_shards, cols, captured,
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    bin,
+                    shard_inboxes,
+                    num_shards,
+                    cols,
+                    captured,
                 );
                 return;
             }
+            BatchResult::GetValue(None) if conn.resp_hquery.remove(&seq).is_some() => {
+                b"*0\r\n".to_vec()
+            }
             BatchResult::GetValue(None) if ctx.count => render_sql_count(conn.proto, bin, 0),
-            BatchResult::GetValue(None) => render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &ctx.out_names, &[]),
+            BatchResult::GetValue(None) => {
+                render_sql_rows(conn.proto, bin, &ctx.schema, &ctx.proj, &ctx.out_names, &[])
+            }
             BatchResult::Error(e) => sql_err_bytes(conn.proto, e),
             _ => sql_err_bytes(conn.proto, "unexpected reply"),
         };
@@ -257,6 +684,7 @@ pub(crate) fn handle_resp_shard_result(
     if conn.sql_select_agg.contains_key(&seq) {
         let proto = conn.proto;
         let bin = conn.mysql_binary.contains(&seq); // ⭐ P2 (借用前 peek)
+        let is_hquery = conn.resp_hquery.contains_key(&seq);
         // ⭐ F71: 此 agg 属内层子查询 → 完成时 materialize 行集而非渲染
         let is_subq_inner = conn.sql_subq.contains_key(&seq);
         // ⭐ F72: 此 agg 属派生表内层 → 完成时物化 (列定义+行集) 交 finish_derived
@@ -264,9 +692,14 @@ pub(crate) fn handle_resp_shard_result(
         enum Fire {
             No,
             Reply(Vec<u8>),
-            Dml { pks: Vec<Vec<u8>>, action: SqlDmlAction, target: (std::sync::Arc<str>, String) },
+            Dml {
+                pks: Vec<Vec<u8>>,
+                action: SqlDmlAction,
+                target: (std::sync::Arc<str>, String),
+            },
             SubqInner(Vec<Vec<ColValue>>),
             DerivedDone(MatResult),
+            HQuery(MatResult),
         }
         let (fire, drained) = {
             let agg = conn.sql_select_agg.get_mut(&seq).expect("just checked");
@@ -309,6 +742,7 @@ pub(crate) fn handle_resp_shard_result(
                     },
                     // ⭐ F72: 派生表内层 → 物化 (含错误; 清理在 fire 处)
                     None if is_derived => Fire::DerivedDone(materialize_select_agg(agg)),
+                    None if is_hquery => Fire::HQuery(materialize_select_agg(agg)),
                     None => Fire::Reply(render_select_agg(proto, bin, agg)),
                 }
             } else {
@@ -324,6 +758,14 @@ pub(crate) fn handle_resp_shard_result(
         match fire {
             Fire::No => {}
             Fire::Reply(bytes) => conn.resp_complete(seq, bytes),
+            Fire::HQuery(res) => {
+                conn.resp_hquery.remove(&seq);
+                let bytes = match res {
+                    Ok((cols, rows)) => resp_hquery_rows(&codec, &cols, &rows),
+                    Err(e) => codec.encode_error(&e),
+                };
+                conn.resp_complete(seq, bytes);
+            }
             // ⭐ F71: 内层子查询完成 → 存行集并推进编排 (行数上限护栏)
             Fire::SubqInner(rows) => {
                 // ⭐ F73: 捕获阶段 OOM 护栏 (精确语义在 fold_one_subq 按叶子类型);
@@ -332,22 +774,34 @@ pub(crate) fn handle_resp_shard_result(
                     conn.sql_subq.remove(&seq);
                     conn.resp_complete(
                         seq,
-                        sql_err_bytes(
-                            proto,
-                            "subquery result too large; rewrite as JOIN",
-                        ),
+                        sql_err_bytes(proto, "subquery result too large; rewrite as JOIN"),
                     );
                     return;
                 }
                 sql_subq_advance(
-                    conn, conn_id, seq, worker_id, default_db, db_view, shard_inboxes,
-                    num_shards, rows,
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    rows,
                 );
             }
             // ⭐ F72: 派生表内层完成 → worker 内存执行外层 (错误时清理 ctx)
             Fire::DerivedDone(res) => match res {
                 Ok((cols, rows)) => finish_derived(
-                    conn, conn_id, seq, worker_id, bin, shard_inboxes, num_shards, cols, rows,
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    bin,
+                    shard_inboxes,
+                    num_shards,
+                    cols,
+                    rows,
                 ),
                 Err(e) => {
                     conn.sql_derived.remove(&seq);
@@ -355,8 +809,17 @@ pub(crate) fn handle_resp_shard_result(
                     if is_cascade_seq(seq) {
                         if let Some(job) = conn.cascade_jobs.remove(&seq) {
                             cascade_job_done(
-                                conn, conn_id, seq, worker_id, default_db,
-                                db_view, shard_inboxes, num_shards, 0, Some(e), &job,
+                                conn,
+                                conn_id,
+                                seq,
+                                worker_id,
+                                default_db,
+                                db_view,
+                                shard_inboxes,
+                                num_shards,
+                                0,
+                                Some(e),
+                                &job,
                             );
                             return;
                         }
@@ -364,14 +827,16 @@ pub(crate) fn handle_resp_shard_result(
                     conn.resp_complete(seq, sql_err_bytes(proto, &e));
                 }
             },
-            Fire::Dml { pks, action, target } => {
+            Fire::Dml {
+                pks,
+                action,
+                target,
+            } => {
                 // ⭐ PG 兼容 (FMT_VER 8): 记录被删 pk — 主 DELETE 或级联 DELETE
                 // 的 phase1 完成即存 (DmlAgg 完成时触发/推进级联); 仅 Delete 需要.
                 if matches!(action, SqlDmlAction::Delete) {
-                    conn.cascade_pending.insert(
-                        seq,
-                        (target.0.clone(), target.1.clone(), pks.clone()),
-                    );
+                    conn.cascade_pending
+                        .insert(seq, (target.0.clone(), target.1.clone(), pks.clone()));
                 }
                 // ⭐ 事务 v1 (F61): 两阶段 DML 的 phase2 在事务中截流
                 // (phase1 读的是已提交态 — v1 文档化语义)
@@ -383,8 +848,16 @@ pub(crate) fn handle_resp_shard_result(
                             if is_cascade_seq(seq) {
                                 if let Some(job) = conn.cascade_jobs.remove(&seq) {
                                     cascade_job_done(
-                                        conn, conn_id, seq, worker_id, default_db,
-                                        db_view, shard_inboxes, num_shards, 0, Some(e),
+                                        conn,
+                                        conn_id,
+                                        seq,
+                                        worker_id,
+                                        default_db,
+                                        db_view,
+                                        shard_inboxes,
+                                        num_shards,
+                                        0,
+                                        Some(e),
                                         &job,
                                     );
                                 }
@@ -397,8 +870,17 @@ pub(crate) fn handle_resp_shard_result(
                     if is_cascade_seq(seq) {
                         if let Some(job) = conn.cascade_jobs.remove(&seq) {
                             cascade_job_done(
-                                conn, conn_id, seq, worker_id, default_db,
-                                db_view, shard_inboxes, num_shards, n, None, &job,
+                                conn,
+                                conn_id,
+                                seq,
+                                worker_id,
+                                default_db,
+                                db_view,
+                                shard_inboxes,
+                                num_shards,
+                                n,
+                                None,
+                                &job,
                             );
                         }
                     } else {
@@ -414,8 +896,17 @@ pub(crate) fn handle_resp_shard_result(
                     if is_cascade_seq(seq) {
                         if let Some(job) = conn.cascade_jobs.remove(&seq) {
                             cascade_job_done(
-                                conn, conn_id, seq, worker_id, default_db,
-                                db_view, shard_inboxes, num_shards, 0, None, &job,
+                                conn,
+                                conn_id,
+                                seq,
+                                worker_id,
+                                default_db,
+                                db_view,
+                                shard_inboxes,
+                                num_shards,
+                                0,
+                                None,
+                                &job,
                             );
                         }
                     } else {
@@ -435,7 +926,13 @@ pub(crate) fn handle_resp_shard_result(
                         let op = sql_dml_op(&target.0, &target.1, pk, &action);
                         let sid = hash_route_op(&op, num_shards);
                         push_task_grouped(
-                            conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes,
+                            conn_id,
+                            seq,
+                            worker_id,
+                            sid as u32,
+                            sid,
+                            op,
+                            shard_inboxes,
                         );
                     }
                 }
@@ -467,7 +964,13 @@ pub(crate) fn handle_resp_shard_result(
     // ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键存在性预检回包
     // (RowGet 对父表; 全存在才在 on_reply 内注册 sql_dml_agg 发原 RowPut)
     if sql_fk_on_reply(
-        conn, conn_id, seq, worker_id, shard_inboxes, num_shards, result,
+        conn,
+        conn_id,
+        seq,
+        worker_id,
+        shard_inboxes,
+        num_shards,
+        result,
     ) {
         return;
     }
@@ -487,8 +990,17 @@ pub(crate) fn handle_resp_shard_result(
             // ⭐ FK 级联 (FMT_VER 8): 级联子任务完成 → 推进级联 (不回复客户端)
             if let Some(job) = conn.cascade_jobs.remove(&seq) {
                 cascade_job_done(
-                    conn, conn_id, seq, worker_id, default_db, db_view, shard_inboxes,
-                    num_shards, agg.affected, agg.error.clone(), &job,
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    agg.affected,
+                    agg.error.clone(),
+                    &job,
                 );
                 return;
             }
@@ -497,8 +1009,18 @@ pub(crate) fn handle_resp_shard_result(
                 if let Some((db, t, pks)) = conn.cascade_pending.remove(&seq) {
                     let affected = agg.affected;
                     if cascade_kickoff(
-                        conn, conn_id, seq, worker_id, &db, default_db, db_view,
-                        shard_inboxes, num_shards, &t, pks, affected,
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        &db,
+                        default_db,
+                        db_view,
+                        shard_inboxes,
+                        num_shards,
+                        &t,
+                        pks,
+                        affected,
                     ) {
                         return;
                     }
@@ -517,7 +1039,13 @@ pub(crate) fn handle_resp_shard_result(
                     }
                 }
                 conn.multi_step(
-                    seq, conn_id, worker_id, default_db, db_view, shard_inboxes, num_shards,
+                    seq,
+                    conn_id,
+                    worker_id,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
                 );
                 return;
             }
@@ -536,7 +1064,8 @@ pub(crate) fn handle_resp_shard_result(
                             .write()
                             .unwrap()
                             .retain(|(d, t, _), _| !(d == &key.0 && t == &key.1));
-                        sh.ddl_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        sh.ddl_epoch
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         0
                     } else {
                         agg.affected
@@ -579,13 +1108,18 @@ pub(crate) fn handle_resp_shard_result(
                                 });
                         }
                         drop(routes);
-                        conn.sql_shared.created_here.write().unwrap().insert(agg.key.clone());
-                        conn.sql_cache.borrow_mut().schemas.insert(
-                            agg.key.clone(),
-                            agg.schema.clone(),
-                        );
+                        conn.sql_shared
+                            .created_here
+                            .write()
+                            .unwrap()
+                            .insert(agg.key.clone());
+                        conn.sql_cache
+                            .borrow_mut()
+                            .schemas
+                            .insert(agg.key.clone(), agg.schema.clone());
                         if !agg.schema.fks.is_empty() {
-                            conn.sql_shared.register_fks(&agg.key.0, &agg.key.1, &agg.schema);
+                            conn.sql_shared
+                                .register_fks(&agg.key.0, &agg.key.1, &agg.schema);
                         }
                         if agg.alter {
                             conn.sql_shared
@@ -600,7 +1134,13 @@ pub(crate) fn handle_resp_shard_result(
                     }
                 }
                 conn.multi_step(
-                    seq, conn_id, worker_id, default_db, db_view, shard_inboxes, num_shards,
+                    seq,
+                    conn_id,
+                    worker_id,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
                 );
                 return;
             }
@@ -627,7 +1167,10 @@ pub(crate) fn handle_resp_shard_result(
                         drop(routes);
                         sh.created_here.write().unwrap().insert(agg.key.clone());
                     }
-                    conn.sql_cache.borrow_mut().schemas.insert(agg.key.clone(), agg.schema.clone());
+                    conn.sql_cache
+                        .borrow_mut()
+                        .schemas
+                        .insert(agg.key.clone(), agg.schema.clone());
                     // ⭐ FK 级联 (FMT_VER 8): 注册外键反向引用 (含 ALTER ADD COLUMN?)
                     if !agg.schema.fks.is_empty() {
                         conn.sql_shared
@@ -818,9 +1361,16 @@ pub(crate) fn handle_resp_shard_result(
             let store_dst = agg.store_dst;
             // ⭐ D3: 二阶段任务用命令发起时的 (db, table), 不受后续 SELECT 影响
             let (agg_db, agg_table) = (agg.db.clone(), agg.table.clone());
-            let mut sets: Vec<Vec<Vec<u8>>> =
-                agg.sets.into_iter().map(|s| s.unwrap_or_default()).collect();
-            let first = if sets.is_empty() { Vec::new() } else { sets.remove(0) };
+            let mut sets: Vec<Vec<Vec<u8>>> = agg
+                .sets
+                .into_iter()
+                .map(|s| s.unwrap_or_default())
+                .collect();
+            let first = if sets.is_empty() {
+                Vec::new()
+            } else {
+                sets.remove(0)
+            };
             let out: Vec<Vec<u8>> = match agg.op {
                 SetAlgOp::Inter => {
                     let others: Vec<HashSet<&[u8]>> = sets
@@ -858,19 +1408,39 @@ pub(crate) fn handle_resp_shard_result(
                 let card = out.len() as i64;
                 let sid = hash_route_key(agg_db.as_ref(), agg_table.as_ref(), &dst, num_shards);
                 let mut remaining = 1usize;
-                let del = BatchOp::Delete { db: agg_db.clone(), table: agg_table.clone(), key: dst.clone() };
+                let del = BatchOp::Delete {
+                    db: agg_db.clone(),
+                    table: agg_table.clone(),
+                    key: dst.clone(),
+                };
                 push_task_grouped(conn_id, seq, worker_id, 0, sid, del, shard_inboxes);
                 if !out.is_empty() {
                     remaining += 1;
-                    let sadd = BatchOp::SAdd { db: agg_db, table: agg_table, key: dst, members: out };
+                    let sadd = BatchOp::SAdd {
+                        db: agg_db,
+                        table: agg_table,
+                        key: dst,
+                        members: out,
+                    };
                     push_task_grouped(conn_id, seq, worker_id, 1, sid, sadd, shard_inboxes);
                 }
-                conn.store_agg.insert(seq, StoreFinishAgg { remaining, card, error: None });
+                conn.store_agg.insert(
+                    seq,
+                    StoreFinishAgg {
+                        remaining,
+                        card,
+                        error: None,
+                    },
+                );
                 return;
             }
             // ⭐ C1: SINTERCARD — 只回势 (LIMIT 截断); 否则回成员数组
             let bytes = if card_only {
-                let card = if limit > 0 { out.len().min(limit) } else { out.len() };
+                let card = if limit > 0 {
+                    out.len().min(limit)
+                } else {
+                    out.len()
+                };
                 codec.encode_integer(card as i64)
             } else {
                 let mut buf = format!("*{}\r\n", out.len()).into_bytes();
@@ -943,14 +1513,30 @@ pub(crate) fn handle_resp_shard_result(
             let dst = agg.dst;
             let sid = hash_route_key(agg_db.as_ref(), agg_table.as_ref(), &dst, num_shards);
             let mut remaining = 1usize;
-            let del = BatchOp::Delete { db: agg_db.clone(), table: agg_table.clone(), key: dst.clone() };
+            let del = BatchOp::Delete {
+                db: agg_db.clone(),
+                table: agg_table.clone(),
+                key: dst.clone(),
+            };
             push_task_grouped(conn_id, seq, worker_id, 0, sid, del, shard_inboxes);
             if !pairs.is_empty() {
                 remaining += 1;
-                let zadd = BatchOp::ZAdd { db: agg_db, table: agg_table, key: dst, pairs };
+                let zadd = BatchOp::ZAdd {
+                    db: agg_db,
+                    table: agg_table,
+                    key: dst,
+                    pairs,
+                };
                 push_task_grouped(conn_id, seq, worker_id, 1, sid, zadd, shard_inboxes);
             }
-            conn.store_agg.insert(seq, StoreFinishAgg { remaining, card, error: None });
+            conn.store_agg.insert(
+                seq,
+                StoreFinishAgg {
+                    remaining,
+                    card,
+                    error: None,
+                },
+            );
         }
         return;
     }
@@ -1087,4 +1673,200 @@ pub(crate) fn handle_resp_shard_result(
         BatchResult::Error(e) => codec.encode_error(e),
     };
     conn.resp_complete(seq, bytes);
+}
+
+/// SQL 列值到 RESP bulk 的无损文本/字节表示。
+/// Bytes/Str/Json 保持原字节；数值和时间沿 SQL 对外文本格式，UUID/DECIMAL
+/// 也不会退化为内部二进制布局。
+fn resp_sql_text_value(ty: ColType, value: &ColValue) -> Vec<u8> {
+    match (ty, value) {
+        (_, ColValue::Null) => Vec::new(),
+        (ColType::I64, ColValue::I64(v)) => v.to_string().into_bytes(),
+        (ColType::F64, ColValue::F64(v)) => v.to_string().into_bytes(),
+        (ColType::Bool, ColValue::I64(v)) => (if *v == 0 { "0" } else { "1" }).into(),
+        (ColType::Date, ColValue::I64(v)) => render_date(*v).into_bytes(),
+        (ColType::Time, ColValue::I64(v)) => render_time(*v).into_bytes(),
+        (ColType::Timestamp, ColValue::I64(v)) => render_timestamp(*v).into_bytes(),
+        (ColType::Uuid, ColValue::Bytes(v)) => render_uuid(v).into_bytes(),
+        (ColType::Decimal { .. }, ColValue::Decimal(v, scale)) => {
+            render_decimal(*v, *scale).into_bytes()
+        }
+        (_, ColValue::Bytes(v)) => v.clone(),
+        (_, ColValue::I64(v)) => v.to_string().into_bytes(),
+        (_, ColValue::F64(v)) => v.to_string().into_bytes(),
+        (_, ColValue::Decimal(v, scale)) => render_decimal(*v, *scale).into_bytes(),
+    }
+}
+
+/// HQUERY 成功结果：RESP 二维数组；NULL 保留为 RESP nil，字段顺序由 FIELDS 确定。
+fn resp_hquery_rows(
+    codec: &RespCodec,
+    cols: &[(String, ColType)],
+    rows: &[Vec<ColValue>],
+) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", rows.len()).into_bytes();
+    for row in rows {
+        out.extend_from_slice(format!("*{}\r\n", cols.len()).as_bytes());
+        for (idx, (_, ty)) in cols.iter().enumerate() {
+            match row.get(idx) {
+                Some(ColValue::Null) | None => out.extend_from_slice(&codec.encode_nil()),
+                Some(v) => out.extend_from_slice(&codec.encode_bulk(&resp_sql_text_value(*ty, v))),
+            }
+        }
+    }
+    out
+}
+
+fn resp_sql_project_reply(
+    codec: &RespCodec,
+    schema: &TableSchema,
+    values: &[ColValue],
+    fields: &[Vec<u8>],
+    mode: RespSqlReadMode,
+) -> Vec<u8> {
+    let one = |ci: Option<u16>| match ci.and_then(|i| values.get(i as usize)) {
+        Some(ColValue::Null) | None => codec.encode_nil(),
+        Some(v) => codec.encode_bulk(&resp_sql_text_value(
+            schema.columns[ci.unwrap() as usize].ty,
+            v,
+        )),
+    };
+    if matches!(mode, RespSqlReadMode::Length) {
+        // SQL NULL 在 Hash 视图中等价于字段不存在：这是 HDEL 的可观察语义，
+        // 也避免 HLEN/HGETALL 与 HEXISTS 对同一列给出互相矛盾的答案。
+        return codec.encode_integer(
+            (0..schema.columns.len())
+                .filter(|i| !schema.dropped.contains(&(*i as u16)))
+                .filter(|i| !matches!(values[*i], ColValue::Null))
+                .count() as i64,
+        );
+    }
+    if matches!(mode, RespSqlReadMode::Exists) {
+        let exists = fields
+            .first()
+            .and_then(|f| std::str::from_utf8(f).ok())
+            .and_then(|n| schema.col_by_name(n))
+            .and_then(|i| values.get(i as usize))
+            .is_some_and(|v| !matches!(v, ColValue::Null));
+        return codec.encode_integer(exists as i64);
+    }
+    if matches!(mode, RespSqlReadMode::Strlen) {
+        let len = fields
+            .first()
+            .and_then(|f| std::str::from_utf8(f).ok())
+            .and_then(|n| schema.col_by_name(n))
+            .and_then(|i| values.get(i as usize))
+            .map(|v| {
+                resp_sql_text_value(
+                    schema.columns[schema
+                        .col_by_name(std::str::from_utf8(&fields[0]).unwrap_or(""))
+                        .unwrap() as usize]
+                        .ty,
+                    v,
+                )
+                .len()
+            })
+            .unwrap_or(0);
+        return codec.encode_integer(len as i64);
+    }
+    if let RespSqlReadMode::Rand { count, withvalues } = mode {
+        let visible: Vec<u16> = (0..schema.columns.len() as u16)
+            .filter(|i| !schema.dropped.contains(i))
+            .filter(|i| !matches!(values[*i as usize], ColValue::Null))
+            .collect();
+        let take = count.unwrap_or(1) as usize;
+        if count.is_none() {
+            return visible.first().map_or_else(
+                || codec.encode_nil(),
+                |&ci| codec.encode_bulk(schema.columns[ci as usize].name.as_bytes()),
+            );
+        }
+        let mut out = format!(
+            "*{}\r\n",
+            visible.len().min(take) * if withvalues { 2 } else { 1 }
+        )
+        .into_bytes();
+        for ci in visible.into_iter().take(take) {
+            out.extend_from_slice(&codec.encode_bulk(schema.columns[ci as usize].name.as_bytes()));
+            if withvalues {
+                out.extend_from_slice(&one(Some(ci)));
+            }
+        }
+        return out;
+    }
+    if !matches!(mode, RespSqlReadMode::Fields) {
+        let visible: Vec<u16> = (0..schema.columns.len() as u16)
+            .filter(|i| !schema.dropped.contains(i))
+            .filter(|i| !matches!(values[*i as usize], ColValue::Null))
+            .collect();
+        let width = match mode {
+            RespSqlReadMode::AllPairs | RespSqlReadMode::Scan => 2,
+            _ => 1,
+        };
+        let mut out = format!("*{}\r\n", visible.len() * width).into_bytes();
+        for ci in visible {
+            match mode {
+                RespSqlReadMode::AllPairs | RespSqlReadMode::Scan => {
+                    out.extend_from_slice(
+                        &codec.encode_bulk(schema.columns[ci as usize].name.as_bytes()),
+                    );
+                    out.extend_from_slice(&one(Some(ci)));
+                }
+                RespSqlReadMode::Keys => out.extend_from_slice(
+                    &codec.encode_bulk(schema.columns[ci as usize].name.as_bytes()),
+                ),
+                RespSqlReadMode::Values => out.extend_from_slice(&one(Some(ci))),
+                RespSqlReadMode::Fields
+                | RespSqlReadMode::Length
+                | RespSqlReadMode::Exists
+                | RespSqlReadMode::Strlen
+                | RespSqlReadMode::Rand { .. } => unreachable!(),
+            }
+        }
+        if matches!(mode, RespSqlReadMode::Scan) {
+            let mut scan = b"*2\r\n$1\r\n0\r\n".to_vec();
+            scan.extend_from_slice(&out);
+            return scan;
+        }
+        return out;
+    }
+    let replies: Vec<Vec<u8>> = fields
+        .iter()
+        .map(|f| {
+            one(std::str::from_utf8(f)
+                .ok()
+                .and_then(|n| schema.col_by_name(n)))
+        })
+        .collect();
+    if replies.len() == 1 {
+        replies.into_iter().next().unwrap()
+    } else {
+        let mut out = format!("*{}\r\n", replies.len()).into_bytes();
+        for r in replies {
+            out.extend_from_slice(&r);
+        }
+        out
+    }
+}
+
+fn resp_sql_missing_reply(codec: &RespCodec, ctx: &RespSqlHGetCtx) -> Vec<u8> {
+    match ctx.mode {
+        RespSqlReadMode::Fields if ctx.fields.len() == 1 => codec.encode_nil(),
+        RespSqlReadMode::Fields => {
+            let mut out = format!("*{}\r\n", ctx.fields.len()).into_bytes();
+            for _ in &ctx.fields {
+                out.extend_from_slice(&codec.encode_nil());
+            }
+            out
+        }
+        RespSqlReadMode::AllPairs | RespSqlReadMode::Keys | RespSqlReadMode::Values => {
+            b"*0\r\n".to_vec()
+        }
+        RespSqlReadMode::Scan => b"*2\r\n$1\r\n0\r\n*0\r\n".to_vec(),
+        RespSqlReadMode::Length | RespSqlReadMode::Exists | RespSqlReadMode::Strlen => {
+            codec.encode_integer(0)
+        }
+        RespSqlReadMode::Rand { count: None, .. } => codec.encode_nil(),
+        RespSqlReadMode::Rand { count: Some(_), .. } => b"*0\r\n".to_vec(),
+    }
 }

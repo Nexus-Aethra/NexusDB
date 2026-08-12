@@ -136,5 +136,9 @@ pub enum BitCtx {
     /// BITCOUNT [start end] (BYTE, 含负索引) → :popcount
     Count { start: i64, end: i64 },
     /// BITPOS bit [start [end]] → :pos / :-1
-    Pos { bit: bool, start: i64, end: Option<i64> },
+    Pos {
+        bit: bool,
+        start: i64,
+        end: Option<i64>,
+    },
 }

@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 
 use crate::protocol::sql::{self, Cond, Pred, SqlStmt};
+use shard_manager::BatchOp;
 use storage::row::ColValue;
 use storage::schema::{ColType, TableSchema};
-use shard_manager::BatchOp;
 
 /// ⭐ 方案 A (调优): EstimateRows 小表阈值 — 双表 Inner JOIN 两表行数均 ≤ 此值
 /// → 跳过 distinct/ranges 统计收集, 直接按行数决策驱动表 (小表 JOIN 固定只 1 轮
@@ -167,6 +167,101 @@ pub struct PendingSql {
     pub stmt: SqlStmt,
     pub db: std::sync::Arc<str>,
     pub table: String,
+}
+
+/// RESP `HGET table:pk field` 的行适配上下文。
+///
+/// 它与 SQL 的 `SqlRowCtx` 分开：回复必须是 RESP bulk/nil，而非 SQL 结果集。
+pub struct RespSqlHGetCtx {
+    pub schema: std::sync::Arc<TableSchema>,
+    pub fields: Vec<Vec<u8>>,
+    pub mode: RespSqlReadMode,
+}
+
+/// schema cache miss 时暂存的 RESP 行适配尝试。schema 不存在或未显式开启
+/// adapter 时，回落到原生 Hash op，确保 KV 语义不被改变。
+pub struct PendingRespSqlHGet {
+    pub db: std::sync::Arc<str>,
+    pub table: String,
+    pub pk_literal: Vec<u8>,
+    pub fields: Vec<Vec<u8>>,
+    pub mode: RespSqlReadMode,
+    pub fallback: BatchOp,
+}
+
+#[derive(Clone, Copy)]
+pub enum RespSqlReadMode {
+    Fields,
+    AllPairs,
+    Keys,
+    Values,
+    Scan,
+    Length,
+    Exists,
+    Strlen,
+    Rand {
+        count: Option<u32>,
+        withvalues: bool,
+    },
+}
+
+/// schema miss 时暂存的 HSET/HMSET adapter 尝试；不能适配时回落原生 Hash。
+pub struct PendingRespSqlHSet {
+    pub db: std::sync::Arc<str>,
+    pub table: String,
+    pub pk_literal: Vec<u8>,
+    pub pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub reply_ok: bool,
+    pub fallback: BatchOp,
+}
+
+/// RowUpdate 回包所需的 RESP HSET/HMSET 语义。
+pub struct RespSqlHSetCtx {
+    pub reply_ok: bool,
+}
+
+/// schema miss 时暂存的 HDEL adapter 尝试。
+pub struct PendingRespSqlHDel {
+    pub db: std::sync::Arc<str>,
+    pub table: String,
+    pub pk_literal: Vec<u8>,
+    pub fields: Vec<Vec<u8>>,
+    pub fallback: BatchOp,
+}
+
+/// schema miss 时暂存的 HSETNX adapter 尝试。
+pub struct PendingRespSqlHSetNx {
+    pub db: std::sync::Arc<str>,
+    pub table: String,
+    pub pk_literal: Vec<u8>,
+    pub field: Vec<u8>,
+    pub value: Vec<u8>,
+    pub fallback: BatchOp,
+}
+
+/// HQUERY 成功完成时把 SQL 物化行改编码为 RESP 二维数组的标记。
+pub struct RespHQueryCtx;
+
+pub struct PendingRespSqlDelete {
+    pub db: std::sync::Arc<str>,
+    pub table: String,
+    pub pk_literal: Vec<u8>,
+    pub fallback: BatchOp,
+}
+
+#[derive(Clone, Copy)]
+pub enum RespSqlIncrDelta {
+    Int(i64),
+    Float(f64),
+}
+
+pub struct PendingRespSqlIncr {
+    pub db: std::sync::Arc<str>,
+    pub table: String,
+    pub pk_literal: Vec<u8>,
+    pub field: Vec<u8>,
+    pub delta: RespSqlIncrDelta,
+    pub fallback: BatchOp,
 }
 
 /// ⭐ F71 (子查询): 非关联 WHERE 子查询编排 — 顺序跑内层→折叠→重跑外层.

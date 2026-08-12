@@ -187,13 +187,16 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
                 if proto == ProtocolKind::Sql {
                     let salt = mysql_gen_salt(id, worker_id2);
-                    state.mysql = Some(MysqlState { salt, phase: 0, pending_db: None });
+                    state.mysql = Some(MysqlState {
+                        salt,
+                        phase: 0,
+                        pending_db: None,
+                    });
                     let greeting = my::build_handshake_v10_caps(&salt, 1, false);
                     state.send_bytes(&greeting);
                 }
                 // 建 per-conn reply 队列 + eventfd
-                let pcefd =
-                    unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                let pcefd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
                 assert!(pcefd >= 0, "per-conn eventfd failed");
                 registry2.lock().unwrap().insert(
                     id,
@@ -263,11 +266,7 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 for entry in reg.values() {
                     let val: u64 = 1;
                     unsafe {
-                        libc::write(
-                            entry.eventfd,
-                            &val as *const u64 as *const libc::c_void,
-                            8,
-                        );
+                        libc::write(entry.eventfd, &val as *const u64 as *const libc::c_void, 8);
                     }
                     woke = true;
                 }

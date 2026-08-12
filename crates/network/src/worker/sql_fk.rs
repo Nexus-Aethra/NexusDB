@@ -7,9 +7,9 @@
 //! 前置: 父表 schema 须已在 worker 缓存 (由调用方在 sql_dispatch_stmt 加载).
 //! 跨 shard: RowGet 按父表主键 hash 路由到父表所在 shard (正确性优先).
 
-use storage::row::ColValue;
+use super::{ConnState, SqlFkIns, hash_route_op, push_task_grouped};
 use shard_manager::{BatchOp, SharedTaskInbox};
-use super::{ConnState, SqlFkIns, push_task_grouped, hash_route_op};
+use storage::row::ColValue;
 
 /// ⭐ 尝试启动外键预检. 返回 `true` = 已进入预检 (INSERT 延迟, 不回包, ops 已
 /// 移入状态); `false` = 未进入 (父表 schema 缺失 / 类型不匹配 / 无 fk),
@@ -30,7 +30,15 @@ pub fn sql_fk_start(
     // 本表 fks: (col, ref_table, ref_col). 每个 RowPut 的 fk 列值 → 父主键.
     let mut checks: Vec<(String, Vec<u8>)> = Vec::new();
     for op in ops {
-        let BatchOp::RowPut { db: _, table: _, pk: _, values } = op else { continue };
+        let BatchOp::RowPut {
+            db: _,
+            table: _,
+            pk: _,
+            values,
+        } = op
+        else {
+            continue;
+        };
         for fk in &schema.fks {
             let i = fk.col as usize;
             if i >= values.len() {
@@ -137,7 +145,12 @@ pub fn sql_fk_on_reply(
     let n = st.ops.len();
     conn.sql_dml_agg.insert(
         seq,
-        super::SqlDmlAgg { remaining: n, affected: 0, error: None, drop_key: None },
+        super::SqlDmlAgg {
+            remaining: n,
+            affected: 0,
+            error: None,
+            drop_key: None,
+        },
     );
     for op in st.ops {
         let sid = hash_route_op(&op, num_shards);
@@ -149,7 +162,11 @@ pub fn sql_fk_on_reply(
 }
 
 /// ⭐ 判断本表所有外键父表 schema 是否已在 worker 缓存.
-pub fn all_parents_cached(conn: &ConnState, db: &str, schema: &storage::schema::TableSchema) -> bool {
+pub fn all_parents_cached(
+    conn: &ConnState,
+    db: &str,
+    schema: &storage::schema::TableSchema,
+) -> bool {
     for fk in &schema.fks {
         let key = (db.to_string(), fk.ref_table.clone());
         if !conn.sql_cache.borrow().schemas.contains_key(&key) {
@@ -158,5 +175,3 @@ pub fn all_parents_cached(conn: &ConnState, db: &str, schema: &storage::schema::
     }
     true
 }
-
-

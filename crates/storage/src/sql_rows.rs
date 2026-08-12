@@ -106,7 +106,11 @@ fn row_pass_preds(cols: &[ColValue], preds: &[ScanPred]) -> bool {
             return false;
         };
         if p.op == PredOp::In {
-            if !p.set.iter().any(|v| cmp_colval(cv, v) == Some(Ordering::Equal)) {
+            if !p
+                .set
+                .iter()
+                .any(|v| cmp_colval(cv, v) == Some(Ordering::Equal))
+            {
                 return false;
             }
             continue;
@@ -140,14 +144,11 @@ pub fn index_val_bytes(ty: ColType, v: &ColValue) -> Option<Vec<u8>> {
     match (ty, v) {
         (_, ColValue::Null) => None,
         (ColType::I64, ColValue::I64(x)) => Some(ks::encode_index_num(ks::encode_idx(*x))),
-        (ColType::F64, ColValue::F64(x)) => {
-            Some(ks::encode_index_num(ks::encode_f64_ordered(*x)))
-        }
+        (ColType::F64, ColValue::F64(x)) => Some(ks::encode_index_num(ks::encode_f64_ordered(*x))),
         // ⭐ F80: Bool/Date/Time/Timestamp 以 i64 承载 → 复用保序数值索引
-        (
-            ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp,
-            ColValue::I64(x),
-        ) => Some(ks::encode_index_num(ks::encode_idx(*x))),
+        (ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp, ColValue::I64(x)) => {
+            Some(ks::encode_index_num(ks::encode_idx(*x)))
+        }
         (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b)) => {
             Some(ks::encode_index_bytes(b))
         }
@@ -217,7 +218,10 @@ impl StorageEngine {
         if let Some(slot) = self.schema_cache_get(db, table) {
             return Ok(slot.clone());
         }
-        let slot = match self.get_physical(db, table, &ks::encode_schema_row()).await? {
+        let slot = match self
+            .get_physical(db, table, &ks::encode_schema_row())
+            .await?
+        {
             Some(bytes) => Some(Arc::new(TableSchema::decode(&bytes).map_err(se)?)),
             None => None,
         };
@@ -252,9 +256,10 @@ impl StorageEngine {
             if unchanged {
                 continue;
             }
-            let root = self.open_table(db, table).await?.ok_or_else(|| {
-                RegistryError::TableNotFound(db.to_string(), table.to_string())
-            })?;
+            let root = self
+                .open_table(db, table)
+                .await?
+                .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
             let prefix = ks::index_value_prefix(idx.iid, &nv);
             let mut dup = false;
             crate::registry::table_scan_prefix(self.pager_mut(), root, &prefix, &mut |k, _v| {
@@ -307,7 +312,8 @@ impl StorageEngine {
             Some(_) => return Err(RegistryError::WrongType),
             None => None,
         };
-        self.check_unique(db, table, &schema, pk, values, &old_ivals).await
+        self.check_unique(db, table, &schema, pk, values, &old_ivals)
+            .await
     }
 
     /// 插入/覆盖一行. `values` 与 schema.columns 一一对应.
@@ -339,7 +345,8 @@ impl StorageEngine {
         // ⭐ O3: UNIQUE 约束 — 写任何行之前拒绝 (防半写状态).
         // 探测仅本 shard: 不同 pk hash 到不同 shard 时漏检 (跨 shard 唯一性
         // gap, v1 文档记录; 真全局唯一需广播探测/全局索引).
-        self.check_unique(db, table, &schema, pk, values, &old_ivals).await?;
+        self.check_unique(db, table, &schema, pk, values, &old_ivals)
+            .await?;
 
         // row 行
         // ⭐ M3-1: SQL 用户行 → 行数 +1 (覆盖不加; 索引条目写不计行数)
@@ -400,9 +407,9 @@ impl StorageEngine {
                 Ok(None) => eprintln!(
                     "[DIAG-ROWPUT-LOST] pk={pk:?} lost after row_put (index updates done)! db={db} table={table}"
                 ),
-                Err(e) => eprintln!(
-                    "[DIAG-ROWPUT-ERR] pk={pk:?} verify error: {e} db={db} table={table}"
-                ),
+                Err(e) => {
+                    eprintln!("[DIAG-ROWPUT-ERR] pk={pk:?} verify error: {e} db={db} table={table}")
+                }
             }
             // ⭐ DIAG canary: per-shard 追踪最近 64 个 pk, 每次插入后全部回查
             {
@@ -411,10 +418,15 @@ impl StorageEngine {
                         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
                     static SHARD_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
                 }
-                let n = SHARD_N.with(|c| { let v = c.get(); c.set(v + 1); v });
+                let n = SHARD_N.with(|c| {
+                    let v = c.get();
+                    c.set(v + 1);
+                    v
+                });
                 // 每 200 次插入做一次全量回查 (避免太慢)
                 if n > 0 && n % 500 == 0 {
-                    let pks: Vec<Vec<u8>> = RECENT_PKS.with(|r| r.borrow().iter().cloned().collect());
+                    let pks: Vec<Vec<u8>> =
+                        RECENT_PKS.with(|r| r.borrow().iter().cloned().collect());
                     let mut lost = 0;
                     for prev_pk in &pks {
                         let rk = ks::encode_string(prev_pk);
@@ -432,13 +444,18 @@ impl StorageEngine {
                         }
                     }
                     if lost > 0 {
-                        eprintln!("[DIAG-CANARY-SUMMARY] {lost}/{} keys lost at shard-insert #{n} db={db} table={table}", pks.len());
+                        eprintln!(
+                            "[DIAG-CANARY-SUMMARY] {lost}/{} keys lost at shard-insert #{n} db={db} table={table}",
+                            pks.len()
+                        );
                     }
                 }
                 RECENT_PKS.with(|r| {
                     let mut r = r.borrow_mut();
                     r.push_back(pk.to_vec());
-                    if r.len() > 4000 { r.pop_front(); }
+                    if r.len() > 4000 {
+                        r.pop_front();
+                    }
                 });
             }
         }
@@ -637,6 +654,164 @@ impl StorageEngine {
         Ok(true)
     }
 
+    /// RESP SQL adapter 的字段删除: 在单 shard 引擎内把指定可空列置为 NULL，
+    /// 并返回实际由非 NULL 变为 NULL 的列数。row_put 负责同步维护二级索引，
+    /// 因而 NULL 列对应的索引项也会被移除。
+    pub async fn row_unset(
+        &mut self,
+        db: &str,
+        table: &str,
+        pk: &[u8],
+        cols: &[u16],
+    ) -> Result<i64, RegistryError> {
+        let schema = self
+            .get_schema(db, table)
+            .await?
+            .ok_or_else(|| se(format!("table {db}.{table} has no schema")))?;
+        let Some(old) = self.row_get(db, table, pk).await? else {
+            return Ok(0);
+        };
+        let mut values = row::decode_row(&schema, &old).map_err(se)?;
+        let mut changed = 0i64;
+        for col in cols {
+            let i = *col as usize;
+            if i >= values.len() || i == schema.pk_col as usize || !schema.columns[i].nullable {
+                return Err(se(format!("bad nullable unset column {col}")));
+            }
+            if !matches!(values[i], row::ColValue::Null) {
+                values[i] = row::ColValue::Null;
+                changed += 1;
+            }
+        }
+        if changed != 0 {
+            self.row_put(db, table, pk, &values).await?;
+        }
+        Ok(changed)
+    }
+
+    /// 条件字段写：仅当目标列当前为 NULL 时才写入，返回是否写入。
+    /// 行不存在不是可安全构造的部分 SQL row，明确报错而非退化为 worker 读后创建。
+    pub async fn row_set_nx(
+        &mut self,
+        db: &str,
+        table: &str,
+        pk: &[u8],
+        col: u16,
+        val: row::ColValue,
+    ) -> Result<bool, RegistryError> {
+        let schema = self
+            .get_schema(db, table)
+            .await?
+            .ok_or_else(|| se(format!("table {db}.{table} has no schema")))?;
+        let Some(old) = self.row_get(db, table, pk).await? else {
+            return Err(se("SQL row does not exist; HSETNX adapter does not create partial rows"));
+        };
+        let i = col as usize;
+        if i >= schema.columns.len() || i == schema.pk_col as usize {
+            return Err(se(format!("bad conditional update column {col}")));
+        }
+        let mut values = row::decode_row(&schema, &old).map_err(se)?;
+        if !matches!(values[i], row::ColValue::Null) {
+            return Ok(false);
+        }
+        values[i] = val;
+        self.row_put(db, table, pk, &values).await?;
+        Ok(true)
+    }
+
+    /// RESP SQL adapter 的原子 patch/upsert：行存在时只更新 sets；行不存在时写入
+    /// 已由 worker 按 schema/default 构造好的完整 insert_values。返回 HSET 语义的
+    /// 新增可见字段数，整个“是否存在→写入”决策在 shard 内完成。
+    pub async fn row_patch_upsert(
+        &mut self,
+        db: &str,
+        table: &str,
+        pk: &[u8],
+        sets: &[(u16, row::SetVal)],
+        insert_values: &[row::ColValue],
+    ) -> Result<i64, RegistryError> {
+        let schema = self
+            .get_schema(db, table)
+            .await?
+            .ok_or_else(|| se(format!("table {db}.{table} has no schema")))?;
+        let Some(old) = self.row_get(db, table, pk).await? else {
+            self.row_put(db, table, pk, insert_values).await?;
+            return Ok(sets.len() as i64);
+        };
+        let mut values = row::decode_row(&schema, &old).map_err(se)?;
+        let mut added = 0i64;
+        for (col, sv) in sets {
+            let i = *col as usize;
+            if i >= values.len() || i == schema.pk_col as usize {
+                return Err(se(format!("bad update column {col}")));
+            }
+            let next = match sv {
+                row::SetVal::Val(v) => v.clone(),
+                row::SetVal::Expr(e) => row::eval_row_expr(e, &values),
+            };
+            if matches!(values[i], row::ColValue::Null) && !matches!(next, row::ColValue::Null) {
+                added += 1;
+            }
+            values[i] = next;
+        }
+        self.row_put(db, table, pk, &values).await?;
+        Ok(added)
+    }
+
+    /// 单列数值原子自增并返回新值。调用方已按 schema 校验列号；这里仍在
+    /// shard/engine 单线程内完成 read-modify-write，不能拆成上层 RowGet+RowUpdate。
+    pub async fn row_incr(
+        &mut self,
+        db: &str,
+        table: &str,
+        pk: &[u8],
+        col: u16,
+        delta: RowIncrDelta,
+    ) -> Result<ColValue, RegistryError> {
+        let schema = self
+            .get_schema(db, table)
+            .await?
+            .ok_or_else(|| se(format!("table {db}.{table} has no schema")))?;
+        let Some(old) = self.row_get(db, table, pk).await? else {
+            return Err(se("SQL row does not exist"));
+        };
+        let mut values = row::decode_row(&schema, &old).map_err(se)?;
+        let i = col as usize;
+        if i >= values.len() || i == schema.pk_col as usize {
+            return Err(se(format!("bad increment column {col}")));
+        }
+        let next = match (schema.columns[i].ty, &values[i], delta) {
+            (ColType::I64, ColValue::I64(v), RowIncrDelta::Int(d)) => ColValue::I64(
+                v.checked_add(d)
+                    .ok_or_else(|| se("integer increment overflow"))?,
+            ),
+            (ColType::F64, ColValue::F64(v), RowIncrDelta::Float(d)) => {
+                let n = *v + d;
+                if n.is_finite() {
+                    ColValue::F64(n)
+                } else {
+                    return Err(se("float increment overflow"));
+                }
+            }
+            (ColType::F64, ColValue::F64(v), RowIncrDelta::Int(d)) => {
+                let n = *v + d as f64;
+                if n.is_finite() {
+                    ColValue::F64(n)
+                } else {
+                    return Err(se("float increment overflow"));
+                }
+            }
+            (ColType::I64, _, RowIncrDelta::Float(_)) => {
+                return Err(se("HINCRBYFLOAT requires a double column"));
+            }
+            (_, ColValue::Null, _) => return Err(se("cannot increment NULL SQL column")),
+            _ => return Err(se("increment requires a numeric SQL column")),
+        };
+        values[i] = next.clone();
+        self.row_put(db, table, pk, &values).await?;
+        Ok(next)
+    }
+
     /// ⭐ S1: SQL DROP TABLE — 物理删表 + 清 engine 侧派生状态
     /// (schema 镜像 / index bloom / 复合提示位). 返回表是否存在过.
     pub async fn drop_table_sql(&mut self, db: &str, table: &str) -> Result<bool, RegistryError> {
@@ -711,11 +886,17 @@ impl StorageEngine {
             let Some(v) = b else { return Ok(None) };
             let enc = match (pk_ty, v) {
                 (ColType::I64, ColValue::I64(i)) => crate::keyspace::encode_idx(*i).to_vec(),
-                (ColType::F64, ColValue::F64(f)) => crate::keyspace::encode_f64_ordered(*f).to_vec(),
-                (ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp, ColValue::I64(i)) => {
-                    crate::keyspace::encode_idx(*i).to_vec()
+                (ColType::F64, ColValue::F64(f)) => {
+                    crate::keyspace::encode_f64_ordered(*f).to_vec()
                 }
-                (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b)) => {
+                (
+                    ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp,
+                    ColValue::I64(i),
+                ) => crate::keyspace::encode_idx(*i).to_vec(),
+                (
+                    ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid,
+                    ColValue::Bytes(b),
+                ) => {
                     if b.is_empty() {
                         return Err(se("bad pk bound (empty bytes)"));
                     }
@@ -730,40 +911,35 @@ impl StorageEngine {
         };
         let lo_enc = enc_bound(lo)?;
         let hi_enc = enc_bound(hi)?;
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         // 起点: 有 lo 用 encode_string(pk_enc(lo)) 精确定位; 无 lo 从 [S] 段头.
         let start = lo_enc.clone().unwrap_or_else(|| vec![ks::KIND_STRING]);
         // 段前缀: [S] 保证扫描不越入其他 kind (Hash/List/...)
         let seg = vec![ks::KIND_STRING];
         let mut n = 0usize;
-        crate::registry::table_scan_range(
-            self.pager_mut(),
-            root,
-            &start,
-            &seg,
-            &mut |k, _v| {
-                // 上界: 扫描越过 [KIND_STRING] 段 (非字符串 key) 或 pk 编码 > hi
-                if k.first() != Some(&ks::KIND_STRING) {
+        crate::registry::table_scan_range(self.pager_mut(), root, &start, &seg, &mut |k, _v| {
+            // 上界: 扫描越过 [KIND_STRING] 段 (非字符串 key) 或 pk 编码 > hi
+            if k.first() != Some(&ks::KIND_STRING) {
+                return ControlFlow::Break(());
+            }
+            if let Some(h) = &hi_enc {
+                // k = [S][klen][pk_enc], 与 [S][klen'][pk_enc(hi)] 整体比较
+                if k > h.as_slice() {
                     return ControlFlow::Break(());
                 }
-                if let Some(h) = &hi_enc {
-                    // k = [S][klen][pk_enc], 与 [S][klen'][pk_enc(hi)] 整体比较
-                    if k > h.as_slice() {
-                        return ControlFlow::Break(());
-                    }
+            }
+            if let Some(pk) = ks::split_string(k) {
+                out.push((Vec::new(), pk.to_vec(), Vec::new()));
+                n += 1;
+                if limit > 0 && n >= limit {
+                    return ControlFlow::Break(());
                 }
-                if let Some(pk) = ks::split_string(k) {
-                    out.push((Vec::new(), pk.to_vec(), Vec::new()));
-                    n += 1;
-                    if limit > 0 && n >= limit {
-                        return ControlFlow::Break(());
-                    }
-                }
-                ControlFlow::Continue(())
-            },
-        )
+            }
+            ControlFlow::Continue(())
+        })
         .await?;
         // 回读行 (批量, 溢出展开)
         let refs: Vec<&[u8]> = out.iter().map(|(_, pk, _)| pk.as_slice()).collect();
@@ -800,7 +976,8 @@ impl StorageEngine {
         };
         // 行来源: key_set 多键点查 > hint 范围扫 > 全表扫
         let raw_rows: Vec<Vec<u8>> = if let Some(ks) = key_set {
-            self.index_multi_point_local(db, table, ks.iid, &ks.keys).await?
+            self.index_multi_point_local(db, table, ks.iid, &ks.keys)
+                .await?
         } else if let Some(h) = hint {
             if h.pk {
                 // ⭐ PG 兼容: 主键区间扫描
@@ -817,7 +994,8 @@ impl StorageEngine {
         } else {
             let scan_limit = if preds.is_empty() { limit } else { 0 };
             let mut raw: Vec<IndexEntry> = Vec::new();
-            self.table_scan_rows_local(db, table, scan_limit, &mut raw).await?;
+            self.table_scan_rows_local(db, table, scan_limit, &mut raw)
+                .await?;
             raw.into_iter().map(|(_v, _pk, rb)| rb).collect()
         };
         for rb in raw_rows {
@@ -828,8 +1006,10 @@ impl StorageEngine {
             if !row_pass_preds(&cols, preds) {
                 continue;
             }
-            let projected: Vec<ColValue> =
-                proj.iter().map(|&i| cols.get(i as usize).cloned().unwrap_or(ColValue::Null)).collect();
+            let projected: Vec<ColValue> = proj
+                .iter()
+                .map(|&i| cols.get(i as usize).cloned().unwrap_or(ColValue::Null))
+                .collect();
             out.push(projected);
             if limit > 0 && out.len() >= limit {
                 break;
@@ -855,7 +1035,8 @@ impl StorageEngine {
         if let Some(h) = hint {
             if h.pk {
                 // 主键区间扫描 → (v, pk, rb)
-                self.pk_scan_local(db, table, h.lo.as_ref(), h.hi.as_ref(), limit, out).await?;
+                self.pk_scan_local(db, table, h.lo.as_ref(), h.hi.as_ref(), limit, out)
+                    .await?;
             } else {
                 // 二级索引范围 → (pk, rb), 转成 (v=pk, pk, rb) 满足三元组
                 let pairs = self
@@ -881,7 +1062,9 @@ impl StorageEngine {
         let mut pk_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut pks: Vec<Vec<u8>> = Vec::new();
         for k in keys {
-            let hit = self.index_scan_pks_local(db, table, iid, Some(k), Some(k), 0).await?;
+            let hit = self
+                .index_scan_pks_local(db, table, iid, Some(k), Some(k), 0)
+                .await?;
             for pk in hit {
                 if pk_seen.insert(pk.clone()) {
                     pks.push(pk);
@@ -968,7 +1151,10 @@ impl StorageEngine {
         })
         .await?;
         if !with_rows {
-            return Ok(entries.into_iter().map(|(v, p)| (v, p, Vec::new())).collect());
+            return Ok(entries
+                .into_iter()
+                .map(|(v, p)| (v, p, Vec::new()))
+                .collect());
         }
         // ⭐ PERF: 批量回表 (LeafGuide 区间复用) — 广播查询大结果集的主要成本
         let refs: Vec<&[u8]> = entries.iter().map(|(_, p)| p.as_slice()).collect();
@@ -1042,9 +1228,10 @@ impl StorageEngine {
             return Ok(());
         }
 
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let prefix = ks::index_prefix(iid);
         let start = match &lo_enc {
             Some(l) => ks::index_value_prefix(iid, l),
@@ -1068,6 +1255,13 @@ impl StorageEngine {
         })
         .await
     }
+}
+
+/// `row_incr` 的精确增量类型；保留 HINCRBY 的 i64 溢出语义。
+#[derive(Debug, Clone, Copy)]
+pub enum RowIncrDelta {
+    Int(i64),
+    Float(f64),
 }
 
 /// 从存量 row 字节算全部索引值: `[(iid, Some(enc_val) | None-NULL)]`.

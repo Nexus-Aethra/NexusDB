@@ -9,11 +9,11 @@
 //! v1 边界: visited 防环 (自引用/菱形引用); 跨 shard 引用行全广播删;
 //! 引用列类型与父 pk 类型不一致时 IN 匹配退化为字节比较.
 
+use super::{ConnState, col_from_ordered_bytes, sql_dispatch_stmt};
 use crate::protocol::sql::{CmpOp, Cond, Pred, SqlStmt, SqlValue};
+use shard_manager::{DbDirView, SharedTaskInbox};
 use storage::row::ColValue;
 use storage::schema::{ColType, FkAction};
-use shard_manager::{DbDirView, SharedTaskInbox};
-use super::{col_from_ordered_bytes, ConnState, sql_dispatch_stmt};
 
 /// 级联子任务 (伪 seq → 完成时推进级联).
 #[derive(Debug, Clone)]
@@ -73,8 +73,18 @@ pub fn cascade_kickoff(
     );
     for r in refs {
         spawn_job(
-            conn, conn_id, root_seq, worker_id, db, default_db, db_view,
-            shard_inboxes, num_shards, table, &r, &pks,
+            conn,
+            conn_id,
+            root_seq,
+            worker_id,
+            db,
+            default_db,
+            db_view,
+            shard_inboxes,
+            num_shards,
+            table,
+            &r,
+            &pks,
         );
     }
     true
@@ -121,8 +131,18 @@ pub fn cascade_job_done(
             let deeper = conn.sql_shared.incoming_fks(&db, &ref_table);
             for r in deeper {
                 spawn_job(
-                    conn, conn_id, root_seq, worker_id, &db, default_db, db_view,
-                    shard_inboxes, num_shards, &ref_table, &r, &ref_pks,
+                    conn,
+                    conn_id,
+                    root_seq,
+                    worker_id,
+                    &db,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    &ref_table,
+                    &r,
+                    &ref_pks,
                 );
             }
         }
@@ -163,10 +183,7 @@ fn spawn_job(
     // SetNull 更新引用行不删行 → 不过滤 (父章被多引用时每引用各置空一次).
     let fresh: Vec<Vec<u8>> = if incoming.action == FkAction::Cascade {
         let mut f = Vec::with_capacity(pks.len());
-        let root = conn
-            .cascade_roots
-            .get_mut(&root_seq)
-            .expect("root 必在");
+        let root = conn.cascade_roots.get_mut(&root_seq).expect("root 必在");
         for pk in pks {
             if root.visited.insert((incoming.table.clone(), pk.clone())) {
                 f.push(pk.clone());
@@ -202,15 +219,28 @@ fn spawn_job(
     };
     let job_seq = (1u64 << 63) | conn.cascade_seq_ctr;
     conn.cascade_seq_ctr = conn.cascade_seq_ctr.wrapping_add(1);
-    conn.cascade_jobs
-        .insert(job_seq, CascadeJob { root_seq, action: incoming.action });
+    conn.cascade_jobs.insert(
+        job_seq,
+        CascadeJob {
+            root_seq,
+            action: incoming.action,
+        },
+    );
     if let Some(root) = conn.cascade_roots.get_mut(&root_seq) {
         root.active += 1;
     }
     // 递归执行 (pk 等值/两阶段/聚合 全走正常路径; 完成在 DmlAgg 拦截点推进)
     sql_dispatch_stmt(
-        conn, conn_id, job_seq, worker_id, db, default_db, db_view, shard_inboxes,
-        num_shards, stmt,
+        conn,
+        conn_id,
+        job_seq,
+        worker_id,
+        db,
+        default_db,
+        db_view,
+        shard_inboxes,
+        num_shards,
+        stmt,
     );
 }
 

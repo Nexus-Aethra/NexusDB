@@ -99,6 +99,17 @@ mod tests {
         let s = parse(b"ALTER TABLE t ADD COLUMN IF NOT EXISTS is_begin BOOLEAN NOT NULL DEFAULT false")
             .unwrap();
         assert!(matches!(s, SqlStmt::AlterTable { if_not_exists: true, .. }));
+
+        let s = parse(b"ALTER TABLE users SET RESP ADAPTER ON").unwrap();
+        assert!(matches!(
+            s,
+            SqlStmt::SetRespRowAdapter { table, enabled: true } if table == "users"
+        ));
+        let s = parse(b"ALTER TABLE users SET RESP ADAPTER OFF").unwrap();
+        assert!(matches!(
+            s,
+            SqlStmt::SetRespRowAdapter { table, enabled: false } if table == "users"
+        ));
     }
 
     #[test]

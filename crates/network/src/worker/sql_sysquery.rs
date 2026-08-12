@@ -70,7 +70,9 @@ pub(crate) fn sysq_finish(
         dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
-            fks: Vec::new(),};
+        fks: Vec::new(),
+        resp_row_adapter: Default::default(),
+    };
     // WHERE 残余过滤 (递归 eval; `__` 前缀的内部标记叶子如 __table__ 视为真,
     // 已在生成器里处理; 未知真实列的条件 → 不匹配则滤掉)
     rows.retain(|r| eval_pred_sysq(&schema, r, &spec.conds));
@@ -100,8 +102,11 @@ pub(crate) fn sysq_finish(
             .iter()
             .map(|c| all_cols.iter().position(|a| a.eq_ignore_ascii_case(c)))
             .collect();
-        let cols: Vec<(&str, ColType)> =
-            spec.cols.iter().map(|c| (c.as_str(), ColType::Str)).collect();
+        let cols: Vec<(&str, ColType)> = spec
+            .cols
+            .iter()
+            .map(|c| (c.as_str(), ColType::Str))
+            .collect();
         let proj: Vec<Vec<ColValue>> = rows
             .iter()
             .map(|r| {
@@ -185,7 +190,9 @@ pub(crate) fn sysq_exists(
         dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
-            fks: Vec::new(),};
+        fks: Vec::new(),
+        resp_row_adapter: Default::default(),
+    };
     let mut rows = rows;
     rows.retain(|r| eval_pred_sysq(&schema, r, &spec.conds));
     let hit = !rows.is_empty();
@@ -276,13 +283,23 @@ pub(crate) fn sysq_render_catalog(
             if full {
                 (
                     vec![
-                        "Field", "Type", "Null", "Key", "Default", "Extra", "Collation",
-                        "Privileges", "Comment",
+                        "Field",
+                        "Type",
+                        "Null",
+                        "Key",
+                        "Default",
+                        "Extra",
+                        "Collation",
+                        "Privileges",
+                        "Comment",
                     ],
                     rows,
                 )
             } else {
-                (vec!["Field", "Type", "Null", "Key", "Default", "Extra"], rows)
+                (
+                    vec!["Field", "Type", "Null", "Key", "Default", "Extra"],
+                    rows,
+                )
             }
         }
         // ⭐ F66: SHOW CREATE TABLE t — 重建 MySQL DDL (SQLAlchemy 从此解析列)
@@ -300,7 +317,10 @@ pub(crate) fn sysq_render_catalog(
                 })
                 .unwrap_or_default();
             let mut rows = Vec::new();
-            if let Some((t, sc)) = entries.iter().find(|(t, _)| t.eq_ignore_ascii_case(&target)) {
+            if let Some((t, sc)) = entries
+                .iter()
+                .find(|(t, _)| t.eq_ignore_ascii_case(&target))
+            {
                 let mut lines: Vec<String> = Vec::new();
                 for (i, c) in sc.columns.iter().enumerate() {
                     let ty: std::borrow::Cow<str> = match c.ty {
@@ -350,7 +370,12 @@ pub(crate) fn sysq_render_catalog(
                 .iter()
                 .map(|(t, _)| {
                     // ⭐ PG 兼容: table_schema 固定 'public' (migrator 以 'public' 探表)
-                    vec![sbytes("def"), sbytes("public"), sbytes(t), sbytes("BASE TABLE")]
+                    vec![
+                        sbytes("def"),
+                        sbytes("public"),
+                        sbytes(t),
+                        sbytes("BASE TABLE"),
+                    ]
                 })
                 .collect(),
         ),

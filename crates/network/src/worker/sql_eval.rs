@@ -145,7 +145,9 @@ pub(crate) fn sql_build_row(
     } else {
         for (name, v) in cols.iter().zip(vals) {
             if name.eq_ignore_ascii_case(HIDDEN_ROWID) {
-                return Err(format!("column '{HIDDEN_ROWID}' is reserved for auto rowid"));
+                return Err(format!(
+                    "column '{HIDDEN_ROWID}' is reserved for auto rowid"
+                ));
             }
             let i = schema
                 .col_by_name(name)
@@ -214,22 +216,6 @@ fn uuid_v4_bytes() -> Vec<u8> {
     b.to_vec()
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// SQL 字面量 → 列值 (Int 可升 F64; 类型不符报错).
 /// ⭐ P1: 数值列收到 Str → 尝试文本解析 (PG 文本参数按目标类型转换语义).
 pub(crate) fn sql_to_col(ty: ColType, v: &SqlValue) -> Result<ColValue, String> {
@@ -260,7 +246,10 @@ pub(crate) fn sql_to_col(ty: ColType, v: &SqlValue) -> Result<ColValue, String> 
         // ⭐ F80: BOOL — TRUE/FALSE(Int 1/0) 或文本 true/false/t/f/1/0 → I64(0/1)
         (ColType::Bool, SqlValue::Int(i)) => ColValue::I64(i64::from(*i != 0)),
         (ColType::Bool, SqlValue::Str(s)) => {
-            let t = std::str::from_utf8(s).unwrap_or("").trim().to_ascii_lowercase();
+            let t = std::str::from_utf8(s)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
             match t.as_str() {
                 "1" | "true" | "t" | "yes" | "y" => ColValue::I64(1),
                 "0" | "false" | "f" | "no" | "n" | "" => ColValue::I64(0),
@@ -268,12 +257,16 @@ pub(crate) fn sql_to_col(ty: ColType, v: &SqlValue) -> Result<ColValue, String> 
             }
         }
         // ⭐ F80: DATE/TIME/TIMESTAMP — 文本解析成 i64 微秒; Int 视为已是微秒
-        (ColType::Date, SqlValue::Str(s)) => parse_date_micros(std::str::from_utf8(s).unwrap_or(""))
-            .map(ColValue::I64)
-            .ok_or("invalid DATE literal (expect 'YYYY-MM-DD')")?,
-        (ColType::Time, SqlValue::Str(s)) => parse_time_micros(std::str::from_utf8(s).unwrap_or(""))
-            .map(ColValue::I64)
-            .ok_or("invalid TIME literal (expect 'HH:MM:SS')")?,
+        (ColType::Date, SqlValue::Str(s)) => {
+            parse_date_micros(std::str::from_utf8(s).unwrap_or(""))
+                .map(ColValue::I64)
+                .ok_or("invalid DATE literal (expect 'YYYY-MM-DD')")?
+        }
+        (ColType::Time, SqlValue::Str(s)) => {
+            parse_time_micros(std::str::from_utf8(s).unwrap_or(""))
+                .map(ColValue::I64)
+                .ok_or("invalid TIME literal (expect 'HH:MM:SS')")?
+        }
         (ColType::Timestamp, SqlValue::Str(s)) => {
             parse_timestamp_micros(std::str::from_utf8(s).unwrap_or(""))
                 .map(ColValue::I64)
@@ -311,7 +304,11 @@ pub(crate) fn sql_to_col(ty: ColType, v: &SqlValue) -> Result<ColValue, String> 
             .and_then(|t| t.trim().parse::<f64>().ok())
             .map(ColValue::F64)
             .ok_or("invalid float text for double column")?,
-        _ => return Err(format!("type mismatch: {v:?} not assignable to {ty:?} column")),
+        _ => {
+            return Err(format!(
+                "type mismatch: {v:?} not assignable to {ty:?} column"
+            ));
+        }
     })
 }
 
@@ -321,10 +318,9 @@ pub(crate) fn sql_pk_bytes(ty: ColType, v: &ColValue) -> Result<Vec<u8>, String>
         (ColType::I64, ColValue::I64(i)) => Ok(storage::keyspace::encode_idx(*i).to_vec()),
         (ColType::F64, ColValue::F64(f)) => Ok(storage::keyspace::encode_f64_ordered(*f).to_vec()),
         // ⭐ F80: Bool/Date/Time/Timestamp 以 i64 承载 → 保序数值编码
-        (
-            ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp,
-            ColValue::I64(i),
-        ) => Ok(storage::keyspace::encode_idx(*i).to_vec()),
+        (ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp, ColValue::I64(i)) => {
+            Ok(storage::keyspace::encode_idx(*i).to_vec())
+        }
         (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b))
             if !b.is_empty() =>
         {
@@ -447,9 +443,10 @@ pub(crate) fn coerce_cmp_lit(ty: ColType, sv: &SqlValue) -> Option<SqlValue> {
 fn coerce_cmp_lit_uuid(colty: ColType, v: &SqlValue) -> Option<SqlValue> {
     if colty == ColType::Uuid {
         match v {
-            SqlValue::Str(s) => {
-                std::str::from_utf8(s).ok().and_then(parse_uuid).map(SqlValue::Str)
-            }
+            SqlValue::Str(s) => std::str::from_utf8(s)
+                .ok()
+                .and_then(parse_uuid)
+                .map(SqlValue::Str),
             _ => None,
         }
     } else {
@@ -487,9 +484,9 @@ pub(crate) fn sql_cmp(cv: &ColValue, sv: &SqlValue) -> Option<std::cmp::Ordering
             a.partial_cmp(&std::str::from_utf8(s).ok()?.trim().parse::<f64>().ok()?)
         }
         // ⭐ F81: DECIMAL 比较 — 字面量转同 scale 定标整数 (精确); Float 走 f64 兜底
-        (ColValue::Decimal(a, sc), SqlValue::Int(b)) => {
-            (*b as i128).checked_mul(pow10_i128(*sc)?).map(|bb| a.cmp(&bb))
-        }
+        (ColValue::Decimal(a, sc), SqlValue::Int(b)) => (*b as i128)
+            .checked_mul(pow10_i128(*sc)?)
+            .map(|bb| a.cmp(&bb)),
         (ColValue::Decimal(a, sc), SqlValue::Str(s)) => {
             let t = std::str::from_utf8(s).ok()?.trim();
             match parse_decimal(t, *sc) {
@@ -566,15 +563,13 @@ pub(crate) fn sql_ok_bytes(proto: ProtocolKind, affected: u64) -> Vec<u8> {
     if proto == ProtocolKind::Http {
         return crate::protocol::http::build_response(
             200,
-            &serde_json::to_vec(&serde_json::json!({ "affected": affected }))
-                .unwrap_or_default(),
+            &serde_json::to_vec(&serde_json::json!({ "affected": affected })).unwrap_or_default(),
             crate::http_config::cors_origin(),
             true,
         );
     }
     if proto == ProtocolKind::Pg {
-        let mut out =
-            crate::protocol::pg::build_command_complete(&format!("OK {affected}"));
+        let mut out = crate::protocol::pg::build_command_complete(&format!("OK {affected}"));
         out.extend_from_slice(&crate::protocol::pg::build_ready());
         out
     } else {
@@ -647,7 +642,10 @@ pub(crate) fn render_sql_rows(
         .enumerate()
         .map(|(k, &i)| {
             let c = &schema.columns[i as usize];
-            let name = names.get(k).and_then(|o| o.as_deref()).unwrap_or(c.name.as_str());
+            let name = names
+                .get(k)
+                .and_then(|o| o.as_deref())
+                .unwrap_or(c.name.as_str());
             (name, c.ty)
         })
         .collect();
@@ -723,7 +721,11 @@ pub(crate) fn sql_dml_op(
 }
 
 /// ⭐ S2: ORDER BY 比较 (多列; NULL 按 asc 排最后, desc 时相反 — PG 默认行为).
-pub(crate) fn sql_order_cmp(a: &[ColValue], b: &[ColValue], order: &[(u16, bool)]) -> std::cmp::Ordering {
+pub(crate) fn sql_order_cmp(
+    a: &[ColValue],
+    b: &[ColValue],
+    order: &[(u16, bool)],
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     for &(col, desc) in order {
         let (av, bv) = (&a[col as usize], &b[col as usize]);

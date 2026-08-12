@@ -403,6 +403,9 @@ pub enum SqlStmt {
     /// ⭐ F79: ALTER TABLE t ADD COLUMN c TYPE (v1 仅追加可空列);
     /// ⭐ compat: DROP COLUMN c (标记删除, 物理保留).
     AlterTable { table: String, add: Option<Column>, drop: Option<String>, if_not_exists: bool },
+    /// 显式打开/关闭 SQL 表的 RESP 行适配。
+    /// 语法: `ALTER TABLE t SET RESP ADAPTER ON|OFF`.
+    SetRespRowAdapter { table: String, enabled: bool },
     /// ⭐ S3: USE db — 连接级切库 (worker 校验存在).
     Use { db: String },
     /// ⭐ S3: DESCRIBE t / DESC t — schema 渲染 (worker 本地).

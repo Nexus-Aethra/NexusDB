@@ -2,10 +2,10 @@
 //! 从 worker/mod.rs 拆分 (2026-08) — 核心 SQL 执行路径.
 //! JOIN→sql_join.rs, UNIQUE→sql_unique.rs, 系统查询→sql_sysquery.rs.
 
-use super::*;
 use super::sql_dml::*;
 use super::sql_join::*;
 use super::sql_sysquery::*;
+use super::*;
 
 pub(crate) fn sql_dispatch_stmt(
     conn: &mut ConnState,
@@ -23,7 +23,10 @@ pub(crate) fn sql_dispatch_stmt(
     // ⭐ ORM-B2: DDL epoch 检查 — DROP/重建后本 worker 陈旧 schema 缓存整体
     // 失效 (一次 relaxed load 热路径; DDL 低频, 全量清空重拉可接受)
     {
-        let ep = conn.sql_shared.ddl_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let ep = conn
+            .sql_shared
+            .ddl_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
         let mut cache = conn.sql_cache.borrow_mut();
         if cache.local_epoch != ep {
             cache.schemas.clear();
@@ -46,7 +49,11 @@ pub(crate) fn sql_dispatch_stmt(
         }
         // ⭐ v2 (F62): SET [SESSION] TRANSACTION — session 改连接默认,
         // 否则改当前事务 (非事务中也落连接默认 — MySQL "下一个事务" 近似)
-        SqlStmt::SetTransaction { iso, read_only, session } => {
+        SqlStmt::SetTransaction {
+            iso,
+            read_only,
+            session,
+        } => {
             if !session && let Some(txn) = conn.txn.as_mut() {
                 if let Some(i) = iso {
                     txn.iso = i;
@@ -127,17 +134,28 @@ pub(crate) fn sql_dispatch_stmt(
                         HashMap::new();
                     for ((d, t, pk), fp) in txn.read_set {
                         let sid = hash_route_key(&d, &t, &pk, num_shards);
-                        checks.entry(sid).or_default().push(
-                            shard_manager::request::ReadCheck { db: d, table: t, pk, fp },
-                        );
+                        checks
+                            .entry(sid)
+                            .or_default()
+                            .push(shard_manager::request::ReadCheck {
+                                db: d,
+                                table: t,
+                                pk,
+                                fp,
+                            });
                     }
                     // 并集 shard: 有写或有验证项都发 (纯验证批 ops 空)
-                    let mut sids: Vec<usize> = groups.keys().chain(checks.keys()).copied().collect();
+                    let mut sids: Vec<usize> =
+                        groups.keys().chain(checks.keys()).copied().collect();
                     sids.sort_unstable();
                     sids.dedup();
                     conn.sql_txn_agg.insert(
                         seq,
-                        SqlTxnAgg { remaining: sids.len(), applied: 0, error: None },
+                        SqlTxnAgg {
+                            remaining: sids.len(),
+                            applied: 0,
+                            error: None,
+                        },
                     );
                     for (gidx, sid) in sids.into_iter().enumerate() {
                         push_task_grouped(
@@ -176,7 +194,10 @@ pub(crate) fn sql_dispatch_stmt(
             }
             None => conn.resp_complete(
                 seq,
-                sql_err_bytes(conn.proto, "SAVEPOINT can only be used in transaction blocks"),
+                sql_err_bytes(
+                    conn.proto,
+                    "SAVEPOINT can only be used in transaction blocks",
+                ),
             ),
         },
         SqlStmt::Release { name } => match conn.txn.as_mut() {
@@ -208,7 +229,10 @@ pub(crate) fn sql_dispatch_stmt(
             );
         }
         // ⭐ 事务 v1 (F61): DDL 在事务中拒绝 (避免与 2PC 交叉)
-        SqlStmt::CreateTable { .. } | SqlStmt::DropTable { .. } | SqlStmt::AlterTable { .. }
+        SqlStmt::CreateTable { .. }
+        | SqlStmt::DropTable { .. }
+        | SqlStmt::AlterTable { .. }
+        | SqlStmt::SetRespRowAdapter { .. }
             if conn.txn.is_some() =>
         {
             conn.resp_complete(
@@ -283,23 +307,45 @@ pub(crate) fn sql_dispatch_stmt(
                         "lower_case_table_names" => "0",
                         "autocommit" => "1",
                         "max_allowed_packet" => "16777216",
-                        "character_set_client" | "character_set_connection"
+                        "character_set_client"
+                        | "character_set_connection"
                         | "character_set_results" => "utf8mb4",
                         _ => "",
                     };
                     (format!("@@{v}"), val.to_string())
                 })
                 .collect();
-            let cols: Vec<(&str, ColType)> =
-                vals.iter().map(|(n, _)| (n.as_str(), ColType::Str)).collect();
-            let row: Vec<ColValue> =
-                vals.iter().map(|(_, val)| ColValue::Bytes(val.as_bytes().to_vec())).collect();
+            let cols: Vec<(&str, ColType)> = vals
+                .iter()
+                .map(|(n, _)| (n.as_str(), ColType::Str))
+                .collect();
+            let row: Vec<ColValue> = vals
+                .iter()
+                .map(|(_, val)| ColValue::Bytes(val.as_bytes().to_vec()))
+                .collect();
             conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cols, &[row]));
         }
         // ⭐ F66: 系统表查询 (information_schema / pg_catalog 虚拟表)
-        SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset, .. } => {
-            let spec =
-                SysQuerySpec { catalog, table, cols, conds, order, limit, offset, exists: false };
+        SqlStmt::SystemQuery {
+            catalog,
+            table,
+            cols,
+            conds,
+            order,
+            limit,
+            offset,
+            ..
+        } => {
+            let spec = SysQuerySpec {
+                catalog,
+                table,
+                cols,
+                conds,
+                order,
+                limit,
+                offset,
+                exists: false,
+            };
             // 纯 db 列表的虚拟表 (schemata / pg_namespace) → 零任务直接合成;
             // 需表/列元数据的 → 发 CatalogDump 挂起
             if spec.needs_catalog() {
@@ -308,8 +354,7 @@ pub(crate) fn sql_dispatch_stmt(
                 let sid = hash_route_key(db, "", &[], num_shards);
                 push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
             } else {
-                let dbs: Vec<String> =
-                    db_view.all_names().iter().map(|s| s.to_string()).collect();
+                let dbs: Vec<String> = db_view.all_names().iter().map(|s| s.to_string()).collect();
                 // default 库隐式不入 resolver — 补入
                 let mut dbs = dbs;
                 if !dbs.iter().any(|d| d.as_str() == default_db.as_ref()) {
@@ -322,9 +367,26 @@ pub(crate) fn sql_dispatch_stmt(
         }
         // ⭐ PG 兼容: SELECT EXISTS (SELECT ...) — 内层转系统查询 exists 判定
         SqlStmt::ExistsStub { inner } => match *inner {
-            SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset, .. } => {
-                let spec =
-                    SysQuerySpec { catalog, table, cols, conds, order, limit, offset, exists: true };
+            SqlStmt::SystemQuery {
+                catalog,
+                table,
+                cols,
+                conds,
+                order,
+                limit,
+                offset,
+                ..
+            } => {
+                let spec = SysQuerySpec {
+                    catalog,
+                    table,
+                    cols,
+                    conds,
+                    order,
+                    limit,
+                    offset,
+                    exists: true,
+                };
                 if spec.needs_catalog() {
                     conn.sql_sysq.insert(seq, spec);
                     let op = BatchOp::CatalogDump { db: db.clone() };
@@ -345,10 +407,13 @@ pub(crate) fn sql_dispatch_stmt(
             _ => {
                 conn.resp_complete(
                     seq,
-                    sql_err_bytes(conn.proto, "EXISTS over non-system query not supported (v1)"),
+                    sql_err_bytes(
+                        conn.proto,
+                        "EXISTS over non-system query not supported (v1)",
+                    ),
                 );
             }
-        }
+        },
         SqlStmt::Use { db: name } => {
             // 校验存在 (default 库隐式不入 resolver, 特判)
             if name.as_str() == default_db.as_ref() || db_view.id_of(&name).is_some() {
@@ -362,27 +427,32 @@ pub(crate) fn sql_dispatch_stmt(
             }
         }
         // ⭐ PG 兼容: CREATE DATABASE — 集群控制面 2PC 建库 (同步低频)
-        SqlStmt::CreateDb { name } => {
-            match conn.sql_shared.cluster_ctl() {
-                Some(mgr) => match mgr.create_db(&name) {
-                    Ok(()) => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0)),
-                    Err(e) => conn.resp_complete(
-                        seq,
-                        sql_err_bytes(
-                            conn.proto,
-                            &format!("database \"{name}\" create failed: {e}"),
-                        ),
+        SqlStmt::CreateDb { name } => match conn.sql_shared.cluster_ctl() {
+            Some(mgr) => match mgr.create_db(&name) {
+                Ok(()) => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0)),
+                Err(e) => conn.resp_complete(
+                    seq,
+                    sql_err_bytes(
+                        conn.proto,
+                        &format!("database \"{name}\" create failed: {e}"),
                     ),
-                },
-                None => {
-                    conn.resp_complete(
-                        seq,
-                        sql_err_bytes(conn.proto, "cluster control plane not available (CREATE DATABASE)"),
-                    );
-                }
+                ),
+            },
+            None => {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(
+                        conn.proto,
+                        "cluster control plane not available (CREATE DATABASE)",
+                    ),
+                );
             }
-        }
-        SqlStmt::CreateTable { table, schema, if_not_exists } => {
+        },
+        SqlStmt::CreateTable {
+            table,
+            schema,
+            if_not_exists,
+        } => {
             // ⭐ IF NOT EXISTS: 表已存在 → 静默跳过 (直接 OK, 不广播)
             if if_not_exists {
                 let key = (db.to_string(), table.clone());
@@ -418,14 +488,23 @@ pub(crate) fn sql_dispatch_stmt(
         | SqlStmt::Delete { ref table, .. }
         | SqlStmt::Update { ref table, .. }
         | SqlStmt::AlterTable { ref table, .. }
+        | SqlStmt::SetRespRowAdapter { ref table, .. }
         | SqlStmt::Describe { ref table } => {
             // ⭐ F71: WHERE 子查询 — 先顺序跑内层折叠, 完后重跑外层 (仅 Select/Delete/Update)
             if matches!(
                 stmt,
                 SqlStmt::Select { .. } | SqlStmt::Delete { .. } | SqlStmt::Update { .. }
             ) && sql_subq_start(
-                conn, conn_id, seq, worker_id, db, default_db, db_view, shard_inboxes,
-                num_shards, &stmt,
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db,
+                default_db,
+                db_view,
+                shard_inboxes,
+                num_shards,
+                &stmt,
             ) {
                 return;
             }
@@ -433,24 +512,57 @@ pub(crate) fn sql_dispatch_stmt(
             // ⭐ W1: worker 级共享缓存 (borrow 局部化: 取 Arc 即还)
             let cached = conn.sql_cache.borrow().schemas.get(&key).cloned();
             if let Some(schema) = cached {
-                sql_run_dml(conn, conn_id, seq, worker_id, db, shard_inboxes, num_shards, schema, stmt);
+                sql_run_dml(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    db,
+                    shard_inboxes,
+                    num_shards,
+                    schema,
+                    stmt,
+                );
             } else {
                 // schema miss: 挂起语句, 先拉 schema (GetSchemaOp 定向单 shard)
                 let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
                 let table_name = table.clone();
-                conn.sql_pending.insert(seq, PendingSql { stmt, db: db.clone(), table: table_name });
-                let op = BatchOp::GetSchemaOp { db: db.clone(), table: table_arc };
+                conn.sql_pending.insert(
+                    seq,
+                    PendingSql {
+                        stmt,
+                        db: db.clone(),
+                        table: table_name,
+                    },
+                );
+                let op = BatchOp::GetSchemaOp {
+                    db: db.clone(),
+                    table: table_arc,
+                };
                 push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
             }
         }
         // ⭐ F67 (JOIN): 两表 hash join — 建 ctx → 补 schema/gather 顺序启动
-        SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset, .. } => {
+        SqlStmt::SelectJoin {
+            from,
+            from_inner,
+            joins,
+            items,
+            conds,
+            order,
+            limit,
+            offset,
+            ..
+        } => {
             // ⭐ F75: 首表为派生表 → 先物化内层 (同 seq 完成点拦截), 完后 finish_derived 建 JOIN
             if let Some(inner) = from_inner {
                 if !matches!(*inner, SqlStmt::Select { .. }) {
                     conn.resp_complete(
                         seq,
-                        sql_err_bytes(conn.proto, "derived-table inner must be a simple SELECT (v1)"),
+                        sql_err_bytes(
+                            conn.proto,
+                            "derived-table inner must be a simple SELECT (v1)",
+                        ),
                     );
                     return;
                 }
@@ -460,19 +572,44 @@ pub(crate) fn sql_dispatch_stmt(
                     if !nested.is_empty() {
                         conn.resp_complete(
                             seq,
-                            sql_err_bytes(conn.proto, "subquery inside derived table not supported (v1)"),
+                            sql_err_bytes(
+                                conn.proto,
+                                "subquery inside derived table not supported (v1)",
+                            ),
                         );
                         return;
                     }
                 }
                 let join_stmt = SqlStmt::SelectJoin {
-                    from, from_inner: None, joins, items, conds, order, limit, offset,
-                    limit_param: None, offset_param: None,
+                    from,
+                    from_inner: None,
+                    joins,
+                    items,
+                    conds,
+                    order,
+                    limit,
+                    offset,
+                    limit_param: None,
+                    offset_param: None,
                 };
-                conn.sql_derived.insert(seq, DerivedCtx::JoinFrom { db: db.clone(), join_stmt });
+                conn.sql_derived.insert(
+                    seq,
+                    DerivedCtx::JoinFrom {
+                        db: db.clone(),
+                        join_stmt,
+                    },
+                );
                 sql_dispatch_stmt(
-                    conn, conn_id, seq, worker_id, db, default_db, db_view, shard_inboxes,
-                    num_shards, *inner,
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    db,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    *inner,
                 );
                 return;
             }
@@ -517,12 +654,24 @@ pub(crate) fn sql_dispatch_stmt(
         }
         // ⭐ F72: FROM 派生表 — 内层先物化 (同 seq 完成点拦截), 完后 finish_derived
         // 在 worker 内存执行外层 (过滤/投影/排序/截断; 不下推 shard)
-        SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset, .. } => {
+        SqlStmt::SelectDerived {
+            inner,
+            alias,
+            items,
+            conds,
+            order,
+            limit,
+            offset,
+            ..
+        } => {
             // v1: 内层仅单表 SELECT (非 JOIN/系统表) — 否则绕过完成点拦截
             if !matches!(*inner, SqlStmt::Select { .. }) {
                 conn.resp_complete(
                     seq,
-                    sql_err_bytes(conn.proto, "derived-table inner must be a simple SELECT (v1)"),
+                    sql_err_bytes(
+                        conn.proto,
+                        "derived-table inner must be a simple SELECT (v1)",
+                    ),
                 );
                 return;
             }
@@ -533,15 +682,36 @@ pub(crate) fn sql_dispatch_stmt(
                 if !nested.is_empty() {
                     conn.resp_complete(
                         seq,
-                        sql_err_bytes(conn.proto, "subquery inside derived table not supported (v1)"),
+                        sql_err_bytes(
+                            conn.proto,
+                            "subquery inside derived table not supported (v1)",
+                        ),
                     );
                     return;
                 }
             }
-            conn.sql_derived.insert(seq, DerivedCtx::Standalone { alias, items, conds, order, limit, offset });
+            conn.sql_derived.insert(
+                seq,
+                DerivedCtx::Standalone {
+                    alias,
+                    items,
+                    conds,
+                    order,
+                    limit,
+                    offset,
+                },
+            );
             sql_dispatch_stmt(
-                conn, conn_id, seq, worker_id, db, default_db, db_view, shard_inboxes,
-                num_shards, *inner,
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db,
+                default_db,
+                db_view,
+                shard_inboxes,
+                num_shards,
+                *inner,
             );
         }
         // ⭐ S1: DROP TABLE — 无需 schema, 数据面广播删表
@@ -557,20 +727,27 @@ pub(crate) fn sql_dispatch_stmt(
             );
             let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
             for sid in 0..num_shards {
-                let op = BatchOp::DropTableOp { db: db.clone(), table: table_arc.clone() };
+                let op = BatchOp::DropTableOp {
+                    db: db.clone(),
+                    table: table_arc.clone(),
+                };
                 push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
             }
         }
     }
 }
 
-
 /// ⭐ F65: 提取 schema 的全局唯一列 (iid, col); 空 = 无全局唯一.
 
-pub(crate) fn conds_to_scan_preds(schema: &TableSchema, conds: &Pred<Cond>) -> Vec<shard_manager::ScanPred> {
+pub(crate) fn conds_to_scan_preds(
+    schema: &TableSchema,
+    conds: &Pred<Cond>,
+) -> Vec<shard_manager::ScanPred> {
     let mut preds = Vec::new();
     for cond in conds.as_conjuncts().unwrap_or_default() {
-        let Some(cidx) = schema.col_by_name(&cond.col) else { continue };
+        let Some(cidx) = schema.col_by_name(&cond.col) else {
+            continue;
+        };
         let ty = schema.columns[cidx as usize].ty;
         // ⭐ DECIMAL 不下推: shard 端按 ordered-bytes 比较, 与 worker 端 Decimal 定标
         // 语义 (字面量转同 scale) 不一致 → 留在 worker 残余过滤 (正确性由 finish 兜底).
@@ -645,7 +822,10 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
             let mut bounds: Vec<(Option<ColValue>, Option<ColValue>)> =
                 Vec::with_capacity(branches.len());
             for c in &branches {
-                if !matches!(c.op, CmpOp::Eq | CmpOp::Ge | CmpOp::Le | CmpOp::Gt | CmpOp::Lt | CmpOp::In) {
+                if !matches!(
+                    c.op,
+                    CmpOp::Eq | CmpOp::Ge | CmpOp::Le | CmpOp::Gt | CmpOp::Lt | CmpOp::In
+                ) {
                     ok = false;
                     break;
                 }
@@ -727,9 +907,14 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
     };
     // 1. pk 等值点查
     let pk_col = &schema.columns[schema.pk_col as usize];
-    if let Some(c) = conds.iter().find(|c| c.op == CmpOp::Eq && c.col == pk_col.name) {
+    if let Some(c) = conds
+        .iter()
+        .find(|c| c.op == CmpOp::Eq && c.col == pk_col.name)
+    {
         let cv = sql_to_col(pk_col.ty, &c.val)?;
-        return Ok(SqlPlan::PkGet { pk: sql_pk_bytes(pk_col.ty, &cv)? });
+        return Ok(SqlPlan::PkGet {
+            pk: sql_pk_bytes(pk_col.ty, &cv)?,
+        });
     }
     // ⭐ PG 兼容 (范围查): 主键列范围谓词 (BETWEEN/>=/<=) → 走主键 B+Tree 区间
     // 扫描 (避免全表扫). 收集 pk 列上的 Ge/Le/Gt/Lt 界.
@@ -756,7 +941,14 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
         }
         if hit {
             // 单边范围选择性低 → 无界扫描接近全表, 仍用索引 (起点定位快于全扫)
-            return Ok(SqlPlan::Index { iid: 0, lo, hi, limit_push: true, eq_enc: None, pk: true });
+            return Ok(SqlPlan::Index {
+                iid: 0,
+                lo,
+                hi,
+                limit_push: true,
+                eq_enc: None,
+                pk: true,
+            });
         }
     }
     // 2. 多索引计分选择
@@ -843,7 +1035,11 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
             score = score.saturating_sub(1);
         }
         // 只有得分 > 0 才算候选; 平局保留首个 (ipos 更小者优先, 确定性)
-        if score > 0 && best.as_ref().map_or(true, |(bs, bpos, _)| score > *bs || (score == *bs && ipos < *bpos)) {
+        if score > 0
+            && best.as_ref().map_or(true, |(bs, bpos, _)| {
+                score > *bs || (score == *bs && ipos < *bpos)
+            })
+        {
             best = Some((score, ipos, idx.iid));
             best_bounds = (lo, hi);
         }
@@ -862,7 +1058,14 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
             (Some(l), Some(h)) if l == h => storage::sql_rows::index_val_bytes(col.ty, l),
             _ => None,
         };
-        return Ok(SqlPlan::Index { iid, lo, hi, limit_push, eq_enc, pk: false });
+        return Ok(SqlPlan::Index {
+            iid,
+            lo,
+            hi,
+            limit_push,
+            eq_enc,
+            pk: false,
+        });
     }
     // ⭐ S2: 无可用索引 → 全表扫 + 残余过滤 (v1 的报错路径退役)
     Ok(SqlPlan::FullScan)
@@ -875,9 +1078,24 @@ mod tests {
     fn test_schema() -> TableSchema {
         TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
-                Column { name: "name".into(), ty: ColType::Str, nullable: true, default: None },
-                Column { name: "score".into(), ty: ColType::I64, nullable: true, default: None },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "name".into(),
+                    ty: ColType::Str,
+                    nullable: true,
+                    default: None,
+                },
+                Column {
+                    name: "score".into(),
+                    ty: ColType::I64,
+                    nullable: true,
+                    default: None,
+                },
             ],
             0,
             &[1, 2],
@@ -886,10 +1104,16 @@ mod tests {
             &[],
             &[],
         )
-        .unwrap()}
+        .unwrap()
+    }
 
     fn c(col: &str, op: CmpOp, val: SqlValue) -> Pred<Cond> {
-        Pred::Leaf(Cond { col: col.into(), op, val, set: vec![] })
+        Pred::Leaf(Cond {
+            col: col.into(),
+            op,
+            val,
+            set: vec![],
+        })
     }
 
     fn andc(preds: Vec<Pred<Cond>>) -> Pred<Cond> {
@@ -908,7 +1132,10 @@ mod tests {
         });
         let (np, _) = sql::normalize_pred_cond(&p);
         let plan = sql_plan_select(&schema, &np).unwrap();
-        assert!(matches!(plan, SqlPlan::FullScan), "大 IN 应回退全扫: {plan:?}");
+        assert!(
+            matches!(plan, SqlPlan::FullScan),
+            "大 IN 应回退全扫: {plan:?}"
+        );
     }
 
     #[test]
@@ -931,7 +1158,10 @@ mod tests {
     fn pk_eq_uses_point_get() {
         let schema = test_schema();
         let plan = sql_plan_select(&schema, &c("id", CmpOp::Eq, SqlValue::Int(42))).unwrap();
-        assert!(matches!(plan, SqlPlan::PkGet { .. }), "pk eq must be PkGet, got {plan:?}");
+        assert!(
+            matches!(plan, SqlPlan::PkGet { .. }),
+            "pk eq must be PkGet, got {plan:?}"
+        );
     }
 
     #[test]
@@ -1055,7 +1285,10 @@ mod tests {
         );
         // 非索引非主键列范围 → FullScan
         let plan = sql_plan_select(&schema, &c("score", CmpOp::Gt, SqlValue::Int(0))).unwrap();
-        assert!(matches!(plan, SqlPlan::Index { pk: false, .. } | SqlPlan::FullScan), "score 有二级索引应走索引: {plan:?}");
+        assert!(
+            matches!(plan, SqlPlan::Index { pk: false, .. } | SqlPlan::FullScan),
+            "score 有二级索引应走索引: {plan:?}"
+        );
     }
 
     #[test]
@@ -1067,7 +1300,11 @@ mod tests {
     #[test]
     fn normalize_not_eq_for_index_plan() {
         let schema = test_schema();
-        let raw = Pred::Not(Box::new(c("name", CmpOp::Eq, SqlValue::Str(b"alice".to_vec()))));
+        let raw = Pred::Not(Box::new(c(
+            "name",
+            CmpOp::Eq,
+            SqlValue::Str(b"alice".to_vec()),
+        )));
         let (np, is_false) = sql::normalize_pred_cond(&raw);
         assert!(!is_false);
         match np {
@@ -1080,10 +1317,7 @@ mod tests {
 
     #[test]
     fn always_false_predicate_short_circuits() {
-        let raw = Pred::And(vec![
-            c("id", CmpOp::Eq, SqlValue::Int(1)),
-            Pred::Or(vec![]),
-        ]);
+        let raw = Pred::And(vec![c("id", CmpOp::Eq, SqlValue::Int(1)), Pred::Or(vec![])]);
         let (_, is_false) = sql::normalize_pred_cond(&raw);
         assert!(is_false, "AND 含恒假项必须标记恒假");
     }
@@ -1117,7 +1351,10 @@ mod tests {
             c("score", CmpOp::Eq, SqlValue::Int(5)),
         ]);
         let plan = sql_plan_select(&schema, &p).unwrap();
-        assert!(matches!(plan, SqlPlan::FullScan), "跨索引列 OR 应 FullScan, got {plan:?}");
+        assert!(
+            matches!(plan, SqlPlan::FullScan),
+            "跨索引列 OR 应 FullScan, got {plan:?}"
+        );
     }
 
     #[test]
@@ -1132,7 +1369,10 @@ mod tests {
             ]),
         ]);
         let plan = sql_plan_select(&schema, &p).unwrap();
-        assert!(matches!(plan, SqlPlan::FullScan), "含 AND 分支应 FullScan, got {plan:?}");
+        assert!(
+            matches!(plan, SqlPlan::FullScan),
+            "含 AND 分支应 FullScan, got {plan:?}"
+        );
     }
 
     #[test]
@@ -1145,6 +1385,9 @@ mod tests {
         ]);
         // id 是 pk, 非独立索引列 → 无索引 → FullScan (pk 点查只支持单值)
         let plan = sql_plan_select(&schema, &p).unwrap();
-        assert!(matches!(plan, SqlPlan::FullScan), "pk 上的 OR 应 FullScan, got {plan:?}");
+        assert!(
+            matches!(plan, SqlPlan::FullScan),
+            "pk 上的 OR 应 FullScan, got {plan:?}"
+        );
     }
 }

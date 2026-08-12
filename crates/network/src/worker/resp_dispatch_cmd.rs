@@ -96,6 +96,19 @@ pub(crate) fn dispatch_resp_command(
                 },
             );
             for key in keys {
+                if try_dispatch_resp_sql_delete(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    db.clone(),
+                    table.clone(),
+                    key.clone(),
+                    shard_inboxes,
+                    num_shards,
+                ) {
+                    continue;
+                }
                 let op = BatchOp::Delete {
                     db: db.clone(),
                     table: table.clone(),
@@ -117,7 +130,9 @@ pub(crate) fn dispatch_resp_command(
             type MGroup = ((usize, std::sync::Arc<str>), Vec<Vec<u8>>, Vec<usize>);
             let mut by_shard: Vec<MGroup> = Vec::new();
             for (i, mut key) in keys.into_iter().enumerate() {
-                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let tbl = conn
+                    .resolve_table(&mut key)
+                    .unwrap_or_else(|| table.clone());
                 let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
                 match by_shard
                     .iter_mut()
@@ -130,7 +145,8 @@ pub(crate) fn dispatch_resp_command(
                     None => by_shard.push(((sid, tbl), vec![key], vec![i])),
                 }
             }
-            let groups: Vec<Vec<usize>> = by_shard.iter().map(|(_, _, idxs)| idxs.clone()).collect();
+            let groups: Vec<Vec<usize>> =
+                by_shard.iter().map(|(_, _, idxs)| idxs.clone()).collect();
             conn.mget_agg.insert(
                 seq,
                 MGetAgg {
@@ -161,7 +177,9 @@ pub(crate) fn dispatch_resp_command(
             type ShardPairs = ((usize, std::sync::Arc<str>), Vec<(Vec<u8>, Vec<u8>)>);
             let mut by_shard: Vec<ShardPairs> = Vec::new();
             for (mut key, value) in pairs {
-                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let tbl = conn
+                    .resolve_table(&mut key)
+                    .unwrap_or_else(|| table.clone());
                 let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
                 match by_shard.iter_mut().find(|(g, _)| g.0 == sid && g.1 == tbl) {
                     Some((_, ps)) => ps.push((key, value)),
@@ -360,7 +378,9 @@ pub(crate) fn dispatch_resp_command(
             type NxPairs = ((usize, std::sync::Arc<str>), Vec<(Vec<u8>, Vec<u8>)>);
             let mut by_shard: Vec<NxPairs> = Vec::new();
             for (mut key, value) in pairs {
-                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let tbl = conn
+                    .resolve_table(&mut key)
+                    .unwrap_or_else(|| table.clone());
                 let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
                 match by_shard.iter_mut().find(|(g, _)| g.0 == sid && g.1 == tbl) {
                     Some((_, ps)) => ps.push((key, value)),
@@ -384,7 +404,11 @@ pub(crate) fn dispatch_resp_command(
             }
         }
         // ---- ⭐ Phase H: Hash (单 key 单 shard, 直推 push_task) ----
-        RespCommand::HSet { key, pairs, reply_ok } => {
+        RespCommand::HSet {
+            key,
+            pairs,
+            reply_ok,
+        } => {
             for (f, v) in &pairs {
                 if let Err(msg) = validate_kv(&key, 0, limits)
                     .and_then(|_| validate_kv(f, v.len().saturating_sub(1), limits))
@@ -393,10 +417,30 @@ pub(crate) fn dispatch_resp_command(
                     return;
                 }
             }
-            if reply_ok {
-                conn.hmset_ok.insert(seq); // HMSET 回 +OK (Integer 转换)
+            if try_dispatch_resp_sql_hset(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                table.clone(),
+                key.clone(),
+                pairs.clone(),
+                reply_ok,
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
             }
-            let op = BatchOp::HSet { db: db.clone(), table: table.clone(), key, pairs };
+            if reply_ok {
+                conn.hmset_ok.insert(seq);
+            } // HMSET 回 +OK (Integer 转换)
+            let op = BatchOp::HSet {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                pairs,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HSetNx { key, field, value } => {
@@ -404,6 +448,21 @@ pub(crate) fn dispatch_resp_command(
                 .and_then(|_| validate_kv(&field, value.len().saturating_sub(1), limits))
             {
                 conn.resp_complete(seq, codec.encode_error(&msg));
+                return;
+            }
+            if try_dispatch_resp_sql_hsetnx(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                table.clone(),
+                key.clone(),
+                field.clone(),
+                value.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
                 return;
             }
             let op = BatchOp::HSetNx {
@@ -415,12 +474,106 @@ pub(crate) fn dispatch_resp_command(
             };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
+        RespCommand::HQuery {
+            table: query_table,
+            terms,
+            fields,
+            limit,
+        } => {
+            let Ok(table_name) = std::str::from_utf8(&query_table) else {
+                conn.resp_complete(seq, codec.encode_error("HQUERY table must be UTF-8"));
+                return;
+            };
+            if fields.is_empty() || terms.len() > 8 || fields.len() > 32 {
+                conn.resp_complete(seq, codec.encode_error("HQUERY exceeds v1 limits"));
+                return;
+            }
+            let mut conds = Vec::with_capacity(terms.len());
+            for (col, op, val) in terms {
+                let (Ok(col), Ok(op)) = (std::str::from_utf8(&col), std::str::from_utf8(&op))
+                else {
+                    conn.resp_complete(
+                        seq,
+                        codec.encode_error("HQUERY identifiers/operators must be UTF-8"),
+                    );
+                    return;
+                };
+                let op = match op {
+                    "=" => CmpOp::Eq,
+                    ">" => CmpOp::Gt,
+                    ">=" => CmpOp::Ge,
+                    "<" => CmpOp::Lt,
+                    "<=" => CmpOp::Le,
+                    _ => unreachable!("RESP parser checked HQUERY operator"),
+                };
+                conds.push(Pred::Leaf(Cond {
+                    col: col.to_string(),
+                    op,
+                    val: SqlValue::Str(val),
+                    set: Vec::new(),
+                }));
+            }
+            let mut items = Vec::with_capacity(fields.len());
+            for field in fields {
+                let Ok(field) = std::str::from_utf8(&field) else {
+                    conn.resp_complete(seq, codec.encode_error("HQUERY field must be UTF-8"));
+                    return;
+                };
+                items.push(sql::SelectItem::Col {
+                    name: field.to_string(),
+                    alias: None,
+                });
+            }
+            conn.resp_hquery.insert(seq, RespHQueryCtx);
+            sql_dispatch_stmt(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db,
+                db,
+                db_view,
+                shard_inboxes,
+                num_shards,
+                SqlStmt::Select {
+                    table: table_name.to_string(),
+                    items,
+                    conds: Pred::And(conds),
+                    limit: Some(limit),
+                    order: Vec::new(),
+                    offset: None,
+                    group_by: Vec::new(),
+                    having: Pred::And(Vec::new()),
+                    limit_param: None,
+                    offset_param: None,
+                },
+            );
+        }
         RespCommand::HGet { key, field } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::HGet { db: db.clone(), table: table.clone(), key, field };
+            if try_dispatch_resp_sql_hget(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                table.clone(),
+                key.clone(),
+                field.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
+            let op = BatchOp::HGet {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                field,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HMGet { key, fields } => {
@@ -428,7 +581,28 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::HMGet { db: db.clone(), table: table.clone(), key, fields };
+            let fallback = BatchOp::HMGet {
+                db: db.clone(),
+                table: table.clone(),
+                key: key.clone(),
+                fields: fields.clone(),
+            };
+            if try_dispatch_resp_sql_read(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                key,
+                fields,
+                RespSqlReadMode::Fields,
+                fallback.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
+            let op = fallback;
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HDel { key, fields } => {
@@ -436,7 +610,26 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::HDel { db: db.clone(), table: table.clone(), key, fields };
+            if try_dispatch_resp_sql_hdel(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                table.clone(),
+                key.clone(),
+                fields.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
+            let op = BatchOp::HDel {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                fields,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HExists { key, field } => {
@@ -444,8 +637,29 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
+            let fallback = BatchOp::HGet {
+                db: db.clone(),
+                table: table.clone(),
+                key: key.clone(),
+                field: field.clone(),
+            };
+            if try_dispatch_resp_sql_read(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                key,
+                vec![field],
+                RespSqlReadMode::Exists,
+                fallback.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
             conn.get_kind.insert(seq, GetKind::HExists);
-            let op = BatchOp::HGet { db: db.clone(), table: table.clone(), key, field };
+            let op = fallback;
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HLen { key } => {
@@ -453,7 +667,27 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::HLen { db: db.clone(), table: table.clone(), key };
+            let fallback = BatchOp::HLen {
+                db: db.clone(),
+                table: table.clone(),
+                key: key.clone(),
+            };
+            if try_dispatch_resp_sql_read(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                key,
+                Vec::new(),
+                RespSqlReadMode::Length,
+                fallback.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
+            let op = fallback;
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HGetAll { key } => {
@@ -461,8 +695,28 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
+            let fallback = BatchOp::HGetAll {
+                db: db.clone(),
+                table: table.clone(),
+                key: key.clone(),
+            };
+            if try_dispatch_resp_sql_read(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                key,
+                Vec::new(),
+                RespSqlReadMode::AllPairs,
+                fallback.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
             conn.pairs_kind.insert(seq, PairsKind::All);
-            let op = BatchOp::HGetAll { db: db.clone(), table: table.clone(), key };
+            let op = fallback;
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HKeys { key } => {
@@ -470,8 +724,28 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
+            let fallback = BatchOp::HGetAll {
+                db: db.clone(),
+                table: table.clone(),
+                key: key.clone(),
+            };
+            if try_dispatch_resp_sql_read(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                key,
+                Vec::new(),
+                RespSqlReadMode::Keys,
+                fallback.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
             conn.pairs_kind.insert(seq, PairsKind::Keys);
-            let op = BatchOp::HGetAll { db: db.clone(), table: table.clone(), key };
+            let op = fallback;
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HVals { key } => {
@@ -479,8 +753,28 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
+            let fallback = BatchOp::HGetAll {
+                db: db.clone(),
+                table: table.clone(),
+                key: key.clone(),
+            };
+            if try_dispatch_resp_sql_read(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                key,
+                Vec::new(),
+                RespSqlReadMode::Values,
+                fallback.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
             conn.pairs_kind.insert(seq, PairsKind::Vals);
-            let op = BatchOp::HGetAll { db: db.clone(), table: table.clone(), key };
+            let op = fallback;
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HScan { key } => {
@@ -488,13 +782,48 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
+            let fallback = BatchOp::HGetAll {
+                db: db.clone(),
+                table: table.clone(),
+                key: key.clone(),
+            };
+            if try_dispatch_resp_sql_read(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                key,
+                Vec::new(),
+                RespSqlReadMode::Scan,
+                fallback.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
             conn.pairs_kind.insert(seq, PairsKind::Scan);
-            let op = BatchOp::HGetAll { db: db.clone(), table: table.clone(), key };
+            let op = fallback;
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HIncrBy { key, field, delta } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
+                return;
+            }
+            if try_dispatch_resp_sql_incr(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                table.clone(),
+                key.clone(),
+                field.clone(),
+                RespSqlIncrDelta::Int(delta),
+                shard_inboxes,
+                num_shards,
+            ) {
                 return;
             }
             let op = BatchOp::HIncrBy {
@@ -509,6 +838,21 @@ pub(crate) fn dispatch_resp_command(
         RespCommand::HIncrByFloat { key, field, delta } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
+                return;
+            }
+            if try_dispatch_resp_sql_incr(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                table.clone(),
+                key.clone(),
+                field.clone(),
+                RespSqlIncrDelta::Float(delta),
+                shard_inboxes,
+                num_shards,
+            ) {
                 return;
             }
             let op = BatchOp::HIncrByFloat {
@@ -530,7 +874,12 @@ pub(crate) fn dispatch_resp_command(
                     return;
                 }
             }
-            let op = BatchOp::SAdd { db: db.clone(), table: table.clone(), key, members };
+            let op = BatchOp::SAdd {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                members,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SRem { key, members } => {
@@ -538,7 +887,12 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::SRem { db: db.clone(), table: table.clone(), key, members };
+            let op = BatchOp::SRem {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                members,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SIsMember { key, member } => {
@@ -546,7 +900,12 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::SIsMember { db: db.clone(), table: table.clone(), key, member };
+            let op = BatchOp::SIsMember {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                member,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SCard { key } => {
@@ -554,7 +913,11 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::SCard { db: db.clone(), table: table.clone(), key };
+            let op = BatchOp::SCard {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SMembers { key } => {
@@ -563,7 +926,11 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             conn.members_kind.insert(seq, MembersKind::List);
-            let op = BatchOp::SMembers { db: db.clone(), table: table.clone(), key };
+            let op = BatchOp::SMembers {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SScan { key } => {
@@ -572,7 +939,11 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             conn.members_kind.insert(seq, MembersKind::Scan);
-            let op = BatchOp::SMembers { db: db.clone(), table: table.clone(), key };
+            let op = BatchOp::SMembers {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SPop { key, count } => {
@@ -584,12 +955,21 @@ pub(crate) fn dispatch_resp_command(
             match count {
                 None => {
                     conn.members_kind.insert(seq, MembersKind::One);
-                    let op = BatchOp::SPop { db: db.clone(), table: table.clone(), key };
+                    let op = BatchOp::SPop {
+                        db: db.clone(),
+                        table: table.clone(),
+                        key,
+                    };
                     push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
                 }
                 Some(c) => {
                     conn.members_kind.insert(seq, MembersKind::List);
-                    let op = BatchOp::SPopN { db: db.clone(), table: table.clone(), key, count: c };
+                    let op = BatchOp::SPopN {
+                        db: db.clone(),
+                        table: table.clone(),
+                        key,
+                        count: c,
+                    };
                     push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
                 }
             }
@@ -602,12 +982,21 @@ pub(crate) fn dispatch_resp_command(
             match count {
                 None => {
                     conn.members_kind.insert(seq, MembersKind::One);
-                    let op = BatchOp::SRandMember { db: db.clone(), table: table.clone(), key };
+                    let op = BatchOp::SRandMember {
+                        db: db.clone(),
+                        table: table.clone(),
+                        key,
+                    };
                     push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
                 }
                 Some(c) => {
                     conn.members_kind.insert(seq, MembersKind::List);
-                    let op = BatchOp::SRandCount { db: db.clone(), table: table.clone(), key, count: c };
+                    let op = BatchOp::SRandCount {
+                        db: db.clone(),
+                        table: table.clone(),
+                        key,
+                        count: c,
+                    };
                     push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
                 }
             }
@@ -617,7 +1006,12 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::SMisMember { db: db.clone(), table: table.clone(), key, members };
+            let op = BatchOp::SMisMember {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                members,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::SInterCard { keys, limit } => {
@@ -645,9 +1039,15 @@ pub(crate) fn dispatch_resp_command(
             );
             for (i, mut key) in keys.into_iter().enumerate() {
                 // ⭐ T2: 源 key 逐个冒号选表 (天然支持跨表代数)
-                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let tbl = conn
+                    .resolve_table(&mut key)
+                    .unwrap_or_else(|| table.clone());
                 let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
-                let smem = BatchOp::SMembers { db: db.clone(), table: tbl, key };
+                let smem = BatchOp::SMembers {
+                    db: db.clone(),
+                    table: tbl,
+                    key,
+                };
                 push_task_grouped(conn_id, seq, worker_id, i as u32, sid, smem, shard_inboxes);
             }
         }
@@ -676,9 +1076,15 @@ pub(crate) fn dispatch_resp_command(
             );
             for (i, mut key) in keys.into_iter().enumerate() {
                 // ⭐ T2: 源 key 逐个冒号选表 (天然支持跨表代数)
-                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let tbl = conn
+                    .resolve_table(&mut key)
+                    .unwrap_or_else(|| table.clone());
                 let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
-                let smem = BatchOp::SMembers { db: db.clone(), table: tbl, key };
+                let smem = BatchOp::SMembers {
+                    db: db.clone(),
+                    table: tbl,
+                    key,
+                };
                 push_task_grouped(conn_id, seq, worker_id, i as u32, sid, smem, shard_inboxes);
             }
         }
@@ -693,7 +1099,9 @@ pub(crate) fn dispatch_resp_command(
             let n = keys.len();
             // ⭐ T2: dst 冒号选表 (二阶段任务写入 dst 的表)
             let mut dst = dst;
-            let dst_tbl = conn.resolve_table(&mut dst).unwrap_or_else(|| table.clone());
+            let dst_tbl = conn
+                .resolve_table(&mut dst)
+                .unwrap_or_else(|| table.clone());
             conn.setalg_agg.insert(
                 seq,
                 SetAlgAgg {
@@ -710,9 +1118,15 @@ pub(crate) fn dispatch_resp_command(
             );
             for (i, mut key) in keys.into_iter().enumerate() {
                 // ⭐ T2: 源 key 逐个冒号选表 (天然支持跨表代数)
-                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let tbl = conn
+                    .resolve_table(&mut key)
+                    .unwrap_or_else(|| table.clone());
                 let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
-                let smem = BatchOp::SMembers { db: db.clone(), table: tbl, key };
+                let smem = BatchOp::SMembers {
+                    db: db.clone(),
+                    table: tbl,
+                    key,
+                };
                 push_task_grouped(conn_id, seq, worker_id, i as u32, sid, smem, shard_inboxes);
             }
         }
@@ -726,7 +1140,9 @@ pub(crate) fn dispatch_resp_command(
             let n = keys.len();
             // ⭐ T2: dst 冒号选表 (二阶段任务写入 dst 的表)
             let mut dst = dst;
-            let dst_tbl = conn.resolve_table(&mut dst).unwrap_or_else(|| table.clone());
+            let dst_tbl = conn
+                .resolve_table(&mut dst)
+                .unwrap_or_else(|| table.clone());
             conn.zstore_agg.insert(
                 seq,
                 ZStoreAgg {
@@ -742,7 +1158,9 @@ pub(crate) fn dispatch_resp_command(
             // 每源 key 取全量 (member, score) — 复用 ZRange withscores 交替串
             for (i, mut key) in keys.into_iter().enumerate() {
                 // ⭐ T2: 源 key 逐个冒号选表
-                let tbl = conn.resolve_table(&mut key).unwrap_or_else(|| table.clone());
+                let tbl = conn
+                    .resolve_table(&mut key)
+                    .unwrap_or_else(|| table.clone());
                 let sid = hash_route_key(db.as_ref(), tbl.as_ref(), &key, num_shards);
                 let zr = BatchOp::ZRange {
                     db: db.clone(),
@@ -759,14 +1177,18 @@ pub(crate) fn dispatch_resp_command(
         // ---- ⭐ Phase L: List (单 key 直推) ----
         RespCommand::LPush { key, values, left } => {
             for v in &values {
-                if let Err(msg) =
-                    validate_kv(&key, v.len().saturating_sub(1), limits)
-                {
+                if let Err(msg) = validate_kv(&key, v.len().saturating_sub(1), limits) {
                     conn.resp_complete(seq, codec.encode_error(&msg));
                     return;
                 }
             }
-            let op = BatchOp::LPush { db: db.clone(), table: table.clone(), key, values, left };
+            let op = BatchOp::LPush {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                values,
+                left,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LPop { key, left, count } => {
@@ -777,7 +1199,11 @@ pub(crate) fn dispatch_resp_command(
             // count 缺省 → 单 bulk (One); 显式 count → 数组 (List)
             conn.members_kind.insert(
                 seq,
-                if count.is_none() { MembersKind::One } else { MembersKind::List },
+                if count.is_none() {
+                    MembersKind::One
+                } else {
+                    MembersKind::List
+                },
             );
             let op = BatchOp::LPop {
                 db: db.clone(),
@@ -793,7 +1219,11 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::LLen { db: db.clone(), table: table.clone(), key };
+            let op = BatchOp::LLen {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LRange { key, start, end } => {
@@ -802,7 +1232,13 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             conn.members_kind.insert(seq, MembersKind::List);
-            let op = BatchOp::LRange { db: db.clone(), table: table.clone(), key, start, end };
+            let op = BatchOp::LRange {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                start,
+                end,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LIndex { key, idx } => {
@@ -810,7 +1246,12 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::LIndex { db: db.clone(), table: table.clone(), key, idx };
+            let op = BatchOp::LIndex {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                idx,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LSet { key, idx, value } => {
@@ -819,7 +1260,13 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             conn.hmset_ok.insert(seq); // Integer(1) → +OK
-            let op = BatchOp::LSet { db: db.clone(), table: table.clone(), key, idx, val: value };
+            let op = BatchOp::LSet {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                idx,
+                val: value,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         // ---- ⭐ C2: List 中段操作 ----
@@ -828,7 +1275,13 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::LRem { db: db.clone(), table: table.clone(), key, count, val: value };
+            let op = BatchOp::LRem {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                count,
+                val: value,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::LTrim { key, start, stop } => {
@@ -837,18 +1290,41 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             conn.hmset_ok.insert(seq); // Integer(1) → +OK
-            let op = BatchOp::LTrim { db: db.clone(), table: table.clone(), key, start, stop };
+            let op = BatchOp::LTrim {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                start,
+                stop,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
-        RespCommand::LPos { key, value, rank, count } => {
+        RespCommand::LPos {
+            key,
+            value,
+            rank,
+            count,
+        } => {
             if let Err(msg) = validate_kv(&key, value.len().saturating_sub(1), limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::LPos { db: db.clone(), table: table.clone(), key, val: value, rank, count };
+            let op = BatchOp::LPos {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                val: value,
+                rank,
+                count,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
-        RespCommand::LInsert { key, before, pivot, value } => {
+        RespCommand::LInsert {
+            key,
+            before,
+            pivot,
+            value,
+        } => {
             if let Err(msg) = validate_kv(&key, value.len().saturating_sub(1), limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
@@ -866,12 +1342,19 @@ pub(crate) fn dispatch_resp_command(
         // ---- ⭐ Phase Z: ZSet (单 key 直推) ----
         RespCommand::ZAdd { key, pairs } => {
             for (_, m) in &pairs {
-                if let Err(msg) = validate_kv(&key, 0, limits).and_then(|_| validate_kv(m, 0, limits)) {
+                if let Err(msg) =
+                    validate_kv(&key, 0, limits).and_then(|_| validate_kv(m, 0, limits))
+                {
                     conn.resp_complete(seq, codec.encode_error(&msg));
                     return;
                 }
             }
-            let op = BatchOp::ZAdd { db: db.clone(), table: table.clone(), key, pairs };
+            let op = BatchOp::ZAdd {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                pairs,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZRem { key, members } => {
@@ -879,7 +1362,12 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::ZRem { db: db.clone(), table: table.clone(), key, members };
+            let op = BatchOp::ZRem {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                members,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZScore { key, member } => {
@@ -887,7 +1375,12 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::ZScore { db: db.clone(), table: table.clone(), key, member };
+            let op = BatchOp::ZScore {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                member,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZCard { key } => {
@@ -895,7 +1388,11 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::ZCard { db: db.clone(), table: table.clone(), key };
+            let op = BatchOp::ZCard {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZIncrBy { key, delta, member } => {
@@ -903,25 +1400,57 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::ZIncrBy { db: db.clone(), table: table.clone(), key, delta, member };
+            let op = BatchOp::ZIncrBy {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                delta,
+                member,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
-        RespCommand::ZRange { key, start, end, rev, withscores } => {
+        RespCommand::ZRange {
+            key,
+            start,
+            end,
+            rev,
+            withscores,
+        } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
             conn.members_kind.insert(seq, MembersKind::List);
-            let op = BatchOp::ZRange { db: db.clone(), table: table.clone(), key, start, end, rev, withscores };
+            let op = BatchOp::ZRange {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                start,
+                end,
+                rev,
+                withscores,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
-        RespCommand::ZRangeByScore { key, min, max, withscores } => {
+        RespCommand::ZRangeByScore {
+            key,
+            min,
+            max,
+            withscores,
+        } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
             conn.members_kind.insert(seq, MembersKind::List);
-            let op = BatchOp::ZRangeByScore { db: db.clone(), table: table.clone(), key, min, max, withscores };
+            let op = BatchOp::ZRangeByScore {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                min,
+                max,
+                withscores,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZRank { key, member, rev } => {
@@ -929,7 +1458,13 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::ZRank { db: db.clone(), table: table.clone(), key, member, rev };
+            let op = BatchOp::ZRank {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                member,
+                rev,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         // ---- ⭐ C1: ZSet/Hash 命令空洞 ----
@@ -938,7 +1473,13 @@ pub(crate) fn dispatch_resp_command(
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
-            let op = BatchOp::ZCount { db: db.clone(), table: table.clone(), key, min, max };
+            let op = BatchOp::ZCount {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                min,
+                max,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZMScore { key, members } => {
@@ -948,7 +1489,12 @@ pub(crate) fn dispatch_resp_command(
             }
             // Values 已是成形 score 串, 按裸 bulk 渲染 (不走 render tag)
             conn.values_raw.insert(seq);
-            let op = BatchOp::ZMScore { db: db.clone(), table: table.clone(), key, members };
+            let op = BatchOp::ZMScore {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                members,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::ZPop { key, rev, count } => {
@@ -957,7 +1503,13 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             conn.members_kind.insert(seq, MembersKind::List);
-            let op = BatchOp::ZPop { db: db.clone(), table: table.clone(), key, rev, count };
+            let op = BatchOp::ZPop {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                rev,
+                count,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::HStrlen { key, field } => {
@@ -966,13 +1518,60 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             // 复用 HGet + Strlen 语义转换 (miss → :0)
+            let fallback = BatchOp::HGet {
+                db: db.clone(),
+                table: table.clone(),
+                key: key.clone(),
+                field: field.clone(),
+            };
+            if try_dispatch_resp_sql_read(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                key,
+                vec![field],
+                RespSqlReadMode::Strlen,
+                fallback.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
+                return;
+            }
             conn.get_kind.insert(seq, GetKind::Strlen);
-            let op = BatchOp::HGet { db: db.clone(), table: table.clone(), key, field };
+            let op = fallback;
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
-        RespCommand::HRandField { key, count, withvalues } => {
+        RespCommand::HRandField {
+            key,
+            count,
+            withvalues,
+        } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
+                return;
+            }
+            let fallback = BatchOp::HRandField {
+                db: db.clone(),
+                table: table.clone(),
+                key: key.clone(),
+                count: count.unwrap_or(1),
+                withvalues,
+            };
+            if try_dispatch_resp_sql_read(
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                db.clone(),
+                key,
+                Vec::new(),
+                RespSqlReadMode::Rand { count, withvalues },
+                fallback.clone(),
+                shard_inboxes,
+                num_shards,
+            ) {
                 return;
             }
             let kind = match (count, withvalues) {
@@ -981,13 +1580,7 @@ pub(crate) fn dispatch_resp_command(
                 (Some(_), false) => PairsKind::Keys,
             };
             conn.pairs_kind.insert(seq, kind);
-            let op = BatchOp::HRandField {
-                db: db.clone(),
-                table: table.clone(),
-                key,
-                count: count.unwrap_or(1),
-                withvalues,
-            };
+            let op = fallback;
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         // ---- ⭐ Phase G: Geo (复用 ZSet 链路 + 渲染钩子) ----
@@ -997,10 +1590,20 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             conn.geo_ctx.insert(seq, GeoCtx::Pos);
-            let op = BatchOp::ZMScore { db: db.clone(), table: table.clone(), key, members };
+            let op = BatchOp::ZMScore {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                members,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
-        RespCommand::GeoDist { key, m1, m2, factor } => {
+        RespCommand::GeoDist {
+            key,
+            m1,
+            m2,
+            factor,
+        } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
@@ -1014,14 +1617,31 @@ pub(crate) fn dispatch_resp_command(
             };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
-        RespCommand::GeoSearch { key, lon, lat, radius_m, asc, count, withcoord, withdist } => {
+        RespCommand::GeoSearch {
+            key,
+            lon,
+            lat,
+            radius_m,
+            asc,
+            count,
+            withcoord,
+            withdist,
+        } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
             conn.geo_ctx.insert(
                 seq,
-                GeoCtx::Search { lon, lat, radius_m, asc, count, withcoord, withdist },
+                GeoCtx::Search {
+                    lon,
+                    lat,
+                    radius_m,
+                    asc,
+                    count,
+                    withcoord,
+                    withdist,
+                },
             );
             // 全量 (member, score) — worker 端 geohash 解码 + 距离过滤
             let op = BatchOp::ZRange {
@@ -1049,7 +1669,13 @@ pub(crate) fn dispatch_resp_command(
                 );
                 return;
             }
-            let op = BatchOp::SetBit { db: db.clone(), table: table.clone(), key, offset, bit };
+            let op = BatchOp::SetBit {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+                offset,
+                bit,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::GetBit { key, offset } => {
@@ -1058,7 +1684,11 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             conn.bit_ctx.insert(seq, BitCtx::GetBit { offset });
-            let op = BatchOp::Get { db: db.clone(), table: table.clone(), key };
+            let op = BatchOp::Get {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::BitCount { key, start, end } => {
@@ -1067,16 +1697,29 @@ pub(crate) fn dispatch_resp_command(
                 return;
             }
             conn.bit_ctx.insert(seq, BitCtx::Count { start, end });
-            let op = BatchOp::Get { db: db.clone(), table: table.clone(), key };
+            let op = BatchOp::Get {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
-        RespCommand::BitPos { key, bit, start, end } => {
+        RespCommand::BitPos {
+            key,
+            bit,
+            start,
+            end,
+        } => {
             if let Err(msg) = validate_kv(&key, 0, limits) {
                 conn.resp_complete(seq, codec.encode_error(&msg));
                 return;
             }
             conn.bit_ctx.insert(seq, BitCtx::Pos { bit, start, end });
-            let op = BatchOp::Get { db: db.clone(), table: table.clone(), key };
+            let op = BatchOp::Get {
+                db: db.clone(),
+                table: table.clone(),
+                key,
+            };
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         RespCommand::InvalidInt(_) => {
@@ -1135,9 +1778,7 @@ pub(crate) fn dispatch_resp_command(
                 out.extend_from_slice(&codec.encode_integer(2));
                 out
             } else {
-                codec.encode_error(
-                    "NOPROTO unsupported protocol version",
-                )
+                codec.encode_error("NOPROTO unsupported protocol version")
             };
             conn.resp_complete(seq, bytes);
         }
@@ -1154,7 +1795,10 @@ pub(crate) fn dispatch_resp_command(
             conn.resp_complete(seq, bytes);
         }
         RespCommand::Unknown(name) => {
-            conn.resp_complete(seq, codec.encode_error(&format!("unknown command '{name}'")));
+            conn.resp_complete(
+                seq,
+                codec.encode_error(&format!("unknown command '{name}'")),
+            );
         }
         RespCommand::WrongArity(name) => {
             conn.resp_complete(

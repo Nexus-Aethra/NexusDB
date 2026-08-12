@@ -116,7 +116,12 @@ pub(crate) fn time_parts(micros: i64) -> (u8, u8, u8, u32) {
     let tod = micros.rem_euclid(MICROS_PER_DAY);
     let micro = (tod % 1_000_000) as u32;
     let secs = tod / 1_000_000;
-    ((secs / 3600) as u8, ((secs % 3600) / 60) as u8, (secs % 60) as u8, micro)
+    (
+        (secs / 3600) as u8,
+        ((secs % 3600) / 60) as u8,
+        (secs % 60) as u8,
+        micro,
+    )
 }
 
 /// ⭐ F80: 16B → 36 字符带连字符 UUID.
@@ -125,7 +130,14 @@ pub(crate) fn render_uuid(b: &[u8]) -> String {
         return String::from_utf8_lossy(b).into_owned();
     }
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 /// ⭐ F80: 解析 UUID 文本 (带/不带连字符) → 16B; 失败返回 None.
@@ -134,7 +146,9 @@ pub(crate) fn parse_uuid(s: &str) -> Option<Vec<u8>> {
     if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    (0..16).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect()
+    (0..16)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect()
 }
 
 /// ⭐ F81: 10^scale (i128; scale<=38 → <i128::MAX). None=溢出.
@@ -156,7 +170,8 @@ pub(crate) fn parse_decimal(s: &str, scale: u8) -> Option<i128> {
     if int_part.is_empty() && frac_part.is_empty() {
         return None;
     }
-    if !int_part.bytes().all(|c| c.is_ascii_digit()) || !frac_part.bytes().all(|c| c.is_ascii_digit())
+    if !int_part.bytes().all(|c| c.is_ascii_digit())
+        || !frac_part.bytes().all(|c| c.is_ascii_digit())
     {
         return None;
     }
@@ -168,9 +183,19 @@ pub(crate) fn parse_decimal(s: &str, scale: u8) -> Option<i128> {
     while frac.len() < sc {
         frac.push('0');
     }
-    let int_val: i128 = if int_part.is_empty() { 0 } else { int_part.parse().ok()? };
-    let frac_val: i128 = if sc == 0 || frac.is_empty() { 0 } else { frac.parse().ok()? };
-    let scaled = int_val.checked_mul(pow10_i128(scale)?)?.checked_add(frac_val)?;
+    let int_val: i128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+    let frac_val: i128 = if sc == 0 || frac.is_empty() {
+        0
+    } else {
+        frac.parse().ok()?
+    };
+    let scaled = int_val
+        .checked_mul(pow10_i128(scale)?)?
+        .checked_add(frac_val)?;
     Some(if neg { -scaled } else { scaled })
 }
 
@@ -182,6 +207,12 @@ pub(crate) fn render_decimal(v: i128, scale: u8) -> String {
     let neg = v < 0;
     let av = v.unsigned_abs();
     let p = 10u128.pow(scale as u32);
-    format!("{}{}.{:0width$}", if neg { "-" } else { "" }, av / p, av % p, width = scale as usize)
+    format!(
+        "{}{}.{:0width$}",
+        if neg { "-" } else { "" },
+        av / p,
+        av % p,
+        width = scale as usize
+    )
 }
 const MICROS_PER_DAY: i64 = 86_400_000_000;

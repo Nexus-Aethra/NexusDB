@@ -28,7 +28,10 @@ pub(crate) fn process_http_input(
                 crate::metrics::HTTP_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let seq = conn.next_seq;
                 conn.next_seq += 1;
-                conn.resp_complete(seq, h::build_response(code, &h::error_body(msg), cors, false));
+                conn.resp_complete(
+                    seq,
+                    h::build_response(code, &h::error_body(msg), cors, false),
+                );
                 conn.close_after_flush = true;
                 break;
             }
@@ -39,8 +42,17 @@ pub(crate) fn process_http_input(
                     conn.close_after_flush = true;
                 }
                 handle_http_request(
-                    conn, conn_id, worker_id, req, http_token, default_db, db_view, limits,
-                    num_shards_total, shard_inboxes, num_shards,
+                    conn,
+                    conn_id,
+                    worker_id,
+                    req,
+                    http_token,
+                    default_db,
+                    db_view,
+                    limits,
+                    num_shards_total,
+                    shard_inboxes,
+                    num_shards,
                 );
             }
         }
@@ -142,7 +154,12 @@ pub(crate) fn handle_http_request(
             });
             conn.resp_complete(
                 seq,
-                h::build_response(200, &serde_json::to_vec(&body).unwrap_or_default(), cors, ka),
+                h::build_response(
+                    200,
+                    &serde_json::to_vec(&body).unwrap_or_default(),
+                    cors,
+                    ka,
+                ),
             );
         }
         ("GET", "/v1/debug/sql-cache") => {
@@ -160,7 +177,12 @@ pub(crate) fn handle_http_request(
             };
             conn.resp_complete(
                 seq,
-                h::build_response(200, &serde_json::to_vec(&body).unwrap_or_default(), cors, ka),
+                h::build_response(
+                    200,
+                    &serde_json::to_vec(&body).unwrap_or_default(),
+                    cors,
+                    ka,
+                ),
             );
         }
         // ---- ⭐ H3: SQL ----
@@ -184,8 +206,16 @@ pub(crate) fn handle_http_request(
             match sql::parse(query.as_bytes()) {
                 Err(e) => conn.resp_complete(seq, sql_err_bytes(ProtocolKind::Http, &e)),
                 Ok(stmt) => sql_dispatch_stmt(
-                    conn, conn_id, seq, worker_id, &db, default_db, db_view, shard_inboxes,
-                    num_shards, stmt,
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    &db,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    stmt,
                 ),
             }
         }
@@ -217,11 +247,19 @@ pub(crate) fn handle_http_request(
             crate::metrics::KV_OPS.fetch_add(1, Relaxed);
             let (op, kv) = match m {
                 "GET" => (
-                    BatchOp::Get { db, table: table_arc, key },
+                    BatchOp::Get {
+                        db,
+                        table: table_arc,
+                        key,
+                    },
                     HttpKvOp::Get,
                 ),
                 "DELETE" => (
-                    BatchOp::Delete { db, table: table_arc, key },
+                    BatchOp::Delete {
+                        db,
+                        table: table_arc,
+                        key,
+                    },
                     HttpKvOp::Delete,
                 ),
                 "PUT" | "POST" => {
@@ -251,7 +289,12 @@ pub(crate) fn handle_http_request(
                         return;
                     }
                     (
-                        BatchOp::Put { db, table: table_arc, key, val: stored },
+                        BatchOp::Put {
+                            db,
+                            table: table_arc,
+                            key,
+                            val: stored,
+                        },
                         HttpKvOp::Put,
                     )
                 }
@@ -260,7 +303,13 @@ pub(crate) fn handle_http_request(
                     return;
                 }
             };
-            conn.http_ctx.insert(seq, HttpReqCtx { op: kv, keep_alive: ka });
+            conn.http_ctx.insert(
+                seq,
+                HttpReqCtx {
+                    op: kv,
+                    keep_alive: ka,
+                },
+            );
             push_task(conn, conn_id, seq, worker_id, op, shard_inboxes, num_shards);
         }
         _ => fail(conn, seq, 404, "not found"),
@@ -332,7 +381,11 @@ pub(crate) fn process_sql_input(
                     break;
                 }
                 // 未配置 TLS 却收到 SSLRequest → 拒
-                conn.send_bytes(&my::build_err(pkt_seq.wrapping_add(1), 1043, "TLS not supported"));
+                conn.send_bytes(&my::build_err(
+                    pkt_seq.wrapping_add(1),
+                    1043,
+                    "TLS not supported",
+                ));
                 conn.close_after_flush = true;
                 break;
             }
@@ -343,9 +396,8 @@ pub(crate) fn process_sql_input(
                 Ok(login) => {
                     // ⭐ S5: 登录带 database → 认证通过后切库 (不存在 1049 断连)
                     let want_db = login.database.clone().filter(|d| !d.is_empty());
-                    let db_ok = |name: &str| {
-                        name == default_db.as_ref() || db_view.id_of(name).is_some()
-                    };
+                    let db_ok =
+                        |name: &str| name == default_db.as_ref() || db_view.id_of(name).is_some();
                     if let Some(d) = &want_db
                         && !db_ok(d)
                     {
@@ -432,8 +484,16 @@ pub(crate) fn process_sql_input(
                     match sql::parse(&payload[1..]) {
                         Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
                         Ok(stmt) => sql_dispatch_stmt(
-                            conn, conn_id, seq, worker_id, &cur_db, default_db, db_view,
-                            shard_inboxes, num_shards, stmt,
+                            conn,
+                            conn_id,
+                            seq,
+                            worker_id,
+                            &cur_db,
+                            default_db,
+                            db_view,
+                            shard_inboxes,
+                            num_shards,
+                            stmt,
                         ),
                     }
                 }
@@ -471,7 +531,14 @@ pub(crate) fn process_sql_input(
                         Ok((stmt, params)) => {
                             let id = conn.next_stmt_id;
                             conn.next_stmt_id += 1;
-                            conn.mysql_stmts.insert(id, MyPrepared { stmt, params, types: None });
+                            conn.mysql_stmts.insert(
+                                id,
+                                MyPrepared {
+                                    stmt,
+                                    params,
+                                    types: None,
+                                },
+                            );
                             conn.resp_complete(seq, my::build_stmt_prepare_ok(id, params));
                         }
                         Err(e) => conn.resp_complete(seq, mysql_err_packet(&e)),
@@ -500,8 +567,16 @@ pub(crate) fn process_sql_input(
                             conn.mysql_binary.insert(seq);
                             let cur_db = conn.current_db.clone();
                             sql_dispatch_stmt(
-                                conn, conn_id, seq, worker_id, &cur_db, default_db, db_view,
-                                shard_inboxes, num_shards, stmt,
+                                conn,
+                                conn_id,
+                                seq,
+                                worker_id,
+                                &cur_db,
+                                default_db,
+                                db_view,
+                                shard_inboxes,
+                                num_shards,
+                                stmt,
                             );
                         }
                         Err(e) => conn.resp_complete(seq, mysql_err_packet(&e)),
@@ -588,8 +663,7 @@ pub(crate) fn process_pg_input(
         match conn.pg_phase {
             // ---- 等 StartupMessage (无 type 帧) ----
             0 => {
-                let Some((n, payload)) = pg::read_startup_frame(&conn.read_buf[cursor..])
-                else {
+                let Some((n, payload)) = pg::read_startup_frame(&conn.read_buf[cursor..]) else {
                     break;
                 };
                 cursor += n;
@@ -633,7 +707,9 @@ pub(crate) fn process_pg_input(
                             } else {
                                 std::sync::Arc::from(dbn.as_str())
                             };
-                            if &*resolved == default_db.as_ref() || db_view.id_of(&resolved).is_some() {
+                            if &*resolved == default_db.as_ref()
+                                || db_view.id_of(&resolved).is_some()
+                            {
                                 conn.current_db = resolved;
                             } else {
                                 conn.send_bytes(&pg::build_error(
@@ -674,7 +750,10 @@ pub(crate) fn process_pg_input(
                 if conn.pg_scram.is_none() {
                     // 首条: SASLInitialResponse (mechanism + client-first)
                     let Some((mech, client_first)) = pg::parse_sasl_initial(payload) else {
-                        conn.send_bytes(&pg::build_error("28P01", "malformed SASL initial response"));
+                        conn.send_bytes(&pg::build_error(
+                            "28P01",
+                            "malformed SASL initial response",
+                        ));
                         conn.close_after_flush = true;
                         continue;
                     };
@@ -689,7 +768,10 @@ pub(crate) fn process_pg_input(
                             conn.pg_scram = Some(state);
                         }
                         None => {
-                            conn.send_bytes(&pg::build_error("28P01", "malformed SCRAM client-first"));
+                            conn.send_bytes(&pg::build_error(
+                                "28P01",
+                                "malformed SCRAM client-first",
+                            ));
                             conn.close_after_flush = true;
                         }
                     }
@@ -721,7 +803,10 @@ pub(crate) fn process_pg_input(
                 match ty {
                     b'Q' => {
                         // 语句预处理: NUL 截断 + trim + 剥尾分号
-                        let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+                        let end = payload
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(payload.len());
                         let text = String::from_utf8_lossy(&payload[..end]);
                         // ⭐ compat: 支持 multi-statement (分号分割, 字符串/注释感知)
                         let parts = sql::split_sql_statements(text.trim());
@@ -745,11 +830,20 @@ pub(crate) fn process_pg_input(
                         } else if parts.len() == 1 {
                             let cur_db = conn.current_db.clone();
                             match sql::parse(parts[0].as_bytes()) {
-                                Err(e) => conn
-                                    .resp_complete(seq, sql_err_bytes(ProtocolKind::Pg, &e)),
+                                Err(e) => {
+                                    conn.resp_complete(seq, sql_err_bytes(ProtocolKind::Pg, &e))
+                                }
                                 Ok(stmt) => sql_dispatch_stmt(
-                                    conn, conn_id, seq, worker_id, &cur_db, default_db,
-                                    db_view, shard_inboxes, num_shards, stmt,
+                                    conn,
+                                    conn_id,
+                                    seq,
+                                    worker_id,
+                                    &cur_db,
+                                    default_db,
+                                    db_view,
+                                    shard_inboxes,
+                                    num_shards,
+                                    stmt,
                                 ),
                             }
                         } else if parts.len() > 1 {
@@ -777,8 +871,14 @@ pub(crate) fn process_pg_input(
                             conn.next_seq = base_sub_seq + 1;
                             conn.multi_sub_seq.insert(base_sub_seq, seq);
                             conn.dispatch_multi_one(
-                                conn_id, worker_id, base_sub_seq, &first, default_db,
-                                db_view, shard_inboxes, num_shards,
+                                conn_id,
+                                worker_id,
+                                base_sub_seq,
+                                &first,
+                                default_db,
+                                db_view,
+                                shard_inboxes,
+                                num_shards,
                             );
                         }
                     }
@@ -840,10 +940,8 @@ pub(crate) fn process_pg_input(
                                     );
                                     // 不回 ParseComplete (挂起)
                                 } else {
-                                    conn.pg_stmts.insert(
-                                        name,
-                                        PgPrepared { stmt, params, oids },
-                                    );
+                                    conn.pg_stmts
+                                        .insert(name, PgPrepared { stmt, params, oids });
                                     let pc = pg::build_parse_complete();
                                     conn.pg_batch.prefix.extend_from_slice(&pc);
                                 }
@@ -944,7 +1042,9 @@ pub(crate) fn process_pg_input(
                             out.extend_from_slice(&pg::build_error("42601", &e));
                             out.extend_from_slice(&pg::build_ready());
                             conn.resp_complete(seq, out);
-                        } else if batch.has_execute && let Some(bound) = batch.bound {
+                        } else if batch.has_execute
+                            && let Some(bound) = batch.bound
+                        {
                             // 结果主体 (T+D+C+Z / C+Z) 由既有渲染产出,
                             // 前缀在 resp_complete 单点拼接
                             conn.pg_ext.insert(seq, batch.prefix);
@@ -1010,11 +1110,21 @@ pub(crate) fn infer_param_oids(
     let mut oids = vec![0u32; params as usize];
     // ⭐ LIMIT/OFFSET 参数恒为整数 (int8=20), 与 schema 无关 → 先推断 (即使 schema miss)
     let (lim_p, off_p) = match stmt {
-        SqlStmt::Select { limit_param, offset_param, .. }
-        | SqlStmt::SystemQuery { limit_param, offset_param, .. }
-        | SqlStmt::SelectJoin { limit_param, offset_param, .. } => {
-            (*limit_param, *offset_param)
+        SqlStmt::Select {
+            limit_param,
+            offset_param,
+            ..
         }
+        | SqlStmt::SystemQuery {
+            limit_param,
+            offset_param,
+            ..
+        }
+        | SqlStmt::SelectJoin {
+            limit_param,
+            offset_param,
+            ..
+        } => (*limit_param, *offset_param),
         _ => (None, None),
     };
     for pidx in [lim_p, off_p].into_iter().flatten() {
@@ -1026,8 +1136,14 @@ pub(crate) fn infer_param_oids(
     // ⭐ 推断 (仅对 NexusDB 支持二进制解码的类型; 其它保持 0 → text)
     let oid_of = |ty: ColType| -> u32 {
         match ty {
-            ColType::I64 | ColType::F64 | ColType::Bool | ColType::Str | ColType::Bytes
-            | ColType::Date | ColType::Time | ColType::Timestamp => type_oid(ty),
+            ColType::I64
+            | ColType::F64
+            | ColType::Bool
+            | ColType::Str
+            | ColType::Bytes
+            | ColType::Date
+            | ColType::Time
+            | ColType::Timestamp => type_oid(ty),
             _ => 0,
         }
     };
@@ -1053,8 +1169,7 @@ pub(crate) fn infer_param_oids(
     if let SqlStmt::Insert { cols, rows, .. } = stmt {
         let col_pos: Vec<Option<usize>> = if cols.is_empty() {
             let n = schema.columns.len();
-            let auto_rowid =
-                super::sql_eval::is_auto_pk(&schema).then_some(schema.pk_col as usize);
+            let auto_rowid = super::sql_eval::is_auto_pk(&schema).then_some(schema.pk_col as usize);
             let hidden = |i: usize| auto_rowid == Some(i) || schema.dropped.contains(&(i as u16));
             (0..n).filter(|&i| !hidden(i)).map(Some).collect()
         } else {
@@ -1112,4 +1227,3 @@ pub(crate) fn infer_param_oids(
 
     (oids, None)
 }
-

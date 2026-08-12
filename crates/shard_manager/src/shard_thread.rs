@@ -1255,6 +1255,55 @@ pub(crate) fn shard_thread_main(
                                     Ok(updated) => BatchResult::DeleteExisted(updated),
                                     Err(err) => BatchResult::Error(err.to_string()),
                                 },
+                                BatchOp::RowUnset {
+                                    db,
+                                    table,
+                                    pk,
+                                    cols,
+                                } => match block_on_io(e.row_unset(&db, &table, &pk, &cols)) {
+                                    Ok(changed) => BatchResult::Integer(changed),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::RowSetNx {
+                                    db,
+                                    table,
+                                    pk,
+                                    col,
+                                    val,
+                                } => match block_on_io(e.row_set_nx(&db, &table, &pk, col, val)) {
+                                    Ok(set) => BatchResult::Integer(i64::from(set)),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::RowPatchUpsert {
+                                    db,
+                                    table,
+                                    pk,
+                                    sets,
+                                    insert_values,
+                                } => match block_on_io(e.row_patch_upsert(
+                                    &db,
+                                    &table,
+                                    &pk,
+                                    &sets,
+                                    &insert_values,
+                                )) {
+                                    Ok(added) => BatchResult::Integer(added),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::RowIncr {
+                                    db,
+                                    table,
+                                    pk,
+                                    col,
+                                    delta,
+                                } => match block_on_io(e.row_incr(&db, &table, &pk, col, delta)) {
+                                    Ok(storage::row::ColValue::I64(v)) => BatchResult::Integer(v),
+                                    Ok(storage::row::ColValue::F64(v)) => BatchResult::Double(v),
+                                    Ok(_) => BatchResult::Error(
+                                        "row increment returned non-numeric value".into(),
+                                    ),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
                                 BatchOp::DropTableOp { db, table } => {
                                     match block_on_io(e.drop_table_sql(&db, &table)) {
                                         Ok(_) => BatchResult::PutOk,
