@@ -7,6 +7,8 @@ use super::*;
 use std::os::fd::AsRawFd;
 
 impl ConnState {
+    // Construction receives all per-connection resources without a global runtime context.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         fd: RawFd,
         proto: ProtocolKind,
@@ -448,6 +450,8 @@ impl ConnState {
 
     /// ⭐ PG 兼容 (multi-statement): 顺序执行一条语句. 解析后 dispatch,
     /// 记录类型 (DDL/DML/同步) 供完成推进. 子 seq = base + dispatched.
+    // Multi-statement execution forwards the same explicit SQL dispatch resources.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_multi_one(
         &mut self,
         conn_id: u64,
@@ -481,10 +485,10 @@ impl ConnState {
                     SqlStmt::DropTable { .. } => 1u8, // DDL (DROP 走 dml_agg? 见下)
                     _ => 0u8,                         // 同步/其他 (SELECT/SET/USE 等同步回包)
                 };
-                if let Some(orig) = self.multi_sub_seq.get(&sub_seq).cloned() {
-                    if let Some(m) = self.multi_stmt.get_mut(&orig) {
-                        m.cur_kind = kind;
-                    }
+                if let Some(orig) = self.multi_sub_seq.get(&sub_seq).cloned()
+                    && let Some(m) = self.multi_stmt.get_mut(&orig)
+                {
+                    m.cur_kind = kind;
                 }
                 sql_dispatch_stmt(
                     self,
@@ -503,6 +507,8 @@ impl ConnState {
     }
 
     /// ⭐ PG 兼容 (multi-statement): 完成处理 — 推进下一条或全部完成回原 seq.
+    // Advancing a multi-statement sequence needs the original routing context.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn multi_step(
         &mut self,
         sub_seq: u64,

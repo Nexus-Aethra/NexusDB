@@ -6,6 +6,8 @@ use super::*;
 // ==================== JOIN 编排核心 ====================
 /// ⭐ F67 (JOIN): handle_resp 认领 — 按 phase 推进. 返回 true = 已处理此 seq.
 /// `group` 仅 EstimateRows 行数批使用 (0=tables[0], 1=tables[1]).
+// JOIN reply routing keeps its protocol resources explicit at this module boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sql_join_drive(
     conn: &mut ConnState,
     conn_id: u64,
@@ -81,33 +83,33 @@ pub(crate) fn sql_join_drive(
                 let ti = group as usize;
                 match c.est_phase {
                     0 => {
-                        if let BatchResult::RowCount(n) = result {
-                            if ti < 2 {
-                                c.est_rows[ti] += n;
-                            }
+                        if let BatchResult::RowCount(n) = result
+                            && ti < 2
+                        {
+                            c.est_rows[ti] += n;
                         }
                     }
                     1 => {
-                        if let BatchResult::DistinctCounts(ds) = result {
-                            if ti < 2 {
-                                let cand = join_candidate_eq_iids(&c, ti);
-                                if let Some(map) = c.join_distinct.get_mut(ti) {
-                                    for ((_, iid), d) in cand.iter().zip(ds.iter()) {
-                                        map.insert(*iid, *d);
-                                    }
+                        if let BatchResult::DistinctCounts(ds) = result
+                            && ti < 2
+                        {
+                            let cand = join_candidate_eq_iids(c, ti);
+                            if let Some(map) = c.join_distinct.get_mut(ti) {
+                                for ((_, iid), d) in cand.iter().zip(ds.iter()) {
+                                    map.insert(*iid, *d);
                                 }
                             }
                         }
                     }
                     _ => {
-                        if let BatchResult::RangeBounds(rbs) = result {
-                            if ti < 2 {
-                                let cand = join_candidate_eq_iids(&c, ti);
-                                if let Some(map) = c.join_ranges.get_mut(ti) {
-                                    for ((_, iid), (lo, hi)) in cand.iter().zip(rbs.iter()) {
-                                        if let (Some(lo), Some(hi)) = (lo, hi) {
-                                            map.insert(*iid, (lo.clone(), hi.clone()));
-                                        }
+                        if let BatchResult::RangeBounds(rbs) = result
+                            && ti < 2
+                        {
+                            let cand = join_candidate_eq_iids(c, ti);
+                            if let Some(map) = c.join_ranges.get_mut(ti) {
+                                for ((_, iid), (lo, hi)) in cand.iter().zip(rbs.iter()) {
+                                    if let (Some(lo), Some(hi)) = (lo, hi) {
+                                        map.insert(*iid, (lo.clone(), hi.clone()));
                                     }
                                 }
                             }
@@ -134,7 +136,7 @@ pub(crate) fn sql_join_drive(
                     // 仅对有候选索引列的表广播 (候选空表跳过)
                     let mut pushes: Vec<(u32, Vec<u32>)> = Vec::new();
                     for t in 0..2 {
-                        let cand = join_candidate_eq_iids(&c, t);
+                        let cand = join_candidate_eq_iids(c, t);
                         if !cand.is_empty() {
                             pushes.push((t as u32, cand.iter().map(|&(_, iid)| iid).collect()));
                         }
@@ -143,7 +145,7 @@ pub(crate) fn sql_join_drive(
                         phase += 1;
                         continue;
                     }
-                    c.est_phase = phase as u8;
+                    c.est_phase = phase;
                     c.remaining = pushes.len() * num_shards;
                     let db = c.db.clone();
                     for (t, iids) in pushes {
@@ -950,12 +952,12 @@ pub(crate) fn sql_join_broadcast(
     }
 }
 
-/// ⭐ F70 (JOIN): 键集合下推决策 — idx>=1 且满足安全条件时, 从前序表抽取
-/// ON 等值键值集合下推为索引点查. 启用条件:
-/// - joins[idx-1].kind ∈ {Inner, Left} (RIGHT/FULL/CROSS 禁用: 语义不能丢未匹配行)
-/// - 息含单个 OnPred::Eq (多列组合键 v1 跳过)
-/// - Eq 一侧属 idx 表且该列有普通二级索引, 另一侧属前序表 ti<idx
-/// - 前序键集合去重后 <= JOIN_KEYSET_MAX (超阈退回全表扫)
+// ⭐ F70 (JOIN): 键集合下推决策 — idx>=1 且满足安全条件时, 从前序表抽取
+// ON 等值键值集合下推为索引点查. 启用条件:
+// - joins[idx-1].kind ∈ {Inner, Left} (RIGHT/FULL/CROSS 禁用: 语义不能丢未匹配行)
+// - 息含单个 OnPred::Eq (多列组合键 v1 跳过)
+// - Eq 一侧属 idx 表且该列有普通二级索引, 另一侧属前序表 ti<idx
+// - 前序键集合去重后 <= JOIN_KEYSET_MAX (超阈退回全表扫)
 /// ⭐ M3-5: 单边范围谓词的扫描占比估计 (0..1, 越小越窄越好; 无 min/max 或非数值 → 1.0).
 /// Gt/Ge: (max - v)/(max - min); Lt/Le: (v - min)/(max - min).
 fn range_ratio(
@@ -1012,10 +1014,10 @@ fn join_candidate_eq_iids(ctx: &SqlJoinCtx, idx: usize) -> Vec<(u16, u32)> {
         if ti != idx {
             continue;
         }
-        if let Some(iid) = schema.indexes.iter().find(|i| i.col == cidx).map(|i| i.iid) {
-            if !out.iter().any(|&(c, _)| c == cidx) {
-                out.push((cidx, iid));
-            }
+        if let Some(iid) = schema.indexes.iter().find(|i| i.col == cidx).map(|i| i.iid)
+            && !out.iter().any(|&(c, _)| c == cidx)
+        {
+            out.push((cidx, iid));
         }
     }
     out

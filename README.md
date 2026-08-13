@@ -21,10 +21,12 @@ At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + p
 > Architecture: [docs/DESIGN.md](./docs/DESIGN.md) · handoff / progress: [docs/AGENTS.md](./docs/AGENTS.md) · fix history: [docs/CHANGELOG.md](./docs/CHANGELOG.md)
 >
 > 📖 **User getting-started guide (features + per-driver access + SQL/type/security examples + performance): [docs/GUIDE.md](./docs/GUIDE.md)**
+>
+> 📦 **Embed NexusDB in a Rust process (sync/async KV API): [docs/EMBEDDED-KV.md](./docs/EMBEDDED-KV.md)**
 
 ---
 
-**[Core Features](#core-features) · [Quick Start](#quick-start) · [Windows (Beta)](#windows-beta) · [Performance](#performance) · [Architecture](#architecture) · [GC & Space Reclamation](#gc--space-reclamation) · [Large-Value Overflow Pages](#large-value-overflow-pages) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [Dev Commands](#dev-commands) · [Troubleshooting](#troubleshooting)**
+**[Core Features](#core-features) · [Quick Start](#quick-start) · [Embedded Library](#embedded-library) · [Windows (Beta)](#windows-beta) · [Performance](#performance) · [Architecture](#architecture) · [GC & Space Reclamation](#gc--space-reclamation) · [Large-Value Overflow Pages](#large-value-overflow-pages) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [Dev Commands](#dev-commands) · [Troubleshooting](#troubleshooting)**
 
 ---
 
@@ -103,6 +105,34 @@ cargo test --workspace --no-fail-fast    # ~30s, expect 0 failed
 ```
 
 > Docker packaging is available (see [container/Dockerfile](./container/Dockerfile) + [container/docker-compose.yml](./container/docker-compose.yml)); details in [docs/GUIDE.md](./docs/GUIDE.md#docker-deployment).
+
+---
+
+## Embedded Library
+
+Use the `nexusdb` library target when an application needs the same shard,
+storage, and WAL engine in-process without opening network listeners. It
+provides synchronous and runtime-agnostic async `set` / `get` / `del`, plus
+same-table `set_many` / `get_many`. `EmbeddedOptions` configures shard-thread
+count, per-shard cache capacity, WAL mode, and either portable `StdFs` or Linux
+`io_uring` persistence.
+
+```rust
+use nexusdb::{EmbeddedOptions, NexusDb};
+
+let db = NexusDb::open(EmbeddedOptions::new("./app-data"))?;
+let app = db.ensure_database("app")?;
+let cache = app.create_table("cache")?;
+cache.set(b"greeting", b"hello")?;
+assert_eq!(cache.get(b"greeting")?, Some(b"hello".to_vec()));
+drop(cache);
+drop(app);
+db.close()?;
+```
+
+See [Embedded KV API](./docs/EMBEDDED-KV.md) for dependency setup, table
+provisioning versus selection, async and batched operations, lifecycle rules,
+and Windows compatibility.
 
 ---
 
@@ -671,6 +701,7 @@ Start with `NLOG_PROBE=1` → on SIGTERM, a 16-bucket histogram is dumped to std
 | Reader | Doc |
 |---|---|
 | Evaluation / day one | this README (+ [docs/GUIDE.md](./docs/GUIDE.md) usage guide) |
+| In-process Rust KV use | [docs/EMBEDDED-KV.md](./docs/EMBEDDED-KV.md) |
 | Architecture | [docs/DESIGN.md](./docs/DESIGN.md) (10 sections) |
 | Development handoff (progress / gotchas / TODO) | [docs/AGENTS.md](./docs/AGENTS.md) |
 | Fix history (F1-F…) | [docs/CHANGELOG.md](./docs/CHANGELOG.md) |

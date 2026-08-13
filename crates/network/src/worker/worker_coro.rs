@@ -102,14 +102,10 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
             reply_bus_r.drain_into(&mut reply_results);
             if !reply_results.is_empty() {
                 for r in reply_results.drain(..) {
-                    let task_id = reg_r
-                        .borrow_mut()
-                        .get_mut(&r.conn_id)
-                        .map(|entry| {
-                            entry.queue.push_back(r);
-                            entry.task_id
-                        })
-                        .flatten();
+                    let task_id = reg_r.borrow_mut().get_mut(&r.conn_id).and_then(|entry| {
+                        entry.queue.push_back(r);
+                        entry.task_id
+                    });
                     if let Some(task_id) = task_id {
                         scheduler::unpark(task_id);
                     }

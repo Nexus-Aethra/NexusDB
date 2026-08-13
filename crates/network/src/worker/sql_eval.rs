@@ -3,6 +3,8 @@
 
 use super::*;
 
+type ScalarConstRow = (Vec<(&'static str, ColType)>, Vec<ColValue>);
+
 /// ⭐ compat: 表达式投影输出行 — 按 (proj 列号, expr_proj 表达式) 构建单行
 /// 输出 (列定义 + 值). Some(expr) → 求值 (JSONB 取字段, 输出 Str);
 /// None → 直接输出 proj 列. 供 materialize_select_agg / RYOW 单行共用.
@@ -46,9 +48,7 @@ pub(crate) fn project_output_row(
 
 /// ⭐ compat: 无 FROM 标量函数投影常量单行 (SELECT NOW() 等).
 /// 返回 (列定义, 常量行); 未知函数报错.
-pub(crate) fn scalar_fn_const_row(
-    items: &[sql::SelectItem],
-) -> Result<(Vec<(&'static str, ColType)>, Vec<ColValue>), String> {
+pub(crate) fn scalar_fn_const_row(items: &[sql::SelectItem]) -> Result<ScalarConstRow, String> {
     let mut cref: Vec<(&str, ColType)> = Vec::with_capacity(items.len());
     let mut row: Vec<ColValue> = Vec::with_capacity(items.len());
     for it in items {
@@ -158,10 +158,11 @@ pub(crate) fn sql_build_row(
     }
     // ⭐ PG 兼容: 未显式提供的列 → 列默认值 (DEFAULT 表达式求值; 显式 NULL 不覆盖)
     for (i, c) in schema.columns.iter().enumerate() {
-        if !provided[i] && !hidden(i) {
-            if let Some(d) = &c.default {
-                out[i] = eval_col_default(c.ty, d)?;
-            }
+        if !provided[i]
+            && !hidden(i)
+            && let Some(d) = &c.default
+        {
+            out[i] = eval_col_default(c.ty, d)?;
         }
     }
     // 自动主键: 未提供 (或显式值) → 生成; 禁止用户覆盖 (保持隐藏语义)

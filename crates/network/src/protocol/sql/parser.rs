@@ -1039,7 +1039,7 @@ fn parse_insert(p: &mut P) -> Result<SqlStmt, String> {
     }
     // ⭐ compat: 吞 RETURNING ... (v1 不返回受影响行值)
     if p.try_kw("RETURNING") {
-        while !matches!(p.peek(), None) {
+        while !p.peek().is_none() {
             p.i += 1;
         }
     }

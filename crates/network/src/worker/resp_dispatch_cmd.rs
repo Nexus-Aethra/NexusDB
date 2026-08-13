@@ -5,6 +5,8 @@
 
 use super::*;
 
+// RESP dispatch needs separate connection, auth, and shard-routing state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_resp_command(
     conn: &mut ConnState,
     conn_id: u64,

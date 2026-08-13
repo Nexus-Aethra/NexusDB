@@ -3,6 +3,8 @@
 
 use super::*;
 
+// Aggregation is invoked by the SQL dispatcher with explicit execution resources.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sql_run_agg_select(
     conn: &mut ConnState,
     conn_id: u64,

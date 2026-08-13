@@ -180,8 +180,8 @@ pub(crate) fn sql_run_dml(
             // v1 边界跳过引用检查 (Loom 前置校验父实体, 不依赖; 文档化).
             if conn.txn.is_none() && !schema.fks.is_empty() {
                 // 父表 schema 均缓存 → 进入外键预检 (全存在才发 RowPut)
-                if all_parents_cached(conn, db, &schema) {
-                    if sql_fk_start(
+                if all_parents_cached(conn, db, &schema)
+                    && sql_fk_start(
                         conn,
                         conn_id,
                         seq,
@@ -191,9 +191,9 @@ pub(crate) fn sql_run_dml(
                         num_shards,
                         &schema,
                         &ops,
-                    ) {
-                        return;
-                    }
+                    )
+                {
+                    return;
                 }
             }
             // ⭐ 事务 v1 (F61): 事务中 INSERT 截流进 write_set (喂 bloom
@@ -846,10 +846,10 @@ pub(crate) fn sql_run_dml(
                             }
                         }
                         for l in conds.leaves() {
-                            if let Some(ci) = schema.col_by_name(&l.col) {
-                                if !row_cols.contains(&ci) {
-                                    row_cols.push(ci);
-                                }
+                            if let Some(ci) = schema.col_by_name(&l.col)
+                                && !row_cols.contains(&ci)
+                            {
+                                row_cols.push(ci);
                             }
                         }
                         // ⭐ P0-2: pk 列始终下推 — worker 端需按 pk 排序保持与 TableScan
@@ -960,9 +960,7 @@ pub(crate) fn sql_run_dml(
                         .leaves()
                         .iter()
                         .filter_map(|c| {
-                            let Some(ci) = schema.col_by_name(&c.col) else {
-                                return None;
-                            };
+                            let ci = schema.col_by_name(&c.col)?;
                             let sop = match c.op {
                                 CmpOp::Eq => shard_manager::PredOp::Eq,
                                 CmpOp::Gt => shard_manager::PredOp::Gt,
@@ -1027,7 +1025,7 @@ pub(crate) fn sql_run_dml(
                                 pk: true,
                             }),
                             key_set_hint: None,
-                            limit: shard_limit as u32,
+                            limit: shard_limit,
                         };
                         push_task_grouped(
                             conn_id,

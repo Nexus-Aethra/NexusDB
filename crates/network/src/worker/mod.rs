@@ -34,6 +34,10 @@ use crate::value_codec::{decode_value, render};
 use storage::row::ColValue;
 use storage::schema::{ColType, TableSchema};
 
+type JoinRange = (Vec<u8>, Vec<u8>);
+type JoinRanges = Vec<HashMap<u32, JoinRange>>;
+type CascadePending = (std::sync::Arc<str>, String, Vec<Vec<u8>>);
+
 /// ⭐ 拆分 (2026-08): SQL 纯工具函数 (不依赖 ConnState 状态).
 mod sql_util;
 use sql_util::*;
@@ -350,7 +354,7 @@ struct SqlJoinCtx {
     /// EstimateRows 路径收集; 无数据 = 空 map, index_hint 退化为取第一个 Eq).
     join_distinct: Vec<std::collections::HashMap<u32, u64>>,
     /// ⭐ M3-5: 每表索引列 (min, max) 有序字节 (ti → iid → (min,max); 范围候选占比).
-    join_ranges: Vec<std::collections::HashMap<u32, (Vec<u8>, Vec<u8>)>>,
+    join_ranges: JoinRanges,
 }
 
 /// ⭐ F67 (JOIN): 单侧 gather 行数上限 (止 worker OOM; 超限报错).
@@ -443,7 +447,7 @@ pub(crate) struct ConnState {
     pub(crate) sql_dml_agg: HashMap<u64, SqlDmlAgg>,
     /// ⭐ PG 兼容 (FMT_VER 8): FK 级联 — 根/子 DELETE 的 phase1 收的
     /// (表, 被删 pk) 列表 (Fire::Dml 存; DmlAgg 完成时触发/推进级联).
-    pub(crate) cascade_pending: HashMap<u64, (std::sync::Arc<str>, String, Vec<Vec<u8>>)>,
+    pub(crate) cascade_pending: HashMap<u64, CascadePending>,
     /// ⭐ PG 兼容: 级联子任务 (伪高位 seq → 完成时推进, 不回包).
     pub(crate) cascade_jobs: HashMap<u64, CascadeJob>,
     /// ⭐ PG 兼容: 级联根状态 (主 DELETE seq → 计数/失败/防环).
@@ -883,7 +887,7 @@ pub(crate) fn feed_route_bloom(
         return;
     };
     for idx in schema.indexes.iter() {
-        if let Some(enc) = storage::sql_rows::index_vals_bytes(&schema, idx, &values) {
+        if let Some(enc) = storage::sql_rows::index_vals_bytes(schema, idx, values) {
             let entry = sh
                 .routes
                 .read()
