@@ -240,6 +240,78 @@ CLI 合约，缺省配置自动使用 `stdfs`，而 `nexusdb-test.toml` 仅是�
 不能作为 Windows `--tests` 交叉编译套件。Windows 当前验收为 workspace check + 原机
 Binary/RESP smoke，跨平台集成测试矩阵是后续 M3 前需要补齐的工作。
 
+#### IOCP / AcceptEx 尝试的踩坑记录（不要重蹈）
+
+2026-08-13 第一次按本设计实现 M1/M2 走 IOCP 路径时，遇到一个 **AcceptEx 在 Win10/11
+overlapped listener + 没 client 时同步返回 TRUE with bytes=0** 的怪异行为：
+
+- `AcceptEx(listener, child, ...)` 立即成功，返回 `TRUE`，`bytes_received=0`。
+- 操作系统照样投递一个 AcceptEx completion 到 IOCP（GQCS 立刻拿到，`key=ACCEPT_KEY`）。
+- 但 child socket 仍是 pre-alloc 状态，**没真正 accepted**：
+  - `SO_UPDATE_ACCEPT_CONTEXT` 失败 `10057 WSAENOTCONN`。
+  - `WSARecv` 在 child 上失败同样的 10057。
+- handler 走 `closesocket(child) + post_next_accept` 重试，OS 立刻复用同一个 handle 编号
+  （476/1112/...），整个 acceptor 进入紧密的 re-arm 死循环，每秒数十万次。
+
+进一步 debug 发现 `OVERLAPPED` 字段在 `OverlappedData` 里的偏移不是 0 —— Rust 默认
+`repr(Rust)` 允许字段重排。**`#[repr(C)]` 是 IOCP 集成的硬要求**，否则 GQCS 拿到的 ptr
+转 cast `*mut OverlappedData` 拿到的是另一个实例。修后 `ov_ptr == data_ptr` 仍然能跑通
+ptr 转换，但 child 仍是 pre-alloc 状态。
+
+第二次实现用 raw `WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED)`
+建 listener + pre-alloc child + AcceptEx 投递，行为一致 —— 说明这是 OS 层面而非 listener
+flag 的问题。Windows 10/11 的 `mswsock!AcceptEx` 在某些条件下"sync success but child not
+connected"。
+
+**结论**：M2 不再追 IOCP 路径。先用每连接阻塞 std::thread 交付，**P2/M3 再考虑 RIO
+(Registered I/O)** 或换其他方案（`wepoll`/winsock catalog）。代码已具备重新切回 IOCP
+的骨架 (`runtime_iocp.rs` 的 `#[cfg(target_os = "windows")]` 入口 + listener/worker 拆分)，
+后续切只是替换 `acceptor_main` / `run_conn` 内的实现，不动上层协议 / shard 入口。
+
+#### 关键 IOCP 集成备忘（再启用时务必检查）
+
+- `struct OverlappedData` 必须 `#[repr(C)]` + 第一个字段是 `overlapped: OVERLAPPED`。
+- `windows-sys = "0.61"`：函数名是 `LPFN_ACCEPTEX`（`Option<unsafe extern "system" fn(...)>`），
+  不是 `ACCEPTEX`；`setsockopt` 第 4 参是 `PSTR`（`*const u8`）不是 `*const c_void`。
+- 启用 AcceptEx 时 child socket **必须** `WSASocketW(..., WSA_FLAG_OVERLAPPED)` 创建；
+  listener 也必须用 `WSA_FLAG_OVERLAPPED`。
+- listener 注册 IOCP 用 `CreateIoCompletionPort(INVALID_HANDLE_VALUE, ...)` 创建，再用
+  `CreateIoCompletionPort(listener, iocp, ACCEPT_KEY, 0)` 注册到 key 非 0 的专属 key；
+  child 用 `key=0` 单独注册。
+- **不要**在 runtime_iocp.rs 之外做 `unsafe` winsock 调用；统一的 listener 创建、注册、
+  accept、IO 提交都集中在 `runtime_iocp.rs` 里。
+- 如果 listener 设 `set_nonblocking(true)`（MVP 必要），winsock 会把 non-blocking 状态
+  继承到 child socket。child 的 read 在没有数据时返回 `WSAEWOULDBLOCK` (10035) 或
+  `WSAETIMEDOUT`，**必须**在 read loop 里 retry + 短暂 sleep，**不能** `return Err` —
+  否则 client 看到 "An existing connection was forcibly closed"。
+
+#### Windows 现有协议的 smoke 验证
+
+`nexusdb-test.toml`（含 `stdfs` backend, RESP 6380, Binary 5433）跑通：
+
+```
+PING                → PONG
+SET user:1 alice    → OK
+GET user:1          → alice
+SET user:2 bob      → OK
+GET user:2          → bob
+DEL user:1          → 1
+GET user:1          → (nil)
+SET counter 100     → OK
+GET counter         → 100
+INCR counter        → ERR runtime_iocp does not yet support Incr
+DBSIZE              → ERR ... not yet supported
+INFO server         → ERR ... not yet supported
+CLIENT LIST         → ERR ... not yet supported
+```
+
+`INCR/HSET/LPUSH/SADD/ZADD/DBSIZE/INFO/CLIENT` 等命令在 `portable.rs` (Linux fallback)
+也是相同错误（"does not yet support"）—— 协议层本身没实现这些命令，不只是 Windows runtime
+缺。下一阶段重点是补 RESP dispatch 树（portable.rs + Windows runtime 同步），不是切 IOCP。
+
+WAL 持久化：服务关闭后重启 `[storage] WAL replay: N applied` 自动恢复上一次的 SET/GET
+数据。重启后 `GET user:2` 仍返回 `bob`。
+
 ### M3 — Binary 协议 (1 天)
 
 **目标**:Binary 协议 smoke 通。

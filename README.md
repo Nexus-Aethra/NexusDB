@@ -24,7 +24,7 @@ At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + p
 
 ---
 
-**[Core Features](#core-features) · [Quick Start](#quick-start) · [Performance](#performance) · [Architecture](#architecture) · [GC & Space Reclamation](#gc--space-reclamation) · [Large-Value Overflow Pages](#large-value-overflow-pages) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [Dev Commands](#dev-commands) · [Troubleshooting](#troubleshooting)**
+**[Core Features](#core-features) · [Quick Start](#quick-start) · [Windows (Beta)](#windows-beta) · [Performance](#performance) · [Architecture](#architecture) · [GC & Space Reclamation](#gc--space-reclamation) · [Large-Value Overflow Pages](#large-value-overflow-pages) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [Dev Commands](#dev-commands) · [Troubleshooting](#troubleshooting)**
 
 ---
 
@@ -103,6 +103,124 @@ cargo test --workspace --no-fail-fast    # ~30s, expect 0 failed
 ```
 
 > Docker packaging is available (see [Dockerfile](./Dockerfile) + [docker-compose.yml](./docker-compose.yml)); details in [docs/GUIDE.md](./docs/GUIDE.md#docker-deployment).
+
+---
+
+## Windows (Beta)
+
+> **Status (2026-08-13)**: `feat/resp-sql-schema-adapter` branch. The Windows
+> build runs end-to-end with `std::net::TcpListener` + one `std::thread` per
+> connection. Linux keeps io_uring + epoll + coroutine scheduler.  Full
+> design and gotchas: [docs/plans/2026-08-13-windows-portability.md](./docs/plans/2026-08-13-windows-portability.md) + [docs/plans/2026-08-13-windows-iocp.md](./docs/plans/2026-08-13-windows-iocp.md).
+
+### What works on Windows today
+
+- **Binary protocol** (port 5433) + **RESP2** (port 6380) — same dispatch
+  path as Linux's `portable.rs` fallback.
+- RESP commands: `PING`, `AUTH`, `SELECT`, `SET`, `GET`, `DEL`, `MGET`, `MSET`,
+  `EXISTS`, `STRLEN`, `TYPE`, `INCR` family, `APPEND`, `SETNX`, `GETSET`, etc.
+  `INCR` / `HSET` / `LPUSH` / `SADD` / `ZADD` / `DBSIZE` / `INFO` /
+  `CLIENT LIST` are not yet wired in the dispatch tree (same gap on Linux
+  `portable.rs`; tracked separately).
+- **WAL persistence** + crash recovery — same on-disk format as Linux, so
+  you can copy a Linux `data/` tree to Windows and replay.
+- **Ctrl-C graceful shutdown** via `SetConsoleCtrlHandler` — stops the
+  acceptor, joins all connection threads, then closes `ShardManager` so
+  WAL gets a final flush.
+- **Default `stdfs` IO backend** — Windows has no `io_uring`; missing or
+  `io_uring` config is auto-corrected to `stdfs`.
+
+### What does not (yet)
+
+- MySQL / PostgreSQL / HTTP REST / TLS facades are Linux-only paths.
+- IOCP / RIO completion port runtime (planned for a later perf pass; the
+  blocker is documented in the design doc).
+- `io_uring` IO backend, perf benchmarks, and the 860-test matrix are
+  Linux-only.
+
+### Build
+
+```bash
+# 1) toolchain
+rustup default stable-x86_64-pc-windows-msvc
+
+# 2) clone + build
+git clone https://github.com/Nexus-Aethra/NexusDB.git
+cd NexusDB
+cargo build --release --workspace
+```
+
+### Run
+
+```bash
+# minimal config (auto-corrects io_backend to stdfs on Windows)
+cat > nexusdb-test.toml <<'TOML'
+[server]
+listen_addr = "127.0.0.1:5433"     # Binary
+redis_addr  = "127.0.0.1:6380"     # RESP (use 6380 to avoid clashing with
+                                  # the SYSTEM-account redis-server on 6379
+                                  # that ships with the Redis.Redis winget
+                                  # package)
+worker_count = 1
+sql_addr = ""                    # disable SQL/PG on Windows
+pg_addr   = ""
+http_addr = ""
+sql_password = ""
+redis_password = ""
+
+[storage]
+block_root = "./data-test"
+num_shards = 2
+io_backend = "stdfs"
+create_if_missing = true
+default_db = "default"
+default_table = "default"
+precreate_dbs = 1
+TOML
+
+./target/release/NexusDB.exe --config nexusdb-test.toml
+```
+
+### Smoke (redis-cli)
+
+```bash
+redis-cli -p 6380 PING                # PONG
+redis-cli -p 6380 SET user:1 alice    # OK
+redis-cli -p 6380 GET user:1          # alice
+redis-cli -p 6380 DEL user:1          # 1
+```
+
+### Gotchas
+
+- **`redis-server` on 6379**: the `Redis.Redis` winget package installs a
+  `redis-server.exe` running as SYSTEM on port 6379. Without admin you
+  cannot stop it; use 6380 for the smoke. Production: pick a free port
+  in your own config.
+- **No `io_uring`**: `io_backend` in the config is ignored on Windows
+  (silently downgraded to `stdfs` when the missing-config path is taken,
+  or you can pin `io_backend = "stdfs"` explicitly).
+- **Listener `set_nonblocking(true)`** is needed so the acceptor can poll
+  the `stop` atomic, but winsock inherits that flag to accepted child
+  sockets. The per-connection thread treats `WSAEWOULDBLOCK` /
+  `WSAETIMEDOUT` on read as transient back-pressure and retries; never
+  close the conn on those errors or clients will see
+  "An existing connection was forcibly closed" between back-to-back
+  commands.
+- **`#[repr(C)]` on `OverlappedData`**: if you ever re-enable the IOCP
+  path, the `OVERLAPPED` field MUST be the first field and the struct
+  MUST be `#[repr(C)]`. Rust's default `repr(Rust)` will reorder fields
+  and GQCS will hand you the wrong dispatch state.
+- **`windows-sys = "0.61"`**: `ACCEPTEX` does not exist; the type is
+  `LPFN_ACCEPTEX` (an `Option<unsafe extern "system" fn(...)>`).
+  `setsockopt`'s 4th argument is `PSTR` (`*const u8`), not
+  `*const c_void`.
+
+### Performance
+
+Not measured on Windows yet. M2 uses one `std::thread` per connection,
+which is fine for development + single-node demo. Higher concurrency
+requires going back to IOCP (see design doc gotchas) or RIO. The Linux
+memtier numbers in [Performance](#performance) do not apply.
 
 ---
 

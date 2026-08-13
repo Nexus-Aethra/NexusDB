@@ -410,6 +410,54 @@ Workspace: ~549 passed, 0 failed (不含慢 repro 测试).
 
 ---
 
+## Windows 可移植性 (2026-08-13)
+
+当前 Windows 跑通的是 P1 MVP: `std::net::TcpListener` + 每连接一个 `std::thread` 阻塞 IO,
+见 `docs/plans/2026-08-13-windows-portability.md` + `docs/plans/2026-08-13-windows-iocp.md`。
+
+- **Linux 主推路径不动**: `server.rs` / `worker/` / `scheduler/` 全部 Linux-only, 性能
+  与 memtier 数字都是 Linux 路径的结果, **不能套用到 Windows**。
+- **Windows 路径**: `crates/network/src/runtime_iocp.rs` (cfg `target_os = "windows"`,
+  ~250 LoC std::net + per-conn thread); `portable.rs` 仍是 Linux 之外的 fallback。
+- **依赖**: Cargo.toml 加 `windows-sys = "0.61"` (Windows-only) 仅用于
+  `SetConsoleCtrlHandler`。
+- **CLI**: `nexusdb [--config <path>] [--version]`, 缺省 config 自动用 `stdfs` (不
+  会因 `io_uring` 拒绝而崩)。
+- **协议范围**: Windows 启动只 bind Binary (5433) + RESP (6380)。SQL/PG/HTTP/TLS
+  仍是 Linux 路径, 启动 cfg-隔离跳过。
+- **已知缺口**: `INCR/HSET/LPUSH/SADD/ZADD/DBSIZE/INFO/CLIENT LIST` 在 dispatch 树上
+  还没接 (portable.rs 也一样), 是协议层本身的事, 不是 Windows runtime 缺。
+
+### Windows IOCP 集成 gotchas (再启用前必看)
+
+1. **`#[repr(C)]` 是硬约束**: `OverlappedData` 必须 `#[repr(C)]` 且第一个字段是
+   `overlapped: OVERLAPPED`, 否则 Rust `repr(Rust)` 会 reorder 字段, GQCS 拿到的
+   ptr 强转 `*mut OverlappedData` 后拿到错位数据。调试时打印 `data_ptr` vs
+   `overlapped as *mut _` 验证 `offset == 0`。
+2. **`AcceptEx` 在 Win10/11 overlapped listener + 没 client 时同步返回 TRUE with
+   bytes=0**: OS 投递完成事件到 IOCP, 但 child socket 仍是 pre-alloc 状态。
+   - 症状: GQCS 立刻拿到 `key=ACCEPT_KEY` 事件; `SO_UPDATE_ACCEPT_CONTEXT` 失败
+     10057 `WSAENOTCONN`; `WSARecv` 在 child 上失败同样 10057;
+     `closesocket(child) + re-arm` 触发 OS 复用 handle 编号 → 死循环。
+   - 解决: 改用 `wepoll` (kernel-bridged epoll) 或 winsock catalog; 或者直接
+     继续用 std::net blocking path (P1 MVP)。
+3. **`windows-sys = "0.61"`**:
+   - `ACCEPTEX` 不存在, 是 `LPFN_ACCEPTEX` (type alias `Option<unsafe extern "system" fn(...)>`)
+   - `setsockopt` 第 4 参是 `PSTR` (`*const u8`), 不是 `*const c_void`
+   - `WSASocketW` 必须传 `WSA_FLAG_OVERLAPPED` 才能配合 IOCP
+4. **Listener `set_nonblocking(true)` 状态继承到 child socket**: acceptor 需要靠它
+   轮询 `stop` atomic, 但 winsock 会继承给 child. child 的 read 在无数据时返回
+   `WSAEWOULDBLOCK` (10035) 或 `WSAETIMEDOUT`, **必须** retry + 短 sleep, **不能**
+   `return Err`, 否则 client 看到 "An existing connection was forcibly closed"。
+5. **优雅停止**: `NetworkServer::shutdown` 顺序: 设 `stop` atomic → acceptor 退出
+   (listener 关闭, accept 立即返回错误) → `stream.shutdown(Shutdown::Both)` 唤醒
+   阻塞的 conn thread → join 所有 conn → `Arc::try_unwrap(mgr)` + `mgr.close()` flush
+   WAL。**不能**反过来先 close mgr 再等 conn 退出, 否则 WAL 没 final flush。
+6. **`redis-server` 6379 在 win 自带**: `Redis.Redis` winget 包安装的 redis-server
+   跑在 SYSTEM 账户, 没 admin 杀不掉; 测试用 6380 避让。
+
+---
+
 ## 关键设计原则 (实施时记住)
 
 ### 调度器 / IO

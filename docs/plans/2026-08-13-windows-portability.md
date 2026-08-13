@@ -73,6 +73,24 @@ P2 IOCP 及各协议 worker 的独立移植。Windows 原机运行 smoke 与 Ctr
 
 验收：Windows 上启动 RESP 监听、SET/GET/DEL、重启恢复、关闭；Linux 协议 e2e 不变。
 
+#### P1 验收 (2026-08-13)
+
+- `cargo build --release` 0 错误
+- `crates/network` 17/17 单元测试通过 (`protocol::resp` / `protocol::crypto` /
+  `value_codec`)
+- 原机 `nexusdb.exe --config nexusdb-test.toml` 启动监听 Binary 5433 + RESP 6380
+- redis-cli PING/SET/GET/DEL/INCR(命令级)/HSET/LPUSH/SADD/ZADD/DBSIZE/INFO/CLIENT LIST
+  完整 smoke：PING/SET/GET/DEL 全部返回正确值；INCR/HSET/... 返回 "not yet supported"
+  (与 Linux `portable.rs` 行为一致，**是协议层未实现，非 Windows runtime 缺**)
+- Ctrl-C 走 `SetConsoleCtrlHandler` → `SHUTDOWN` atomic → 优雅退出（acceptor
+  `shutdown(Shutdown::Both)` 唤醒阻塞 read + join 所有 connection threads + `mgr.close()`
+  flush WAL）
+- WAL 持久化：服务关闭后重启自动 replay 上次 SET/GET
+- `nexusdb-test.toml` 默认端口 6380（6379 被 win 自带 `redis-server` 占着，SYSTEM
+  账户运行，没 admin 杀不掉；用 6380 是测试方便，正式部署可改回 6379）
+- 缺省 config（无 `--config`）自动用 `stdfs` 后端（Linux 默认 `io_uring` 在 Windows 不可用）
+- 缺省 `block_root = "./data"`，与 Linux 路径 `"./data"` 语义一致
+
 ### P2：Windows 原生 reactor（IOCP）
 
 1. 用 IOCP 替换 P1 Windows 阻塞 worker，支持 accept/read/write completion。
@@ -80,6 +98,26 @@ P2 IOCP 及各协议 worker 的独立移植。Windows 原机运行 smoke 与 Ctr
 3. 给 socket/file request 加取消、关闭竞态和背压测试。
 
 验收：Windows 32 客户端 pipeline 测试无丢包/卡死；吞吐以 P1 为基线提升，Linux 不受影响。
+
+#### P2 暂缓说明（2026-08-13）
+
+第一轮 P2 实施按 `[2026-08-13-windows-iocp.md]()` 设计走 IOCP 完成端口路径，M1/M2 已经
+跑通编译和 binary echo，但 RESP 端到端碰到了 **Win10/11 上 AcceptEx 同步返回 TRUE
+但 child 仍 pre-alloc** 的 OS 行为，详见设计文档的"IOCP / AcceptEx 尝试的踩坑记录"节。
+
+当前决定：
+
+- **保持 P1 (std::net blocking + 每连接 std::thread) 作为 Windows 主推路径**，所有 M3+
+  的 SQL/PG/HTTP/TLS 协议补齐都基于这条路径，每连接一个 OS thread 已经能撑住开发 +
+  单机 demo 的并发量。
+- **M2 增量不再追 IOCP**；标记 M2 当前实现边界 = P1 + RESP dispatch，把 P2 挪到
+  P3 之后的 "perf" 阶段。
+- 如果未来再上 IOCP / RIO：
+  - `#[repr(C)]` + OVERLAPPED 第一个字段
+  - 复现问题：先在最小 listener + AcceptEx 投递 + GQCS 上回放，确认 `bytes=0` 是 sync
+    success 但 child 真实 accepted 再继续；目前观察到的是 child 永远不 accepted。
+  - 备用方案：换 `wepoll` (kernel-bridged epoll) 或 winsock catalog extension，或在
+    `wepoll` 上跑 `mio`-style 状态机。
 
 ### P3：发布与矩阵
 

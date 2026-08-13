@@ -24,7 +24,7 @@
 
 ---
 
-**[核心特性](#核心特性) · [快速开始](#快速开始) · [性能](#性能) · [架构总览](#架构总览) · [GC 与空间回收](#gc-与空间回收) · [大 value 溢出页](#大-value-溢出页) · [支持的协议](#支持的协议) · [配置](#配置) · [开发命令](#开发命令) · [故障排查](#故障排查)**
+**[核心特性](#核心特性) · [快速开始](#快速开始) · [Windows (Beta)](#windows-beta) · [性能](#性能) · [架构总览](#架构总览) · [GC 与空间回收](#gc-与空间回收) · [大 value 溢出页](#大-value-溢出页) · [支持的协议](#支持的协议) · [配置](#配置) · [开发命令](#开发命令) · [故障排查](#故障排查)**
 
 ---
 
@@ -101,6 +101,108 @@ Binary 协议端口 (5433) 测试用例见 [`crates/network/tests/end_to_end.rs`
 ```bash
 cargo test --workspace --no-fail-fast    # ~30s, 0 failed 预期
 ```
+
+---
+
+## Windows (Beta)
+
+> **状态 (2026-08-13)**: `feat/resp-sql-schema-adapter` 分支。Windows 构建端到端跑通
+> (`std::net::TcpListener` + 每连接一个 `std::thread`)。Linux 继续 io_uring + epoll +
+> 协程调度器。完整设计与踩坑见 [docs/plans/2026-08-13-windows-portability.md](./docs/plans/2026-08-13-windows-portability.md) + [docs/plans/2026-08-13-windows-iocp.md](./docs/plans/2026-08-13-windows-iocp.md)。
+
+### Windows 上目前能用的功能
+
+- **Binary 协议** (端口 5433) + **RESP2** (端口 6380) — 跟 Linux `portable.rs` 走同一条 dispatch。
+- RESP 命令: `PING`, `AUTH`, `SELECT`, `SET`, `GET`, `DEL`, `MGET`, `MSET`,
+  `EXISTS`, `STRLEN`, `TYPE`, `INCR` 系列, `APPEND`, `SETNX`, `GETSET` 等。
+  `INCR` / `HSET` / `LPUSH` / `SADD` / `ZADD` / `DBSIZE` / `INFO` /
+  `CLIENT LIST` 在 dispatch 树上还没接上 (Linux `portable.rs` 上同样没接, 是
+  协议层本身没实现, 不是 Windows runtime 缺)。
+- **WAL 持久化** + 崩溃恢复 — 跟 Linux 用同一份磁盘格式, 可以把 Linux 的
+  `data/` 目录拷到 Windows 上直接 replay。
+- **Ctrl-C 优雅停止** (`SetConsoleCtrlHandler`) — 停 acceptor, join 所有连接线程,
+  再关 `ShardManager` 触发 WAL final flush。
+- **默认 `stdfs` IO 后端** — Windows 没有 `io_uring`; 配置缺失或写 `io_uring`
+  会被自动纠正为 `stdfs`。
+
+### Windows 上目前还不能用的
+
+- MySQL / PostgreSQL / HTTP REST / TLS 门面仍是 Linux 路径, Windows 不启动。
+- IOCP / RIO 完成端口 runtime (后续 perf 阶段再上; 设计文档里有完整踩坑记录)。
+- `io_uring` IO 后端、memtier 压测、860+ 测试跨平台矩阵都只在 Linux 上跑。
+
+### 编译
+
+```bash
+# 1) 工具链
+rustup default stable-x86_64-pc-windows-msvc
+
+# 2) clone + build
+git clone https://github.com/Nexus-Aethra/NexusDB.git
+cd NexusDB
+cargo build --release --workspace
+```
+
+### 运行
+
+```bash
+# 最小 config (Windows 上会自动把 io_backend 纠正为 stdfs)
+cat > nexusdb-test.toml <<'TOML'
+[server]
+listen_addr = "127.0.0.1:5433"     # Binary
+redis_addr  = "127.0.0.1:6380"     # RESP (用 6380 避开自带的 redis-server)
+worker_count = 1
+sql_addr = ""                    # Windows 关掉 SQL/PG
+pg_addr   = ""
+http_addr = ""
+sql_password = ""
+redis_password = ""
+
+[storage]
+block_root = "./data-test"
+num_shards = 2
+io_backend = "stdfs"
+create_if_missing = true
+default_db = "default"
+default_table = "default"
+precreate_dbs = 1
+TOML
+
+./target/release/NexusDB.exe --config nexusdb-test.toml
+```
+
+### Smoke 测试 (redis-cli)
+
+```bash
+redis-cli -p 6380 PING                # PONG
+redis-cli -p 6380 SET user:1 alice    # OK
+redis-cli -p 6380 GET user:1          # alice
+redis-cli -p 6380 DEL user:1          # 1
+```
+
+### 踩坑 / Gotchas
+
+- **`redis-server` 占着 6379**: `Redis.Redis` winget 包安装的
+  `redis-server.exe` 跑在 SYSTEM 账户监听 6379, 没 admin 杀不掉; 测试用 6380
+  避让。生产可改成自己 config 里的空闲端口。
+- **没有 `io_uring`**: Windows 上 `io_backend` 字段被忽略 (缺省 config 时自动
+  降级到 `stdfs`, 也可以直接显式写 `io_backend = "stdfs"`)。
+- **Listener `set_nonblocking(true)` 状态继承到 child**: acceptor 需要靠它
+  轮询 `stop` atomic, 但 winsock 会把这个 flag 继承给 accept 出来的子 socket。
+  每个连接线程把 `WSAEWOULDBLOCK` / `WSAETIMEDOUT` 当成正常背压, 短 sleep
+  后 retry; **绝不能** `return Err` 关连接, 不然 client 在连发命令时
+  会看到 "An existing connection was forcibly closed"。
+- **`#[repr(C)]` 是 IOCP `OverlappedData` 的硬约束**: 以后再启用 IOCP 路径时,
+  `OVERLAPPED` 必须是第一个字段, struct 必须 `#[repr(C)]`。Rust 默认
+  `repr(Rust)` 会 reorder 字段, GQCS 拿到的 ptr 强转后会拿到错位的状态。
+- **`windows-sys = "0.61"` 类型细节**:
+  - `ACCEPTEX` 不存在, 是 `LPFN_ACCEPTEX` (`Option<unsafe extern "system" fn(...)>`)
+  - `setsockopt` 第 4 参是 `PSTR` (`*const u8`), 不是 `*const c_void`
+
+### 性能
+
+Windows 上未测。M2 用每连接 `std::thread`, 适合开发 + 单机 demo。更高并发
+需要回到 IOCP (见设计文档) 或 RIO。Linux 上的 memtier 数字不适用于 Windows。
 
 ---
 
