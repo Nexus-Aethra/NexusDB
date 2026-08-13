@@ -51,12 +51,14 @@ enum ParkState {
 /// ```
 pub struct ParkCurrent {
     state: ParkState,
+    slot_id: Option<usize>,
 }
 
 impl ParkCurrent {
     pub(crate) fn new() -> Self {
         Self {
             state: ParkState::Pending,
+            slot_id: None,
         }
     }
 }
@@ -77,17 +79,44 @@ impl Future for ParkCurrent {
                 PARKED.with(|p| {
                     p.borrow_mut().insert(slot_id, cx.waker().clone());
                 });
+                self.slot_id = Some(slot_id);
                 self.state = ParkState::Parked;
                 Poll::Pending
             }
-            // 第二次 poll: 已经被 unpark 唤醒, 完成
+            // 重新 poll 不等于已经 unpark：IO CQE、重复 wake 都可能让本 future 再次被
+            // 调度。只有 `unpark` 从表中移除了 waker，才是真正的完成信号。
             ParkState::Parked => {
-                self.state = ParkState::Resolved;
-                Poll::Ready(())
+                let slot_id = self.slot_id.expect("parked state without slot id");
+                PARKED.with(|p| {
+                    let mut parked = p.borrow_mut();
+                    if parked.contains_key(&slot_id) {
+                        parked.insert(slot_id, cx.waker().clone());
+                        Poll::Pending
+                    } else {
+                        self.state = ParkState::Resolved;
+                        Poll::Ready(())
+                    }
+                })
             }
             // 已完成: 再次 poll 时直接 Ready (idempotent, 防止误用)
             ParkState::Resolved => Poll::Ready(()),
         }
+    }
+}
+
+impl Drop for ParkCurrent {
+    fn drop(&mut self) {
+        if self.state != ParkState::Parked {
+            return;
+        }
+        let Some(slot_id) = self.slot_id else {
+            return;
+        };
+        // `select_fd_or_unpark` 可能由 fd 事件胜出；此时必须移除它留下的 park
+        // waker，否则后续 reply 会错误唤醒已进入下一轮等待的同一 slot。
+        let _ = PARKED.try_with(|p| {
+            p.borrow_mut().remove(&slot_id);
+        });
     }
 }
 

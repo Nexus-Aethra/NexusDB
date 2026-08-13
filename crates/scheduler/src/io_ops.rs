@@ -21,6 +21,17 @@ use std::task::{Context, Poll};
 use crate::scheduler::with_current;
 use crate::scheduler::with_current_slot;
 
+/// 取消被 future drop 遗留的内核请求。
+///
+/// Drop 可能发生在 scheduler 已销毁之后；此时 io_uring 已随 scheduler 回收，无需再
+/// 提交 cancel。正常 task poll/drop 路径则必须取消，尤其是 `select_read` 的落选 PollFd。
+fn cancel_submitted(user_data: &Cell<Option<u64>>) {
+    let Some(ud) = user_data.take() else {
+        return;
+    };
+    let _ = with_current(|s| s.cancel_submitted_io(ud));
+}
+
 /// 公共逻辑: 已提交过 → 扫 CQE
 /// 返回 `Some(code)` 表示有结果; `None` 表示还没到.
 macro_rules! poll_cqe {
@@ -258,6 +269,12 @@ impl<'a> Future for Read<'a> {
     }
 }
 
+impl Drop for Read<'_> {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
+    }
+}
+
 // ---------- Write ----------
 
 struct Write<'a> {
@@ -295,6 +312,12 @@ impl<'a> Future for Write<'a> {
     }
 }
 
+impl Drop for Write<'_> {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
+    }
+}
+
 // ---------- Fsync ----------
 
 struct Fsync {
@@ -324,6 +347,12 @@ impl Future for Fsync {
     }
 }
 
+impl Drop for Fsync {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
+    }
+}
+
 // ---------- Close ----------
 
 struct Close {
@@ -350,6 +379,12 @@ impl Future for Close {
         let ud = submit_sqe!(entry, slot_id, cx);
         this.user_data.set(Some(ud));
         Poll::Pending
+    }
+}
+
+impl Drop for Close {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
     }
 }
 
@@ -407,6 +442,12 @@ impl Future for PollFd {
     }
 }
 
+impl Drop for PollFd {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
+    }
+}
+
 /// 公开 API: 等待 fd 上指定的 poll 事件 (如 libc::POLLIN).
 /// ⭐ 协程 worker 用: 监听 socket 可读 / reply eventfd 可读, 替代 epoll 的等待.
 /// 返回触发的事件 mask. 若 fd 已关闭则返回 error.
@@ -434,7 +475,11 @@ pub async fn select_fd_or_unpark(fd: RawFd) -> io::Result<u8> {
         type Output = io::Result<u8>;
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            // 1. socket 可读?
+            // 1. 先注册 unpark waker。这样 reply 在 socket poll 提交前到达也不会丢失。
+            if let Poll::Ready(()) = Pin::new(&mut this.park).poll(cx) {
+                return Poll::Ready(Ok(2));
+            }
+            // 2. socket 可读?
             match Pin::new(&mut this.fd_poll).poll(cx) {
                 Poll::Ready(Ok(mask)) if mask & libc::POLLIN as u32 != 0 => {
                     return Poll::Ready(Ok(1));
@@ -442,10 +487,6 @@ pub async fn select_fd_or_unpark(fd: RawFd) -> io::Result<u8> {
                 Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {}
-            }
-            // 2. 被 unpark? (park 第二次 poll → Ready)
-            if let Poll::Ready(()) = Pin::new(&mut this.park).poll(cx) {
-                return Poll::Ready(Ok(2));
             }
             Poll::Pending
         }
@@ -559,6 +600,12 @@ impl<'a> Future for ReadFixed<'a> {
     }
 }
 
+impl Drop for ReadFixed<'_> {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
+    }
+}
+
 // ---------- WriteFixed (T18a) ----------
 
 struct WriteFixed<'a> {
@@ -596,6 +643,12 @@ impl<'a> Future for WriteFixed<'a> {
     }
 }
 
+impl Drop for WriteFixed<'_> {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
+    }
+}
+
 // ---------- FsyncFixed (T18a) ----------
 
 struct FsyncFixed {
@@ -622,6 +675,12 @@ impl Future for FsyncFixed {
         let ud = submit_sqe!(entry, slot_id, cx);
         this.user_data.set(Some(ud));
         Poll::Pending
+    }
+}
+
+impl Drop for FsyncFixed {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
     }
 }
 
@@ -665,6 +724,12 @@ impl Future for ReadFixedBuf {
     }
 }
 
+impl Drop for ReadFixedBuf {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
+    }
+}
+
 // ---------- WriteFixedBuf (T18b) ----------
 
 struct WriteFixedBuf {
@@ -702,6 +767,12 @@ impl Future for WriteFixedBuf {
         let ud = submit_sqe!(entry, slot_id, cx);
         this.user_data.set(Some(ud));
         Poll::Pending
+    }
+}
+
+impl Drop for WriteFixedBuf {
+    fn drop(&mut self) {
+        cancel_submitted(&self.user_data);
     }
 }
 

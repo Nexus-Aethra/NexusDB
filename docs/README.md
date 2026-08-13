@@ -14,6 +14,7 @@
 
 - [RESP write-path performance plan](./plans/2026-08-05-resp-write-path-performance.md)
 - [RESP ↔ SQL schema adapter plan](./plans/2026-08-09-resp-sql-schema-adapter.md)
+- [Coroutine scheduler hardening plan](./plans/2026-08-13-coroutine-scheduler-hardening.md)
 - [SQL optimizer plan](./sql-optimizer-plan.md)
 - [PostgreSQL dialect and Loom integration plan](./pg-dialect-gap-loom.md)
 - [Scheduler audit](./scheduler-audit.md)

@@ -23,13 +23,13 @@ mod yield_now;
 
 pub use fd_pool::{FdPool, FdPoolError, MAX_FD_PER_SHARD};
 
-pub use io_registry::{IoOpState, IoRegistry};
+pub use io_registry::{IoOpState, IoRegistry, IoRegistryStats};
 pub use park::{
     clear_all_parked, is_parked, park_current_coroutine, parked_count, register_parked,
     take_parked, unpark,
 };
 pub use scheduler::current_task_id;
-pub use pool::Pool;
+pub use pool::{Pool, POOL_SIZE};
 pub use ready::{ReadyQueueHandle, new_handle as new_ready_queue};
 pub use scheduler::{SchedHandle, Scheduler, with_current};
 pub use task::{JoinError, JoinHandle, spawn, spawn_on, spawn_on_low};

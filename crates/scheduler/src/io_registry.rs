@@ -15,9 +15,19 @@ pub struct IoOpState {
     pub result: Option<i32>,
 }
 
+/// 单 scheduler 生命周期内的 IO registry 观测快照。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IoRegistryStats {
+    pub registered: u64,
+    pub completed: u64,
+    pub cancelled: u64,
+    pub unknown_cqe: u64,
+}
+
 pub struct IoRegistry {
     inner: HashMap<u64, IoOpState>,
     next_user_data: AtomicU64,
+    stats: IoRegistryStats,
 }
 
 impl IoRegistry {
@@ -25,6 +35,7 @@ impl IoRegistry {
         Self {
             inner: HashMap::new(),
             next_user_data: AtomicU64::new(1),
+            stats: IoRegistryStats::default(),
         }
     }
 
@@ -39,6 +50,7 @@ impl IoRegistry {
                 result: None,
             },
         );
+        self.stats.registered += 1;
         ud
     }
 
@@ -48,9 +60,16 @@ impl IoRegistry {
     }
 
     /// 标记某 ud 的 CQE 已到, 存结果. 不移除, 让 io_ops.poll 自己 take.
-    pub fn mark_completed(&mut self, user_data: u64, result: i32) {
+    /// 返回是否找到对应的 pending registry entry。
+    pub fn mark_completed(&mut self, user_data: u64, result: i32) -> bool {
         if let Some(s) = self.inner.get_mut(&user_data) {
+            if s.result.is_none() {
+                self.stats.completed += 1;
+            }
             s.result = Some(result);
+            true
+        } else {
+            false
         }
     }
 
@@ -84,13 +103,19 @@ impl IoRegistry {
     }
 
     /// 取消单个 ud (Future 完成或 slot drop).
-    pub fn cancel(&mut self, user_data: u64) {
-        self.inner.remove(&user_data);
+    pub fn cancel(&mut self, user_data: u64) -> bool {
+        let removed = self.inner.remove(&user_data).is_some();
+        if removed {
+            self.stats.cancelled += 1;
+        }
+        removed
     }
 
     /// 取消某 slot 的所有注册 (RR 强制复用时).
     pub fn cancel_slot(&mut self, slot_id: usize) {
+        let before = self.inner.len();
         self.inner.retain(|_, st| st.slot_id != slot_id);
+        self.stats.cancelled += (before - self.inner.len()) as u64;
     }
 
     /// 当前 in-flight 操作数 (调试 / has_work 用).
@@ -100,6 +125,15 @@ impl IoRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// 记录不属于任何 pending task 的 CQE，例如 AsyncCancel 自身的完成事件。
+    pub fn record_unknown_cqe(&mut self) {
+        self.stats.unknown_cqe += 1;
+    }
+
+    pub fn stats(&self) -> IoRegistryStats {
+        self.stats
     }
 }
 

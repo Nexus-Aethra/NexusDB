@@ -27,16 +27,19 @@ use std::collections::{HashMap, VecDeque};
 use super::*;
 use crate::protocol::mysql as my;
 use scheduler::io_ops as sio;
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
-/// 每连接的 reply 队列 + 精确唤醒 eventfd.
+/// 每连接的 reply 队列 + 本地 scheduler task id.
 struct ConnReply {
     queue: VecDeque<shard_manager::TaskResult>,
-    eventfd: std::os::unix::io::RawFd,
+    task_id: Option<usize>,
 }
 
-type ConnRegistry = Arc<Mutex<HashMap<u64, ConnReply>>>;
+/// 所有访问均发生在同一 worker 的 scheduler thread，不需要 Mutex。
+type ConnRegistry = Rc<RefCell<HashMap<u64, ConnReply>>>;
 
 /// 协程 worker 入口. 每 worker 1 个 Scheduler, 每连接 1 个协程.
 pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
@@ -69,7 +72,7 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
         Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // ---- per-conn reply 注册表 (reply_dispatch 写, 连接协程读) ----
-    let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let registry: ConnRegistry = Rc::new(RefCell::new(HashMap::new()));
     // ⭐ shutdown: 停止 reply_dispatch 协程的信号 eventfd (主循环退出时写, 让协程 break).
     let stop_efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     assert!(stop_efd >= 0, "stop_efd failed");
@@ -95,22 +98,16 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
             unsafe {
                 libc::read(reply_eventfd, &mut v as *mut u64 as *mut libc::c_void, 8);
             }
-            // drain 所有回包, 按 conn_id 路由到 per-conn 队列 + 写 per-conn eventfd
+            // drain 所有回包, 按 conn_id 路由到私有队列并 unpark 目标连接协程。
             reply_bus_r.drain_into(&mut reply_results);
             if !reply_results.is_empty() {
-                let mut reg = reg_r.lock().unwrap();
                 for r in reply_results.drain(..) {
-                    if let Some(entry) = reg.get_mut(&r.conn_id) {
+                    let task_id = reg_r.borrow_mut().get_mut(&r.conn_id).map(|entry| {
                         entry.queue.push_back(r);
-                        // 精确唤醒该连接协程 (level-triggered eventfd)
-                        let val: u64 = 1;
-                        unsafe {
-                            libc::write(
-                                entry.eventfd,
-                                &val as *const u64 as *const libc::c_void,
-                                8,
-                            );
-                        }
+                        entry.task_id
+                    }).flatten();
+                    if let Some(task_id) = task_id {
+                        scheduler::unpark(task_id);
                     }
                     // conn 已移除 (已关闭) → 回包丢弃 (client 已断开)
                 }
@@ -195,14 +192,12 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                     let greeting = my::build_handshake_v10_caps(&salt, 1, false);
                     state.send_bytes(&greeting);
                 }
-                // 建 per-conn reply 队列 + eventfd
-                let pcefd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-                assert!(pcefd >= 0, "per-conn eventfd failed");
-                registry2.lock().unwrap().insert(
+                // 建 per-conn reply 队列；连接协程首次 poll 时写入 task id。
+                registry2.borrow_mut().insert(
                     id,
                     ConnReply {
                         queue: VecDeque::new(),
-                        eventfd: pcefd,
+                        task_id: None,
                     },
                 );
                 // spawn 连接协程
@@ -218,7 +213,7 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 let limits_c = nc.limits;
                 let sql_password_c = nc.auth_password.clone();
                 let tls_c = nc.tls_config.clone();
-                // ⭐ shutdown: 连接协程持有 worker 级 stop, select_read 返回后检查退出.
+                // ⭐ shutdown: 连接协程持有 worker 级 stop, unpark 后检查退出.
                 let stop_c = stop2.clone();
                 scheduler::spawn_on(&sched_conn, async move {
                     conn_coro(
@@ -226,7 +221,6 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                         id,
                         worker_id2,
                         nc.fd,
-                        pcefd,
                         reg_c,
                         stop_c,
                         db_c,
@@ -256,21 +250,9 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
         if stopped && active.load(std::sync::atomic::Ordering::Acquire) == 0 {
             break;
         }
-        // ⭐ shutdown: worker 已停止但还有 idle 连接协程挂在 select_read 上
-        // (客户端未断开 → active 不归零). 写 per-conn eventfd 唤醒它们检查 stop 退出,
-        // 否则 server.shutdown 的 pool.join() 会无限等待.
+        // shutdown: 唤醒所有 parked 连接协程检查 stop，避免 pool.join 等待 idle conn。
         if stopped {
-            let mut woke = false;
-            {
-                let reg = registry.lock().unwrap();
-                for entry in reg.values() {
-                    let val: u64 = 1;
-                    unsafe {
-                        libc::write(entry.eventfd, &val as *const u64 as *const libc::c_void, 8);
-                    }
-                    woke = true;
-                }
-            }
+            let woke = registry.borrow().values().filter_map(|entry| entry.task_id).any(scheduler::unpark);
             if woke {
                 continue; // 立即再 drive, 让连接协程处理 stop 退出
             }
@@ -280,12 +262,8 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
 
     // ---- 收尾 ----
     // 不在此 drive (worker 已停止调度). reply_dispatch 的 stop_efd 通知仅用于让其在
-    // scheduler drop 前自然退出. 关闭 per-conn eventfd (残留).
-    for (_, entry) in registry.lock().unwrap().drain() {
-        unsafe {
-            libc::close(entry.eventfd);
-        }
-    }
+    // scheduler drop 前自然退出。reply registry 仅含内存队列，随 worker 一起释放。
+    registry.borrow_mut().clear();
     // 关闭 stop_efd (reply_dispatch 协程结束时也会 close, 但 worker 也 move 了一份用于写).
     unsafe {
         libc::close(stop_efd);
@@ -295,14 +273,13 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
 /// 单连接协程: 循环等待 socket 可读 或 本连接 reply 到达, 处理之.
 ///
 /// socket 可读 → `recv_async` (io_uring) 读入 read_buf → 同步协议处理 (push shard).
-/// reply 到达 (per-conn eventfd) → 消耗 eventfd → drain 自己队列 → `handle_resp_shard_result`.
+/// reply 到达 → scheduler unpark → drain 自己队列 → `handle_resp_shard_result`.
 #[allow(clippy::too_many_arguments)]
 async fn conn_coro(
     mut conn: ConnState,
     conn_id: u64,
     worker_id: u32,
     fd: std::os::unix::io::RawFd,
-    reply_eventfd: std::os::unix::io::RawFd,
     registry: ConnRegistry,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     db: std::sync::Arc<str>,
@@ -314,11 +291,26 @@ async fn conn_coro(
     num_shards: usize,
     tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
 ) {
+    let task_id = scheduler::current_task_id();
+    if let Some(entry) = registry.borrow_mut().get_mut(&conn_id) {
+        entry.task_id = Some(task_id);
+    } else {
+        return;
+    }
     loop {
-        // 同时等 socket 可读 (1) 或 本连接 reply 到达 (2)
-        let which = match sio::select_read(fd, reply_eventfd).await {
-            Ok(w) => w,
-            Err(_) => break, // fd 关闭/错误 → 结束
+        // 先检查已到达的 reply；随后 `select_fd_or_unpark` 会先注册 park waker，避免
+        // 两步之间的 reply 丢唤醒。
+        let which = if registry
+            .borrow()
+            .get(&conn_id)
+            .is_some_and(|entry| !entry.queue.is_empty())
+        {
+            2
+        } else {
+            match sio::select_fd_or_unpark(fd).await {
+                Ok(w) => w,
+                Err(_) => break, // fd 关闭/错误 → 结束
+            }
         };
         // ⭐ shutdown: worker 已停止 → 连接协程退出 (server.shutdown 不依赖客户端断开).
         if stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -409,15 +401,11 @@ async fn conn_coro(
                 Err(_) => break,
             }
         } else {
-            // 本连接 reply 到达: 消耗 eventfd + drain 自己队列处理
-            let mut v: u64 = 0;
-            unsafe {
-                libc::read(reply_eventfd, &mut v as *mut u64 as *mut libc::c_void, 8);
-            }
+            // 本连接 reply 到达: drain 自己队列处理
             let mut close = false;
             loop {
                 let r = {
-                    let mut reg = registry.lock().unwrap();
+                    let mut reg = registry.borrow_mut();
                     reg.get_mut(&conn_id).and_then(|e| e.queue.pop_front())
                 };
                 let Some(r) = r else { break };
@@ -447,11 +435,7 @@ async fn conn_coro(
         }
     }
 
-    // 连接协程结束: 移除 registry 条目 + 关闭 per-conn eventfd.
-    if let Some(entry) = registry.lock().unwrap().remove(&conn_id) {
-        unsafe {
-            libc::close(entry.eventfd);
-        }
-    }
+    // 连接协程结束: 移除 registry 条目。
+    registry.borrow_mut().remove(&conn_id);
     // ConnState drop 会关闭其持有的 TcpStream (fd 所有权已转给 ConnState), 不在此手动 close.
 }

@@ -32,6 +32,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::thread::ThreadId;
 use std::time::Duration;
 
 use crate::io_registry::IoRegistry;
@@ -45,6 +46,8 @@ const PARK_TIMEOUT: Duration = Duration::from_micros(100);
 /// ⭐ G0: 每个调度 wave 至多 poll 的低优先级协程数 (后台任务限额).
 const LOW_PRIO_BUDGET: usize = 1;
 const IO_URING_ENTRIES: u32 = 1024;
+/// Cancel SQE 的 CQE 不属于任何 task；IoRegistry user_data 从 1 开始分配。
+pub(crate) const CANCEL_CQE_USER_DATA: u64 = 0;
 
 pub struct Scheduler {
     pool: Pool,
@@ -60,6 +63,8 @@ pub struct Scheduler {
     /// 调 `flush_sq()` 一次 submit 提交全部 — 驱动循环攒批 (少 enter), 同步
     /// 忙等路径 (block_on_io) 也能保证 SQE 不被滞留 (正确性).
     pub(crate) sq_pending: bool,
+    /// 首次驱动时绑定；后续从另一线程驱动会立即失败，而非无声破坏 Rc/RefCell 契约。
+    driver_thread: Option<ThreadId>,
 }
 
 /// 跨线程 stop 句柄 (Send). 克隆后任意线程可调 `stop()` 设置 flag,
@@ -113,6 +118,7 @@ impl Scheduler {
             registry: IoRegistry::new(),
             ring,
             sq_pending: false,
+            driver_thread: None,
         }
     }
 
@@ -176,28 +182,31 @@ impl Scheduler {
     }
 
     fn drive_once_inner(&mut self) {
-        // === Phase 1: drain task_queue ===
-        let mut batch: Vec<(BoxFuture<'static, ()>, bool)> = Vec::with_capacity(BATCH_SIZE);
+        self.bind_driver_thread();
+        // === Phase 1/2: admission queue → 空闲 slot ===
+        // 满载时保留队首 task，绝不能回绕覆盖仍在运行的 future。
         {
             let mut q = self.task_queue.lock().unwrap();
-            while batch.len() < BATCH_SIZE {
+            let mut admitted = 0;
+            while admitted < BATCH_SIZE {
                 match q.pop_front() {
-                    Some(InternalMessage::Task(req)) => batch.push((req.future, req.low_priority)),
+                    Some(InternalMessage::Task(req)) => {
+                        let Some(slot_id) = self.pool.acquire() else {
+                            q.push_front(InternalMessage::Task(req));
+                            break;
+                        };
+                        let slot = self.pool.slot(slot_id);
+                        slot.future = Some(req.future);
+                        slot.low_priority = req.low_priority;
+                        ready::push(&self.ready, slot_id);
+                        admitted += 1;
+                    }
                     Some(InternalMessage::Stop) => {
                         self.stop_flag.store(true, Ordering::Release);
                     }
                     None => break,
                 }
             }
-        }
-
-        // === Phase 2: 给每个 future acquire 一个 slot, push 到 ready ===
-        for (fut, low) in batch {
-            let slot_id = self.pool.acquire();
-            let slot = self.pool.slot(slot_id);
-            slot.future = Some(fut);
-            slot.low_priority = low;
-            ready::push(&self.ready, slot_id);
         }
 
         // === Phase 3: 把 ready 里的 future 全部 poll ===
@@ -323,6 +332,31 @@ impl Scheduler {
         self.sq_pending = true;
     }
 
+    /// 取消一个已提交但其 future 已被 drop 的 io_uring 请求。
+    ///
+    /// 仅从 registry 删除不足以释放内核中的 PollAdd/IO；必须同时提交
+    /// IORING_OP_ASYNC_CANCEL。取消操作本身使用保留 user_data=0，CQE 到达后会被
+    /// drain 路径自然忽略。
+    pub(crate) fn cancel_submitted_io(&mut self, target_user_data: u64) {
+        self.registry.cancel(target_user_data);
+        let entry = io_uring::opcode::AsyncCancel::new(target_user_data)
+            .build()
+            .user_data(CANCEL_CQE_USER_DATA);
+        let mut pushed = false;
+        while !pushed {
+            let mut sq = self.ring.submission();
+            match unsafe { sq.push(&entry) } {
+                Ok(()) => pushed = true,
+                Err(_) => {
+                    sq.sync();
+                    drop(sq);
+                    let _ = self.ring.submit();
+                }
+            }
+        }
+        self.mark_sq_pending();
+    }
+
     fn drain_completions(&mut self) {
         let cq = self.ring.completion();
         let mut to_wake: Vec<usize> = Vec::new();
@@ -330,9 +364,12 @@ impl Scheduler {
             let ud = cqe.user_data();
             let result = cqe.result();
             // mark_completed 不移除, 让 io_ops.poll_cqe 自己取结果 (take_result).
-            self.registry.mark_completed(ud, result);
-            if let Some(st) = self.registry.inner_peek(ud) {
-                to_wake.push(st.slot_id);
+            if self.registry.mark_completed(ud, result) {
+                if let Some(st) = self.registry.inner_peek(ud) {
+                    to_wake.push(st.slot_id);
+                }
+            } else if ud != CANCEL_CQE_USER_DATA {
+                self.registry.record_unknown_cqe();
             }
         }
         for slot_id in to_wake {
@@ -375,25 +412,28 @@ impl Scheduler {
 
     /// 把 task_queue 中的新 task 装入 pool + push 到 ready (供 SchedHandle 三阶段驱动).
     pub fn drain_task_queue_phase(&mut self) {
-        let mut batch: Vec<(BoxFuture<'static, ()>, bool)> = Vec::with_capacity(BATCH_SIZE);
         {
             let mut q = self.task_queue.lock().unwrap();
-            while batch.len() < BATCH_SIZE {
+            let mut admitted = 0;
+            while admitted < BATCH_SIZE {
                 match q.pop_front() {
-                    Some(InternalMessage::Task(req)) => batch.push((req.future, req.low_priority)),
+                    Some(InternalMessage::Task(req)) => {
+                        let Some(slot_id) = self.pool.acquire() else {
+                            q.push_front(InternalMessage::Task(req));
+                            break;
+                        };
+                        let slot = self.pool.slot(slot_id);
+                        slot.future = Some(req.future);
+                        slot.low_priority = req.low_priority;
+                        ready::push(&self.ready, slot_id);
+                        admitted += 1;
+                    }
                     Some(InternalMessage::Stop) => {
                         self.stop_flag.store(true, Ordering::Release);
                     }
                     None => break,
                 }
             }
-        }
-        for (fut, low) in batch {
-            let slot_id = self.pool.acquire();
-            let slot = self.pool.slot(slot_id);
-            slot.future = Some(fut);
-            slot.low_priority = low;
-            ready::push(&self.ready, slot_id);
         }
     }
 
@@ -429,6 +469,21 @@ impl Scheduler {
             }
         }
     }
+
+    fn bind_driver_thread(&mut self) {
+        let current = std::thread::current().id();
+        match self.driver_thread {
+            Some(owner) => assert_eq!(
+                owner, current,
+                "a Scheduler may only be driven from its original thread"
+            ),
+            None => self.driver_thread = Some(current),
+        }
+    }
+
+    pub fn io_registry_stats(&self) -> crate::io_registry::IoRegistryStats {
+        self.registry.stats()
+    }
 }
 
 impl Default for Scheduler {
@@ -462,20 +517,23 @@ pub(crate) fn clear_current_scheduler() {
 /// io_ops.poll 触发的 with_current 应该返回 None 或等待; 不应该 panic.
 /// 当前选择: try_borrow_mut 失败时 panic (driver 线程上不该有竞争).
 pub fn with_current<R>(f: impl FnOnce(&mut Scheduler) -> R) -> Option<R> {
-    CURRENT.with(|c| {
+    // TLS 析构阶段 drop future 仍可能尝试清理已提交 IO；此时 scheduler/ring 已在
+    // 同一析构链中释放，不能因访问已销毁的 CURRENT 再次 panic/abort。
+    CURRENT.try_with(|c| {
         let rc = c.borrow();
         let cell = rc.as_ref()?;
         let mut s = cell.try_borrow_mut().ok()?;
         Some(f(&mut s))
     })
+    .ok()
+    .flatten()
 }
 
-// SAFETY: SchedHandle 是一个 newtype 包装 Rc<RefCell<Scheduler>>, 让它跨线程
-// Send/Sync 以便测试可以把 sched 转到独立线程跑.
+// SAFETY: handle 只能以唯一所有权 move 到 driver 线程；运行时会在首次 drive 后绑定
+// thread id。它不是 Sync，不能借用共享给多个线程并发驱动。
 pub struct SchedHandle(pub std::rc::Rc<std::cell::RefCell<Scheduler>>);
 // SAFETY: 见上.
 unsafe impl Send for SchedHandle {}
-unsafe impl Sync for SchedHandle {}
 
 // ⭐ Manual Clone (既支持 Clone 也让我们能 clone Rc 共享 scheduler).
 impl Clone for SchedHandle {
@@ -509,6 +567,7 @@ impl SchedHandle {
     ///
     /// 每次迭代**临时 borrow**, drive_once 完成后释放 borrow, 让 wrapper poll 时无冲突.
     pub fn drive_until_idle(self, max_iters: usize) -> bool {
+        self.0.borrow_mut().bind_driver_thread();
         let mut total_iters = 0usize;
         for _ in 0..max_iters {
             total_iters += 1;
