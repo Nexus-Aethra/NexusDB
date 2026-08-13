@@ -100,7 +100,10 @@ pub fn parse_startup(payload: &[u8]) -> Result<(String, Option<String>), String>
 
 /// PasswordMessage payload → 密码 (尾 NUL 剥除).
 pub fn parse_password(payload: &[u8]) -> String {
-    let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+    let end = payload
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(payload.len());
     String::from_utf8_lossy(&payload[..end]).into_owned()
 }
 
@@ -166,9 +169,7 @@ pub struct ScramState {
 pub fn scram_server_first(client_first: &[u8]) -> Option<(ScramState, Vec<u8>)> {
     let s = std::str::from_utf8(client_first).ok()?;
     // 剥 gs2 头: 支持 "n,,"/"y,," (无 CB); "p=" (要求 CB) v1 不支持
-    let bare = s
-        .strip_prefix("n,,")
-        .or_else(|| s.strip_prefix("y,,"))?;
+    let bare = s.strip_prefix("n,,").or_else(|| s.strip_prefix("y,,"))?;
     // 取 client nonce (r=...)
     let cnonce = bare.split(',').find_map(|kv| kv.strip_prefix("r="))?;
     let snonce = String::from_utf8(crate::protocol::crypto::rand_printable(18)).ok()?;
@@ -191,8 +192,14 @@ pub fn scram_server_first(client_first: &[u8]) -> Option<(ScramState, Vec<u8>)> 
 
 /// SCRAM 步骤 2: 验证 client-final-message, 返回 server-final ("v=...") 或 None (认证失败).
 /// client_final 形如 `c=biws,r=fullnonce,p=base64(proof)`.
-pub fn scram_verify_final(state: &ScramState, client_final: &[u8], password: &str) -> Option<Vec<u8>> {
-    use crate::protocol::crypto::{base64_decode, base64_encode, hmac_sha256, pbkdf2_sha256_32, sha256};
+pub fn scram_verify_final(
+    state: &ScramState,
+    client_final: &[u8],
+    password: &str,
+) -> Option<Vec<u8>> {
+    use crate::protocol::crypto::{
+        base64_decode, base64_encode, hmac_sha256, pbkdf2_sha256_32, sha256,
+    };
     let s = std::str::from_utf8(client_final).ok()?;
     // 校验 nonce 一致
     let recv_nonce = s.split(',').find_map(|kv| kv.strip_prefix("r="))?;
@@ -396,7 +403,11 @@ pub fn parse_parse(payload: &[u8]) -> Result<(String, Vec<u8>, Vec<u32>), String
     let name = read_cstr(payload, &mut pos).ok_or("bad Parse: name")?;
     let query = read_cstr(payload, &mut pos).ok_or("bad Parse: query")?;
     let n = u16::from_be_bytes(
-        payload.get(pos..pos + 2).ok_or("bad Parse: oid count")?.try_into().unwrap(),
+        payload
+            .get(pos..pos + 2)
+            .ok_or("bad Parse: oid count")?
+            .try_into()
+            .unwrap(),
     ) as usize;
     pos += 2;
     let mut oids = Vec::with_capacity(n);
@@ -446,7 +457,10 @@ pub fn parse_bind(payload: &[u8]) -> Result<BindMsg, String> {
         } else {
             let l = len as usize;
             params.push(Some(
-                payload.get(pos..pos + l).ok_or("bad Bind: param value")?.to_vec(),
+                payload
+                    .get(pos..pos + l)
+                    .ok_or("bad Bind: param value")?
+                    .to_vec(),
             ));
             pos += l;
         }

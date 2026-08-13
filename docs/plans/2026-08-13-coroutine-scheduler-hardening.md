@@ -26,14 +26,69 @@
   分配 per-connection eventfd 或持有第二个 PollAdd。组合等待先注册 park waker，并在
   socket 胜出时清理残留 waker；同时修复 `ParkCurrent` 将任意重 poll 误判成 unpark 的
   错误唤醒缺陷。
-- [ ] **P1-B ready queue 与 driver 事件化**
-- [ ] **P2 公平性、后台维护与参数自适应**
+- [↩] **P1-B ready queue 与 driver 事件化**：已完成实验实现与回归，但默认 epoll 的
+  mixed A/B 未优于 P1-A，且拆分 CQE 阻塞策略后仍不稳定；代码已回退，保留测试数据与设计
+  结论，后续须以隔离指标重新立项。
+- [ ] **P2 公平性、后台维护与参数自适应**：尚未进入结果版本；继续使用 P1-A 的固定低
+  优先级预算，等待长时 queue-wait 与 compact 饥饿证据后再实现 aging。
 
 ## 已知基线与问题
 
 历史同机基线中，协程 worker 的吞吐约为 epoll 的 60%，且 p99.9 更高；默认运行路径
 仍是 epoll，只有 `NEXUS_CORO_WORKER=1` 启用协程 worker。因此后续比较必须显式指定
 两种模式、同一份配置、独立数据目录和相同预热过程。
+
+2026-08-13 首轮 P1 验收（4 worker / 4 shard / 32 client / pipeline 16 / 64B /
+100K preload / WAL off / mixed 1:1 / 10s，单轮，仅作方向性证据）：
+
+| 模式 | Ops/s | p99 | p99.9 |
+|---|---:|---:|---:|
+| epoll | 240.5K | 4.32ms | 19.07ms |
+| coroutine（P1-A 提交基线） | 160.4K（66.7%） | 6.72ms | 29.18ms |
+| coroutine（P1-B 实验） | 168.6K（70.1%，相对 P1-A +5.1%） | 5.95ms | 39.42ms |
+
+协程仍未达到晋级门槛，保持 opt-in。另试验过“PollAdd 后同步 recv”以去掉 io_uring
+Read，但吞吐进一步降至 148.6K ops/s，已在同轮回退；后续需聚焦 poll 重臂与任务批处理，
+不能把同步 recv 当作热路径优化。
+
+当前差距的已验证归因是网络协程热路径的固定事件成本：`PollAdd` 默认 one-shot，连接每
+次 socket 事件都要重新提交 poll；随后 `recv_async` 还要提交一次 io_uring Read。因此一
+次输入至少经过两次 SQE/CQE、两次 registry 状态迁移和两次 task 唤醒。epoll worker 则由
+一次共享 epoll wait 取得就绪事件后直接消费 socket。
+
+已试验 Linux 5.13+ multishot `PollAdd`（当前内核 7.0 满足前提）：单 fd 回归可连续交付
+两次 CQE，但真实 32-client preload 在约 32% 停滞，说明当前“await 一个就绪后立刻继续
+协议处理”的协程模型与 level-triggered multishot 的背压/重新消费语义不兼容。实验已回退。
+结论是 multishot 作为方向正确，但只能随每连接的显式 read-ready 状态机、CQE `MORE` 队列
+和接收背压一起重构，不能作为当前 PollFd 的直接替换。
+
+2026-08-13 补充了一项低风险实验：协程路径在已收到 `POLLIN` 后，使用 socket 专用的
+`IORING_OP_RECV` 取代通用 `IORING_OP_READ(offset=-1)`。socketpair 回归及 coroutine
+协议 e2e 均通过；紧邻的 30 秒 A/B 为 RECV 136.5K、READ 132.9K ops/s，p99/p99.9 为
+7.49/29.18ms vs 7.78/34.30ms。差异只有约 2.7%，而此前 10 秒样本波动达
+151.2K–171.4K，尚不足以证明改善。因此该试验已回退，不能据此宣称吞吐提升。它也无法消除一条
+输入的两阶段等待成本；更关键的是，nonblocking socket 上直接提交单次 RECV 会收到 EAGAIN，
+仍需 readiness 机制，不能安全地作为 `PollAdd` 的直接替换。
+
+同日完成 shard 侧初步 A/B：默认 epoll 网络层、4 worker / 4 shard / 32 client /
+pipeline 16 / 64B / 100K preload / WAL off / overwrite、每侧连续三轮 10 秒。P1-A 基线
+为 125.5K、124.0K、118.6K ops/s（中位数 124.0K）；当前 P1-B/P2 为 124.2K、125.8K、
+129.9K（中位数 125.8K，约 +1.5%）。说明通用 scheduler 改动对 shard 路径无回退，
+但收益尚低于环境波动，不能作为独立吞吐优化成果。`NLOG_PROBE=1` 在该高压场景会输出
+过量文本并触发临时目录配额，后续应把 scheduler/shard 探针改为采样或仅 shutdown dump，
+再进行长时尾延迟与 flush backlog 验收。
+
+默认 epoll 网络路径的 mixed 1:1 回归也完成了相邻三轮对照（同样为 4 worker / 4 shard /
+32 client / pipeline 16 / 64B / 100K preload / WAL off / 10 秒）：P1-A 为 254.5K、237.1K、
+232.9K（中位数 237.1K）；当前为 229.4K、233.4K、264.4K（中位数 233.4K，约 -1.6%）。
+当前 p99.9 中位数为 6.14ms，基线为 5.18ms。样本量不足以归因，却未满足“确定无回退”标准；
+在扩展 scheduler 改动前，应先隔离 `drive_until_idle` 的 CQE 阻塞策略和 ready queue 改造，
+对 shard flush 驱动分别做 A/B。
+
+隔离后，让 shard 保持非阻塞 drive、仅 coroutine worker 在 idle 时等待 CQE，三轮 mixed
+结果为 241.8K、220.4K、205.6K（中位数 220.4K），仍低于 P1-A。故本轮最终结果版本选择
+`43158c8` 的 P1-A；P1-B/P2 所有未提交代码已回退。P1-B 的 coroutine 局部收益保留为后续
+专用网络 runtime 重构的依据，但不能以默认路径性能为代价合入通用 scheduler。
 
 本轮审计发现以下必须先处理的问题：
 

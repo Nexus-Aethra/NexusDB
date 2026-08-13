@@ -25,10 +25,10 @@
 
 use std::io;
 use std::io::Read;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::alloc::{PidAllocator, VpidAllocator};
+use crate::file_at::FileAt;
 use crate::meta_cache::MetaCache;
 use crate::types::{DEFAULT_DB_NAME, DEFAULT_SHARD_ID, PAGE_SIZE, PID_ALIVE, PidLocation};
 
@@ -166,11 +166,7 @@ pub fn recover_for_shard(
     //    扫描不信任的 Internal 页 vpid; 注意用已分配 slot 而非数组水位,
     //    mate 文件可能预分配全零区)
     let scan_next_vpid = if seen_any { max_vpid + 1 } else { 0 };
-    let mate_next_vpid = meta
-        .iter_allocated()
-        .map(|(v, _)| v + 1)
-        .max()
-        .unwrap_or(0);
+    let mate_next_vpid = meta.iter_allocated().map(|(v, _)| v + 1).max().unwrap_or(0);
     let next_vpid = scan_next_vpid.max(mate_next_vpid);
     let next_file_id = if seen_any { last_pid.0 + 1 } else { 0 };
     let mut pid_alloc = if seen_any {
@@ -192,8 +188,7 @@ pub fn recover_for_shard(
         let cur = pid_alloc.current();
         let scanned_tuple = (cur.0, cur.1, cur.2 as u16);
         if saved_tuple > scanned_tuple && saved.page_idx <= u8::MAX as u16 {
-            pid_alloc =
-                PidAllocator::new(saved.file_id, saved.chunk_idx, saved.page_idx as u8);
+            pid_alloc = PidAllocator::new(saved.file_id, saved.chunk_idx, saved.page_idx as u8);
         }
     }
 

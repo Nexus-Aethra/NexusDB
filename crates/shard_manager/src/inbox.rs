@@ -9,9 +9,11 @@
 //!
 //! **容量**: 4096 请求. 超出时 caller spin-yield 重试.
 
-use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(target_os = "linux")]
+use std::os::unix::io::RawFd;
 
 use crossbeam_queue::ArrayQueue;
 
@@ -29,6 +31,7 @@ const INBOX_CAPACITY: usize = 4096;
 /// drain 时重置 pending=0, 下一次 push 再次触发通知.
 pub struct ShardInbox {
     ring: ArrayQueue<ShardRequest>,
+    #[cfg(target_os = "linux")]
     eventfd: RawFd,
     /// 自上次 drain 以来的 pending push 计数.
     /// 第一个 push (0→1) 触发 eventfd_write, 后续搭车.
@@ -38,10 +41,13 @@ pub struct ShardInbox {
 impl ShardInbox {
     /// 创建新的 ShardInbox. eventfd 初始值 0, 非 semaphore 模式.
     pub fn new() -> Self {
+        #[cfg(target_os = "linux")]
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        #[cfg(target_os = "linux")]
         assert!(fd >= 0, "eventfd creation failed");
         Self {
             ring: ArrayQueue::new(INBOX_CAPACITY),
+            #[cfg(target_os = "linux")]
             eventfd: fd,
             pending: AtomicU64::new(0),
         }
@@ -49,10 +55,13 @@ impl ShardInbox {
 
     /// 带自定义容量创建.
     pub fn with_capacity(cap: usize) -> Self {
+        #[cfg(target_os = "linux")]
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        #[cfg(target_os = "linux")]
         assert!(fd >= 0, "eventfd creation failed");
         Self {
             ring: ArrayQueue::new(cap),
+            #[cfg(target_os = "linux")]
             eventfd: fd,
             pending: AtomicU64::new(0),
         }
@@ -66,9 +75,12 @@ impl ShardInbox {
         self.ring.push(req)?;
         // 只有第一个 pending (0→1) 才通知 shard
         if self.pending.fetch_add(1, Ordering::AcqRel) == 0 {
-            let val: u64 = 1;
-            unsafe {
-                libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+            #[cfg(target_os = "linux")]
+            {
+                let val: u64 = 1;
+                unsafe {
+                    libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+                }
             }
         }
         Ok(())
@@ -112,11 +124,21 @@ impl ShardInbox {
     /// Blocking wait: 读 eventfd (阻塞直到有新请求).
     /// 返回累积的通知计数 (通常 >= 1).
     pub fn wait(&self) -> u64 {
-        let mut val: u64 = 0;
-        unsafe {
-            libc::read(self.eventfd, &mut val as *mut u64 as *mut libc::c_void, 8);
+        #[cfg(target_os = "linux")]
+        {
+            let mut val: u64 = 0;
+            unsafe {
+                libc::read(self.eventfd, &mut val as *mut u64 as *mut libc::c_void, 8);
+            }
+            val
         }
-        val
+        #[cfg(not(target_os = "linux"))]
+        {
+            while self.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            1
+        }
     }
 
     /// 当前 ring buffer 中的待处理请求数.
@@ -130,6 +152,7 @@ impl ShardInbox {
     }
 
     /// 获取 eventfd (供外部 epoll/io_uring 注册).
+    #[cfg(target_os = "linux")]
     pub fn eventfd(&self) -> RawFd {
         self.eventfd
     }
@@ -143,6 +166,7 @@ impl Default for ShardInbox {
 
 impl Drop for ShardInbox {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         unsafe {
             libc::close(self.eventfd);
         }

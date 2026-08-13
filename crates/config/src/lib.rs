@@ -261,7 +261,13 @@ impl StorageConfig {
     pub fn io_backend(&self) -> Result<storage::IoBackend, String> {
         match self.io_backend.to_ascii_lowercase().as_str() {
             "stdfs" => Ok(storage::IoBackend::StdFs),
-            "io_uring" | "iouring" => Ok(storage::IoBackend::IoUring),
+            "io_uring" | "iouring" if platform::storage_backend_supported(&self.io_backend) => {
+                Ok(storage::IoBackend::IoUring)
+            }
+            "io_uring" | "iouring" => Err(format!(
+                "storage.io_backend=io_uring is unsupported on {:?}; use stdfs or select that target's native backend",
+                platform::CURRENT.target
+            )),
             other => Err(format!("storage.io_backend invalid: {other:?} (expect stdfs|io_uring)")),
         }
     }

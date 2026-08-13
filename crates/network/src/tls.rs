@@ -3,11 +3,16 @@
 //! 手写 PEM 解析 (复用 crypto::base64_decode), 免 rustls-pemfile 依赖。
 //! 支持证书链 (多段 CERTIFICATE) 与私钥 (PKCS8 / PKCS1 RSA / SEC1 EC)。
 
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
+#[cfg(target_os = "linux")]
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+};
 
 /// 从 PEM 文本抽取所有 `-----BEGIN {label}-----`..`-----END {label}-----` 段的 DER 字节.
+#[cfg(target_os = "linux")]
 fn pem_blocks(pem: &str, label: &str) -> Vec<Vec<u8>> {
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
@@ -26,11 +31,15 @@ fn pem_blocks(pem: &str, label: &str) -> Vec<Vec<u8>> {
 }
 
 /// 加载证书链 + 私钥 PEM → rustls ServerConfig (ring provider, 无客户端认证).
-pub fn load_server_config(cert_path: &str, key_path: &str) -> Result<Arc<rustls::ServerConfig>, String> {
+#[cfg(target_os = "linux")]
+pub type ServerConfig = rustls::ServerConfig;
+
+#[cfg(target_os = "linux")]
+pub fn load_server_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>, String> {
     let cert_pem = std::fs::read_to_string(cert_path)
         .map_err(|e| format!("read tls_cert {cert_path}: {e}"))?;
-    let key_pem = std::fs::read_to_string(key_path)
-        .map_err(|e| format!("read tls_key {key_path}: {e}"))?;
+    let key_pem =
+        std::fs::read_to_string(key_path).map_err(|e| format!("read tls_key {key_path}: {e}"))?;
 
     let certs: Vec<CertificateDer<'static>> = pem_blocks(&cert_pem, "CERTIFICATE")
         .into_iter()
@@ -59,4 +68,17 @@ pub fn load_server_config(cert_path: &str, key_path: &str) -> Result<Arc<rustls:
         .with_single_cert(certs, key)
         .map_err(|e| format!("tls cert/key: {e}"))?;
     Ok(Arc::new(cfg))
+}
+
+/// Windows MVP 暂不提供 SQL/PG STARTTLS；由配置层在启动前拒绝启用证书。
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct ServerConfig;
+
+#[cfg(not(target_os = "linux"))]
+pub fn load_server_config(
+    _cert_path: &str,
+    _key_path: &str,
+) -> Result<std::sync::Arc<ServerConfig>, String> {
+    Err("TLS is not available on this platform in the current portable runtime".to_string())
 }

@@ -102,10 +102,14 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
             reply_bus_r.drain_into(&mut reply_results);
             if !reply_results.is_empty() {
                 for r in reply_results.drain(..) {
-                    let task_id = reg_r.borrow_mut().get_mut(&r.conn_id).map(|entry| {
-                        entry.queue.push_back(r);
-                        entry.task_id
-                    }).flatten();
+                    let task_id = reg_r
+                        .borrow_mut()
+                        .get_mut(&r.conn_id)
+                        .map(|entry| {
+                            entry.queue.push_back(r);
+                            entry.task_id
+                        })
+                        .flatten();
                     if let Some(task_id) = task_id {
                         scheduler::unpark(task_id);
                     }
@@ -252,7 +256,11 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
         }
         // shutdown: 唤醒所有 parked 连接协程检查 stop，避免 pool.join 等待 idle conn。
         if stopped {
-            let woke = registry.borrow().values().filter_map(|entry| entry.task_id).any(scheduler::unpark);
+            let woke = registry
+                .borrow()
+                .values()
+                .filter_map(|entry| entry.task_id)
+                .any(scheduler::unpark);
             if woke {
                 continue; // 立即再 drive, 让连接协程处理 stop 退出
             }

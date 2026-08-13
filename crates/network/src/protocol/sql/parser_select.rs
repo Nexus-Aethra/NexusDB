@@ -129,7 +129,10 @@ pub(crate) fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
             let _ = p.ident()?;
         }
         p.done()?;
-        Ok(mk(if full { "full_tables" } else { "tables" }, Pred::And(Vec::new())))
+        Ok(mk(
+            if full { "full_tables" } else { "tables" },
+            Pred::And(Vec::new()),
+        ))
     } else if p.try_kw("COLUMNS") || p.try_kw("FIELDS") {
         // FROM|IN t [FROM|IN db]
         if !(p.try_kw("FROM") || p.try_kw("IN")) {
@@ -140,7 +143,10 @@ pub(crate) fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
             let _ = p.ident()?;
         }
         p.done()?;
-        Ok(mk(if full { "full_columns" } else { "columns" }, table_leaf(table)))
+        Ok(mk(
+            if full { "full_columns" } else { "columns" },
+            table_leaf(table),
+        ))
     } else if p.try_kw("DATABASES") || p.try_kw("SCHEMAS") {
         p.done()?;
         Ok(mk("databases", Pred::And(Vec::new())))
@@ -194,8 +200,21 @@ pub(crate) fn parse_opt_alias(p: &mut P) -> Option<String> {
         let up = s.to_ascii_uppercase();
         let reserved = matches!(
             up.as_str(),
-            "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS"
-                | "ON" | "WHERE" | "ORDER" | "LIMIT" | "OFFSET" | "GROUP" | "HAVING" | "USING"
+            "JOIN"
+                | "INNER"
+                | "LEFT"
+                | "RIGHT"
+                | "FULL"
+                | "OUTER"
+                | "CROSS"
+                | "ON"
+                | "WHERE"
+                | "ORDER"
+                | "LIMIT"
+                | "OFFSET"
+                | "GROUP"
+                | "HAVING"
+                | "USING"
         );
         if !reserved {
             let a = s.clone();
@@ -215,8 +234,22 @@ pub(crate) fn parse_col_alias(p: &mut P) -> Option<String> {
         let up = s.to_ascii_uppercase();
         let reserved = matches!(
             up.as_str(),
-            "FROM" | "AS" | "WHERE" | "ORDER" | "GROUP" | "HAVING" | "LIMIT" | "OFFSET"
-                | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "ON" | "USING"
+            "FROM"
+                | "AS"
+                | "WHERE"
+                | "ORDER"
+                | "GROUP"
+                | "HAVING"
+                | "LIMIT"
+                | "OFFSET"
+                | "JOIN"
+                | "INNER"
+                | "LEFT"
+                | "RIGHT"
+                | "FULL"
+                | "CROSS"
+                | "ON"
+                | "USING"
         );
         if !reserved {
             let a = s.clone();
@@ -282,7 +315,10 @@ pub(crate) fn parse_join(
     first_table: String,
 ) -> Result<SqlStmt, String> {
     let first_alias = parse_opt_alias(p).unwrap_or_else(|| first_table.clone());
-    let from = TableRef { table: first_table, alias: first_alias };
+    let from = TableRef {
+        table: first_table,
+        alias: first_alias,
+    };
     parse_join_from(p, sel_items, from, None)
 }
 
@@ -310,8 +346,14 @@ pub(crate) fn parse_join_from(
             loop {
                 let c = p.ident()?;
                 preds.push(OnPred::Eq(
-                    QualCol { qualifier: None, col: c.clone() },
-                    QualCol { qualifier: Some(alias.clone()), col: c },
+                    QualCol {
+                        qualifier: None,
+                        col: c.clone(),
+                    },
+                    QualCol {
+                        qualifier: Some(alias.clone()),
+                        col: c,
+                    },
                 ));
                 match p.next()? {
                     Tok::Comma => continue,
@@ -328,7 +370,11 @@ pub(crate) fn parse_join_from(
             }
             preds
         };
-        joins.push(JoinClause { kind, table: TableRef { table, alias }, on });
+        joins.push(JoinClause {
+            kind,
+            table: TableRef { table, alias },
+            on,
+        });
     }
     // WHERE / ORDER / LIMIT / OFFSET 复用单表解析后把列名转限定名
     let conds_raw = parse_where(p)?;
@@ -355,8 +401,22 @@ pub(crate) fn parse_join_from(
         val: c.val.clone(),
         set: c.set.clone(),
     });
-    let order = order_raw.into_iter().map(|(s, d)| (QualCol::parse(&s), d)).collect();
-    Ok(SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset, limit_param, offset_param })
+    let order = order_raw
+        .into_iter()
+        .map(|(s, d)| (QualCol::parse(&s), d))
+        .collect();
+    Ok(SqlStmt::SelectJoin {
+        from,
+        from_inner,
+        joins,
+        items,
+        conds,
+        order,
+        limit,
+        offset,
+        limit_param,
+        offset_param,
+    })
 }
 
 /// ⭐ F69: HAVING 谓词树 (OR<AND<NOT<primary; 叶子 = 输出列 label op val).
@@ -365,7 +425,11 @@ pub(crate) fn parse_having_or(p: &mut P) -> Result<Pred<Cond>, String> {
     while p.try_kw("OR") {
         terms.push(parse_having_and(p)?);
     }
-    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Pred::Or(terms) })
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        Pred::Or(terms)
+    })
 }
 
 pub(crate) fn parse_having_and(p: &mut P) -> Result<Pred<Cond>, String> {
@@ -373,7 +437,11 @@ pub(crate) fn parse_having_and(p: &mut P) -> Result<Pred<Cond>, String> {
     while p.try_kw("AND") {
         terms.push(parse_having_not(p)?);
     }
-    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Pred::And(terms) })
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        Pred::And(terms)
+    })
 }
 
 pub(crate) fn parse_having_not(p: &mut P) -> Result<Pred<Cond>, String> {
@@ -402,7 +470,12 @@ pub(crate) fn parse_having_not(p: &mut P) -> Result<Pred<Cond>, String> {
         }
         let op = p.cmp_op()?;
         let val = p.value()?;
-        Ok(Pred::Leaf(Cond { col: label, op, val, set: Vec::new() }))
+        Ok(Pred::Leaf(Cond {
+            col: label,
+            op,
+            val,
+            set: Vec::new(),
+        }))
     }
 }
 
@@ -419,7 +492,8 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     } else if !top && matches!(p.peek(), Some(Tok::Num(_))) {
         // ⭐ F71: 子查询中的字面量投影 (如 EXISTS 的 `SELECT 1`) — 值无关, 视为全列
         p.next()?;
-    } else if top && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("VERSION"))
+    } else if top
+        && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("VERSION"))
         && p.peek2_is_lparen()
     {
         // ⭐ S3: SELECT version() — psql/驱动探测 stub (仅当 `version(` 是函数调用;
@@ -429,7 +503,8 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
         p.expect(&Tok::RParen, ")")?;
         p.done()?;
         return Ok(SqlStmt::VersionStub);
-    } else if top && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("DATABASE"))
+    } else if top
+        && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("DATABASE"))
         && p.peek2_is_lparen()
     {
         // ⭐ S5: SELECT DATABASE() — mysql cli USE 后探测
@@ -465,7 +540,9 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                             _ => {}
                         }
                     }
-                    items.push(SelectItem::ScalarFn { name: name.to_ascii_lowercase() });
+                    items.push(SelectItem::ScalarFn {
+                        name: name.to_ascii_lowercase(),
+                    });
                     break;
                 }
                 let func = match name.to_ascii_uppercase().as_str() {
@@ -502,7 +579,12 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 };
                 p.expect(&Tok::RParen, ")")?;
                 let alias = parse_col_alias(p);
-                items.push(SelectItem::Agg { func, arg, distinct, alias });
+                items.push(SelectItem::Agg {
+                    func,
+                    arg,
+                    distinct,
+                    alias,
+                });
             } else if matches!(p.peek(), Some(Tok::Arrow | Tok::ArrowText)) {
                 // ⭐ compat: JSONB 操作符 j->'a' / j->>'a' (v1: 列 + 字面量键, 可链式)
                 let mut expr = ScalarExpr::Col(name);
@@ -535,7 +617,11 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     }
     if !matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FROM")) {
         // ⭐ compat: 无 FROM 的标量函数投影 (SELECT NOW()/CURRENT_TIMESTAMP) — 常量单行
-        if items.iter().all(|i| matches!(i, SelectItem::ScalarFn { .. })) && !items.is_empty() {
+        if items
+            .iter()
+            .all(|i| matches!(i, SelectItem::ScalarFn { .. }))
+            && !items.is_empty()
+        {
             p.done()?;
             return Ok(SqlStmt::ScalarSelect { items });
         }
@@ -667,7 +753,8 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             return Err("SELECT * is not valid with GROUP BY".into());
         }
     }
-    if has_having && !items.iter().any(|i| matches!(i, SelectItem::Agg { .. }))
+    if has_having
+        && !items.iter().any(|i| matches!(i, SelectItem::Agg { .. }))
         && group_by.is_empty()
     {
         return Err("HAVING requires GROUP BY or aggregate function".into());
@@ -757,5 +844,16 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
         }
     }
     p.done_if(top)?;
-    Ok(SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having, limit_param, offset_param })
+    Ok(SqlStmt::Select {
+        table,
+        items,
+        conds,
+        limit,
+        order,
+        offset,
+        group_by,
+        having,
+        limit_param,
+        offset_param,
+    })
 }

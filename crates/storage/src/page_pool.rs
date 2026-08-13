@@ -21,10 +21,13 @@
 //! ```
 
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
 use std::io;
 use std::ops::{Deref, DerefMut};
 
-use crate::types::{CHUNK_SIZE, PAGE_SIZE};
+#[cfg(target_os = "linux")]
+use crate::types::CHUNK_SIZE;
+use crate::types::PAGE_SIZE;
 
 /// Pool 容量 (16 page = 256KB per thread).
 const POOL_CAPACITY: usize = 16;
@@ -158,6 +161,7 @@ pub fn pool_len() -> usize {
 ///
 /// `register_buffers` 是 unsafe 的, 因为 buffer 内存必须在注册期间有效.
 /// `RegisteredBufPool` 持有 `Box<[u8; CHUNK_SIZE]>` 确保 buffer 不被移动.
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct RegisteredBufPool {
     /// 所有注册的 chunk buffer (Box 保证地址稳定).
@@ -169,6 +173,7 @@ pub struct RegisteredBufPool {
     registered: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl RegisteredBufPool {
     /// 注册 N 个 chunk 大小 buffer 到 ring.
     ///
@@ -233,6 +238,7 @@ impl RegisteredBufPool {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for RegisteredBufPool {
     fn drop(&mut self) {
         if self.registered {
@@ -244,7 +250,7 @@ impl Drop for RegisteredBufPool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

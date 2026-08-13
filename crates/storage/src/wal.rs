@@ -65,7 +65,11 @@ pub fn crc32(data: &[u8]) -> u32 {
         for (i, e) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 == 1 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 == 1 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *e = c;
         }
@@ -147,8 +151,18 @@ fn decode_payload(p: &[u8]) -> Option<WalRecord> {
     pos += 4;
     let val = p.get(pos..pos + val_len)?.to_vec();
     match op {
-        OP_PUT => Some(WalRecord { db, table, pkey, value: Some(val) }),
-        OP_DEL => Some(WalRecord { db, table, pkey, value: None }),
+        OP_PUT => Some(WalRecord {
+            db,
+            table,
+            pkey,
+            value: Some(val),
+        }),
+        OP_DEL => Some(WalRecord {
+            db,
+            table,
+            pkey,
+            value: None,
+        }),
         _ => None,
     }
 }
@@ -253,10 +267,16 @@ impl WalWriter {
             self.dirty_since_sync = true;
         }
         if self.dirty_since_sync {
+            #[cfg(target_os = "linux")]
             if self.use_uring {
                 use std::os::fd::AsRawFd;
                 scheduler::io_ops::fsync(self.cur.as_raw_fd()).await?;
             } else {
+                self.cur.sync_data()?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Windows MVP 始终使用 StdFs；配置层不会允许 io_uring。
                 self.cur.sync_data()?;
             }
             self.dirty_since_sync = false;
@@ -274,7 +294,8 @@ impl WalWriter {
             self.buf.clear();
             self.dirty_since_sync = true;
         }
-        self.sealed.push(Self::seg_path(&self.dir, self.shard_id, self.cur_seq));
+        self.sealed
+            .push(Self::seg_path(&self.dir, self.shard_id, self.cur_seq));
         self.cur_seq += 1;
         self.cur = std::fs::OpenOptions::new()
             .create(true)

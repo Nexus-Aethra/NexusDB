@@ -164,7 +164,10 @@ pub fn rand_bytes(n: usize) -> Vec<u8> {
 pub fn rand_printable(n: usize) -> Vec<u8> {
     // 用 base64url 字母表, 保证无 ',' 且可打印
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    rand_bytes(n).into_iter().map(|b| ALPHABET[(b & 63) as usize]).collect()
+    rand_bytes(n)
+        .into_iter()
+        .map(|b| ALPHABET[(b & 63) as usize])
+        .collect()
 }
 
 // ===== base64 (标准字母表; SCRAM salt/proof 编解码) =====
@@ -183,8 +186,16 @@ pub fn base64_encode(data: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
         out.push(B64[((n >> 18) & 63) as usize] as char);
         out.push(B64[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { B64[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -235,7 +246,9 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert_eq!(
-            hex(&sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
     }

@@ -13,7 +13,7 @@ use std::os::fd::{IntoRawFd, RawFd};
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{Sender, bounded};
 use shard_manager::ShardManager;
 
 use crate::acceptor::{AcceptorConfig, NewConn};
@@ -78,8 +78,7 @@ impl SharedWorkerPool {
         let mut worker_wakeups = Vec::with_capacity(worker_count);
         let mut worker_configs = Vec::with_capacity(worker_count);
         for (i, rx) in worker_inbox_recv.into_iter().enumerate() {
-            let conn_eventfd =
-                unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            let conn_eventfd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             assert!(conn_eventfd >= 0, "eventfd creation failed");
             worker_wakeups.push(conn_eventfd);
             let shard_inboxes: Vec<_> = (0..num_shards)
@@ -163,54 +162,54 @@ impl NetworkServer {
 
         // ⭐ 解耦 (Phase 3/T3.1): 复用全局共享 worker 池 (多协议 server 共享线程),
         // 线程数 = 池大小, 不随 server 数膨胀.
-        let (worker_inboxes, worker_wakeups, worker_pool) = if let Some(shared) = &config.shared_workers
-        {
-            (shared.inboxes(), shared.wakeups(), None)
-        } else {
-            // 1. 创建 N 个 worker inbox + 启动 worker threads (自建池)
-            let worker_count = config.worker_count.max(1);
-            let mut worker_inboxes: Vec<Sender<NewConn>> = Vec::with_capacity(worker_count);
-            let mut worker_inbox_recv: Vec<_> = Vec::with_capacity(worker_count);
-            for _ in 0..worker_count {
-                let (tx, rx) = bounded(inbox_capacity);
-                worker_inboxes.push(tx);
-                worker_inbox_recv.push(rx);
-            }
-            //    ⭐ 方向 1: 每 worker 一个新连接通知 eventfd (nonblocking, 供 epoll 注册).
-            //    fd 所有权归 worker (退出时 close); acceptor 只写不 close.
-            let num_shards = config.shard_manager.num_shards();
-            let mut worker_wakeups: Vec<RawFd> = Vec::with_capacity(worker_count);
-            let mut worker_configs = Vec::with_capacity(worker_count);
-            for (i, rx) in worker_inbox_recv.into_iter().enumerate() {
-                let conn_eventfd =
-                    unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-                assert!(conn_eventfd >= 0, "eventfd creation failed");
-                worker_wakeups.push(conn_eventfd);
-                // 收集所有 shard 的 task inbox
-                let shard_inboxes: Vec<_> = (0..num_shards)
-                    .map(|s| config.shard_manager.task_inbox(s).clone())
-                    .collect();
-                let worker_id = config.worker_id_base + i as u32;
-                worker_configs.push(WorkerConfig {
-                    worker_id,
-                    inbox: rx,
-                    conn_eventfd,
-                    shard_inboxes,
-                    reply_bus: config.shard_manager.reply_bus_set.get_arc(worker_id),
-                    default_db: config.default_db.clone(),
-                    default_table: config.default_table.clone(),
-                    protocol: config.protocol,
-                    limits: config.limits,
-                    auth_password: config.auth_password.clone(),
-                    // ⭐ D3 (分库): SELECT n → db name 翻译视图 (Arc 共享只读)
-                    db_view: config.shard_manager.db_view(),
-                    sql_shared: config.sql_shared.clone(),
-                    tls_config: config.tls_config.clone(),
-                });
-            }
-            let worker_pool = WorkerPool::start(worker_configs)?;
-            (worker_inboxes, worker_wakeups, Some(worker_pool))
-        };
+        let (worker_inboxes, worker_wakeups, worker_pool) =
+            if let Some(shared) = &config.shared_workers {
+                (shared.inboxes(), shared.wakeups(), None)
+            } else {
+                // 1. 创建 N 个 worker inbox + 启动 worker threads (自建池)
+                let worker_count = config.worker_count.max(1);
+                let mut worker_inboxes: Vec<Sender<NewConn>> = Vec::with_capacity(worker_count);
+                let mut worker_inbox_recv: Vec<_> = Vec::with_capacity(worker_count);
+                for _ in 0..worker_count {
+                    let (tx, rx) = bounded(inbox_capacity);
+                    worker_inboxes.push(tx);
+                    worker_inbox_recv.push(rx);
+                }
+                //    ⭐ 方向 1: 每 worker 一个新连接通知 eventfd (nonblocking, 供 epoll 注册).
+                //    fd 所有权归 worker (退出时 close); acceptor 只写不 close.
+                let num_shards = config.shard_manager.num_shards();
+                let mut worker_wakeups: Vec<RawFd> = Vec::with_capacity(worker_count);
+                let mut worker_configs = Vec::with_capacity(worker_count);
+                for (i, rx) in worker_inbox_recv.into_iter().enumerate() {
+                    let conn_eventfd =
+                        unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                    assert!(conn_eventfd >= 0, "eventfd creation failed");
+                    worker_wakeups.push(conn_eventfd);
+                    // 收集所有 shard 的 task inbox
+                    let shard_inboxes: Vec<_> = (0..num_shards)
+                        .map(|s| config.shard_manager.task_inbox(s).clone())
+                        .collect();
+                    let worker_id = config.worker_id_base + i as u32;
+                    worker_configs.push(WorkerConfig {
+                        worker_id,
+                        inbox: rx,
+                        conn_eventfd,
+                        shard_inboxes,
+                        reply_bus: config.shard_manager.reply_bus_set.get_arc(worker_id),
+                        default_db: config.default_db.clone(),
+                        default_table: config.default_table.clone(),
+                        protocol: config.protocol,
+                        limits: config.limits,
+                        auth_password: config.auth_password.clone(),
+                        // ⭐ D3 (分库): SELECT n → db name 翻译视图 (Arc 共享只读)
+                        db_view: config.shard_manager.db_view(),
+                        sql_shared: config.sql_shared.clone(),
+                        tls_config: config.tls_config.clone(),
+                    });
+                }
+                let worker_pool = WorkerPool::start(worker_configs)?;
+                (worker_inboxes, worker_wakeups, Some(worker_pool))
+            };
 
         // 2. 提前创建 listener (暴露 local_addr 给 caller)
         let listener = TcpListener::bind(listen_addr)?;
@@ -256,7 +255,6 @@ impl NetworkServer {
             acceptor_stop: Some(acceptor_stop),
         })
     }
-
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr

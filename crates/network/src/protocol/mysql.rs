@@ -35,7 +35,13 @@ const AUTH_PLUGIN: &[u8] = b"mysql_native_password";
 // =====================================================================
 
 pub fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let mut h: [u32; 5] = [
+        0x6745_2301,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
     let ml = (data.len() as u64) * 8;
     let mut msg = data.to_vec();
     msg.push(0x80);
@@ -228,7 +234,11 @@ pub const CLIENT_SSL: u32 = 0x0000_0800;
 
 /// HandshakeV10, 可选宣告 CLIENT_SSL (tls=true 时客户端可发 SSLRequest 升级).
 pub fn build_handshake_v10_caps(salt: &[u8; 20], thread_id: u32, tls: bool) -> Vec<u8> {
-    let caps = if tls { SERVER_CAPS | CLIENT_SSL } else { SERVER_CAPS };
+    let caps = if tls {
+        SERVER_CAPS | CLIENT_SSL
+    } else {
+        SERVER_CAPS
+    };
     let mut p = Vec::with_capacity(96);
     p.push(10); // protocol version
     p.extend_from_slice(b"8.0.0-NexusDB\0");
@@ -372,16 +382,16 @@ pub fn build_eof(seq: u8) -> Vec<u8> {
 
 fn mysql_type(ty: ColType) -> u8 {
     match ty {
-        ColType::I64 => 8,     // LONGLONG
-        ColType::F64 => 5,     // DOUBLE
-        ColType::Str => 253,   // VAR_STRING
-        ColType::Bytes => 252, // BLOB
-        ColType::Bool => 1,    // TINY (tinyint(1))
-        ColType::Date => 10,   // DATE
-        ColType::Time => 11,   // TIME
-        ColType::Timestamp => 12, // DATETIME
-        ColType::Json => 245,  // JSON
-        ColType::Uuid => 253,  // VAR_STRING (char(36))
+        ColType::I64 => 8,              // LONGLONG
+        ColType::F64 => 5,              // DOUBLE
+        ColType::Str => 253,            // VAR_STRING
+        ColType::Bytes => 252,          // BLOB
+        ColType::Bool => 1,             // TINY (tinyint(1))
+        ColType::Date => 10,            // DATE
+        ColType::Time => 11,            // TIME
+        ColType::Timestamp => 12,       // DATETIME
+        ColType::Json => 245,           // JSON
+        ColType::Uuid => 253,           // VAR_STRING (char(36))
         ColType::Decimal { .. } => 246, // NEWDECIMAL
     }
 }
@@ -531,12 +541,9 @@ fn read_lenenc(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
             l
         }
         0xFD => {
-            let l = u32::from_le_bytes([
-                *buf.get(*pos)?,
-                *buf.get(*pos + 1)?,
-                *buf.get(*pos + 2)?,
-                0,
-            ]) as usize;
+            let l =
+                u32::from_le_bytes([*buf.get(*pos)?, *buf.get(*pos + 1)?, *buf.get(*pos + 2)?, 0])
+                    as usize;
             *pos += 3;
             l
         }
@@ -640,10 +647,7 @@ pub fn parse_stmt_execute(
 
 /// ⭐ P2: 二进制协议结果集 (COM_STMT_EXECUTE 响应).
 /// binary row = [0x00 头][NULL bitmap (n+2+7)/8, 位偏移 +2][各列二进制值].
-pub fn build_binary_result_set(
-    cols: &[(&str, ColType)],
-    rows: &[Vec<ColValue>],
-) -> Vec<u8> {
+pub fn build_binary_result_set(cols: &[(&str, ColType)], rows: &[Vec<ColValue>]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut seq = 1u8;
     let push = |out: &mut Vec<u8>, seq: &mut u8, payload: &[u8]| {
@@ -756,10 +760,15 @@ mod tests {
     #[test]
     fn sha1_rfc_vectors() {
         let hex = |b: [u8; 20]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        assert_eq!(hex(sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            hex(sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
         assert_eq!(hex(sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
         assert_eq!(
-            hex(sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex(sha1(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
         );
     }
@@ -802,7 +811,10 @@ mod tests {
         assert_eq!(p[0], 10);
         // 构造一个 HandshakeResponse41 再解析
         let mut resp = Vec::new();
-        let flags = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_WITH_DB;
+        let flags = CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION
+            | CLIENT_PLUGIN_AUTH
+            | CLIENT_CONNECT_WITH_DB;
         resp.extend_from_slice(&flags.to_le_bytes());
         resp.extend_from_slice(&0x0100_0000u32.to_le_bytes());
         resp.push(45);
@@ -822,7 +834,13 @@ mod tests {
 
     #[test]
     fn lenenc_boundaries() {
-        let cases: [(u64, usize); 5] = [(250, 1), (251, 3), (0xFFFF, 3), (0x1_0000, 4), (0x100_0000, 9)];
+        let cases: [(u64, usize); 5] = [
+            (250, 1),
+            (251, 3),
+            (0xFFFF, 3),
+            (0x1_0000, 4),
+            (0x100_0000, 9),
+        ];
         for (v, want_len) in cases {
             let mut b = Vec::new();
             lenenc_int(&mut b, v);
@@ -833,10 +851,26 @@ mod tests {
     #[test]
     fn result_set_structure() {
         let rows = vec![
-            vec![ColValue::I64(1), ColValue::Bytes(b"a".to_vec()), ColValue::Null],
-            vec![ColValue::I64(2), ColValue::Bytes(b"b".to_vec()), ColValue::F64(1.5)],
+            vec![
+                ColValue::I64(1),
+                ColValue::Bytes(b"a".to_vec()),
+                ColValue::Null,
+            ],
+            vec![
+                ColValue::I64(2),
+                ColValue::Bytes(b"b".to_vec()),
+                ColValue::F64(1.5),
+            ],
         ];
-        let rs = build_result_set(1, &[("id", ColType::I64), ("n", ColType::Str), ("s", ColType::F64)], &rows);
+        let rs = build_result_set(
+            1,
+            &[
+                ("id", ColType::I64),
+                ("n", ColType::Str),
+                ("s", ColType::F64),
+            ],
+            &rows,
+        );
         // 逐帧: 列数(1) + 列定义(3) + EOF + 行(2) + EOF = 8 帧, seq 1..=8
         let mut pos = 0;
         let mut seqs = Vec::new();

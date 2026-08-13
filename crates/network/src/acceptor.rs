@@ -88,7 +88,9 @@ impl Acceptor {
             let fd = stream.into_raw_fd();
 
             let idx = match config.lb_strategy {
-                LbStrategy::RoundRobin => next_worker.fetch_add(1, Ordering::Relaxed) % worker_count,
+                LbStrategy::RoundRobin => {
+                    next_worker.fetch_add(1, Ordering::Relaxed) % worker_count
+                }
                 LbStrategy::Random => {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};

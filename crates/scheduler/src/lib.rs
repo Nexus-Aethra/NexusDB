@@ -11,16 +11,23 @@ mod await_predicate;
 mod park;
 mod pool;
 mod ready;
+#[cfg(target_os = "linux")]
+mod scheduler;
+#[cfg(not(target_os = "linux"))]
+#[path = "scheduler_portable.rs"]
 mod scheduler;
 mod task;
 mod trace;
 mod waker;
 
+#[cfg(target_os = "linux")]
 pub mod fd_pool;
+#[cfg(target_os = "linux")]
 pub mod io_ops;
 mod io_registry;
 mod yield_now;
 
+#[cfg(target_os = "linux")]
 pub use fd_pool::{FdPool, FdPoolError, MAX_FD_PER_SHARD};
 
 pub use io_registry::{IoOpState, IoRegistry, IoRegistryStats};

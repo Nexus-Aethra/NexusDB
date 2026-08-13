@@ -154,7 +154,11 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
             }
         }
         p.done()?;
-        return Ok(SqlStmt::CreateIndex { table, cols, if_not_exists });
+        return Ok(SqlStmt::CreateIndex {
+            table,
+            cols,
+            if_not_exists,
+        });
     }
     if p.try_kw("EXTENSION") {
         // CREATE EXTENSION [IF NOT EXISTS] "name" — 吞掉 (uuid-ossp 等)
@@ -255,7 +259,10 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                 fks.push(FkDefRaw {
                     col: c,
                     ref_table,
-                    ref_col: ref_cols.into_iter().next().unwrap_or_else(|| "id".to_string()),
+                    ref_col: ref_cols
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| "id".to_string()),
                     action,
                 });
             }
@@ -322,7 +329,12 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                         "id".to_string()
                     };
                     let action = parse_fk_action(p)?;
-                    fks.push(FkDefRaw { col: name.clone(), ref_table, ref_col, action });
+                    fks.push(FkDefRaw {
+                        col: name.clone(),
+                        ref_table,
+                        ref_col,
+                        action,
+                    });
                 } else if p.try_kw("CHECK") {
                     // ⭐ compat: 列级 CHECK (expr) — v1 吞 (不强制约束)
                     if p.peek() == Some(&Tok::LParen) {
@@ -346,7 +358,12 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                 }
                 pk = Some(columns.len() as u16);
             }
-            columns.push(Column { name, ty, nullable, default });
+            columns.push(Column {
+                name,
+                ty,
+                nullable,
+                default,
+            });
         }
         match p.next()? {
             Tok::Comma => continue,
@@ -382,7 +399,10 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                     .map(|i| i as u16)
                     .ok_or_else(|| format!("UNIQUE on unknown column {u}"))?
             } else {
-                if columns.iter().any(|c| c.name.eq_ignore_ascii_case("__rowid")) {
+                if columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case("__rowid"))
+                {
                     return Err("column name '__rowid' is reserved for auto rowid".into());
                 }
                 columns.push(Column {
@@ -442,7 +462,11 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
         &fk_defs,
     )
     .map_err(|e| e.to_string())?;
-    Ok(SqlStmt::CreateTable { table, schema, if_not_exists })
+    Ok(SqlStmt::CreateTable {
+        table,
+        schema,
+        if_not_exists,
+    })
 }
 
 /// `INSERT INTO t [(c1,...)] VALUES (v1,...)`
@@ -455,13 +479,17 @@ pub(crate) fn parse_col_type(p: &mut P) -> Result<(ColType, bool), String> {
         if p.peek() == Some(&Tok::LParen) {
             p.next()?;
             precision = match p.next()? {
-                Tok::Num(n) => n.parse::<u8>().map_err(|_| "bad DECIMAL precision".to_string())?,
+                Tok::Num(n) => n
+                    .parse::<u8>()
+                    .map_err(|_| "bad DECIMAL precision".to_string())?,
                 other => return Err(format!("expected DECIMAL precision, got {other:?}")),
             };
             if p.peek() == Some(&Tok::Comma) {
                 p.next()?;
                 scale = match p.next()? {
-                    Tok::Num(n) => n.parse::<u8>().map_err(|_| "bad DECIMAL scale".to_string())?,
+                    Tok::Num(n) => n
+                        .parse::<u8>()
+                        .map_err(|_| "bad DECIMAL scale".to_string())?,
                     other => return Err(format!("expected DECIMAL scale, got {other:?}")),
                 };
             }
@@ -519,10 +547,13 @@ pub(crate) fn parse_col_type(p: &mut P) -> Result<(ColType, bool), String> {
         };
     if is_array {
         // 数组类型映射为 Str 列 (值为 JSON 数组文本); 保持类型信息在注释/元数据
-        return Ok((match ty {
-            ColType::I64 => ColType::I64,
-            _ => ColType::Str,
-        }, false));
+        return Ok((
+            match ty {
+                ColType::I64 => ColType::I64,
+                _ => ColType::Str,
+            },
+            false,
+        ));
     }
     Ok((ty, serial))
 }
@@ -539,7 +570,11 @@ pub(crate) fn parse_drop(p: &mut P) -> Result<SqlStmt, String> {
         return Ok(SqlStmt::DdlStub);
     }
     p.kw("TABLE")?;
-    let _if_exists = p.try_kw("IF") && { p.try_kw("NOT"); p.try_kw("EXISTS"); true };
+    let _if_exists = p.try_kw("IF") && {
+        p.try_kw("NOT");
+        p.try_kw("EXISTS");
+        true
+    };
     // 支持逗号分隔多表 DROP: 只取首表 (其余吞)
     let table = p.table_ident()?;
     while p.try_kw("CASCADE") || p.try_kw("RESTRICT") {}
@@ -576,14 +611,23 @@ pub(crate) fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
         p.try_kw("COLUMN"); // 可选
         let name = p.ident()?;
         p.done()?;
-        return Ok(SqlStmt::AlterTable { table, add: None, drop: Some(name), if_not_exists: false });
+        return Ok(SqlStmt::AlterTable {
+            table,
+            add: None,
+            drop: Some(name),
+            if_not_exists: false,
+        });
     }
     if !p.try_kw("ADD") {
         return Err("only ALTER TABLE ADD COLUMN / DROP COLUMN is supported (v1)".into());
     }
     p.try_kw("COLUMN"); // 可选
     // ⭐ compat: ADD COLUMN IF NOT EXISTS
-    let if_not_exists = p.try_kw("IF") && { p.try_kw("NOT"); p.try_kw("EXISTS"); true };
+    let if_not_exists = p.try_kw("IF") && {
+        p.try_kw("NOT");
+        p.try_kw("EXISTS");
+        true
+    };
     let name = p.ident()?;
     let (ty, is_serial) = parse_col_type(p)?;
     // 列属性: NULL/NOT NULL/DEFAULT
@@ -608,12 +652,19 @@ pub(crate) fn parse_alter(p: &mut P) -> Result<SqlStmt, String> {
     // ⭐ compat: NOT NULL 且无 DEFAULT → 旧行无法回填, 保持 v1 拒绝;
     //   有 DEFAULT (如迁移的 NOT NULL DEFAULT false) → 接受 (由 worker 回填默认).
     if !nullable && default.is_none() {
-        return Err("ADD COLUMN NOT NULL requires a DEFAULT (v1: cannot backfill existing rows)".into());
+        return Err(
+            "ADD COLUMN NOT NULL requires a DEFAULT (v1: cannot backfill existing rows)".into(),
+        );
     }
     p.done()?;
     Ok(SqlStmt::AlterTable {
         table,
-        add: Some(Column { name, ty, nullable, default }),
+        add: Some(Column {
+            name,
+            ty,
+            nullable,
+            default,
+        }),
         drop: None,
         if_not_exists,
     })

@@ -4,11 +4,15 @@
 
 pub mod binary;
 pub mod crypto;
+#[cfg(target_os = "linux")]
 pub mod http;
+#[cfg(target_os = "linux")]
 pub mod mysql;
+#[cfg(target_os = "linux")]
 pub mod pg;
 pub mod resp;
 pub mod resp_cmd;
+#[cfg(target_os = "linux")]
 pub mod sql;
 
 use thiserror::Error;

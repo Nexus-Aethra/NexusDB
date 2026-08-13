@@ -35,6 +35,7 @@ pub mod collections_list;
 pub mod db_name_resolver;
 pub mod engine;
 pub mod engine_io;
+pub mod file_at;
 pub mod keyspace;
 pub mod geo;
 pub mod index_bloom;

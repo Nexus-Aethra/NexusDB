@@ -105,8 +105,7 @@ fn main() {
         // reply_bus 数 = 共享池 worker 数 (worker_id 0..total_workers-1).
         reply_bus_count: Some(total_workers.max(cfg.storage.num_shards)),
         // ⭐ WAL (F60): off | periodic (默认) | strict (validate 已挡非法值)
-        wal_mode: storage::wal::WalMode::parse(&cfg.storage.wal_mode)
-            .unwrap_or_default(),
+        wal_mode: storage::wal::WalMode::parse(&cfg.storage.wal_mode).unwrap_or_default(),
     };
     let mgr = match ShardManager::open(opts) {
         Ok(m) => Arc::new(m),
@@ -192,8 +191,8 @@ fn main() {
         limits,
         auth_password: None,
         worker_id_base: 0,
-            sql_shared: sql_shared.clone(),
-            tls_config: None,
+        sql_shared: sql_shared.clone(),
+        tls_config: None,
         shared_workers: Some(shared_pool.clone()),
     }) {
         Ok(s) => s,
@@ -242,7 +241,10 @@ fn main() {
     };
 
     // 6c. ⭐ Z2: SQL 门面 (MySQL wire protocol, mysql cli 直连)
-    let sql_enabled = !cfg.server.sql_addr.is_empty();
+    // Windows P1 currently exposes the Binary + RESP facades through the
+    // portable socket runtime. SQL/PG/HTTP remain on the Linux reactor until
+    // the IOCP worker lands, so do not let default config make Windows exit.
+    let sql_enabled = cfg!(target_os = "linux") && !cfg.server.sql_addr.is_empty();
     let sql_server = if sql_enabled {
         let sql_addr = cfg.server.sql_addr.parse().expect("validated sql addr");
         // 空密码 = 免密登录
@@ -281,7 +283,7 @@ fn main() {
     };
 
     // 6d. ⭐ S4: PostgreSQL wire 门面 (psql 直连; 密码复用 sql_password)
-    let pg_enabled = !cfg.server.pg_addr.is_empty();
+    let pg_enabled = cfg!(target_os = "linux") && !cfg.server.pg_addr.is_empty();
     let pg_server = if pg_enabled {
         let pg_addr = cfg.server.pg_addr.parse().expect("validated pg addr");
         let pg_password = if cfg.server.sql_password.is_empty() {
@@ -305,7 +307,11 @@ fn main() {
             shared_workers: Some(shared_pool.clone()),
         }) {
             Ok(s) => {
-                nlog::info!("main", "SQL (PostgreSQL wire) listening on {}", s.local_addr());
+                nlog::info!(
+                    "main",
+                    "SQL (PostgreSQL wire) listening on {}",
+                    s.local_addr()
+                );
                 Some(s)
             }
             Err(e) => {
@@ -320,7 +326,7 @@ fn main() {
 
     // 6e. ⭐ H1: HTTP REST 门面 (JSON + CORS + /metrics)
     network::metrics::init_start_time();
-    let http_enabled = !cfg.server.http_addr.is_empty();
+    let http_enabled = cfg!(target_os = "linux") && !cfg.server.http_addr.is_empty();
     let http_server = if http_enabled {
         let http_addr = cfg.server.http_addr.parse().expect("validated http addr");
         network::http_config::set_cors_origin(Some(cfg.server.http_cors_origin.clone()));

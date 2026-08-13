@@ -2,7 +2,7 @@
 //!
 //! Phase 1 stub: 简单包装 crossbeam unbounded channel.
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::protocol::Response;
 use shard_manager::{ReplySink, ShardResponse};

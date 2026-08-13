@@ -38,8 +38,7 @@ impl Protocol for BinaryProtocol {
         if buf.len() < HEADER_LEN {
             return Ok(DecodeOutcome::NeedMore);
         }
-        let total_len =
-            u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let total_len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
         if total_len < HEADER_LEN {
             return Err(ProtocolError::InvalidLength(format!(
                 "total_len {total_len} < header {HEADER_LEN}"
@@ -113,8 +112,7 @@ impl Protocol for BinaryProtocol {
         if buf.len() < HEADER_LEN {
             return Ok(DecodeOutcome::NeedMore);
         }
-        let total_len =
-            u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let total_len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
         if total_len > self.max_frame_size() {
             return Err(ProtocolError::FrameTooLarge {
                 size: total_len,
@@ -139,13 +137,11 @@ impl Protocol for BinaryProtocol {
             RESP_PUT_OK => Response::PutOk,
             RESP_DELETE_OK => Response::DeleteOk,
             RESP_GET => {
-                let val =
-                    buf[HEADER_LEN + key_len..HEADER_LEN + key_len + val_len].to_vec();
+                let val = buf[HEADER_LEN + key_len..HEADER_LEN + key_len + val_len].to_vec();
                 Response::Get(if val.is_empty() { None } else { Some(val) })
             }
             RESP_ERROR => {
-                let msg =
-                    buf[HEADER_LEN + key_len..HEADER_LEN + key_len + val_len].to_vec();
+                let msg = buf[HEADER_LEN + key_len..HEADER_LEN + key_len + val_len].to_vec();
                 let s = String::from_utf8_lossy(&msg).into_owned();
                 Response::Error(s)
             }

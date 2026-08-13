@@ -17,9 +17,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+use crate::file_at::FileAt;
 use crate::meta_cache::MetaCache;
 use crate::types::{
     BLOCK_SIZE, CHUNK_SIZE, DEFAULT_DB_ID, DbId, PAGE_SIZE, PAGES_PER_CHUNK, PID_ALIVE, PageKey,
@@ -179,7 +179,9 @@ impl FileBuf {
     }
 
     fn take(&mut self, chunk_idx: u8) -> Option<ChunkBuf> {
-        self.chunks.get_mut(chunk_idx as usize).and_then(|s| s.take())
+        self.chunks
+            .get_mut(chunk_idx as usize)
+            .and_then(|s| s.take())
     }
 
     fn resident_count(&self) -> usize {
@@ -230,11 +232,8 @@ impl NowChunks {
         data: &[u8; PAGE_SIZE],
     ) {
         // ⭐ DIAG: 检测非 MetaPage 写入 chunk(0,0) page_idx=0 (覆写 MetaPage)
-        if diag_enabled()
-            && key.file_id == 0
-            && key.chunk_idx == 0
-            && page_idx == 0
-            && data[4] != 1  // page_type != Meta
+        if diag_enabled() && key.file_id == 0 && key.chunk_idx == 0 && page_idx == 0 && data[4] != 1
+        // page_type != Meta
         {
             eprintln!(
                 "[DIAG-META-OVERWRITE] vpid={vpid} writing type={} to chunk(0,0) page_idx=0!\n\
@@ -263,7 +262,10 @@ impl NowChunks {
         if diag_enabled() && key.file_id == 0 && key.chunk_idx == 0 {
             eprintln!(
                 "[DIAG-TAKE-CHUNK] key={key:?} page_count={}\nbacktrace:\n{:?}",
-                self.file(key.file_id).and_then(|f| f.slot(key.chunk_idx)).map(|c| c.page_count).unwrap_or(0),
+                self.file(key.file_id)
+                    .and_then(|f| f.slot(key.chunk_idx))
+                    .map(|c| c.page_count)
+                    .unwrap_or(0),
                 std::backtrace::Backtrace::force_capture()
             );
         }
@@ -376,16 +378,16 @@ impl NowChunks {
             let off = i * PAGE_SIZE;
             // page 自描述: magic "LCBP" 判存在, vpid 在 [0x18..0x20]
             if &buf.data[off..off + 4] == b"LCBP" {
-                let vpid = u64::from_le_bytes(
-                    buf.data[off + 0x18..off + 0x20].try_into().expect("8B"),
-                );
+                let vpid =
+                    u64::from_le_bytes(buf.data[off + 0x18..off + 0x20].try_into().expect("8B"));
                 buf.vpids[i] = vpid;
                 buf.page_count += 1;
             }
         }
         // ⭐ DIAG: 追踪 chunk 加载 (定位写入错位根因)
         if diag_enabled() {
-            let existing = self.file(key.file_id)
+            let existing = self
+                .file(key.file_id)
                 .and_then(|f| f.slot(key.chunk_idx))
                 .map(|c| c.page_count);
             // 特别检查 chunk(0,0) page_idx=0 是否为 MetaPage

@@ -99,13 +99,26 @@ impl AggFn {
 /// ⭐ G1 (F63): SELECT 投影项 — 纯列或聚合函数. ⭐ F76: 可带输出列别名 (AS).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
-    Col { name: String, alias: Option<String> },
+    Col {
+        name: String,
+        alias: Option<String>,
+    },
     /// arg = None 仅 COUNT(*). ⭐ F77: distinct = COUNT(DISTINCT col). ⭐ F78: arg 可为表达式.
-    Agg { func: AggFn, arg: Option<ScalarExpr>, distinct: bool, alias: Option<String> },
+    Agg {
+        func: AggFn,
+        arg: Option<ScalarExpr>,
+        distinct: bool,
+        alias: Option<String>,
+    },
     /// ⭐ compat: 标量函数投影 (NOW()/version()) — worker 渲染常量.
-    ScalarFn { name: String },
+    ScalarFn {
+        name: String,
+    },
     /// ⭐ compat: 表达式投影 (JSONB 取字段 j->'a' / j->>'a', v1 仅列+常量键).
-    Expr { expr: ScalarExpr, alias: Option<String> },
+    Expr {
+        expr: ScalarExpr,
+        alias: Option<String>,
+    },
 }
 
 /// ⭐ F78: 算术运算符.
@@ -133,10 +146,18 @@ impl ArithOp {
 pub enum ScalarExpr {
     Col(String),
     Lit(SqlValue),
-    Bin { op: ArithOp, l: Box<ScalarExpr>, r: Box<ScalarExpr> },
+    Bin {
+        op: ArithOp,
+        l: Box<ScalarExpr>,
+        r: Box<ScalarExpr>,
+    },
     /// ⭐ compat: JSONB 取字段 `base->key` (as_text=false) / `base->>key` (as_text=true).
     /// 仅支持 base=列 + key=字符串字面量 (v1).
-    JsonGet { base: Box<ScalarExpr>, key: Box<ScalarExpr>, as_text: bool },
+    JsonGet {
+        base: Box<ScalarExpr>,
+        key: Box<ScalarExpr>,
+        as_text: bool,
+    },
     /// ⭐ PG 兼容 (UPDATE SET): 一元 `NOT expr` (布尔取反; SET 表达式 RHS).
     Not(Box<ScalarExpr>),
 }
@@ -154,7 +175,12 @@ impl ScalarExpr {
             },
             ScalarExpr::Bin { op, l, r } => format!("{} {} {}", l.render(), op.sym(), r.render()),
             ScalarExpr::JsonGet { base, key, as_text } => {
-                format!("{} {} {}", base.render(), if *as_text { "->>" } else { "->" }, key.render())
+                format!(
+                    "{} {} {}",
+                    base.render(),
+                    if *as_text { "->>" } else { "->" },
+                    key.render()
+                )
             }
             ScalarExpr::Not(e) => format!("NOT {}", e.render()),
         }
@@ -206,7 +232,12 @@ impl SelectItem {
         match self {
             SelectItem::ScalarFn { name } => name.clone(),
             SelectItem::Col { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
-            SelectItem::Agg { func, arg, distinct, alias } => alias.clone().unwrap_or_else(|| {
+            SelectItem::Agg {
+                func,
+                arg,
+                distinct,
+                alias,
+            } => alias.clone().unwrap_or_else(|| {
                 let inner = match arg {
                     None => "*".to_string(),
                     Some(e) => e.render(),
@@ -311,8 +342,14 @@ impl QualCol {
     /// 按首个 `.` 拆 (tokenizer 把 `u.id` 当单 Ident); 无点 → qualifier None.
     pub fn parse(s: &str) -> QualCol {
         match s.split_once('.') {
-            Some((q, c)) => QualCol { qualifier: Some(q.to_string()), col: c.to_string() },
-            None => QualCol { qualifier: None, col: s.to_string() },
+            Some((q, c)) => QualCol {
+                qualifier: Some(q.to_string()),
+                col: c.to_string(),
+            },
+            None => QualCol {
+                qualifier: None,
+                col: s.to_string(),
+            },
         }
     }
 }
@@ -341,7 +378,11 @@ pub struct TableRef {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OnPred {
     Eq(QualCol, QualCol),
-    Cmp { left: QualCol, op: CmpOp, right: QualCol },
+    Cmp {
+        left: QualCol,
+        op: CmpOp,
+        right: QualCol,
+    },
 }
 
 /// ⭐ F68 (JOIN): 一个 JOIN 子句 (左深链中的一步). CROSS 时 on 空.
@@ -372,9 +413,17 @@ pub struct JoinCond {
 pub enum SqlStmt {
     /// CREATE TABLE: schema 已构建完成 (含 pk / 索引 iid 分配).
     /// `if_not_exists=true` → 表已存在时静默跳过 (不报错).
-    CreateTable { table: String, schema: TableSchema, if_not_exists: bool },
+    CreateTable {
+        table: String,
+        schema: TableSchema,
+        if_not_exists: bool,
+    },
     /// INSERT: cols 为空 = 全列序; ⭐ S1: rows 支持多行 VALUES.
-    Insert { table: String, cols: Vec<String>, rows: Vec<Vec<SqlValue>> },
+    Insert {
+        table: String,
+        cols: Vec<String>,
+        rows: Vec<Vec<SqlValue>>,
+    },
     /// SELECT: items 空 = `*` 全列 (⭐ O1 投影; ⭐ G1/F63 列+聚合混合).
     /// group_by/having 见 G1; order = (列名或聚合 label, desc); offset 排序后截断.
     Select {
@@ -393,16 +442,29 @@ pub enum SqlStmt {
     /// ⭐ S1: DELETE FROM t WHERE ... (WHERE 必带 — 全删由全表扫路径支撑).
     Delete { table: String, conds: Pred<Cond> },
     /// ⭐ S1: UPDATE t SET c=v[, ...] WHERE ... (禁改 pk 列, 规划层拦).
-    Update { table: String, sets: Vec<(String, SqlValue)>, conds: Pred<Cond> },
+    Update {
+        table: String,
+        sets: Vec<(String, SqlValue)>,
+        conds: Pred<Cond>,
+    },
     /// ⭐ S1: DROP TABLE t.
     DropTable { table: String },
     /// ⭐ compat: CREATE INDEX [IF NOT EXISTS] name ON t (col[, col]) [WHERE ...] — v1 吞/建索引.
-    CreateIndex { table: String, cols: Vec<String>, if_not_exists: bool },
+    CreateIndex {
+        table: String,
+        cols: Vec<String>,
+        if_not_exists: bool,
+    },
     /// ⭐ compat: 纯 PG 专有 DDL 吞掉 (EXTENSION / FUNCTION / TRIGGER / SEQUENCE ...) — 无副作用.
     DdlStub,
     /// ⭐ F79: ALTER TABLE t ADD COLUMN c TYPE (v1 仅追加可空列);
     /// ⭐ compat: DROP COLUMN c (标记删除, 物理保留).
-    AlterTable { table: String, add: Option<Column>, drop: Option<String>, if_not_exists: bool },
+    AlterTable {
+        table: String,
+        add: Option<Column>,
+        drop: Option<String>,
+        if_not_exists: bool,
+    },
     /// 显式打开/关闭 SQL 表的 RESP 行适配。
     /// 语法: `ALTER TABLE t SET RESP ADAPTER ON|OFF`.
     SetRespRowAdapter { table: String, enabled: bool },
@@ -471,13 +533,20 @@ pub enum SqlStmt {
     },
     /// ⭐ 事务 v1 (F61): BEGIN / START TRANSACTION.
     /// ⭐ v2 (F62): 可选隔离级别与读写属性尾缀.
-    Begin { iso: Option<TxnIso>, read_only: Option<bool> },
+    Begin {
+        iso: Option<TxnIso>,
+        read_only: Option<bool>,
+    },
     /// ⭐ 事务 v1 (F61): COMMIT.
     Commit,
     /// ⭐ 事务 v1 (F61): ROLLBACK.
     Rollback,
     /// ⭐ v2 (F62): SET [SESSION] TRANSACTION ... (session=连接默认 / 否则当前事务).
-    SetTransaction { iso: Option<TxnIso>, read_only: Option<bool>, session: bool },
+    SetTransaction {
+        iso: Option<TxnIso>,
+        read_only: Option<bool>,
+        session: bool,
+    },
     /// ⭐ v2 (F62): SAVEPOINT name.
     Savepoint { name: String },
     /// ⭐ v2 (F62): ROLLBACK TO [SAVEPOINT] name.
