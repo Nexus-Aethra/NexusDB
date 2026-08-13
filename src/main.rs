@@ -15,10 +15,12 @@ use shard_manager::{ShardManager, ShardManagerOptions};
 /// 信号标志 (SIGINT/SIGTERM → true).
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
 extern "C" fn on_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
+#[cfg(target_os = "linux")]
 fn main() {
     let mut config_path = PathBuf::from("./nexusdb.toml");
     let mut args = std::env::args().skip(1);
@@ -448,4 +450,19 @@ fn ensure_catalog(mgr: &ShardManager, db: &str, table: &str) {
             }
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn main() {
+    // M1 skeleton: cargo check -p network passes on Windows, but the
+    // Linux-shaped main() above depends on NetworkServerConfig fields
+    // (shard_manager, default_db, sql_shared, ...) that are not yet
+    // wired into the IOCP runtime.  Until M2+ lands a real ShardManager
+    // bridge, this binary is a placeholder so the workspace still builds.
+    //
+    // See docs/plans/2026-08-13-windows-iocp.md for the milestone map.
+    eprintln!("NexusDB on Windows is M1 skeleton only.");
+    eprintln!("cargo check -p network passes; runtime_iocp binary path is not yet wired.");
+    eprintln!("See docs/plans/2026-08-13-windows-iocp.md for the M1-M7 plan.");
+    std::process::exit(0);
 }
