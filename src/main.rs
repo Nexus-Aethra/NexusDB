@@ -13,12 +13,21 @@ use network::{KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind};
 use shard_manager::{ShardManager, ShardManagerOptions};
 
 /// 信号标志 (SIGINT/SIGTERM → true).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
 extern "C" fn on_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn console_handler(_ctrl_type: u32) -> i32 {
+    SHUTDOWN.store(true, Ordering::Release);
+    1
+}
+
+#[cfg(target_os = "linux")]
 fn main() {
     let mut config_path = PathBuf::from("./nexusdb.toml");
     let mut args = std::env::args().skip(1);
@@ -448,4 +457,129 @@ fn ensure_catalog(mgr: &ShardManager, db: &str, table: &str) {
             }
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn main() {
+    use std::time::Duration;
+    use network::{KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind};
+    use shard_manager::{ShardManager, ShardManagerOptions};
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // 1. 加载 config (default path: ./nexusdb-test.toml)
+    let config_path = PathBuf::from("./nexusdb-test.toml");
+    let (cfg, from_file) = match config::NexusConfig::load_or_default(&config_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[nexusdb] config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "[nexusdb] Windows M2: config loaded (from_file={from_file}, data={})",
+        cfg.storage.block_root.display()
+    );
+
+    // 2. 启动 ShardManager (io_backend = "stdfs" 走 std fs, 不依赖 io_uring)
+    let io_backend = cfg.storage.io_backend().expect("validated backend");
+    let total_workers = cfg.server.worker_count.max(1);
+    let opts = ShardManagerOptions {
+        num_shards: cfg.storage.num_shards,
+        block_root: cfg.storage.block_root.clone(),
+        create_if_missing: cfg.storage.create_if_missing,
+        io_backend,
+        io_config: storage::IoBackendConfig {
+            backend: io_backend,
+            ..Default::default()
+        },
+        chunk_cache_size: cfg.storage.chunk_cache_size,
+        reply_bus_count: Some(total_workers.max(cfg.storage.num_shards)),
+        wal_mode: storage::wal::WalMode::parse(&cfg.storage.wal_mode).unwrap_or_default(),
+    };
+    let mgr = match ShardManager::open(opts) {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            eprintln!("[nexusdb] shard manager open failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 3. 确保默认 db/table 存在
+    ensure_catalog(&mgr, &cfg.storage.default_db, &cfg.storage.default_table);
+
+    // 4. 启动 Binary 端口 (M2)
+    let limits = KvLimits {
+        max_key_bytes: cfg.server.max_key_bytes,
+        max_value_bytes: cfg.server.max_value_bytes,
+    };
+    let listen_addr: std::net::SocketAddr =
+        cfg.server.listen_addr.parse().expect("validated addr");
+    let binary_server = match NetworkServer::start(NetworkServerConfig {
+        listen_addr,
+        protocol: ProtocolKind::Binary,
+        worker_count: total_workers,
+        limits,
+        shard_manager: mgr.clone(),
+        default_db: cfg.storage.default_db.clone(),
+        default_table: cfg.storage.default_table.clone(),
+        auth_password: None,
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[nexusdb] Binary server start failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "[nexusdb] Binary listening on {}",
+        binary_server.local_addr()
+    );
+
+    // 5. 启动 RESP 端口 (M2)
+    let resp_server = if !cfg.server.redis_addr.is_empty() {
+        let resp_addr: std::net::SocketAddr =
+            cfg.server.redis_addr.parse().expect("validated redis addr");
+        let auth_password = if cfg.server.redis_password.is_empty() {
+            None
+        } else {
+            Some(cfg.server.redis_password.clone())
+        };
+        match NetworkServer::start(NetworkServerConfig {
+            listen_addr: resp_addr,
+            protocol: ProtocolKind::Resp,
+            worker_count: total_workers,
+            limits,
+            shard_manager: mgr.clone(),
+            default_db: cfg.storage.default_db.clone(),
+            default_table: cfg.storage.default_table.clone(),
+            auth_password,
+        }) {
+            Ok(s) => {
+                eprintln!("[nexusdb] RESP listening on {}", s.local_addr());
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("[nexusdb] RESP server start failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // 6. 等 Ctrl-C
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(console_handler), 1);
+    }
+    eprintln!("[nexusdb] running (Ctrl-C to quit)");
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!("[nexusdb] shutdown requested");
+
+    let _ = binary_server.shutdown();
+    if let Some(s) = resp_server {
+        let _ = s.shutdown();
+    }
+    eprintln!("[nexusdb] shutdown complete");
 }

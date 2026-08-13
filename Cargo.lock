@@ -12,6 +12,7 @@ dependencies = [
  "nlog",
  "shard_manager",
  "storage",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -197,6 +198,7 @@ dependencies = [
  "storage",
  "tempfile",
  "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

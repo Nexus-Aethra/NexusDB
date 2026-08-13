@@ -1,0 +1,31 @@
+# NexusDB Windows 兼容性测试配置
+# 关键调整: io_backend = "stdfs" (io_uring 是 Linux only)
+
+[server]
+listen_addr = "127.0.0.1:5433"        # Binary
+worker_count = 1
+redis_addr = "127.0.0.1:6380"         # RESP (Redis 兼容); 6379 被 win 自带 redis-server 占用 (SYSTEM 权限, 杀不掉)
+sql_addr = "127.0.0.1:5434"           # MySQL wire
+pg_addr = "127.0.0.1:5435"            # PostgreSQL wire
+http_addr = "127.0.0.1:6778"          # REST
+sql_password = "test"                 # SQL 登录密码
+redis_password = ""
+max_key_bytes = 1024
+max_value_bytes = 1048576
+
+[storage]
+block_root = "./data-test"             # 隔离的测试 data 目录
+num_shards = 2                         # Windows 上小一点
+io_backend = "stdfs"                   # ★ 关键: Windows 用 stdfs
+chunk_cache_size = 8
+wal_mode = "periodic"
+create_if_missing = true
+default_db = "default"
+default_table = "default"
+precreate_dbs = 1                      # 预建 db1
+
+[log]
+level = "info"
+dir = "./logs-test"
+flush_interval_ms = 500
+stderr = true

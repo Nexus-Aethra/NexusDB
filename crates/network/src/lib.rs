@@ -21,7 +21,7 @@
 #[cfg(target_os = "linux")]
 pub mod acceptor;
 pub mod kv_to_shard;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[path = "portable.rs"]
 pub mod portable;
 pub mod protocol;
@@ -32,7 +32,9 @@ pub mod tls;
 pub mod value_codec;
 #[cfg(target_os = "linux")]
 pub mod worker;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub mod runtime_iocp;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub use portable::{SqlSharedRoutes, new_sql_shared};
 #[cfg(target_os = "linux")]
 pub use worker::{SqlSharedRoutes, new_sql_shared};
@@ -97,7 +99,7 @@ pub mod geo_bridge {
 #[cfg(target_os = "linux")]
 pub use acceptor::{Acceptor, AcceptorConfig, LbStrategy, NewConn};
 pub use kv_to_shard::dispatch_request;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub use portable::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 pub use protocol::{
     BinaryProtocol, DecodeOutcome, KvLimits, Protocol, ProtocolError, Request, RespCodec,
@@ -106,5 +108,7 @@ pub use protocol::{
 pub use reply_bus::{ReplyBusReceiver, ReplyBusSender, ReplyEnvelope};
 #[cfg(target_os = "linux")]
 pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
+#[cfg(target_os = "windows")]
+pub use runtime_iocp::{NetworkServer, NetworkServerConfig, ProtocolKind};
 #[cfg(target_os = "linux")]
 pub use worker::{WorkerConfig, WorkerPool};
