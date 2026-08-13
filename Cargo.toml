@@ -23,3 +23,6 @@ storage = { path = "crates/storage" }
 shard_manager = { path = "crates/shard_manager" }
 network = { path = "crates/network" }
 libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

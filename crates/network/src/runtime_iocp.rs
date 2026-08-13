@@ -1,33 +1,36 @@
-//! Windows IOCP runtime for the network layer.
+//! Windows runtime for the network layer.
 //!
-//! M1 skeleton: bind + listen (std::net) + IOCP worker pool + per-conn echo
-//! (no protocol parsing yet — that lands in M2-M6).  See
-//! `docs/plans/2026-08-13-windows-iocp.md` for the full design.
+//! M2 (revised after IOCP/AcceptEx dead-loop on Windows): pure std blocking
+//! path.  One acceptor thread calls `TcpListener::incoming()`; each accepted
+//! `TcpStream` is dispatched to a fresh `std::thread` that runs RESP / Binary
+//! protocol dispatch synchronously.  Concurrency comes from one thread per
+//! connection; per-thread blocking IO keeps the code path simple and
+//! debuggable.  M3+ will revisit IOCP (or RIO) for higher fan-out.
+//!
+//! Only `ProtocolKind::Binary` and `ProtocolKind::Resp` are accepted in M2;
+//! Sql / Pg / Http land in M4-M6.
 
 #![cfg(target_os = "windows")]
 
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::Networking::WinSock::{
-    closesocket, WSARecv, WSASend, INVALID_SOCKET, SOCKADDR_STORAGE, SOCKET, WSAEWOULDBLOCK,
-    WSA_IO_PENDING,
+use shard_manager::ShardManager;
+
+use crate::kv_to_shard::dispatch_request;
+use crate::protocol::{
+    BinaryProtocol, DecodeOutcome, KvLimits, Protocol, Request, RespCodec, RespCommand, Response,
+    validate_request,
 };
-use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus, OVERLAPPED,
-};
 
-use crate::protocol::KvLimits;
+const RECV_BUF_CAP: usize = 8 * 1024;
 
-/// Sentinel completion key for shutdown.
-const SHUTDOWN_KEY: usize = 0xFFFF_FFFF;
-
-/// Protocol a listener accepts.  Only `Binary` and `Resp` are actually wired in
-/// M1; M2+ will route the rest.
+/// Protocol a listener accepts.  M2 routes Binary + Resp; M3+ will route the
+/// rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolKind {
     Binary,
@@ -42,86 +45,59 @@ pub struct NetworkServerConfig {
     pub protocol: ProtocolKind,
     pub worker_count: usize,
     pub limits: KvLimits,
+    pub shard_manager: Arc<ShardManager>,
+    pub default_db: String,
+    pub default_table: String,
+    pub auth_password: Option<String>,
 }
 
-/// Newtype around `HANDLE` so it is `Send + Sync`.  The IOCP handle is safe to
-/// share across worker threads: any operation on it goes through Win32 APIs
-/// that themselves are thread-safe (GetQueuedCompletionStatus / PostQueued...).
-/// This is `Copy` so we can pass it into each thread without wrapping in
-/// `Arc<Mutex<>>` and adding a lock on the hot path.
-#[derive(Clone, Copy)]
-struct IocpHandle(HANDLE);
-unsafe impl Send for IocpHandle {}
-unsafe impl Sync for IocpHandle {}
+struct ConnShared {
+    mgr: Arc<ShardManager>,
+    default_db: String,
+    default_table: String,
+    auth_password: Option<String>,
+    limits: KvLimits,
+}
 
 pub struct NetworkServer {
     local_addr: SocketAddr,
     stop: Arc<AtomicBool>,
-    iocp: IocpHandle,
-    worker_handles: Vec<thread::JoinHandle<()>>,
+    /// Held so the OS socket is only closed when we explicitly shut down;
+    /// the acceptor thread observes `stop` and exits.
     acceptor_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl NetworkServer {
     pub fn start(config: NetworkServerConfig) -> std::io::Result<Self> {
-        // Bind via std so the platform-correct sockaddr path is used.
-        let listener = std::net::TcpListener::bind(config.listen_addr)?;
-        let local_addr = listener.local_addr()?;
-        // WSAStartup not strictly required on modern Windows but call it once
-        // per process to be safe; idempotent via a Once.
-        wsa_startup()?;
-
-        // Create the IOCP with concurrency = worker_count.
-        let iocp_raw: HANDLE = unsafe {
-            CreateIoCompletionPort(
-                std::ptr::null_mut::<std::ffi::c_void>(),
-                std::ptr::null_mut(),
-                0,
-                config.worker_count as u32,
-            )
-        };
-        if iocp_raw.is_null() {
-            return Err(std::io::Error::last_os_error());
+        if !matches!(config.protocol, ProtocolKind::Binary | ProtocolKind::Resp) {
+            return Err(std::io::Error::other(
+                "M2: runtime_iocp supports Binary and Resp only (Sql/Pg/Http land in M4-M6)",
+            ));
         }
-        let iocp = IocpHandle(iocp_raw);
+
+        let listener = TcpListener::bind(config.listen_addr)?;
+        let local_addr = listener.local_addr()?;
+
+        let shared = Arc::new(ConnShared {
+            mgr: config.shard_manager,
+            default_db: config.default_db,
+            default_table: config.default_table,
+            auth_password: config.auth_password,
+            limits: config.limits,
+        });
 
         let stop = Arc::new(AtomicBool::new(false));
-        let mut worker_handles = Vec::with_capacity(config.worker_count);
-        for worker_id in 0..config.worker_count {
-            let iocp_thread = iocp;
-            let stop_thread = stop.clone();
-            let handle = thread::Builder::new()
-                .name(format!("iocp-worker-{worker_id}"))
-                .stack_size(4 * 1024 * 1024)
-                .spawn(move || worker_main(iocp_thread, stop_thread))
-                .map_err(|e| std::io::Error::other(format!("spawn worker: {e}")))?;
-            worker_handles.push(handle);
-        }
-
-        // Acceptor takes the raw SOCKET so we don't have to clone the
-        // std listener (which is owned).  It also closes the listener when
-        // it exits.
-        let raw_listener: SOCKET = {
-            use std::os::windows::io::AsRawSocket;
-            listener.as_raw_socket() as SOCKET
-        };
-        let acceptor_handle = {
-            let iocp_thread = iocp;
-            let stop_thread = stop.clone();
-            thread::Builder::new()
-                .name("iocp-acceptor".to_string())
-                .spawn(move || acceptor_main(raw_listener, iocp_thread, stop_thread))
-                .map_err(|e| std::io::Error::other(format!("spawn acceptor: {e}")))?
-        };
-        // listener is dropped here; the raw SOCKET in the acceptor thread
-        // remains valid because `as_raw_socket` is a borrow, not a move.
-        drop(listener);
+        let stop_thread = stop.clone();
+        let shared_thread = shared.clone();
+        let protocol = config.protocol;
+        let acceptor_handle = thread::Builder::new()
+            .name(format!("runtime-acceptor-{protocol:?}"))
+            .spawn(move || acceptor_main(listener, stop_thread, shared_thread, protocol))
+            .map_err(|e| std::io::Error::other(format!("spawn acceptor: {e}")))?;
 
         Ok(Self {
             local_addr,
             stop,
-            iocp,
-            worker_handles,
             acceptor_handle: Some(acceptor_handle),
         })
     }
@@ -132,239 +108,215 @@ impl NetworkServer {
 
     pub fn shutdown(mut self) -> std::io::Result<()> {
         self.stop.store(true, Ordering::Release);
-
-        for _ in 0..self.worker_handles.len() {
-            unsafe { PostQueuedCompletionStatus(self.iocp.0, 0, SHUTDOWN_KEY, std::ptr::null_mut()) };
-        }
-        for h in self.worker_handles.drain(..) {
-            let _ = h.join();
-        }
+        // Closing the listener requires owning the TcpListener, which lives
+        // in the acceptor thread.  We can't drop it from here; instead the
+        // shutdown path is:
+        //   1. main thread sets stop = true
+        //   2. main thread drops the NetworkServer, which is currently
+        //      impossible because we just consumed `self` by-value.
+        //   3. acceptor thread loops with non-blocking accept and checks
+        //      stop each iteration.  After observing stop, it returns and
+        //      drops the listener, which then closes the OS socket.
+        //
+        // We need the accept() to time out so the loop can re-check `stop`.
+        // So we set the listener to non-blocking and accept with a short
+        // poll interval.  To make that work, we set non-blocking BEFORE
+        // handing the listener to the thread.
+        // (Done in acceptor_main via `set_nonblocking`.)
         if let Some(h) = self.acceptor_handle.take() {
             let _ = h.join();
         }
-        unsafe { CloseHandle(self.iocp.0) };
         Ok(())
     }
 }
 
-// ===========================================================================
-// Acceptor: blocking accept, then post the first WSARecv on the new socket.
-// ===========================================================================
-
-fn acceptor_main(raw_listener: SOCKET, iocp: IocpHandle, stop: Arc<AtomicBool>) {
-    while !stop.load(Ordering::Acquire) {
-        let mut storage: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
-        let mut len: i32 = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
-        let accepted = unsafe {
-            windows_sys::Win32::Networking::WinSock::accept(
-                raw_listener,
-                &mut storage as *mut _ as *mut _,
-                &mut len,
-            )
-        };
-        if accepted == INVALID_SOCKET {
-            if stop.load(Ordering::Acquire) {
-                break;
-            }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(WSAEWOULDBLOCK) {
-                thread::sleep(Duration::from_millis(20));
-                continue;
-            }
-            // Transient error: back off briefly and keep going.
-            thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-
-        // Register the socket to the IOCP.  Completion key is the raw socket
-        // value cast to usize so the worker can recover it.
-        let key = accepted as usize;
-        let sock_handle = accepted as isize as *mut std::ffi::c_void;
-        let reg: HANDLE = unsafe {
-            CreateIoCompletionPort(sock_handle, iocp.0, key, 0)
-        };
-        if reg.is_null() {
-            unsafe { closesocket(accepted) };
-            continue;
-        }
-
-        // Allocate a fresh OverlappedData for the first WSARecv.
-        let data = OverlappedData::new_recv(accepted, 8 * 1024);
-        unsafe { post_wsa_recv(accepted, data) };
+fn acceptor_main(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    shared: Arc<ConnShared>,
+    protocol: ProtocolKind,
+) {
+    // Make accept() non-blocking so we can poll `stop` and break out
+    // promptly on shutdown.  Per-conn threads are the heavy lifters; this
+    // thread is just a dispatcher.
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("[runtime] set_nonblocking failed: {e}");
     }
-
-    // Acceptor exiting: close the listener so no new connections arrive.
-    unsafe { closesocket(raw_listener) };
+    let local = listener.local_addr().ok();
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let shared_thread = shared.clone();
+                let proto_thread = protocol;
+                let name = format!("runtime-conn-{proto_thread:?}");
+                let _ = thread::Builder::new()
+                    .name(name)
+                    .spawn(move || {
+                        if let Err(e) = run_conn(stream, shared_thread, proto_thread) {
+                            eprintln!("[runtime] conn ended: {e}");
+                        }
+                    });
+            }
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                std::io::ErrorKind::Interrupted => continue,
+                _ => {
+                    eprintln!("[runtime] accept error: {e}");
+                    thread::sleep(Duration::from_millis(50));
+                }
+            },
+        }
+    }
+    if let Some(addr) = local {
+        eprintln!("[runtime] acceptor for {addr} exiting");
+    }
 }
 
-// ===========================================================================
-// Worker: GQCS -> handle completion.
-// ===========================================================================
+fn run_conn(
+    mut stream: TcpStream,
+    shared: Arc<ConnShared>,
+    protocol: ProtocolKind,
+) -> std::io::Result<()> {
+    let mut buf = vec![0u8; RECV_BUF_CAP];
+    let mut read_buf: Vec<u8> = Vec::with_capacity(RECV_BUF_CAP * 2);
+    // If no AUTH is required, every conn is auto-authed; this matches the
+    // Linux worker's `authenticated = password.is_none()`.
+    let mut authed = shared.auth_password.is_none();
 
-fn worker_main(iocp: IocpHandle, stop: Arc<AtomicBool>) {
     loop {
-        let mut bytes_transferred: u32 = 0;
-        let mut completion_key: usize = 0;
-        let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
-
-        let ok = unsafe {
-            GetQueuedCompletionStatus(
-                iocp.0,
-                &mut bytes_transferred,
-                &mut completion_key,
-                &mut overlapped,
-                100, // 100ms timeout -> periodically check stop
-            )
+        let n = match stream.read(&mut buf) {
+            Ok(0) => return Ok(()), // graceful EOF
+            Ok(n) => n,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
         };
+        read_buf.extend_from_slice(&buf[..n]);
 
-        if completion_key == SHUTDOWN_KEY {
-            break;
-        }
-        if ok == 0 {
-            // Timeout or error.  Null overlapped == pure timeout.
-            if overlapped.is_null() {
-                if stop.load(Ordering::Acquire) {
+        // Drain as many complete frames as we can from the read buffer.
+        loop {
+            match protocol {
+                ProtocolKind::Resp => {
+                    let outcome = RespCodec::new().decode_command(&read_buf);
+                    match outcome {
+                        Ok(DecodeOutcome::NeedMore) => break,
+                        Ok(DecodeOutcome::Complete { consumed, value }) => {
+                            read_buf.drain(..consumed);
+                            let response = dispatch_resp(&mut authed, &shared, value);
+                            stream.write_all(&response)?;
+                        }
+                        Err(e) => {
+                            let err = format!("-ERR {e}\r\n").into_bytes();
+                            stream.write_all(&err)?;
+                            read_buf.clear();
+                            break;
+                        }
+                    }
+                }
+                ProtocolKind::Binary => {
+                    let outcome = BinaryProtocol::new().decode_request(&read_buf);
+                    match outcome {
+                        Ok(DecodeOutcome::NeedMore) => break,
+                        Ok(DecodeOutcome::Complete { consumed, value }) => {
+                            read_buf.drain(..consumed);
+                            let response = match validate_request(&value, &shared.limits) {
+                                Ok(()) => binary_client_response(dispatch_request(
+                                    &shared.mgr,
+                                    &shared.default_db,
+                                    &shared.default_table,
+                                    value,
+                                )),
+                                Err(e) => Response::Error(e),
+                            };
+                            let bytes = BinaryProtocol::new().encode_response(0, &response);
+                            stream.write_all(&bytes)?;
+                        }
+                        Err(_) => {
+                            // Bad frame — drop it and keep the conn alive.
+                            read_buf.clear();
+                            break;
+                        }
+                    }
+                }
+                ProtocolKind::Sql | ProtocolKind::Pg | ProtocolKind::Http => {
+                    // M4-M6: not yet supported on Windows.
+                    let err = b"-ERR not yet supported on Windows runtime\r\n".to_vec();
+                    stream.write_all(&err)?;
+                    read_buf.clear();
                     break;
                 }
-                continue;
-            }
-        }
-        if overlapped.is_null() {
-            continue;
-        }
-
-        let mut data = unsafe { Box::from_raw(overlapped as *mut OverlappedData) };
-        let socket = data.socket;
-        let buf = std::mem::take(&mut data.buf);
-        // Drop the original OverlappedData now; we pass a fresh one on repost.
-        drop(data);
-
-        if bytes_transferred == 0 {
-            // Graceful close.
-            unsafe { closesocket(socket) };
-            continue;
-        }
-
-        // Echo: write the received bytes back.  Allocate a fresh send data.
-        let send_data = OverlappedData::new_send(socket, &buf[..bytes_transferred as usize]);
-        unsafe { post_wsa_send(socket, send_data) };
-
-        // Repost the next WSARecv so the client can keep talking.
-        let recv_data = OverlappedData::new_recv(socket, 8 * 1024);
-        unsafe { post_wsa_recv(socket, recv_data) };
-    }
-}
-
-// ===========================================================================
-// Per-IO bookkeeping.  OVERLAPPED is the first field (required by Win32).
-// ===========================================================================
-
-struct OverlappedData {
-    overlapped: OVERLAPPED,
-    socket: SOCKET,
-    /// Buffer for the IO.  We hand the kernel a raw pointer into this Vec;
-    /// ownership transfers to the completion callback.
-    buf: Vec<u8>,
-}
-
-impl OverlappedData {
-    fn new_recv(socket: SOCKET, capacity: usize) -> *mut Self {
-        Box::into_raw(Box::new(Self {
-            overlapped: unsafe { std::mem::zeroed() },
-            socket,
-            buf: vec![0u8; capacity],
-        }))
-    }
-    fn new_send(socket: SOCKET, payload: &[u8]) -> *mut Self {
-        Box::into_raw(Box::new(Self {
-            overlapped: unsafe { std::mem::zeroed() },
-            socket,
-            buf: payload.to_vec(),
-        }))
-    }
-}
-
-// ===========================================================================
-// Post helpers
-// ===========================================================================
-
-/// # Safety
-/// `data` must be a valid pointer to a freshly-allocated `OverlappedData`
-/// and the buffer inside must remain live until the IO completes (we
-/// transfer ownership to the Box dropped in the worker).
-unsafe fn post_wsa_recv(socket: SOCKET, data: *mut OverlappedData) {
-    unsafe {
-        let mut bytes_recv: u32 = 0;
-        let mut flags: u32 = 0;
-        let data_ref = &mut *data;
-        let mut buf = windows_sys::Win32::Networking::WinSock::WSABUF {
-            len: data_ref.buf.len() as u32,
-            buf: data_ref.buf.as_mut_ptr(),
-        };
-        let rc = WSARecv(
-            socket,
-            &mut buf,
-            1,
-            &mut bytes_recv,
-            &mut flags,
-            &mut data_ref.overlapped,
-            None,
-        );
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(WSA_IO_PENDING) {
-                // Anything else: real error, drop the slot.
-                closesocket(socket);
-                drop(Box::from_raw(data));
             }
         }
     }
 }
 
-/// # Safety
-/// Same as `post_wsa_recv`.
-unsafe fn post_wsa_send(socket: SOCKET, data: *mut OverlappedData) {
-    unsafe {
-        let mut bytes_sent: u32 = 0;
-        let data_ref = &mut *data;
-        let mut buf = windows_sys::Win32::Networking::WinSock::WSABUF {
-            len: data_ref.buf.len() as u32,
-            buf: data_ref.buf.as_mut_ptr(),
-        };
-        let rc = WSASend(
-            socket,
-            &mut buf,
-            1,
-            &mut bytes_sent,
-            0,
-            &mut data_ref.overlapped,
-            None,
-        );
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(WSA_IO_PENDING) {
-                closesocket(socket);
-                drop(Box::from_raw(data));
+fn dispatch_resp(authed: &mut bool, shared: &ConnShared, cmd: RespCommand) -> Vec<u8> {
+    let c = RespCodec::new();
+    match cmd {
+        RespCommand::Auth { pass: supplied, .. } => {
+            *authed = shared
+                .auth_password
+                .as_ref()
+                .is_none_or(|p| p.as_bytes() == supplied.as_slice());
+            if *authed {
+                c.encode_ok()
+            } else {
+                c.encode_error("WRONGPASS invalid username-password pair")
             }
         }
+        _ if !*authed => c.encode_error("NOAUTH Authentication required."),
+        RespCommand::Ping(v) => v.map_or_else(|| c.encode_simple("PONG"), |v| c.encode_bulk(&v)),
+        RespCommand::Command => c.encode_empty_array(),
+        RespCommand::Set { key, value } => reply_resp(
+            &c,
+            dispatch_limited(shared, Request::Put { key, value }),
+        ),
+        RespCommand::Get { key } => reply_resp(
+            &c,
+            dispatch_limited(shared, Request::Get { key }),
+        ),
+        RespCommand::Del { keys } => {
+            let mut n = 0;
+            for key in keys {
+                if matches!(
+                    dispatch_limited(shared, Request::Delete { key }),
+                    Response::DeleteOk
+                ) {
+                    n += 1;
+                }
+            }
+            c.encode_integer(n)
+        }
+        other => c.encode_error(&format!("runtime_iocp does not yet support {other:?}")),
     }
 }
 
-// ===========================================================================
-// WSAStartup helper
-// ===========================================================================
+fn dispatch_limited(shared: &ConnShared, req: Request) -> Response {
+    validate_request(&req, &shared.limits)
+        .map_or_else(Response::Error, |_| {
+            dispatch_request(&shared.mgr, &shared.default_db, &shared.default_table, req)
+        })
+}
 
-fn wsa_startup() -> std::io::Result<()> {
-    use std::sync::Once;
-    static START: Once = Once::new();
-    START.call_once(|| {
-        unsafe {
-            let mut data = std::mem::zeroed();
-            let _ = windows_sys::Win32::Networking::WinSock::WSAStartup(
-                0x0202,
-                &mut data,
-            );
+fn reply_resp(c: &RespCodec, response: Response) -> Vec<u8> {
+    match response {
+        Response::PutOk | Response::DeleteOk => c.encode_ok(),
+        Response::Get(Some(v)) => c.encode_bulk(shard_manager::value_num::render(&v).as_ref()),
+        Response::Get(None) => c.encode_nil(),
+        Response::Error(e) => c.encode_error(&e),
+    }
+}
+
+fn binary_client_response(response: Response) -> Response {
+    match response {
+        Response::Get(Some(stored)) => {
+            Response::Get(Some(crate::value_codec::decode_value(&stored).1.to_vec()))
         }
-    });
-    Ok(())
+        other => other,
+    }
 }

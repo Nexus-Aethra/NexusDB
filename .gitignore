@@ -27,3 +27,5 @@ bench_tmp/
 .cargo/
 .linker/
 
+data-test/
+logs-test/
