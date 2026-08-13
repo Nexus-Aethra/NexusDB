@@ -267,12 +267,20 @@ fn run_conn(
         let n = match stream.read(&mut buf) {
             Ok(0) => return Ok(()), // graceful EOF
             Ok(n) => n,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::Interrupted {
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut => {
+                    // ⭐ Windows-only: when the listener is in
+                    // `set_nonblocking(true)` mode the accepted child
+                    // inherits a non-blocking flag (winsock quirk).  A
+                    // WouldBlock/TimedOut on read is normal back-pressure —
+                    // retry, do not close the conn.
+                    thread::sleep(Duration::from_millis(2));
                     continue;
                 }
-                return Err(e);
-            }
+                _ => return Err(e),
+            },
         };
         read_buf.extend_from_slice(&buf[..n]);
 
