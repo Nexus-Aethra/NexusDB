@@ -2,6 +2,7 @@
 // 职责: 各存储命令的 RMW/扫描/事务应用 (exec_incr/exec_append/exec_txn_apply/
 // exec_task_op 等), 操作 StorageEngine, 与 ShardManager 状态解耦.
 use crate::manager::block_on_io;
+use std::ops::ControlFlow;
 use storage::StorageEngine;
 
 pub(crate) fn exec_incr(
@@ -255,6 +256,114 @@ pub(crate) fn exec_row_put(
     }
 }
 
+/// ⭐ Phase Scan: 列出表内 String 类型 user keys (BTree 有序, 跨 leaf 游标).
+///
+/// 行为契约:
+/// - 只走 `[S][varint klen][user_key]` 前缀 (KEYSPACE::KIND_STRING), 不跨
+///   H/L/T/Z 复合结构 (与 HKEYS/SMEMBERS/LRANGE/ZRANGE 互不重叠).
+/// - `prefix` 为空 = 全表 string key; 非空 = user_key 字节序以此开头 (BTree
+///   物理 key 含 `[S][klen]` 公共前缀, 同长度 user_key 共享, 跨长度通过
+///   `split_string` 解析后再回退到 bytewise 前缀比较).
+/// - `with_values = true` 时按 user_key 逐个 `table_get_typed` 拉 stored value
+///   (含 type tag; 未知 key 返回 `None`, 与 HSet/HGetAll 的 (None) 区分).
+/// - `limit > 0` 时在 callback 内 `Break` 早停.
+/// ⭐ Phase Scan: 列出表内 String 类型 user keys (BTree 有序, 跨 leaf 游标).
+///
+/// 行为契约:
+/// - 只走 `[S][varint klen][user_key]` 前缀 (KEYSPACE::KIND_STRING), 不跨
+///   H/L/T/Z 复合结构 (与 HKEYS/SMEMBERS/LRANGE/ZRANGE 互不重叠).
+/// - 范围闭开 `[start, end)` (BTree 字节序): start 空 = 从头; end 空 = 到尾.
+/// - `prefix` 为空 = 不做前缀过滤; 非空 = user_key 必须以此前缀开头
+///   (BTree 物理 key 共享 `[S][klen]` 前缀, 跨长度由 `split_string` 剥出后回退
+///   到 user_key 字节序 starts_with 检查).
+/// - `with_values = true` 时按 user_key 逐个 `table_get` 拉 stored value
+///   (含 type tag; 未知 key 返回 `None`, 与 HSet/HGetAll 的 (None) 区分).
+/// - `limit > 0` 时在 callback 内 `Break` 早停.
+///
+/// **实现权衡**: 范围 / 前缀 / limit 都在 callback 内做 post-filter — BTree
+/// 不知道 user 提供的 `start` 对应的 varint klen 是什么, 物理 start 难拼; 用
+/// callback 过滤换来正确性. 几十到几百条规模下 cost 忽略; 大规模时可在
+/// `exec_scan_keys` 顶部按 `start` 长度构造物理 start, 跳到对应 leaf 起点.
+pub(crate) fn exec_scan_keys(
+    e: &mut StorageEngine,
+    db: &str,
+    table: &str,
+    start: &[u8],
+    end: &[u8],
+    prefix: &[u8],
+    limit: u32,
+    with_values: bool,
+) -> crate::request::BatchResult {
+    use crate::request::BatchResult;
+    // 1. open_table 找不到 → 空集 (与 table_get_typed 一致: 表不存在视为无 key).
+    let root = match block_on_io(e.open_table(db, table)) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return if with_values {
+                BatchResult::KeysWithValues(Vec::new())
+            } else {
+                BatchResult::Keys(Vec::new())
+            };
+        }
+        Err(err) => return BatchResult::Error(err.to_string()),
+    };
+
+    // 2. 物理扫描前缀 = `[KIND_STRING]`. 跨 leaf 游标由 btree_scan 处理.
+    //    范围 / 前缀 / limit 都在 callback 里做 post-filter (BTree 不知道 user
+    //    start 的 varint klen 是什么, 物理 start 难拼; 用 callback 过滤换来
+    //    正确性 — 几十到几百条规模下 cost 忽略).
+    let scan_prefix = [storage::keyspace::KIND_STRING];
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let scan_result = block_on_io(storage::registry::table_scan_prefix(
+        e.pager_mut(),
+        root,
+        &scan_prefix,
+        &mut |pkey, _stored| {
+            // 物理 = [S][varint klen][user_key], 剥前缀拿 user_key.
+            let Some(uk) = storage::keyspace::split_string(pkey) else {
+                return ControlFlow::Continue(());
+            };
+            // 范围闭开 [start, end):
+            // - start 空: 不做下界过滤; 非空: uk < start → 跳过.
+            // - end 空: 不做上界; 非空: uk >= end → 停 (BTree 后面可能还有更小的,
+            //   但本表 BTree 序保证 uk 之后只会 >= 当前 uk, 故安全 break).
+            if !start.is_empty() && uk < start {
+                return ControlFlow::Continue(());
+            }
+            if !end.is_empty() && uk >= end {
+                return ControlFlow::Break(());
+            }
+            // 前缀过滤 (post-filter).
+            if !prefix.is_empty() && !uk.starts_with(prefix) {
+                return ControlFlow::Continue(());
+            }
+            if limit > 0 && keys.len() >= limit as usize {
+                return ControlFlow::Break(());
+            }
+            keys.push(uk.to_vec());
+            ControlFlow::Continue(())
+        },
+    ));
+    if let Err(err) = scan_result {
+        return BatchResult::Error(err.to_string());
+    }
+
+    if !with_values {
+        return BatchResult::Keys(keys);
+    }
+
+    // 3. 逐 key 拉 stored value (含 type tag, 长度可能 0, 调用方按 tag 解释).
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(keys.len());
+    for k in &keys {
+        match block_on_io(e.table_get(db, table, k)) {
+            Ok(Some(v)) => out.push((k.clone(), v)),
+            Ok(None) => out.push((k.clone(), Vec::new())), // 与"扫到但被并发删"区分
+            Err(err) => return BatchResult::Error(err.to_string()),
+        }
+    }
+    BatchResult::KeysWithValues(out)
+}
+
 /// ⭐ Q5: IndexScan — shard 内闭环 "本地索引扫 → 本地回表" (禁止两跳).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_index_scan(
@@ -487,6 +596,16 @@ pub(crate) fn exec_task_op(
                 })
                 .collect(),
         ),
+        // ⭐ Phase Scan: 列出 String user keys (跨 shard 由 ShardManager::scan 归并)
+        crate::request::BatchOp::ScanKeys {
+            ref db,
+            ref table,
+            ref start,
+            ref end,
+            ref prefix,
+            limit,
+            with_values,
+        } => exec_scan_keys(e, db, table, start, end, prefix, limit, with_values),
         // ⭐ Phase H: Hash ops (单 key 单 shard, 无需聚合)
         crate::request::BatchOp::HSet {
             ref db,

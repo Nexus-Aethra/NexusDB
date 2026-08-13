@@ -273,6 +273,30 @@ pub enum BatchOp {
         table: std::sync::Arc<str>,
         iids: Vec<u32>,
     },
+    /// ⭐ Phase Scan: 列出表中 String 类型 keys — 仅 STRING 前缀, 不跨复合结构.
+    ///
+    /// **范围语义** (BTree 有序字节序, 闭开区间 `[start, end)`):
+    /// - `start` 空 = 从头扫; 非空 = 从 `start` 之后第一个 key 开始 (`start` 本身可能命中).
+    /// - `end` 空 = 一直扫到表尾; 非空 = 命中 `end` 即 `Break` 早停 (exclusive).
+    /// - `prefix` 空 = 不做前缀过滤; 非空 = user_key 必须以此开头 (首遇非 prefix 即 `Break`,
+    ///   配合 range 用法可实现"p 开头到 q 之前"的开闭区间).
+    /// - 三者可任意组合: `(start=, end=)` = 全表; `(start=b, end=d)` = b..d;
+    ///   `(prefix=use, end=usr)` = use..usr 闭开 (BTree 序保证).
+    ///
+    /// `limit` = 0 = 不限; 否则本地 limit 条 (跨 shard 各自 limit, 合并后截断).
+    /// `with_values` = true: 同时取回每个 key 的 stored value (含 type tag).
+    ///
+    /// 故意只扫 STRING 区域, 与 HKEYS / SMEMBERS / LRANGE / ZRANGE 互不重叠,
+    /// 嵌入式 list 场景下不会把 hash 字段、set 成员误报为顶级 key.
+    ScanKeys {
+        db: std::sync::Arc<str>,
+        table: std::sync::Arc<str>,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        prefix: Vec<u8>,
+        limit: u32,
+        with_values: bool,
+    },
     // ---- ⭐ Phase H: Hash (全部单 key 路由, 一个 hash 的所有 field 同 shard) ----
     /// HSET 多 field: 返回新增 field 数 (Integer). value 带 tag.
     HSet {
@@ -838,6 +862,8 @@ impl BatchOp {
             EstimateDistinct { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ M3-5: min/max 估计广播 op, 不走路由
             EstimateRanges { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
+            // ⭐ Phase Scan: 广播 op, 不走路由 (与 IndexScan 同模式)
+            ScanKeys { db, table, .. } => (db.as_ref(), table.as_ref(), &[]),
             // ⭐ 事务批: 取第一个 op 的 locator (组内同 shard, 仅兼容用;
             // ensure_table 在 shard 端逐 op 处理)
             TxnApply { ops, .. } => ops.first().map(|o| o.locator()).unwrap_or(("", "", &[])),
@@ -950,6 +976,8 @@ impl BatchOp {
             EstimateDistinct { .. } => None,
             // ⭐ M3-5: min/max 估计无 key
             EstimateRanges { .. } => None,
+            // ⭐ Phase Scan: 列表/前缀扫描, 无单 key (整表广播)
+            ScanKeys { .. } => None,
             // ⭐ X2: schema op 无 key
             SetSchemaOp { .. } | GetSchemaOp { .. } => None,
             TxnApply { .. } => None,
@@ -1028,6 +1056,11 @@ pub enum BatchResult {
     DistinctCounts(Vec<u64>),
     /// ⭐ M3-5 (CBO): 索引列 (min, max) 有序字节 (EstimateRanges 响应, 与 iids 同序).
     RangeBounds(Vec<RangeBound>),
+    /// ⭐ Phase Scan: 仅 user keys (无 type tag, 直接是 application bytes, 升序).
+    Keys(Vec<Vec<u8>>),
+    /// ⭐ Phase Scan: (user_key, stored_value_with_tag) — tag 由调用方按
+    /// `value_num::is_known_tag` 解释; 未知 tag 时首字节非已知 tag, payload 紧随其后.
+    KeysWithValues(Vec<(Vec<u8>, Vec<u8>)>),
     Error(String),
 }
 

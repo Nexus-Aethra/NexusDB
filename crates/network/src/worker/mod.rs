@@ -649,6 +649,8 @@ fn batch_result_to_response(result: &BatchResult) -> Response {
         BatchResult::RowCount(_) => Response::PutOk, // M3-2 行数估计不走 Binary
         BatchResult::DistinctCounts(_) => Response::PutOk, // M3-4 distinct 不走 Binary
         BatchResult::RangeBounds(_) => Response::PutOk, // M3-5 min/max 不走 Binary
+        // ⭐ Phase Scan: 列表扫描只暴露给嵌入式 API, Binary 门面不会触发
+        BatchResult::Keys(_) | BatchResult::KeysWithValues(_) => Response::PutOk,
         BatchResult::GetValue(None) => Response::Get(None),
         BatchResult::GetValue(Some(stored)) => {
             let (_tag, payload) = decode_value(stored);

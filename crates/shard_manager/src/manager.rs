@@ -534,6 +534,94 @@ impl ShardManager {
         Ok(merged)
     }
 
+    /// ⭐ Phase Scan: 列出表内 String user keys (跨 shard 归并, 升序).
+    ///
+    /// **范围闭开 `[start, end)`** (BTree 字节序):
+    /// - `start` 空 = 从头; 非空 = 从 `start` 之后第一个 key 开始 (`start` 本身可能命中).
+    /// - `end` 空 = 一直扫到表尾; 非空 = 命中 `end` 即停 (exclusive).
+    /// - `prefix` 空 = 不做前缀过滤; 非空 = user_key 字节序以此开头.
+    /// - 三者独立, 可任意组合 (e.g. `start=b, end=d, prefix=` 拿 b..d 全部).
+    /// - `limit` = 0: 不限; > 0: 全局至多 `limit` 条.
+    /// - 任一 shard 报错即整体报错.
+    pub fn scan(
+        &self,
+        db: &str,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        prefix: &[u8],
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let v = self.scan_with_values(db, table, start, end, prefix, limit)?;
+        Ok(v.into_iter().map(|(k, _)| k).collect())
+    }
+
+    /// ⭐ Phase Scan: 同 `scan`, 但同时返回每个 key 的 stored value (含 type tag).
+    /// 调用方按 `value_num::is_known_tag` + tag 常量解释, 未知 tag 时降级为 raw bytes.
+    ///
+    /// **重要**: `value` 是 stored bytes (含 type tag), 解释时先看首字节:
+    /// - `TAG_RAW` (0x01) → 后续 bytes 即 payload
+    /// - `TAG_I64` (0x02) + 长度 9 → 后 8B LE
+    /// - `TAG_F64` (0x03) + 长度 9 → 后 8B LE
+    /// - `TAG_F32` (0x06) + 长度 5 → 后 4B LE
+    /// - 其它 tag: 跳过首字节, payload 为 `value[1..]`
+    pub fn scan_with_values(
+        &self,
+        db: &str,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        prefix: &[u8],
+        limit: u32,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        // 每 shard 单独一份 ScanKeys (各自 limit 下推, 归并后全局截断).
+        let mut futures = Vec::with_capacity(self.num_shards);
+        for shard in &self.shards {
+            let (tx, fut) = PendingReply::new();
+            let op = BatchOp::ScanKeys {
+                db: std::sync::Arc::from(db),
+                table: std::sync::Arc::from(table),
+                start: start.to_vec(),
+                end: end.to_vec(),
+                prefix: prefix.to_vec(),
+                limit,
+                with_values: true,
+            };
+            shard.inbox.push_spin(ShardRequest::Batch {
+                ops: vec![op],
+                req_id: 0,
+                reply: tx,
+            });
+            futures.push(fut);
+        }
+        // 各 shard 局部有序, 跨 shard concat + sortby = 全局升序 (shard 数小, 足够便宜).
+        // 同 key 可能在路由变更时被两个 shard 同时持有 — 用 HashSet 去重 (罕见; 简单可靠).
+        let mut merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for fut in futures {
+            match block_on_v2(fut) {
+                Ok(ShardReply::BatchResults(mut rs)) => match rs.pop() {
+                    Some(BatchResult::KeysWithValues(mut pairs)) => {
+                        for (k, v) in pairs.drain(..) {
+                            if seen.insert(k.clone()) {
+                                merged.push((k, v));
+                            }
+                        }
+                    }
+                    Some(BatchResult::Error(e)) => return Err(e),
+                    _ => return Err("unexpected scan result".to_string()),
+                },
+                Ok(_) => return Err("unexpected reply".to_string()),
+                Err(kind) => return Err(format!("{kind:?}")),
+            }
+        }
+        merged.sort_by(|a, b| a.0.cmp(&b.0));
+        if limit > 0 {
+            merged.truncate(limit as usize);
+        }
+        Ok(merged)
+    }
+
     /// 内部实现: 按 shard 分组 → 每 shard 一次 push + block_on → 重组结果.
     fn batch_ops_inner(&self, ops: &[BatchOp]) -> Vec<BatchResult> {
         if ops.is_empty() {
@@ -736,6 +824,147 @@ impl ShardManager {
                 Err(kind) => Err(ShardError::from_kind(kind)),
             }
         })
+    }
+
+    /// ⭐ Phase Scan (async): 同 `scan` 但非阻塞.
+    ///
+    /// 跨 shard 走 fan-out + 并发 await + 归并排序. 任一 shard 报错即整体报错
+    /// (第一个错误返错, 其余 reply 被丢弃; 不阻塞业务后续操作).
+    pub async fn scan_async(
+        &self,
+        db: &str,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        prefix: &[u8],
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let v = self
+            .scan_with_values_async(db, table, start, end, prefix, limit)
+            .await?;
+        Ok(v.into_iter().map(|(k, _)| k).collect())
+    }
+
+    /// ⭐ Phase Scan (async): 同 `scan_with_values` 但非阻塞.
+    pub async fn scan_with_values_async(
+        &self,
+        db: &str,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        prefix: &[u8],
+        limit: u32,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        use std::sync::Arc;
+        // 每 shard 一份 ScanKeys, 并发 push, 并发 await.
+        let mut futures = Vec::with_capacity(self.num_shards);
+        for shard in &self.shards {
+            let (tx, fut) = PendingReply::new();
+            let op = BatchOp::ScanKeys {
+                db: Arc::from(db),
+                table: Arc::from(table),
+                start: start.to_vec(),
+                end: end.to_vec(),
+                prefix: prefix.to_vec(),
+                limit,
+                with_values: true,
+            };
+            shard.inbox.push_spin(ShardRequest::Batch {
+                ops: vec![op],
+                req_id: 0,
+                reply: tx,
+            });
+            futures.push(fut);
+        }
+        // 并发 await 所有 shard.
+        let mut merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for fut in futures {
+            match fut.await {
+                Ok(ShardReply::BatchResults(mut rs)) => match rs.pop() {
+                    Some(BatchResult::KeysWithValues(mut pairs)) => {
+                        for (k, v) in pairs.drain(..) {
+                            if seen.insert(k.clone()) {
+                                merged.push((k, v));
+                            }
+                        }
+                    }
+                    Some(BatchResult::Error(e)) => return Err(e),
+                    _ => return Err("unexpected scan result".to_string()),
+                },
+                Ok(other) => {
+                    return Err(format!("unexpected reply: {other:?}"));
+                }
+                Err(kind) => return Err(format!("{kind:?}")),
+            }
+        }
+        merged.sort_by(|a, b| a.0.cmp(&b.0));
+        if limit > 0 {
+            merged.truncate(limit as usize);
+        }
+        Ok(merged)
+    }
+
+    /// ⭐ Batch (async): 同 `batch_ops` 但非阻塞 — 每个 op 单独路由 + 并发 await.
+    ///
+    /// 返回 `Vec<BatchResult>` 顺序与输入 `ops` 一致. 任一 op 报错, 该位置是
+    /// `BatchResult::Error`, 其它位置仍正常返回 (不像 `scan_async` 整批返错;
+    /// 单 op 隔离, 与 `batch_ops` 同步行为一致).
+    pub async fn batch_ops_async(&self, ops: Vec<BatchOp>) -> Vec<BatchResult> {
+        if ops.is_empty() {
+            return Vec::new();
+        }
+        // 按 shard 分组, 同时记录 (shard_id, orig_index) 重组回输入序.
+        let mut grouped: Vec<Vec<(usize, BatchOp)>> = vec![Vec::new(); self.num_shards];
+        for (i, op) in ops.iter().enumerate() {
+            let (db, table, key) = op.locator();
+            let shard_id = self.route_db_table_key(db, table, key);
+            grouped[shard_id].push((i, op.clone()));
+        }
+        // 准备 per-shard 异步 reply — push 后等所有回复合并.
+        let mut shard_futures: Vec<(Vec<usize>, _)> = Vec::new();
+        for (shard_id, group) in grouped.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let (tx, fut) = PendingReply::new();
+            let batch_ops: Vec<BatchOp> = group.iter().map(|(_, op)| op.clone()).collect();
+            let orig_indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+            self.shards[shard_id].inbox.push_spin(ShardRequest::Batch {
+                ops: batch_ops,
+                req_id: 0,
+                reply: tx,
+            });
+            shard_futures.push((orig_indices, fut));
+        }
+        // 并发 await — 每个 shard 一次 Batch 回复含该 shard 内全部 op 的 results,
+        // 按 orig_indices 顺序还原到原数组.
+        let mut results: Vec<BatchResult> = (0..ops.len())
+            .map(|_| BatchResult::Error("pending".into()))
+            .collect();
+        for (orig_indices, fut) in shard_futures {
+            match fut.await {
+                Ok(ShardReply::BatchResults(rs)) => {
+                    // rs 顺序与 push 时的 ops 顺序一致, 也就是 group 顺序.
+                    for (slot, result) in orig_indices.iter().zip(rs.into_iter()) {
+                        results[*slot] = result;
+                    }
+                }
+                Ok(other) => {
+                    let err = BatchResult::Error(format!("unexpected reply: {other:?}"));
+                    for slot in orig_indices {
+                        results[slot] = err.clone();
+                    }
+                }
+                Err(kind) => {
+                    let err = BatchResult::Error(format!("{kind:?}"));
+                    for slot in orig_indices {
+                        results[slot] = err.clone();
+                    }
+                }
+            }
+        }
+        results
     }
 
     // =================================================================

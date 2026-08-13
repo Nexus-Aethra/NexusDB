@@ -712,6 +712,18 @@ pub(crate) fn shard_thread_main(
                                             .collect(),
                                     )
                                 }
+                                // ⭐ Phase Scan: 列出 String user keys (跨 shard 由 ShardManager::scan 归并)
+                                BatchOp::ScanKeys {
+                                    db,
+                                    table,
+                                    start,
+                                    end,
+                                    prefix,
+                                    limit,
+                                    with_values,
+                                } => {
+                                    exec_scan_keys(e, &db, &table, &start, &end, &prefix, limit, with_values)
+                                }
                                 // ⭐ F65: 占坑 op (管理面兼容; 热路径走 ShardTask → exec_task_op)
                                 op @ (BatchOp::ReserveUnique { .. }
                                 | BatchOp::StealUnique { .. }
