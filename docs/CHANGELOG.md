@@ -10,6 +10,71 @@
 
 ---
 
+## 2026-08-13 会话二十四 (F84 嵌入式 API 扩展 — 类型感知 + 列表/范围扫描 + 完整 async 对齐)
+
+嵌入式 KV API 第二阶段, 在 P1/P2 落地的基础上 (`NexusDb`/`Database`/`Table` + 同步/异步 `set/get/del` + 批量) 补齐生产场景真正常用的三类能力, 并把现有方法的 async 对齐补全。**零新外部依赖, 零存储引擎改动** — 全部基于 storage 已有的 `table_scan_prefix` / `table_scan_range` (BTree 范围扫描) + `value_num` 类型 tag 体系。
+
+### 1. `TypedValue` 强类型 value 解释器
+- 公开 `enum TypedValue { Raw/Int/Float/Float32/Str/Doc/Unknown }` (位置在 `src/lib.rs`), 业务侧拿到强类型 Rust 值, 不必关心内部 type tag 字节
+- `as_i64()` / `as_f64()` (兼容 `Float32` 无损提升) / `as_bytes()` (Raw + Str) / `type_name()` (debug 用) / `raw_bytes()` (含 tag, 自行解释用)
+- `decode_typed(stored_bytes)` 容错: 未知 tag / 长度异常 / 空 stored 全部走 `Unknown`, 不 panic
+- `Table::get_typed(key) -> Option<TypedValue>`: 单点类型感知 get
+- 同一表内可混合 raw + int + float (业务用 `set` 写字符串, 通过 network 层 INCR 改写为 int tag), 解释器按实际存储 tag 各自解释
+
+### 2. 列表/范围扫描 (`Table::list*` / `list_typed*` 系列)
+- 底层新增 `BatchOp::ScanKeys { db, table, start, end, prefix, limit, with_values }` + `BatchResult::Keys(Vec<Vec<u8>>)` / `KeysWithValues(Vec<(Vec<u8>, Vec<u8>)>)`
+- 走 `storage::registry::table_scan_prefix` (BTree 范围扫描) 走完所有 leaf, callback 剥 `[S][varint klen][user_key]` 物理前缀拿 user_key
+- **故意只扫 `[KIND_STRING]` 区域** — 与 HKEYS/SMEMBERS/LRANGE/ZRANGE 互不重叠, 不会把 hash field 或 set member 误报为顶级 key
+- shard 端实现 `exec_scan_keys` (跨 leaf 游标 + 范围闭开 `[start, end)` + 前缀过滤 + limit 早停)
+- `ShardManager::scan / scan_with_values` 跨 shard fan-out + 各 shard 局部有序 + 全局 sort + HashSet 去重 (路由变更兜底)
+- `Table` 公开同步方法 9 个 + async 对应 9 个:
+  - `list / list_prefix / list_limit`
+  - `list_range(start, end, limit)` — 范围闭开
+  - `list_range_prefix(start, end, prefix, limit)` — 范围 + 前缀
+  - `list_typed / list_typed_limit / list_typed_range / list_typed_range_prefix` — 上述各方法的类型感知版本
+  - 全部带 `*_async` (共 9 个 scan/range 异步方法)
+- 顺带补 `set_many_async / get_many_async / get_many_typed_async / get_typed_async` 4 个 async (同步版 batch + 1 个 type-aware 早已有)
+- **典型用法**: "列一组 name + 查每个 id" 单次往返: `for (name, typed) in table.list_typed()? { let id = typed.as_bytes()?; }`
+- **范围语义**: BTree 字节序闭开 `[start, end)`; start/end 各自可空; start 不在表内也正确 (e.g. `[bb, d)` over `[a,b,c,d,e]` → `[c]`); start == end = 空范围; 范围 + 前缀独立可组合
+
+### 3. 完整 async 对齐
+- `ShardManager` 加 3 个 async 原语: `scan_async` / `scan_with_values_async` / `batch_ops_async` (跨 shard fan-out + 并发 await + 归并)
+- `Table` 加 11 个 async 方法: `get_typed_async` / `set_many_async` / `get_many_async` / `get_many_typed_async` + 9 个 list/range/list_typed 的 `*_async` 对应
+- async 版 `set_many_async` / `get_many_async` 跟同步版签名一致, 返回 `Vec<Result>` 与输入同序, 业务侧可定位单条失败
+- 内部走 `std::future::Future`, 业务侧可选 tokio / async-std / pollster 任意 runtime
+- **Table 方法盘点**: 同步 15 个 (3 KV 基础 + 2 批量 + 1 type-aware `get_typed` + 9 scan/range 含 4 个 list_typed) + 异步 16 个 (3 KV 基础 + 3 批量含 `get_many_typed_async` + 1 `get_typed_async` + 9 scan/range) = 31 个全部 sync/async 双轨
+
+### 4. 文档同步
+- `README.md` Embedded Library 节扩写, 列出 4 大类能力 (point/batch/typed/scan)
+- `docs/EMBEDDED-KV.md` 重写, 加 "Listing and range scans" + "Type-aware reads" 两节, 含完整方法表 + 范围语义 + async 提及
+- `docs/plans/2026-08-13-embedded-kv-api.md` 追加 P3 "Scan + Typed 扩展" 节
+
+### 测试快照
+- 全 workspace **862 → 867** (+5 NexusDB lib 测试, scan/typed/async 各覆盖 1+ 测试)
+- nexusdb lib: 6 → 11 (新增 `scan_list_basic_and_prefix_and_limit` / `scan_list_typed_mixed_types` / `scan_list_does_not_leak_composite_members` / `scan_list_range_basic` / `scan_list_range_with_prefix` / `scan_list_typed_range_mixed_types` / `async_api_parity_with_sync` / `async_cross_shard_correctness`)
+- 既有 storage 182 / shard_manager 32 / network 77 全部回归 0 failed, clippy 0
+- 新增 `examples/embedded_scan.rs` (同步) + `examples/embedded_scan_async.rs` (异步), `cargo run --example` 实机通
+
+### 边界 (v1)
+- **范围 / 前缀 / limit 全是 callback post-filter**: 底层 `table_scan_range` 的物理 `start` 需要 `[S][varint klen][user_start]`, 但 user 提供的 start 对应 varint klen 不确定, 无法精确构造物理 start; 用 callback 过滤换来正确性, 几十到几百条规模下 cost 忽略, 大量数据 (10w+) 留 v2 加 "smart physical start" 优化
+- **scan 不跨 hash/set/list/zset 复合结构** — 故意, 避免误报; 业务需要的话走 RESP 命令
+- **混合类型 (raw + int) 当前阶段只能通过 network 层 INCR 触发** — 嵌入式 API 的 `set` 永远写 `TAG_RAW`; 想要嵌入式直写 int/float 留 v2
+- **类型感知对未知 tag 走 `Unknown` 不 silent 强转** — 业务侧 `raw_bytes()` 自行解释; TAG_STR 非 UTF-8 也走 `Unknown`
+- **async list 不分页 / 不流式** — 一次拿 `Vec<Vec<u8>>`; 大量数据分页用 `list_range(start, end, limit)` 多次调用
+
+### 跟 F1-F83 的衔接
+- F1-F41 修复历史: 跳过 (无新修复)
+- F42-F47 复合结构体系: hash/set/list/zset 仍仅 RESP 暴露, 嵌入式 API 不透出
+- F48 分库分表: 嵌入式 API 复用 `EmbeddedOptions::num_shards` + `ensure_database` (与 RESP 共享底层 DbDirView)
+- F50-F55 SQL 索引: 不影响 (SQL 门面专属)
+- F60 WAL: 透明 (嵌入式层用 `EmbeddedIoBackend::StdFs` 走 stdfs, WAL 仍由 `wal_mode` 配置)
+- F61 事务: 不影响 (嵌入式层 v1 无事务 API; 需要业务层自己组合 `set_many` + `get_many`)
+- F80-F83 数据类型 + 认证 + TLS: 不影响 (SQL 协议层专属)
+
+---
+
+## 2026-08-13 会话二十三 (根目录文档归类: AGENTS/CHANGELOG/DESIGN → docs/)
+
 ## 2026-08-13 会话二十三 (根目录文档归类: AGENTS/CHANGELOG/DESIGN → docs/)
 
 动机: 根目录除了 `README.md` / `README-CN.md` 还剩 `AGENTS.md` / `CHANGELOG.md` / `DESIGN.md` 三个项目级 md, 跟用户/开发两类读者都相关但没归类到一起。统一搬到 `docs/` 下, 仓库根只留面向用户的两份 README。
