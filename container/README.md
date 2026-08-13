@@ -41,4 +41,4 @@ docker run -d --name nexusdb \
 - **首选**: `run.sh` 已自动加 `--security-opt seccomp=unconfined` + `--cap-add SYS_ADMIN`(io_uring_register 需要)
 - **备选**: 改用 `container/docker-stdfs.toml`(标准文件 IO, 任何内核都跑)
 
-详细历史: 仓库根 [`AGENTS.md`](../AGENTS.md) 的服务化章节 + [`CHANGELOG.md`](../CHANGELOG.md) io_uring 调试记录。
+详细历史: [`docs/AGENTS.md`](../docs/AGENTS.md) 的服务化章节 + [`docs/CHANGELOG.md`](../docs/CHANGELOG.md) io_uring 调试记录。

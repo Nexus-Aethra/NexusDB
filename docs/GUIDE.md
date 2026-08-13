@@ -2,7 +2,7 @@
 
 > **语言 / Language**: **English** | [简体中文](./GUIDE-CN.md)
 
-> A user-facing getting-started guide. For design & implementation details see [`DESIGN.md`](../DESIGN.md); for fix/evolution history see [`CHANGELOG.md`](../CHANGELOG.md).
+> A user-facing getting-started guide. For design & implementation details see [`DESIGN.md`](./DESIGN.md); for fix/evolution history see [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## Table of Contents
 1. [What It Is](#1-what-it-is)
@@ -442,4 +442,4 @@ Delivered but with v1 limitations — keep in mind when evaluating/using:
 - **JSON**: text storage, single row < 64KB, no JSON path index.
 - **Time**: unified naive UTC, no timezone conversion.
 
-> Full gap list: the "SQL gap" section of [`README.md`](../README.md) and [`CHANGELOG.md`](../CHANGELOG.md).
+> Full gap list: the "SQL gap" section of [`README.md`](../README.md) and [`CHANGELOG.md`](./CHANGELOG.md).

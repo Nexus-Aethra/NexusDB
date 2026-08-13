@@ -18,7 +18,7 @@
 
 核心上它兼具**写密集友好的架构**(Share-Nothing + per-core thread + io_uring 异步 I/O + 自研协程调度器, 不依赖 tokio)、**完整的 SQL 子集**(JOIN / 子查询 / 聚合 / GROUP BY / 事务)与 **Redis 数据结构**并存, 以及**生产级可靠性**(崩溃恢复、WAL 持久、860+ 测试、clippy 0 警告)。
 
-> 设计架构见 [DESIGN.md](./DESIGN.md); 接手 / 进度 见 [AGENTS.md](./AGENTS.md); 修复历史 见 [CHANGELOG.md](./CHANGELOG.md).
+> 设计架构见 [docs/DESIGN.md](./docs/DESIGN.md); 接手 / 进度 见 [docs/AGENTS.md](./docs/AGENTS.md); 修复历史 见 [docs/CHANGELOG.md](./docs/CHANGELOG.md).
 >
 > 📖 **使用者上手指南 (功能介绍 + 各驱动接入 + SQL/类型/安全示例 + 性能): [docs/GUIDE-CN.md](./docs/GUIDE-CN.md)**
 
@@ -310,7 +310,7 @@ Windows 上未测。M2 用每连接 `std::thread`, 适合开发 + 单机 demo。
 - **顺序不变量**: data chunk 写盘确认 → meta window 写盘 → pid.state 三段闭环, 任何一段失败均可重试
 - **GC 与大 value**: 见下两节
 
-完整分节: [DESIGN.md](./DESIGN.md) (10 节).
+完整分节: [docs/DESIGN.md](./docs/DESIGN.md) (10 节).
 
 ### 平台依赖
 
@@ -408,7 +408,7 @@ Overflow 数据页:
 | **MySQL (wire)** | **5434** | ✅ SQL 子集 | **mysql cli 直连** + `mysql_native_password` / `caching_sha2_password` fast-auth 登录 + **TLS (opt-in)**; 语法见下方 SQL 门面节 |
 | **PostgreSQL (wire)** | **5435** | ✅ SQL 子集 | **psql 直连** + **SCRAM-SHA-256 认证** + **TLS (opt-in, SSLRequest→'S')**; 与 MySQL 门面**共内核**, 同库互读写 |
 | Binary (自研) | 5433 | ⚠️ 内部 | 内部协议 (测试/压测工具); 对外接入请用 REST/RESP/SQL 门面, 后续版本默认禁用 |
-| MongoDB (BSON) | - | 🚧 设计路线 | 见 [DESIGN.md §10](./DESIGN.md) |
+| MongoDB (BSON) | - | 🚧 设计路线 | 见 [docs/DESIGN.md §10](./docs/DESIGN.md) |
 
 ### RESP 命令面 (2026-07-28)
 
@@ -620,7 +620,7 @@ redis-cli -p 6379 -x SET bigkey < /dev/urandom   # 1024B..1MB 自动溢出
 redis-cli -p 6379 GET bigkey                     # 字节一致回
 ```
 
-调试技巧与 gotchas 见 [AGENTS.md](./AGENTS.md).
+调试技巧与 gotchas 见 [docs/AGENTS.md](./docs/AGENTS.md).
 
 ---
 
@@ -630,7 +630,7 @@ redis-cli -p 6379 GET bigkey                     # 字节一致回
 |---|---|
 | 启动报 `permission denied` / `disk full` | `block_root` 路径权限 / 磁盘空间; 检查 [config/nexusdb.toml](./config/nexusdb.toml) `[storage].block_root` |
 | 启动 hang 在 io_uring 初始化 | 容器 / 沙箱无 io_uring 支持; 改 `io_backend = "stdfs"` 临时规避 |
-| `RST_STREAM` 长尾突增 | 网络层 TCP_NODELAY 注意事项; 见 [AGENTS.md](./AGENTS.md) |
+| `RST_STREAM` 长尾突增 | 网络层 TCP_NODELAY 注意事项; 见 [docs/AGENTS.md](./docs/AGENTS.md) |
 | p99 突刺 ~ ms 级 | 多为磁盘 fsync 排队; 切换 NVMe / `NLOG_PROBE=1` 拿探针对照 |
 | 大 value GET 拿到 `ERR ... value too long` | payload 超过 `max_value_bytes` (默认 1 MB); 检查 [config/nexusdb.toml](./config/nexusdb.toml) 或 `client->server` 中 |
 | p99 从 3 ms 跳到 6 ms | 多为 in-flight 8 触顶退化同步写; 降 `[storage].num_shards` 或升 SSD |
@@ -661,9 +661,9 @@ redis-cli -p 6379 GET bigkey                     # 字节一致回
 | 读者 | 文档 |
 |---|---|
 | 评估 / 第一天 | 本 README |
-| 架构理解 | [DESIGN.md](./DESIGN.md) (10 节) |
-| 接手开发 (进度 / gotchas / 待办) | [AGENTS.md](./AGENTS.md) |
-| 修复历史 (F1-F…) | [CHANGELOG.md](./CHANGELOG.md) |
+| 架构理解 | [docs/DESIGN.md](./docs/DESIGN.md) (10 节) |
+| 接手开发 (进度 / gotchas / 待办) | [docs/AGENTS.md](./docs/AGENTS.md) |
+| 修复历史 (F1-F…) | [docs/CHANGELOG.md](./docs/CHANGELOG.md) |
 | 活跃计划、故障报告与历史实施记录 | [文档索引](./docs/README.md) |
 | Bug 根因调查示例 | [`docs/bug-report-btree-split-routing.md`](./docs/bug-report-btree-split-routing.md) |
 

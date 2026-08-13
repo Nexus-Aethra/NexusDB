@@ -2,7 +2,7 @@
 
 > **语言 / Language**: [English](./GUIDE.md) | **简体中文**
 
-> 面向使用者的上手指南。设计与实现细节见 [`DESIGN.md`](../DESIGN.md);修复/演进历史见 [`CHANGELOG.md`](../CHANGELOG.md)。
+> 面向使用者的上手指南。设计与实现细节见 [`DESIGN.md`](./DESIGN.md);修复/演进历史见 [`CHANGELOG.md`](./CHANGELOG.md)。
 
 ## 目录
 1. [这是什么](#1-这是什么)
@@ -453,4 +453,4 @@ default_table = "default"
 - **JSON**:文本存储,单行 < 64KB,不建 JSON 路径索引。
 - **时间**:统一 UTC 裸值,无时区转换。
 
-> 完整 gap 清单见 [`README-CN.md`](../README-CN.md) 的 "SQL gap" 段与 [`CHANGELOG.md`](../CHANGELOG.md)。
+> 完整 gap 清单见 [`README-CN.md`](../README-CN.md) 的 "SQL gap" 段与 [`CHANGELOG.md`](./CHANGELOG.md)。

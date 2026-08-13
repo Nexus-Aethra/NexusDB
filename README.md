@@ -18,7 +18,7 @@
 
 At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + per-core thread + io_uring async I/O + a hand-written coroutine scheduler, no tokio), a **complete SQL subset** (JOIN / subqueries / aggregation / GROUP BY / transactions) coexisting with **Redis data structures**, and **production-grade reliability** (crash recovery, WAL durability, 860+ tests, clippy 0 warnings).
 
-> Architecture: [DESIGN.md](./DESIGN.md) · handoff / progress: [AGENTS.md](./AGENTS.md) · fix history: [CHANGELOG.md](./CHANGELOG.md)
+> Architecture: [docs/DESIGN.md](./docs/DESIGN.md) · handoff / progress: [docs/AGENTS.md](./docs/AGENTS.md) · fix history: [docs/CHANGELOG.md](./docs/CHANGELOG.md)
 >
 > 📖 **User getting-started guide (features + per-driver access + SQL/type/security examples + performance): [docs/GUIDE.md](./docs/GUIDE.md)**
 
@@ -327,7 +327,7 @@ Key design points:
 - **Ordering invariant**: data chunk write confirmed → meta window write → pid.state, a three-stage closed loop; any stage can be retried on failure.
 - **GC & large values**: see the two sections below.
 
-Full breakdown: [DESIGN.md](./DESIGN.md) (10 sections).
+Full breakdown: [docs/DESIGN.md](./docs/DESIGN.md) (10 sections).
 
 ### Platform dependencies
 
@@ -425,7 +425,7 @@ Implementation: [`crates/storage/src/overflow.rs`](./crates/storage/src/overflow
 | **MySQL (wire)** | **5434** | ✅ SQL subset | **`mysql` CLI direct connect** + `mysql_native_password` / `caching_sha2_password` fast-auth login + **TLS (opt-in)**; syntax in the SQL facade section below |
 | **PostgreSQL (wire)** | **5435** | ✅ SQL subset | **`psql` direct connect** + **SCRAM-SHA-256 auth** + **TLS (opt-in, SSLRequest→'S')**; **shares the kernel** with MySQL facade, same-db read/write |
 | Binary (custom) | 5433 | ⚠️ Internal | internal protocol (test/bench tools); use REST/RESP/SQL for external access, disabled by default in future versions |
-| MongoDB (BSON) | - | 🚧 Roadmap | see [DESIGN.md §10](./DESIGN.md) |
+| MongoDB (BSON) | - | 🚧 Roadmap | see [docs/DESIGN.md §10](./docs/DESIGN.md) |
 
 ### RESP command surface (2026-07-28)
 
@@ -630,7 +630,7 @@ redis-cli -p 6379 -x SET bigkey < /dev/urandom   # 1024B..1MB auto overflow
 redis-cli -p 6379 GET bigkey                     # byte-identical
 ```
 
-Debugging tips and gotchas: [AGENTS.md](./AGENTS.md).
+Debugging tips and gotchas: [docs/AGENTS.md](./docs/AGENTS.md).
 
 ---
 
@@ -640,7 +640,7 @@ Debugging tips and gotchas: [AGENTS.md](./AGENTS.md).
 |---|---|
 | startup `permission denied` / `disk full` | `block_root` path permission / disk space; check [config/nexusdb.toml](./config/nexusdb.toml) `[storage].block_root` |
 | startup hangs at io_uring init | container/sandbox without io_uring support; set `io_backend = "stdfs"` to work around |
-| `RST_STREAM` tail-latency spikes | network-layer TCP_NODELAY caveats; see [AGENTS.md](./AGENTS.md) |
+| `RST_STREAM` tail-latency spikes | network-layer TCP_NODELAY caveats; see [docs/AGENTS.md](./docs/AGENTS.md) |
 | p99 spikes to ms level | usually disk fsync queuing; switch to NVMe / use `NLOG_PROBE=1` for a probe comparison |
 | large-value GET returns `ERR ... value too long` | payload exceeds `max_value_bytes` (default 1 MB); check [config/nexusdb.toml](./config/nexusdb.toml) or the client→server path |
 | p99 jumps from 3 ms to 6 ms | usually in-flight 8 cap degrading to sync writes; lower `[storage].num_shards` or upgrade SSD |
@@ -671,9 +671,9 @@ Start with `NLOG_PROBE=1` → on SIGTERM, a 16-bucket histogram is dumped to std
 | Reader | Doc |
 |---|---|
 | Evaluation / day one | this README (+ [docs/GUIDE.md](./docs/GUIDE.md) usage guide) |
-| Architecture | [DESIGN.md](./DESIGN.md) (10 sections) |
-| Development handoff (progress / gotchas / TODO) | [AGENTS.md](./AGENTS.md) |
-| Fix history (F1-F…) | [CHANGELOG.md](./CHANGELOG.md) |
+| Architecture | [docs/DESIGN.md](./docs/DESIGN.md) (10 sections) |
+| Development handoff (progress / gotchas / TODO) | [docs/AGENTS.md](./docs/AGENTS.md) |
+| Fix history (F1-F…) | [docs/CHANGELOG.md](./docs/CHANGELOG.md) |
 | Active plans, incident reports, and historical records | [docs index](./docs/README.md) |
 | Bug root-cause investigation example | [`docs/bug-report-btree-split-routing.md`](./docs/bug-report-btree-split-routing.md) |
 

@@ -5,10 +5,10 @@
 - [README](../README.md) / [Chinese README](../README-CN.md): installation,
   protocols, configuration, and benchmark snapshots.
 - [GUIDE](./GUIDE.md) / [Chinese guide](./GUIDE-CN.md): feature-oriented usage.
-- [DESIGN](../DESIGN.md): architecture and persistent-data invariants.
-- [AGENTS](../AGENTS.md): current development handoff, verified status, and
+- [DESIGN](./DESIGN.md): architecture and persistent-data invariants.
+- [AGENTS](./AGENTS.md): current development handoff, verified status, and
   operational gotchas.
-- [CHANGELOG](../CHANGELOG.md): chronological fixes and validation evidence.
+- [CHANGELOG](./CHANGELOG.md): chronological fixes and validation evidence.
 
 ## Active plans and audits
 

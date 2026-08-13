@@ -10,6 +10,30 @@
 
 ---
 
+## 2026-08-13 会话二十三 (根目录文档归类: AGENTS/CHANGELOG/DESIGN → docs/)
+
+动机: 根目录除了 `README.md` / `README-CN.md` 还剩 `AGENTS.md` / `CHANGELOG.md` / `DESIGN.md` 三个项目级 md, 跟用户/开发两类读者都相关但没归类到一起。统一搬到 `docs/` 下, 仓库根只留面向用户的两份 README。
+
+**变更**:
+- `AGENTS.md` → `docs/AGENTS.md`
+- `CHANGELOG.md` → `docs/CHANGELOG.md`
+- `DESIGN.md` → `docs/DESIGN.md`
+- `LICENSE` 不动 (项目元数据, 非文档)
+- `README.md` / `README-CN.md` 留根 (用户第一眼看到的入口)
+
+**引用同步**:
+- `README.md` / `README-CN.md` 内 `[./DESIGN.md]` → `[./docs/DESIGN.md]` 等
+- `docs/README.md` 内 `../DESIGN.md` → `./DESIGN.md` 等 (现在与目标同层)
+- `docs/GUIDE.md` / `docs/GUIDE-CN.md` 内 `../DESIGN.md` → `./DESIGN.md` 等
+- `container/README.md` 内 `../AGENTS.md` → `../docs/AGENTS.md` 等
+- `docs/archive/specs/2026-07-17-scheduler-crate-design.md` 内 `../../../DESIGN.md` → `../../DESIGN.md` (从根移走后的 broken 链接修复)
+- `docs/archive/plans/*` 内 `../../DESIGN.md` 自动指向新位置, 不用改
+- `docs/CHANGELOG.md` / `docs/DESIGN.md` / `docs/AGENTS.md` 内部纯文本引用保持原样 (历史快照, 描述性)
+
+**build 验证**: `cargo build --release` 0 errors (纯文档改动, 没碰代码)。
+
+---
+
 ## 2026-08-13 会话二十二 (目录重组: config/ + container/)
 
 动机: 根目录散落 `nexusdb.toml` / `Dockerfile` / `docker-compose.yml` / `deploy/*` / `scripts/bench.toml` / `scripts/smoke.toml`, 看着乱。
