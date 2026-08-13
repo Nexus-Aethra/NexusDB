@@ -77,7 +77,7 @@
 ```bash
 git clone <repo-url> && cd NexusDB
 cargo build --release --workspace        # 首次 ~2min
-cp nexusdb.toml /tmp/nexus.toml          # 按需修改 listen_addr / block_root
+cp config/nexusdb.toml /tmp/nexus.toml          # 按需修改 listen_addr / block_root
 ./target/release/NexusDB --config /tmp/nexus.toml
 ```
 
@@ -147,7 +147,7 @@ cargo build --release --workspace
 
 ```bash
 # 最小 config (Windows 上会自动把 io_backend 纠正为 stdfs)
-cat > nexusdb-test.toml <<'TOML'
+cat > config/nexusdb-test.toml <<'TOML'
 [server]
 listen_addr = "127.0.0.1:5433"     # Binary
 redis_addr  = "127.0.0.1:6380"     # RESP (用 6380 避开自带的 redis-server)
@@ -168,7 +168,7 @@ default_table = "default"
 precreate_dbs = 1
 TOML
 
-./target/release/NexusDB.exe --config nexusdb-test.toml
+./target/release/NexusDB.exe --config config/nexusdb-test.toml
 ```
 
 ### Smoke 测试 (redis-cli)
@@ -531,7 +531,7 @@ redis-cli set counter 5              # 默认库, default 表
 
 ## 配置
 
-完整字段注释见 [`nexusdb.toml`](./nexusdb.toml). 重点 section:
+完整字段注释见 [`config/nexusdb.toml`](./config/nexusdb.toml). 重点 section:
 
 ```toml
 [server]
@@ -584,7 +584,7 @@ stderr = true
 | [`crates/network`](./crates/network) | 五协议门面 (Binary + RESP2 + MySQL wire + PostgreSQL wire + HTTP REST) + **全局共享 worker 池** (线程数=配置, 不随协议数膨胀; 每 worker 协程 Scheduler 或 epoll) + `KvLimits` | ✅ |
 | [`crates/shard_manager`](./crates/shard_manager) | 多 shard 控制器 (`ShardManager`/`Router`/`Inbox`/`TaskReplyBus`) + `latency_probe` 探针 + stress 基准 | ✅ |
 | [`crates/config`](./crates/config) | TOML 配置加载 | ✅ |
-| 根 `src/main.rs` | 服务器入口: `nexusdb --config nexusdb.toml`, 信号优雅退出 | ✅ |
+| 根 `src/main.rs` | 服务器入口: `nexusdb --config config/nexusdb.toml`, 信号优雅退出 | ✅ |
 
 活跃计划、故障报告与历史实施记录见[文档索引](./docs/README.md)。
 
@@ -603,10 +603,10 @@ cargo clippy --workspace --all-targets
 cargo build --release
 
 # 启动 (生产)
-RUST_MIN_STACK=8388608 ./target/release/NexusDB --config nexusdb.toml
+RUST_MIN_STACK=8388608 ./target/release/NexusDB --config config/nexusdb.toml
 
 # 启动 + 探针 (性能调优, 直方图 dump 到 stderr, SIGTERM 时)
-NLOG_PROBE=1 ./target/release/NexusDB --config nexusdb.toml
+NLOG_PROBE=1 ./target/release/NexusDB --config config/nexusdb.toml
 
 # 单 crate 测 (开发时快速迭代)
 cargo test -p storage --lib
@@ -628,11 +628,11 @@ redis-cli -p 6379 GET bigkey                     # 字节一致回
 
 | 现象 | 可能原因 / 处置 |
 |---|---|
-| 启动报 `permission denied` / `disk full` | `block_root` 路径权限 / 磁盘空间; 检查 [nexusdb.toml](./nexusdb.toml) `[storage].block_root` |
+| 启动报 `permission denied` / `disk full` | `block_root` 路径权限 / 磁盘空间; 检查 [config/nexusdb.toml](./config/nexusdb.toml) `[storage].block_root` |
 | 启动 hang 在 io_uring 初始化 | 容器 / 沙箱无 io_uring 支持; 改 `io_backend = "stdfs"` 临时规避 |
 | `RST_STREAM` 长尾突增 | 网络层 TCP_NODELAY 注意事项; 见 [AGENTS.md](./AGENTS.md) |
 | p99 突刺 ~ ms 级 | 多为磁盘 fsync 排队; 切换 NVMe / `NLOG_PROBE=1` 拿探针对照 |
-| 大 value GET 拿到 `ERR ... value too long` | payload 超过 `max_value_bytes` (默认 1 MB); 检查 [nexusdb.toml](./nexusdb.toml) 或 `client->server` 中 |
+| 大 value GET 拿到 `ERR ... value too long` | payload 超过 `max_value_bytes` (默认 1 MB); 检查 [config/nexusdb.toml](./config/nexusdb.toml) 或 `client->server` 中 |
 | p99 从 3 ms 跳到 6 ms | 多为 in-flight 8 触顶退化同步写; 降 `[storage].num_shards` 或升 SSD |
 | 数据读不到 | 多 db 切换: 确认 SET 时使用的 db 名 (`SELECT dbname`); 默认 db 始终有效 |
 

@@ -10,6 +10,34 @@
 
 ---
 
+## 2026-08-13 会话二十二 (目录重组: config/ + container/)
+
+动机: 根目录散落 `nexusdb.toml` / `Dockerfile` / `docker-compose.yml` / `deploy/*` / `scripts/bench.toml` / `scripts/smoke.toml`, 看着乱。
+
+**变更**:
+- `nexusdb.toml`, `nexusdb-test.toml` 从仓库根移入 `config/`
+- `scripts/bench.toml`, `scripts/smoke.toml` 从 `scripts/` 移入 `config/`(精简命名: `config/bench.toml`, `config/smoke.toml`)
+- `Dockerfile`, `docker-compose.yml`, `.dockerignore` 从仓库根移入 `container/`
+- `deploy/` 整目录移入 `container/` 并精简命名:
+  - `deploy/nexusdb.docker.toml` → `container/docker.toml`
+  - `deploy/nexusdb.stdfs.toml` → `container/docker-stdfs.toml`
+  - `deploy/run.sh` → `container/run.sh`
+  - `deploy/seccomp-io_uring.json` → `container/seccomp-io_uring.json`
+- `scripts/` 保留 `.sh` / `.py` 脚本(只移走 toml)
+- `main.rs` 默认 config 路径:
+  - Linux: `./nexusdb.toml` → 找不到时回退 `./config/nexusdb.toml`
+  - Windows: `./config/nexusdb.toml` → 找不到时回退 `./nexusdb-test.toml` (老 M2 验证配置)
+  - **用户显式 `--config <path>` 时不静默回退**; 路径不存在直接报错
+- `container/docker-compose.yml` 改用 `build.context = ".."` + `dockerfile = "container/Dockerfile"`(build context 仍是仓库根)
+- `container/run.sh` 同步更新 `docker build -f` 路径
+- `config/README.md` + `container/README.md` 新增, 列出每个文件用途
+
+**README/GUIDE/AGENTS/DESIGN**: 所有路径引用同步更新(`./nexusdb.toml` → `config/nexusdb.toml` 等)。CHANGELOG 历史记录保留原文件名作为事件快照。
+
+**build 验证**: `cargo build --release` 0 errors。
+
+---
+
 ## 2026-08-13 会话二十一 (Windows 可移植性 — P1 MVP 跑通 + IOCP 尝试回退)
 
 目标: 让 NexusDB 在 Windows 原生可运行, redis-cli 直连能 SET/GET/DEL。计划见

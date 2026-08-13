@@ -48,7 +48,7 @@ cargo build --release
 
 > Note: the storage layer's async frames are large; running/testing needs a bigger thread stack: `RUST_MIN_STACK=67108864`.
 
-### Minimal config `nexusdb.toml`
+### Minimal config (`config/nexusdb.toml`)
 ```toml
 [server]
 sql_addr = "127.0.0.1:5434"      # MySQL wire
@@ -65,12 +65,12 @@ default_table = "default"
 
 ### Start
 ```bash
-RUST_MIN_STACK=67108864 ./target/release/NexusDB --config nexusdb.toml
+RUST_MIN_STACK=67108864 ./target/release/NexusDB --config config/nexusdb.toml
 ```
 On startup the log prints each facade's listen address. Leaving any facade's `addr` empty disables that facade.
 
 ### Docker Deployment
-The repo ships a [`Dockerfile`](../Dockerfile) (multi-stage: Rust builder → debian-slim) + [`docker-compose.yml`](../docker-compose.yml) + a container default config [`deploy/nexusdb.docker.toml`](../deploy/nexusdb.docker.toml).
+The repo ships a [`container/Dockerfile`](../container/Dockerfile) (multi-stage: Rust builder → debian-slim) + [`container/docker-compose.yml`](../container/docker-compose.yml) + a container default config [`container/docker.toml`](../container/docker.toml) (with the `container/docker-stdfs.toml` variant for seccomp-restricted hosts).
 ```bash
 # build image
 docker build -t nexusdb:latest .
@@ -105,7 +105,7 @@ cd NexusDB
 cargo build --release --workspace
 ```
 
-Minimal `nexusdb-test.toml` (auto-corrects `io_backend` to `stdfs`):
+Minimal `config/nexusdb-test.toml` (auto-corrects `io_backend` to `stdfs`):
 
 ```toml
 [server]
@@ -131,7 +131,7 @@ precreate_dbs = 1
 Run + smoke:
 
 ```bash
-./target/release/NexusDB.exe --config nexusdb-test.toml
+./target/release/NexusDB.exe --config config/nexusdb-test.toml
 # in another shell (assuming Redis.Redis installed under Program Files):
 & "C:\Program Files\Redis\redis-cli.exe" -p 6380 PING             # PONG
 & "C:\Program Files\Redis\redis-cli.exe" -p 6380 SET user:1 alice # OK

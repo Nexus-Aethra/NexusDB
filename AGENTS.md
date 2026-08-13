@@ -20,7 +20,7 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
   - `crates/network` — 网络层: acceptor + epoll worker + **双协议门面 (Binary + RESP2/Redis 兼容含 AUTH)** + KvLimits 校验 + value type tag (✅)
   - `crates/shard_manager` — 多 shard 控制器 + hash 路由 + 2PC + **TaskInbox/TaskReplyBus 直连架构** (✅)
   - `crates/config` (TOML) / `crates/logging` (nlog, io_uring 协程融合 logger) (✅)
-  - 根 binary `src/main.rs` — 服务器入口: `nexusdb --config nexusdb.toml`, Binary(5433, 内部) + RESP(6379) + MySQL wire(5434) + PostgreSQL wire(5435) + REST HTTP(6778) 五监听, 信号优雅退出
+  - 根 binary `src/main.rs` — 服务器入口: `nexusdb --config config/nexusdb.toml`, Binary(5433, 内部) + RESP(6379) + MySQL wire(5434) + PostgreSQL wire(5435) + REST HTTP(6778) 五监听, 信号优雅退出
 
 ## 当前进度
 
@@ -290,7 +290,7 @@ NexusDB: 面向写密集/低延迟/高并发的**独立单机数据库服务** (
 ### 当前能力盘点
 
 **已支持** (T1-T17 + F32-F47):
-- **服务化**: `nexusdb --config nexusdb.toml` 启动, Binary(5433) + RESP/Redis(6379) 双协议监听, redis-cli/memtier 可直接使用, SIGINT/SIGTERM 优雅退出 (退出前排空异步落盘 + final flush)
+- **服务化**: `nexusdb --config config/nexusdb.toml` 启动, Binary(5433) + RESP/Redis(6379) 双协议监听, redis-cli/memtier 可直接使用, SIGINT/SIGTERM 优雅退出 (退出前排空异步落盘 + final flush)
 - **元数据**: open/close/flush; create_db/drop_db/open_db/list_dbs/use_db; create_table/drop_table/open_table/list_tables (2PC 跨 shard)
 - **KV 数据**: table_put / table_get / table_delete (含覆盖写 leaf_update); 大 value 溢出页 (≤1MB)
 - **Redis 数据结构**: String (含范围/RMW/批量) + Hash + Set (含代数/*STORE) + List (含中段操作) + ZSet (双索引, 含 *STORE) + Geo (复用 ZSet) + Bitmap (复用 String); 统一类型 meta + 全类型 WRONGTYPE + crash 计数重建
@@ -562,7 +562,7 @@ Workspace: ~549 passed, 0 failed (不含慢 repro 测试).
 | `docs/superpowers/plans/2026-07-26-stress-verify-bug-investigation.md` | stress verify bug 排查时间线 (F32 阶段) |
 | `crates/page/src/dump.rs` | 调试工具: 解析输出 page 结构 |
 | `crates/logging/src/lib.rs` | nlog 模块, 含 io_uring 协程融合 logger 设计说明 |
-| `scripts/smoke.toml` + `scripts/smoke_client.py` | 服务器端到端 smoke 测试 (含 redis-cli 验证步骤) |
+| `config/smoke.toml` + `scripts/smoke_client.py` | 服务器端到端 smoke 测试 (含 redis-cli 验证步骤) |
 
 ---
 

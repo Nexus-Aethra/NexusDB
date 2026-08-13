@@ -33,8 +33,12 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> i32 {
 
 #[cfg(target_os = "linux")]
 fn main() {
-    let mut config_path = PathBuf::from("./nexusdb.toml");
+    // 默认查找: ./nexusdb.toml → 找不到则 ./config/nexusdb.toml (新结构)
+    // 用户显式 --config 时, 严格用指定路径 (不静默回退; 找不到就报错)
+    let legacy_default = PathBuf::from("./nexusdb.toml");
+    let mut config_path = legacy_default.clone();
     let mut args = std::env::args().skip(1);
+    let mut user_explicit = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" | "-c" => {
@@ -42,6 +46,7 @@ fn main() {
                     eprintln!("--config requires a path");
                     std::process::exit(2);
                 }));
+                user_explicit = true;
             }
             "--version" | "-V" => {
                 println!("NexusDB {}", env!("CARGO_PKG_VERSION"));
@@ -56,6 +61,13 @@ fn main() {
     }
 
     // 1. 加载配置 (文件不存在 → 默认值)
+    //    仅在默认路径时回退: ./nexusdb.toml 不在则查 ./config/nexusdb.toml
+    if !user_explicit && config_path == legacy_default && !config_path.exists() {
+        let candidate = PathBuf::from("./config/nexusdb.toml");
+        if candidate.exists() {
+            config_path = candidate;
+        }
+    }
     let (cfg, from_file) = match config::NexusConfig::load_or_default(&config_path) {
         Ok(v) => v,
         Err(e) => {
@@ -472,8 +484,12 @@ fn main() {
 
     // Keep the same CLI contract as Linux.  A missing config is still usable
     // on Windows by selecting the portable stdfs default below.
-    let mut config_path = PathBuf::from("./nexusdb.toml");
+    // 默认查找顺序: ./config/nexusdb.toml; 找不到就用内置默认 (stdfs + 全 facade 关闭)
+    // 用户显式 --config 时, 严格用指定路径 (不静默回退; 找不到就报错)
+    let default_path = PathBuf::from("./config/nexusdb.toml");
+    let mut config_path = default_path.clone();
     let mut args = std::env::args().skip(1);
+    let mut user_explicit = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" | "-c" => {
@@ -481,6 +497,7 @@ fn main() {
                     eprintln!("--config requires a path");
                     std::process::exit(2);
                 }));
+                user_explicit = true;
             }
             "--version" | "-V" => {
                 println!("NexusDB {}", env!("CARGO_PKG_VERSION"));
@@ -491,6 +508,19 @@ fn main() {
                 eprintln!("usage: nexusdb [--config <path>] [--version]");
                 std::process::exit(2);
             }
+        }
+    }
+    // 仅在默认路径时回退: ./config/nexusdb.toml 不存在 → ./nexusdb-test.toml (老 M2 验证)
+    // 都不在就用内置默认 (stdfs + 全 facade 关闭)
+    if !user_explicit && config_path == default_path && !config_path.exists() {
+        let legacy = PathBuf::from("./nexusdb-test.toml");
+        if legacy.exists() {
+            eprintln!(
+                "[nexusdb] WARN: {} not found, falling back to legacy {}",
+                config_path.display(),
+                legacy.display()
+            );
+            config_path = legacy;
         }
     }
     let (mut cfg, from_file) = match config::NexusConfig::load_or_default(&config_path) {

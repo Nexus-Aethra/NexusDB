@@ -48,7 +48,7 @@ cargo build --release
 
 > 注:存储层 async 帧较大,运行/测试需要更大线程栈:`RUST_MIN_STACK=67108864`。
 
-### 最简配置 `nexusdb.toml`
+### 最简配置 (`config/nexusdb.toml`)
 ```toml
 [server]
 sql_addr = "127.0.0.1:5434"      # MySQL wire
@@ -65,12 +65,12 @@ default_table = "default"
 
 ### 启动
 ```bash
-RUST_MIN_STACK=67108864 ./target/release/NexusDB --config nexusdb.toml
+RUST_MIN_STACK=67108864 ./target/release/NexusDB --config config/nexusdb.toml
 ```
 启动后日志会打印各门面监听地址。任一门面 `addr` 留空即禁用该门面。
 
 ### Docker 部署
-镜像随仓库提供 [`Dockerfile`](../Dockerfile)(多阶段:Rust builder → debian-slim)+ [`docker-compose.yml`](../docker-compose.yml)+ 容器默认配置 [`deploy/nexusdb.docker.toml`](../deploy/nexusdb.docker.toml)。
+镜像随仓库提供 [`container/Dockerfile`](../container/Dockerfile)(多阶段:Rust builder → debian-slim)+ [`container/docker-compose.yml`](../container/docker-compose.yml)+ 容器默认配置 [`container/docker.toml`](../container/docker.toml)(受限 seccomp 环境备 [`container/docker-stdfs.toml`](../container/docker-stdfs.toml))。
 ```bash
 # 构建镜像
 docker build -t nexusdb:latest .
@@ -104,7 +104,7 @@ cd NexusDB
 cargo build --release --workspace
 ```
 
-最小 `nexusdb-test.toml` (Windows 上自动纠正 `io_backend` 为 `stdfs`):
+最小 `config/nexusdb-test.toml` (Windows 上自动纠正 `io_backend` 为 `stdfs`):
 
 ```toml
 [server]
@@ -128,7 +128,7 @@ precreate_dbs = 1
 运行 + smoke:
 
 ```bash
-./target/release/NexusDB.exe --config nexusdb-test.toml
+./target/release/NexusDB.exe --config config/nexusdb-test.toml
 # 另一个 shell (Redis.Redis 装在 Program Files 下):
 & "C:\Program Files\Redis\redis-cli.exe" -p 6380 PING             # PONG
 & "C:\Program Files\Redis\redis-cli.exe" -p 6380 SET user:1 alice # OK

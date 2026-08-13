@@ -77,7 +77,7 @@ At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + p
 ```bash
 git clone <repo-url> && cd NexusDB
 cargo build --release --workspace        # first build ~2min
-cp nexusdb.toml /tmp/nexus.toml          # adjust listen_addr / block_root as needed
+cp config/nexusdb.toml /tmp/nexus.toml          # adjust listen_addr / block_root as needed
 ./target/release/NexusDB --config /tmp/nexus.toml
 ```
 
@@ -102,7 +102,7 @@ Binary protocol port (5433) test cases: [`crates/network/tests/end_to_end.rs`](.
 cargo test --workspace --no-fail-fast    # ~30s, expect 0 failed
 ```
 
-> Docker packaging is available (see [Dockerfile](./Dockerfile) + [docker-compose.yml](./docker-compose.yml)); details in [docs/GUIDE.md](./docs/GUIDE.md#docker-deployment).
+> Docker packaging is available (see [container/Dockerfile](./container/Dockerfile) + [container/docker-compose.yml](./container/docker-compose.yml)); details in [docs/GUIDE.md](./docs/GUIDE.md#docker-deployment).
 
 ---
 
@@ -154,7 +154,7 @@ cargo build --release --workspace
 
 ```bash
 # minimal config (auto-corrects io_backend to stdfs on Windows)
-cat > nexusdb-test.toml <<'TOML'
+cat > config/nexusdb-test.toml <<'TOML'
 [server]
 listen_addr = "127.0.0.1:5433"     # Binary
 redis_addr  = "127.0.0.1:6380"     # RESP (use 6380 to avoid clashing with
@@ -178,7 +178,7 @@ default_table = "default"
 precreate_dbs = 1
 TOML
 
-./target/release/NexusDB.exe --config nexusdb-test.toml
+./target/release/NexusDB.exe --config config/nexusdb-test.toml
 ```
 
 ### Smoke (redis-cli)
@@ -542,7 +542,7 @@ Design philosophy: **unified record encoding + value type tag** is reserved (`TA
 
 ## Configuration
 
-Full field comments in [`nexusdb.toml`](./nexusdb.toml). Key sections:
+Full field comments in [`config/nexusdb.toml`](./config/nexusdb.toml). Key sections:
 
 ```toml
 [server]
@@ -594,7 +594,7 @@ stderr = true
 | [`crates/network`](./crates/network) | five-protocol facades (Binary + RESP2 + MySQL/PG wire + HTTP REST) + **global shared worker pool** (thread count = config, not multiplied by protocols; per-worker coroutine Scheduler or epoll) + `KvLimits` + `tls` | ✅ |
 | [`crates/shard_manager`](./crates/shard_manager) | multi-shard controller (`ShardManager`/`Router`/`Inbox`/`TaskReplyBus`) + `latency_probe` + stress bench | ✅ |
 | [`crates/config`](./crates/config) | TOML config loading | ✅ |
-| root `src/main.rs` | server entry: `nexusdb --config nexusdb.toml`, graceful shutdown on signal | ✅ |
+| root `src/main.rs` | server entry: `nexusdb --config config/nexusdb.toml`, graceful shutdown on signal | ✅ |
 
 Active plans, incident reports, and archived implementation records: [docs index](./docs/README.md).
 
@@ -613,10 +613,10 @@ cargo clippy --workspace --all-targets
 cargo build --release
 
 # start (production)
-RUST_MIN_STACK=8388608 ./target/release/NexusDB --config nexusdb.toml
+RUST_MIN_STACK=8388608 ./target/release/NexusDB --config config/nexusdb.toml
 
 # start + probe (perf tuning, histogram dumped to stderr on SIGTERM)
-NLOG_PROBE=1 ./target/release/NexusDB --config nexusdb.toml
+NLOG_PROBE=1 ./target/release/NexusDB --config config/nexusdb.toml
 
 # single-crate test (fast dev iteration)
 cargo test -p storage --lib
@@ -638,11 +638,11 @@ Debugging tips and gotchas: [AGENTS.md](./AGENTS.md).
 
 | Symptom | Likely cause / action |
 |---|---|
-| startup `permission denied` / `disk full` | `block_root` path permission / disk space; check [nexusdb.toml](./nexusdb.toml) `[storage].block_root` |
+| startup `permission denied` / `disk full` | `block_root` path permission / disk space; check [config/nexusdb.toml](./config/nexusdb.toml) `[storage].block_root` |
 | startup hangs at io_uring init | container/sandbox without io_uring support; set `io_backend = "stdfs"` to work around |
 | `RST_STREAM` tail-latency spikes | network-layer TCP_NODELAY caveats; see [AGENTS.md](./AGENTS.md) |
 | p99 spikes to ms level | usually disk fsync queuing; switch to NVMe / use `NLOG_PROBE=1` for a probe comparison |
-| large-value GET returns `ERR ... value too long` | payload exceeds `max_value_bytes` (default 1 MB); check [nexusdb.toml](./nexusdb.toml) or the client→server path |
+| large-value GET returns `ERR ... value too long` | payload exceeds `max_value_bytes` (default 1 MB); check [config/nexusdb.toml](./config/nexusdb.toml) or the client→server path |
 | p99 jumps from 3 ms to 6 ms | usually in-flight 8 cap degrading to sync writes; lower `[storage].num_shards` or upgrade SSD |
 | data not found | multi-db switching: confirm the db name used on SET (`SELECT dbname`); the default db is always valid |
 
