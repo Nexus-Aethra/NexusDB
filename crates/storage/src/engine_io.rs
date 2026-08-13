@@ -201,13 +201,12 @@ impl StorageEngine {
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let existed = crate::registry::table_delete(&mut self.pager, table_vpid, pkey).await?;
         // ⭐ M3-1: 删除成功 → 近似行数 -1 (saturating 防下溢)
-        if existed {
-            if let Some(c) = self
+        if existed
+            && let Some(c) = self
                 .row_counts
                 .get_mut(&(db.to_string(), table.to_string()))
-            {
-                *c = c.saturating_sub(1);
-            }
+        {
+            *c = c.saturating_sub(1);
         }
         // ⭐ WAL (F60): 存在才记 (不存在的 delete 重放无意义)
         if existed && let Some(w) = self.wal.as_mut() {

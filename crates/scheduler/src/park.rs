@@ -89,12 +89,15 @@ impl Future for ParkCurrent {
                 let slot_id = self.slot_id.expect("parked state without slot id");
                 PARKED.with(|p| {
                     let mut parked = p.borrow_mut();
-                    if parked.contains_key(&slot_id) {
-                        parked.insert(slot_id, cx.waker().clone());
-                        Poll::Pending
-                    } else {
-                        self.state = ParkState::Resolved;
-                        Poll::Ready(())
+                    match parked.entry(slot_id) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            e.insert(cx.waker().clone());
+                            Poll::Pending
+                        }
+                        std::collections::hash_map::Entry::Vacant(_) => {
+                            self.state = ParkState::Resolved;
+                            Poll::Ready(())
+                        }
                     }
                 })
             }

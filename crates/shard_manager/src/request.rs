@@ -977,6 +977,9 @@ pub struct ReadCheck {
     pub fp: Option<u32>,
 }
 
+/// ⭐ M3-5 (CBO): 索引列 (min, max) 字节边界 (None = 该列无值, 不参与直方图).
+pub type RangeBound = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// 单个 batch 操作的结果.
 ///
 /// (无 Eq: `Double(f64)` 浮点无全序等值; 测试用 PartialEq 断言足够.)
@@ -1024,7 +1027,7 @@ pub enum BatchResult {
     /// ⭐ M3-4 (CBO): 索引列 distinct 计数 (EstimateDistinct 响应, 与 cols 同序).
     DistinctCounts(Vec<u64>),
     /// ⭐ M3-5 (CBO): 索引列 (min, max) 有序字节 (EstimateRanges 响应, 与 iids 同序).
-    RangeBounds(Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>),
+    RangeBounds(Vec<RangeBound>),
     Error(String),
 }
 

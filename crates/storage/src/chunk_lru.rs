@@ -175,10 +175,10 @@ impl PageLru {
             self.promote(key);
             return;
         }
-        if self.entries.len() >= self.capacity {
-            if let Some(victim) = self.least_recent {
-                self.remove(victim);
-            }
+        if self.entries.len() >= self.capacity
+            && let Some(victim) = self.least_recent
+        {
+            self.remove(victim);
         }
         let mut cached = vec![0u8; PAGE_SIZE].into_boxed_slice();
         cached.copy_from_slice(bytes);

@@ -245,7 +245,7 @@ impl StorageEngine {
         old_ivals: &Option<Vec<(u32, Option<Vec<u8>>)>>,
     ) -> Result<(), RegistryError> {
         for idx in schema.indexes.iter().filter(|i| i.unique) {
-            let Some(nv) = index_vals_bytes(schema, idx, &values) else {
+            let Some(nv) = index_vals_bytes(schema, idx, values) else {
                 continue;
             };
             // 值未变 (同 pk 覆盖) 不必探测
@@ -360,7 +360,7 @@ impl StorageEngine {
 
         // 索引行: 逐 IndexDef 对比新旧值, 只动变化的
         for idx in schema.indexes.clone() {
-            let new_iv = index_vals_bytes(&schema, &idx, &values);
+            let new_iv = index_vals_bytes(&schema, &idx, values);
             let old_iv = old_ivals
                 .as_ref()
                 .and_then(|m| m.iter().find(|(iid, _)| *iid == idx.iid))
@@ -424,7 +424,7 @@ impl StorageEngine {
                     v
                 });
                 // 每 200 次插入做一次全量回查 (避免太慢)
-                if n > 0 && n % 500 == 0 {
+                if n > 0 && n.is_multiple_of(500) {
                     let pks: Vec<Vec<u8>> =
                         RECENT_PKS.with(|r| r.borrow().iter().cloned().collect());
                     let mut lost = 0;
@@ -865,7 +865,7 @@ impl StorageEngine {
     /// ⭐ PG 兼容 (范围查): 主键 B+Tree 区间扫描 — 扫 `[KIND_STRING]` 段,
     /// 起点 = `encode_string(pk_enc(lo))` (无 lo 从段头), 上界 = pk 编码
     /// > pk_enc(hi) 即 Break (含界). 返回 (空 val, pk, row_bytes) 与
-    /// IndexEntry 同构; limit 0 = 不限. 主键列范围谓词避免全表扫.
+    /// > IndexEntry 同构; limit 0 = 不限. 主键列范围谓词避免全表扫.
     pub async fn pk_scan_local(
         &mut self,
         db: &str,

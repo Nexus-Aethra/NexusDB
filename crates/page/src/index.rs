@@ -256,28 +256,6 @@ impl PageIndex {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{PageIndex, Segment};
-
-    #[test]
-    fn find_segment_by_offset_is_upper_bound_binary_search() {
-        let idx = PageIndex {
-            segments: vec![
-                Segment { first_item_off: 32, item_count: 1, first_full_key: vec![] },
-                Segment { first_item_off: 96, item_count: 1, first_full_key: b"a".to_vec() },
-                Segment { first_item_off: 192, item_count: 1, first_full_key: b"b".to_vec() },
-                Segment { first_item_off: 384, item_count: 1, first_full_key: b"c".to_vec() },
-            ],
-            key_count: 4,
-        };
-        assert_eq!(idx.find_segment_by_offset(0), 0);
-        assert_eq!(idx.find_segment_by_offset(96), 1);
-        assert_eq!(idx.find_segment_by_offset(191), 1);
-        assert_eq!(idx.find_segment_by_offset(999), 3);
-    }
-}
-
 // ===== pre_split / pre_merge (基于 PageIndex 的段分裂与合并) =====
 
 /// 预分裂 segments[seg_idx]: 当 item_count >= MAX_PER_CHECKPOINT (32) 时,
@@ -437,4 +415,26 @@ pub fn pre_split_segment(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PageIndex, Segment};
+
+    #[test]
+    fn find_segment_by_offset_is_upper_bound_binary_search() {
+        let idx = PageIndex {
+            segments: vec![
+                Segment { first_item_off: 32, item_count: 1, first_full_key: vec![] },
+                Segment { first_item_off: 96, item_count: 1, first_full_key: b"a".to_vec() },
+                Segment { first_item_off: 192, item_count: 1, first_full_key: b"b".to_vec() },
+                Segment { first_item_off: 384, item_count: 1, first_full_key: b"c".to_vec() },
+            ],
+            key_count: 4,
+        };
+        assert_eq!(idx.find_segment_by_offset(0), 0);
+        assert_eq!(idx.find_segment_by_offset(96), 1);
+        assert_eq!(idx.find_segment_by_offset(191), 1);
+        assert_eq!(idx.find_segment_by_offset(999), 3);
+    }
 }

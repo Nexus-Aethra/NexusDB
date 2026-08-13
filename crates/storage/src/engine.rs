@@ -28,6 +28,11 @@ use crate::chunk_writer::{ChunkWriter, NowChunks};
 use crate::engine_io::init_meta_page;
 use crate::meta_cache::MetaCache;
 use crate::meta_page::META_VPID;
+
+// ⭐ M3-5 / M3-5b 统计类型别名: (db, table, column_id) 联合 key + (min, max) / 基数 value
+type StatsKey = (String, String, u32);
+type DistinctCounts = std::collections::HashMap<StatsKey, u64>;
+type RangeCounts = std::collections::HashMap<StatsKey, (Vec<u8>, Vec<u8>)>;
 use crate::pager::Pager;
 use crate::pager_io::PagerIo;
 use crate::recover::{recover, recover_for_shard, shard_dir_path};
@@ -158,9 +163,9 @@ pub struct StorageEngine {
     pub(crate) row_counts: std::collections::HashMap<(String, String), u64>,
     /// ⭐ M3-4 (CBO): 每索引列近似 distinct 基数 (索引值写入时 bloom miss = 新值 → +1;
     /// bloom 假阳性 → 低估, 近似可接受). 内存增量, 重启后从 0 重算.
-    pub(crate) distinct_counts: std::collections::HashMap<(String, String, u32), u64>,
+    pub(crate) distinct_counts: DistinctCounts,
     /// ⭐ M3-5 (CBO): 每索引列 (min, max) 有序字节 (值序比较; 范围选择度/直方图基础).
-    pub(crate) range_counts: std::collections::HashMap<(String, String, u32), (Vec<u8>, Vec<u8>)>,
+    pub(crate) range_counts: RangeCounts,
     /// ⭐ M3-1b: CBO 统计持久化文件 (block_dir/stats.bin; 崩溃不保证, 近似统计可接受).
     pub(crate) stats_path: std::path::PathBuf,
     /// Opt-in per-Put path timings for shard latency diagnosis.  Kept inside

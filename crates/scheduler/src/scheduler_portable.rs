@@ -131,6 +131,12 @@ impl Scheduler {
     }
 }
 
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 thread_local! {
     static CURRENT: RefCell<Option<Rc<RefCell<Scheduler>>>> = const { RefCell::new(None) };
     static CURRENT_SLOT: Cell<Option<usize>> = const { Cell::new(None) };

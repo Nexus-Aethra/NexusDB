@@ -601,7 +601,7 @@ impl Pager {
         // A cache entry can never mask nowchunks/write_queue/in-flight data.
         if let Some(cached) = self.chunk_list.peek_page(key, page_idx) {
             let mut out = page_pool::alloc();
-            out.copy_from_slice(&cached[..]);
+            out.copy_from_slice(cached);
             return Ok(out);
         }
         // 4. chunk_list 命中 (peek 走 LRU 访问)
@@ -858,16 +858,16 @@ impl Pager {
     /// 避免写时队列无限膨胀, 且无等待+收割死锁风险.
     pub async fn swap_full_chunk_to_write_queue(&mut self, key: PageKey) -> io::Result<()> {
         // ⭐ DIAG: swap 前校验 chunk(0,0) 各页数据
-        if crate::chunk_writer::diag_enabled() && key.file_id == 0 && key.chunk_idx == 0 {
-            if let Some(chunk) = self.nowchunks.peek_chunk(key) {
-                for pidx in [0usize, 1, 30, 60, 63] {
-                    let off = pidx * PAGE_SIZE;
-                    eprintln!(
-                        "[DIAG-SWAP-CHECK] page_idx={pidx} magic={:02X?} type={}",
-                        &chunk[off..off + 4],
-                        chunk[off + 4]
-                    );
-                }
+        if crate::chunk_writer::diag_enabled() && key.file_id == 0 && key.chunk_idx == 0
+            && let Some(chunk) = self.nowchunks.peek_chunk(key)
+        {
+            for pidx in [0usize, 1, 30, 60, 63] {
+                let off = pidx * PAGE_SIZE;
+                eprintln!(
+                    "[DIAG-SWAP-CHECK] page_idx={pidx} magic={:02X?} type={}",
+                    &chunk[off..off + 4],
+                    chunk[off + 4]
+                );
             }
         }
         let Some(chunk_box) = self.nowchunks.take_chunk_box(key) else {

@@ -324,7 +324,7 @@ pub(crate) fn exec_txn_apply(
             // 批内自冲突 (盘上探测看不见未应用的同批写)
             if let Ok(Some(schema)) = block_on_io(e.get_schema(db, table)) {
                 for idx in schema.indexes.iter().filter(|i| i.unique) {
-                    if let Some(nv) = storage::sql_rows::index_vals_bytes(&schema, idx, &values) {
+                    if let Some(nv) = storage::sql_rows::index_vals_bytes(&schema, idx, values) {
                         let key = (format!("{db}\u{0}{table}"), idx.iid, nv);
                         if let Some(prev) = batch_uniques.insert(key, pk.clone())
                             && &prev != pk

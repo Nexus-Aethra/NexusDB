@@ -444,7 +444,7 @@ pub(crate) fn drain_async_flush(
     flush_done: &FlushDoneSlot,
 ) {
     loop {
-        let _ = drive_async_flush(engine, rt, flush_done, 256, usize::MAX, true);
+        drive_async_flush(engine, rt, flush_done, 256, usize::MAX, true);
         let drained = {
             let mut e_borrow = engine.borrow_mut();
             match e_borrow.as_mut() {
@@ -628,7 +628,7 @@ pub(crate) fn shard_thread_main(
                     break (b, t);
                 }
                 // timeout 醒来无数据: 驱动异步落盘 + 周期刷盘后继续睡
-                let _ = drive_async_flush(&engine, &rt, &flush_done, 256, usize::MAX, true);
+                drive_async_flush(&engine, &rt, &flush_done, 256, usize::MAX, true);
                 spins = 0;
                 continue;
             }
