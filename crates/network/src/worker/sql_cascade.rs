@@ -118,33 +118,33 @@ pub fn cascade_job_done(
             .get_mut(&root_seq)
             .expect("cascade root 必存在");
         root.active = root.active.saturating_sub(1);
-        if let Some(e) = error {
-            if root.failed.is_none() {
-                root.failed = Some(e);
-            }
+        if let Some(e) = error
+            && root.failed.is_none()
+        {
+            root.failed = Some(e);
         }
     }
     // 递归: Cascade 子任务删了引用表行 → 其被删 pk 的更深引用
     // (递归 spawn 会 active += 1 — 必须在最终计数判断前完成)
-    if job.action == FkAction::Cascade {
-        if let Some((_jdb, ref_table, ref_pks)) = conn.cascade_pending.remove(&seq) {
-            let deeper = conn.sql_shared.incoming_fks(&db, &ref_table);
-            for r in deeper {
-                spawn_job(
-                    conn,
-                    conn_id,
-                    root_seq,
-                    worker_id,
-                    &db,
-                    default_db,
-                    db_view,
-                    shard_inboxes,
-                    num_shards,
-                    &ref_table,
-                    &r,
-                    &ref_pks,
-                );
-            }
+    if job.action == FkAction::Cascade
+        && let Some((_jdb, ref_table, ref_pks)) = conn.cascade_pending.remove(&seq)
+    {
+        let deeper = conn.sql_shared.incoming_fks(&db, &ref_table);
+        for r in deeper {
+            spawn_job(
+                conn,
+                conn_id,
+                root_seq,
+                worker_id,
+                &db,
+                default_db,
+                db_view,
+                shard_inboxes,
+                num_shards,
+                &ref_table,
+                &r,
+                &ref_pks,
+            );
         }
     }
     // 全部级联完成 (递归后实时读 active) → 回复根 DELETE

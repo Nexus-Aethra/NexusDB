@@ -6,6 +6,8 @@
 
 use super::*;
 
+// Subquery orchestration shares the same explicit routing boundary as SQL dispatch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sql_subq_start(
     conn: &mut ConnState,
     conn_id: u64,

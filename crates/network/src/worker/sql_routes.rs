@@ -9,6 +9,8 @@ use storage::schema::TableSchema;
 
 /// 路由条目: per-shard 只增 bloom 组 (Arc 克隆锁外读写).
 pub type RouteBlooms = std::sync::Arc<Vec<storage::index_bloom::IndexBloom>>;
+type FkIncomingKey = (std::sync::Arc<str>, String);
+type FkIncomingMap = HashMap<FkIncomingKey, Vec<FkIncoming>>;
 
 /// ⭐ ORM-B2: 进程级共享路由缓存 (跨 worker 跨 SQL 门面单例).
 /// bloom 本体原子无锁; RwLock 仅保护 map 结构 (读取克隆 Arc 锁外操作,
@@ -29,7 +31,7 @@ pub struct SqlSharedRoutes {
     cluster_ctl: std::sync::RwLock<Option<std::sync::Arc<shard_manager::ShardManager>>>,
     /// ⭐ PG 兼容 (FMT_VER 8): 外键反向引用 — (db, ref_table) → 引用它的表.
     /// 由 CREATE TABLE 注册 / DROP TABLE 移除; 级联删除按此分发.
-    fk_incoming: std::sync::RwLock<HashMap<(std::sync::Arc<str>, String), Vec<FkIncoming>>>,
+    fk_incoming: std::sync::RwLock<FkIncomingMap>,
 }
 
 impl Default for SqlSharedRoutes {

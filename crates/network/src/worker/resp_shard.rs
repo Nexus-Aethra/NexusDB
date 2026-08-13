@@ -5,6 +5,8 @@
 
 use super::*;
 
+// Shard replies retain their routing context explicitly to preserve worker isolation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_resp_shard_result(
     conn: &mut ConnState,
     conn_id: u64,
@@ -806,23 +808,23 @@ pub(crate) fn handle_resp_shard_result(
                 Err(e) => {
                     conn.sql_derived.remove(&seq);
                     // ⭐ FK 级联: 级联 job 的 phase1 收集出错 → 推进级联 (不回复)
-                    if is_cascade_seq(seq) {
-                        if let Some(job) = conn.cascade_jobs.remove(&seq) {
-                            cascade_job_done(
-                                conn,
-                                conn_id,
-                                seq,
-                                worker_id,
-                                default_db,
-                                db_view,
-                                shard_inboxes,
-                                num_shards,
-                                0,
-                                Some(e),
-                                &job,
-                            );
-                            return;
-                        }
+                    if is_cascade_seq(seq)
+                        && let Some(job) = conn.cascade_jobs.remove(&seq)
+                    {
+                        cascade_job_done(
+                            conn,
+                            conn_id,
+                            seq,
+                            worker_id,
+                            default_db,
+                            db_view,
+                            shard_inboxes,
+                            num_shards,
+                            0,
+                            Some(e),
+                            &job,
+                        );
+                        return;
                     }
                     conn.resp_complete(seq, sql_err_bytes(proto, &e));
                 }
@@ -1005,38 +1007,38 @@ pub(crate) fn handle_resp_shard_result(
                 return;
             }
             // ⭐ FK 级联: 根 DELETE 完成且无错误 → 有引用表则进入级联 (延迟回复)
-            if agg.error.is_none() && agg.drop_key.is_none() {
-                if let Some((db, t, pks)) = conn.cascade_pending.remove(&seq) {
-                    let affected = agg.affected;
-                    if cascade_kickoff(
-                        conn,
-                        conn_id,
-                        seq,
-                        worker_id,
-                        &db,
-                        default_db,
-                        db_view,
-                        shard_inboxes,
-                        num_shards,
-                        &t,
-                        pks,
-                        affected,
-                    ) {
-                        return;
-                    }
+            if agg.error.is_none()
+                && agg.drop_key.is_none()
+                && let Some((db, t, pks)) = conn.cascade_pending.remove(&seq)
+            {
+                let affected = agg.affected;
+                if cascade_kickoff(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    &db,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    &t,
+                    pks,
+                    affected,
+                ) {
+                    return;
                 }
             }
             // ⭐ PG 兼容 (multi-statement): 该 seq 属于多语句序列 → 推进下一条
             // (不直接回复客户端)
             if conn.multi_sub_seq.contains_key(&seq) {
                 let had_err = agg.error.is_some();
-                if had_err {
-                    if let Some(orig) = conn.multi_sub_seq.get(&seq).cloned() {
-                        if let Some(m) = conn.multi_stmt.get_mut(&orig) {
-                            m.error = Some(agg.error.clone().unwrap_or_default());
-                            m.stmts.clear();
-                        }
-                    }
+                if had_err
+                    && let Some(orig) = conn.multi_sub_seq.get(&seq).cloned()
+                    && let Some(m) = conn.multi_stmt.get_mut(&orig)
+                {
+                    m.error = Some(agg.error.clone().unwrap_or_default());
+                    m.stmts.clear();
                 }
                 conn.multi_step(
                     seq,

@@ -5,6 +5,8 @@
 - [README](../README.md) / [Chinese README](../README-CN.md): installation,
   protocols, configuration, and benchmark snapshots.
 - [GUIDE](./GUIDE.md) / [Chinese guide](./GUIDE-CN.md): feature-oriented usage.
+- [Embedded KV API](./EMBEDDED-KV.md): use NexusDB directly from a Rust
+  process without starting network listeners.
 - [DESIGN](./DESIGN.md): architecture and persistent-data invariants.
 - [AGENTS](./AGENTS.md): current development handoff, verified status, and
   operational gotchas.

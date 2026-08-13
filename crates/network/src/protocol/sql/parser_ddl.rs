@@ -34,13 +34,10 @@ pub(crate) struct FkDefRaw {
 pub(crate) fn parse_fk_action(p: &mut P) -> Result<storage::schema::FkAction, String> {
     use storage::schema::FkAction;
     let mut action = FkAction::NoAction;
-    loop {
-        let Some(first) = p.peek().and_then(|t| match t {
-            Tok::Ident(s) => Some(s.to_ascii_lowercase()),
-            _ => None,
-        }) else {
-            break;
-        };
+    while let Some(first) = p.peek().and_then(|t| match t {
+        Tok::Ident(s) => Some(s.to_ascii_lowercase()),
+        _ => None,
+    }) {
         if first != "on" {
             break;
         }
@@ -149,7 +146,7 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
         let cols = read_col_list(p)?;
         // 吞可选 WHERE 部分索引 (至语句结束)
         if p.try_kw("WHERE") {
-            while !matches!(p.peek(), None) {
+            while !p.peek().is_none() {
                 p.i += 1;
             }
         }
@@ -579,7 +576,7 @@ pub(crate) fn parse_drop(p: &mut P) -> Result<SqlStmt, String> {
     let table = p.table_ident()?;
     while p.try_kw("CASCADE") || p.try_kw("RESTRICT") {}
     if matches!(p.peek(), Some(Tok::Comma)) {
-        while !matches!(p.peek(), None) {
+        while !p.peek().is_none() {
             p.i += 1;
         }
     }

@@ -3,6 +3,8 @@
 
 use super::*;
 
+// HTTP parsing receives independent protocol, database, and shard resources.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_http_input(
     conn: &mut ConnState,
     conn_id: u64,
@@ -346,6 +348,8 @@ pub(crate) fn mysql_err_packet(msg: &str) -> Vec<u8> {
     crate::protocol::mysql::build_err(1, code, msg)
 }
 
+// SQL wire parsing keeps authentication, database, TLS, and shard state explicit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_sql_input(
     conn: &mut ConnState,
     conn_id: u64,
@@ -1184,10 +1188,10 @@ pub(crate) fn infer_param_oids(
                     if idx >= oids.len() {
                         continue;
                     }
-                    if let Some(Some(col)) = col_pos.get(j) {
-                        if let Some(col_def) = schema.columns.get(*col) {
-                            oids[idx] = oid_of(col_def.ty);
-                        }
+                    if let Some(Some(col)) = col_pos.get(j)
+                        && let Some(col_def) = schema.columns.get(*col)
+                    {
+                        oids[idx] = oid_of(col_def.ty);
                     }
                 }
             }
@@ -1203,21 +1207,21 @@ pub(crate) fn infer_param_oids(
     if let Some(conds) = conds {
         for leaf in conds.leaves() {
             let col = &leaf.col;
-            if let Some(col_idx) = schema.col_by_name(col) {
-                if let Some(col_def) = schema.columns.get(col_idx as usize) {
-                    let oid = oid_of(col_def.ty);
-                    if let SqlValue::Param(idx) = &leaf.val {
+            if let Some(col_idx) = schema.col_by_name(col)
+                && let Some(col_def) = schema.columns.get(col_idx as usize)
+            {
+                let oid = oid_of(col_def.ty);
+                if let SqlValue::Param(idx) = &leaf.val {
+                    let idx = *idx as usize;
+                    if idx < oids.len() {
+                        oids[idx] = oid;
+                    }
+                }
+                for v in &leaf.set {
+                    if let SqlValue::Param(idx) = v {
                         let idx = *idx as usize;
                         if idx < oids.len() {
                             oids[idx] = oid;
-                        }
-                    }
-                    for v in &leaf.set {
-                        if let SqlValue::Param(idx) = v {
-                            let idx = *idx as usize;
-                            if idx < oids.len() {
-                                oids[idx] = oid;
-                            }
                         }
                     }
                 }

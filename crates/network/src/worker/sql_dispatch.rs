@@ -7,6 +7,8 @@ use super::sql_join::*;
 use super::sql_sysquery::*;
 use super::*;
 
+// This is the protocol-to-SQL handoff; its inputs are distinct connection and routing resources.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sql_dispatch_stmt(
     conn: &mut ConnState,
     conn_id: u64,
@@ -738,7 +740,6 @@ pub(crate) fn sql_dispatch_stmt(
 }
 
 /// ⭐ F65: 提取 schema 的全局唯一列 (iid, col); 空 = 无全局唯一.
-
 pub(crate) fn conds_to_scan_preds(
     schema: &TableSchema,
     conds: &Pred<Cond>,
@@ -894,8 +895,7 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                 }
                 bounds.push((lo, hi));
             }
-            if ok && branch_idx.is_some() {
-                let ipos = branch_idx.unwrap();
+            if ok && let Some(ipos) = branch_idx {
                 let branches: Vec<(u16, Option<ColValue>, Option<ColValue>)> = bounds
                     .into_iter()
                     .map(|(lo, hi)| (ipos as u16, lo, hi))
@@ -1036,9 +1036,9 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
         }
         // 只有得分 > 0 才算候选; 平局保留首个 (ipos 更小者优先, 确定性)
         if score > 0
-            && best.as_ref().map_or(true, |(bs, bpos, _)| {
-                score > *bs || (score == *bs && ipos < *bpos)
-            })
+            && best
+                .as_ref()
+                .is_none_or(|(bs, bpos, _)| score > *bs || (score == *bs && ipos < *bpos))
         {
             best = Some((score, ipos, idx.iid));
             best_bounds = (lo, hi);

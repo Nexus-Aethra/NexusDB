@@ -114,10 +114,8 @@ pub fn sql_fk_on_reply(
             // 缺失: 记录 (无法从回包拿父表名 — 用剩余计数推断, 但只需知道"有缺失")
             st.missing.push((String::new(), Vec::new()));
         }
-        shard_manager::request::BatchResult::Error(e) => {
-            if st.error.is_none() {
-                st.error = Some(e.clone());
-            }
+        shard_manager::request::BatchResult::Error(e) if st.error.is_none() => {
+            st.error = Some(e.clone());
         }
         _ => {}
     }
@@ -155,7 +153,7 @@ pub fn sql_fk_on_reply(
     for op in st.ops {
         let sid = hash_route_op(&op, num_shards);
         let (_, table, _) = op.locator();
-        super::feed_route_bloom(conn, st.db.as_ref(), &table, st.schema.as_ref(), &op, sid);
+        super::feed_route_bloom(conn, st.db.as_ref(), table, st.schema.as_ref(), &op, sid);
         push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
     }
     true

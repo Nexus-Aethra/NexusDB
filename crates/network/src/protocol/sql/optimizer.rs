@@ -230,22 +230,20 @@ where
                         break;
                     }
                 }
-                if ok {
-                    if let Pred::Leaf(c) = b {
-                        vals.push(c.val().clone());
-                    }
+                if ok && let Pred::Leaf(c) = b {
+                    vals.push(c.val().clone());
                 }
             }
             // OR 单分支已被结构归一展开为 Leaf, 到这里必然 ≥2 分支 (且全 Eq 同列)
-            if ok {
-                if let Some(c0) = v.iter().find_map(|b| match b {
+            if ok
+                && let Some(c0) = v.iter().find_map(|b| match b {
                     Pred::Leaf(c) => Some(c),
                     _ => None,
-                }) {
-                    let mut set = vals;
-                    sort_in_set(&mut set);
-                    return Pred::Leaf(C::build_in(c0, set));
-                }
+                })
+            {
+                let mut set = vals;
+                sort_in_set(&mut set);
+                return Pred::Leaf(C::build_in(c0, set));
             }
             pred.clone()
         }
@@ -284,8 +282,8 @@ fn push_not_to_leaf(pred: &Pred<Cond>) -> Pred<Cond> {
                 Some(nc) => Pred::Leaf(nc),
                 None => pred.clone(),
             },
-            Pred::And(v) => Pred::And(v.iter().map(|p| push_not_to_leaf(p)).collect()),
-            Pred::Or(v) => Pred::Or(v.iter().map(|p| push_not_to_leaf(p)).collect()),
+            Pred::And(v) => Pred::And(v.iter().map(push_not_to_leaf).collect()),
+            Pred::Or(v) => Pred::Or(v.iter().map(push_not_to_leaf).collect()),
             Pred::Not(b) => push_not_to_leaf(b),
         },
         Pred::And(v) => Pred::And(v.iter().map(push_not_to_leaf).collect()),

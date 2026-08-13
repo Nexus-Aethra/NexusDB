@@ -10,8 +10,11 @@ dependencies = [
  "libc",
  "network",
  "nlog",
+ "pollster",
  "shard_manager",
  "storage",
+ "tempfile",
+ "thiserror",
  "windows-sys 0.61.2",
 ]
 
