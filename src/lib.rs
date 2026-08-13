@@ -10,6 +10,26 @@ use shard_manager::{ShardError, ShardManager, ShardManagerOptions};
 
 pub type EmbeddedResult<T> = Result<T, EmbeddedError>;
 
+/// Storage I/O backend for an embedded instance.
+///
+/// `IoUring` is available on supported Linux kernels. `StdFs` is portable and
+/// remains the default, including on Windows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EmbeddedIoBackend {
+    #[default]
+    StdFs,
+    IoUring,
+}
+
+impl EmbeddedIoBackend {
+    fn to_storage(self) -> storage::IoBackend {
+        match self {
+            Self::StdFs => storage::IoBackend::StdFs,
+            Self::IoUring => storage::IoBackend::IoUring,
+        }
+    }
+}
+
 /// Errors exposed by the embedded API.
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddedError {
@@ -25,9 +45,11 @@ pub enum EmbeddedError {
 #[derive(Debug, Clone)]
 pub struct EmbeddedOptions {
     pub data_dir: PathBuf,
+    /// One independent storage/scheduler thread is created per shard.
     pub num_shards: usize,
     pub chunk_cache_size: usize,
     pub wal_mode: storage::wal::WalMode,
+    pub io_backend: EmbeddedIoBackend,
 }
 
 impl EmbeddedOptions {
@@ -46,6 +68,7 @@ impl Default for EmbeddedOptions {
             num_shards: 1,
             chunk_cache_size: 4,
             wal_mode: storage::wal::WalMode::default(),
+            io_backend: EmbeddedIoBackend::default(),
         }
     }
 }
@@ -77,6 +100,8 @@ impl NexusDb {
         let mut manager_options = ShardManagerOptions::new(options.num_shards, options.data_dir);
         manager_options.chunk_cache_size = options.chunk_cache_size;
         manager_options.wal_mode = options.wal_mode;
+        manager_options.io_backend = options.io_backend.to_storage();
+        manager_options.io_config = storage::IoBackendConfig::from(manager_options.io_backend);
         let manager = Arc::new(ShardManager::open(manager_options)?);
         Ok(Self { manager })
     }
@@ -248,6 +273,18 @@ fn strip_tag(value: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn io_backend_selection_maps_to_storage_backend() {
+        assert_eq!(
+            EmbeddedIoBackend::StdFs.to_storage(),
+            storage::IoBackend::StdFs
+        );
+        assert_eq!(
+            EmbeddedIoBackend::IoUring.to_storage(),
+            storage::IoBackend::IoUring
+        );
+    }
 
     #[test]
     fn sync_and_async_kv_roundtrip() {

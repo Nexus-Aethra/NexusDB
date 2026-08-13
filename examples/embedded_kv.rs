@@ -1,7 +1,10 @@
-use nexusdb::{EmbeddedOptions, NexusDb};
+use nexusdb::{EmbeddedIoBackend, EmbeddedOptions, NexusDb};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = NexusDb::open(EmbeddedOptions::new("./embedded-data"))?;
+    let mut options = EmbeddedOptions::new("./embedded-data");
+    // Portable default; use IoUring on a supported Linux host if desired.
+    options.io_backend = EmbeddedIoBackend::StdFs;
+    let db = NexusDb::open(options)?;
     let app = db.ensure_database("app")?;
     let cache = app.create_table("cache")?;
 

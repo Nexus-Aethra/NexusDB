@@ -14,8 +14,8 @@ During local development, depend on the repository directly:
 nexusdb = { path = "../NexusDB" }
 ```
 
-The public entry points are `NexusDb`, `EmbeddedOptions`, `Database`, `Table`,
-`EmbeddedError`, and `EmbeddedResult`.
+The public entry points are `NexusDb`, `EmbeddedOptions`, `EmbeddedIoBackend`,
+`Database`, `Table`, `EmbeddedError`, and `EmbeddedResult`.
 
 ## Open, select, and use a table
 
@@ -88,6 +88,26 @@ assert_eq!(values[1].as_ref().unwrap(), &None);
   storage crate's default WAL mode. Set `num_shards`, `chunk_cache_size`, and
   `wal_mode` before calling `open` when the application needs different
   durability or parallelism trade-offs.
+
+## I/O backend
+
+`EmbeddedOptions::io_backend` selects the persistence backend. It defaults to
+`EmbeddedIoBackend::StdFs`, the portable choice. On a supported Linux host,
+select `IoUring` to use NexusDB's asynchronous io_uring path:
+
+```rust
+use nexusdb::{EmbeddedIoBackend, EmbeddedOptions, NexusDb};
+
+let mut options = EmbeddedOptions::new("./app-data");
+options.num_shards = 4;
+options.chunk_cache_size = 32;
+options.io_backend = EmbeddedIoBackend::IoUring;
+let db = NexusDb::open(options)?;
+```
+
+`IoUring` requires an available Linux io_uring runtime. Use `StdFs` for
+Windows, unsupported kernels, restricted containers, and predictable portable
+deployment.
 
 ## Windows
 

@@ -113,7 +113,9 @@ cargo test --workspace --no-fail-fast    # ~30s, expect 0 failed
 Use the `nexusdb` library target when an application needs the same shard,
 storage, and WAL engine in-process without opening network listeners. It
 provides synchronous and runtime-agnostic async `set` / `get` / `del`, plus
-same-table `set_many` / `get_many`.
+same-table `set_many` / `get_many`. `EmbeddedOptions` configures shard-thread
+count, per-shard cache capacity, WAL mode, and either portable `StdFs` or Linux
+`io_uring` persistence.
 
 ```rust
 use nexusdb::{EmbeddedOptions, NexusDb};
