@@ -11,15 +11,20 @@
 //! **关键约束**: 所有 `PagerIo` 方法必须从 Scheduler 线程调用 (协程上下文).
 //! `io_ops::read/write/fsync` 通过 `with_current` 访问 scheduler 的 io_uring.
 
+#[cfg(target_os = "linux")]
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::FileExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::file_at::FileAt;
+#[cfg(target_os = "linux")]
 use crate::page_pool::RegisteredBufPool;
 use crate::types::{CHUNK_SIZE, IoBackend, IoBackendConfig, PAGE_SIZE, PageKey};
 
@@ -130,6 +135,7 @@ impl StdFsBackend {
 ///
 /// **T18b**: 持有 `RegisteredBufPool` 实现固定缓冲区 IO.
 /// 懒注册: 第一次 IO 时注册 2 个 1MB buffer 到 ring.
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct IoUringBackend {
     /// Per-Pager FD 池 (T18a). RefCell 提供内部可变性, 因为 `PagerIoBackend` 方法取 `&self`.
@@ -146,6 +152,7 @@ pub struct IoUringBackend {
     fd_cache: RefCell<HashMap<PathBuf, File>>,
 }
 
+#[cfg(target_os = "linux")]
 impl IoUringBackend {
     pub fn new(config: IoBackendConfig) -> Self {
         Self {
@@ -249,12 +256,14 @@ impl IoUringBackend {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Default for IoUringBackend {
     fn default() -> Self {
         Self::new(IoBackendConfig::default())
     }
 }
 
+#[cfg(target_os = "linux")]
 impl PagerIoBackend for IoUringBackend {
     async fn read_chunk(&self, path: &Path, off: u64) -> io::Result<Vec<u8>> {
         // 尝试 fixed file + fixed buffer 路径 (T18b)
@@ -492,6 +501,7 @@ impl PagerIoBackend for IoUringBackend {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl IoUringBackend {
     /// ⭐ Phase C: 同文件 N 个 chunk 批量写 + 单次 fsync (长尾对症).
     ///
@@ -561,6 +571,55 @@ impl IoUringBackend {
             }
         }
         scheduler::io_ops::fsync(fd).await
+    }
+
+    fn evict_path(&self, path: &Path) {
+        self.fd_cache.borrow_mut().remove(path);
+        let _ = scheduler::with_current(|s| {
+            self.fd_pool.borrow_mut().release_path(s.ring_mut(), path);
+        });
+    }
+}
+
+/// 非 Linux 构建中的兼容占位后端。配置层会拒绝选择 io_uring；该实现只让程序化
+/// 构造保持安全，并委托可移植的 StdFs 路径。
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IoUringBackend(StdFsBackend);
+
+#[cfg(not(target_os = "linux"))]
+impl IoUringBackend {
+    pub fn new(_config: IoBackendConfig) -> Self {
+        Self(StdFsBackend)
+    }
+
+    async fn write_chunks_file_batch(&self, path: &Path, items: &[(u64, &[u8])]) -> io::Result<()> {
+        self.0.write_chunks_file_batch(path, items).await
+    }
+
+    async fn write_plain_file_batch(&self, path: &Path, items: &[(u64, &[u8])]) -> io::Result<()> {
+        self.0.write_chunks_file_batch(path, items).await
+    }
+
+    fn evict_path(&self, _path: &Path) {}
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PagerIoBackend for IoUringBackend {
+    async fn read_chunk(&self, path: &Path, off: u64) -> io::Result<Vec<u8>> {
+        self.0.read_chunk(path, off).await
+    }
+    async fn read_page(&self, path: &Path, off: u64) -> io::Result<Vec<u8>> {
+        self.0.read_page(path, off).await
+    }
+    async fn write_chunk(&self, path: &Path, off: u64, data: &[u8]) -> io::Result<()> {
+        self.0.write_chunk(path, off, data).await
+    }
+    async fn fsync(&self, path: &Path) -> io::Result<()> {
+        self.0.fsync(path).await
+    }
+    fn name(&self) -> &'static str {
+        "StdFsFallback"
     }
 }
 
@@ -746,13 +805,7 @@ impl PagerIo {
     pub fn evict_path(&self, path: &Path) {
         match self {
             PagerIo::StdFs(_) => {}
-            PagerIo::IoUring(b) => {
-                b.fd_cache.borrow_mut().remove(path);
-                let _ = scheduler::with_current(|s| {
-                    // 拆借: ring 与 fd_pool 均在 scheduler/backend 内部
-                    b.fd_pool.borrow_mut().release_path(s.ring_mut(), path);
-                });
-            }
+            PagerIo::IoUring(b) => b.evict_path(path),
         }
     }
 }

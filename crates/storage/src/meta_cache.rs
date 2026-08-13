@@ -21,9 +21,9 @@
 use std::fs::File;
 use std::io;
 use std::io::Read;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use crate::file_at::FileAt;
 use crate::types::{DbId, META_PID, PidLocation};
 
 /// dirty window 大小: 1MB.

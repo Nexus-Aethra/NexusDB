@@ -62,10 +62,25 @@ pub(crate) fn sql_subq_start(
     let first = inners[0].clone();
     conn.sql_subq.insert(
         seq,
-        SubqCtx { outer: stmt.clone(), db: db.clone(), inners, results: Vec::new(), cur: 0 },
+        SubqCtx {
+            outer: stmt.clone(),
+            db: db.clone(),
+            inners,
+            results: Vec::new(),
+            cur: 0,
+        },
     );
     sql_dispatch_stmt(
-        conn, conn_id, seq, worker_id, db, default_db, db_view, shard_inboxes, num_shards, first,
+        conn,
+        conn_id,
+        seq,
+        worker_id,
+        db,
+        default_db,
+        db_view,
+        shard_inboxes,
+        num_shards,
+        first,
     );
     true
 }
@@ -92,7 +107,16 @@ pub(crate) fn sql_subq_advance(
     };
     if let Some(inner) = next {
         sql_dispatch_stmt(
-            conn, conn_id, seq, worker_id, &db, default_db, db_view, shard_inboxes, num_shards, inner,
+            conn,
+            conn_id,
+            seq,
+            worker_id,
+            &db,
+            default_db,
+            db_view,
+            shard_inboxes,
+            num_shards,
+            inner,
         );
         return;
     }
@@ -107,7 +131,15 @@ pub(crate) fn sql_subq_advance(
         Ok(fp) => {
             let outer = stmt_replace_conds(ctx.outer, fp);
             sql_dispatch_stmt(
-                conn, conn_id, seq, worker_id, &db, default_db, db_view, shard_inboxes, num_shards,
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                &db,
+                default_db,
+                db_view,
+                shard_inboxes,
+                num_shards,
                 outer,
             );
         }
@@ -138,7 +170,12 @@ pub(crate) fn derived_capture_rowctx(
         })
         .collect();
     let rows = if hit {
-        vec![ctx.proj.iter().map(|&i| values[i as usize].clone()).collect()]
+        vec![
+            ctx.proj
+                .iter()
+                .map(|&i| values[i as usize].clone())
+                .collect(),
+        ]
     } else {
         vec![]
     };
@@ -161,7 +198,14 @@ pub(crate) fn finish_derived(
     let ctx = conn.sql_derived.remove(&seq).expect("derived ctx");
     match ctx {
         // ⭐ F72: 单独派生表 → worker 内存执行外层并回包
-        DerivedCtx::Standalone { alias, items, conds, order, limit, offset } => {
+        DerivedCtx::Standalone {
+            alias,
+            items,
+            conds,
+            order,
+            limit,
+            offset,
+        } => {
             let bytes = derived_render(
                 conn.proto, binary, &alias, &items, &conds, &order, limit, offset, &cols, rows,
             );
@@ -170,7 +214,16 @@ pub(crate) fn finish_derived(
         // ⭐ F75: 派生表作 JOIN 首表 → 预填 tables[0] 后转 JOIN 状态机
         DerivedCtx::JoinFrom { db, join_stmt } => {
             finish_derived_join(
-                conn, conn_id, seq, worker_id, shard_inboxes, num_shards, db, join_stmt, cols, rows,
+                conn,
+                conn_id,
+                seq,
+                worker_id,
+                shard_inboxes,
+                num_shards,
+                db,
+                join_stmt,
+                cols,
+                rows,
             );
         }
     }
@@ -191,11 +244,27 @@ pub(crate) fn finish_derived_join(
     rows: Vec<Vec<ColValue>>,
 ) {
     if rows.len() > JOIN_MAX_ROWS {
-        conn.resp_complete(seq, sql_err_bytes(conn.proto, "derived table too large (limit 262144 rows)"));
+        conn.resp_complete(
+            seq,
+            sql_err_bytes(conn.proto, "derived table too large (limit 262144 rows)"),
+        );
         return;
     }
-    let SqlStmt::SelectJoin { from, joins, items, conds, order, limit, offset, .. } = join_stmt else {
-        conn.resp_complete(seq, sql_err_bytes(conn.proto, "internal: derived join expects SelectJoin"));
+    let SqlStmt::SelectJoin {
+        from,
+        joins,
+        items,
+        conds,
+        order,
+        limit,
+        offset,
+        ..
+    } = join_stmt
+    else {
+        conn.resp_complete(
+            seq,
+            sql_err_bytes(conn.proto, "internal: derived join expects SelectJoin"),
+        );
         return;
     };
     // 合成派生表 schema (内层真实列类型); proj = 全列 identity (行已定宽)
@@ -215,7 +284,9 @@ pub(crate) fn finish_derived_join(
         dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
-            fks: Vec::new(),});
+        fks: Vec::new(),
+        resp_row_adapter: Default::default(),
+    });
     let ncols = cols.len() as u16;
     let mut tables: Vec<JoinTable> = Vec::with_capacity(joins.len() + 1);
     tables.push(JoinTable {
@@ -312,7 +383,9 @@ pub(crate) fn derived_render(
         dropped: Vec::new(),
         next_iid: 0,
         version_ncols: Vec::new(),
-            fks: Vec::new(),};
+        fks: Vec::new(),
+        resp_row_adapter: Default::default(),
+    };
     let conds = match conds_in.try_map(&|c: &Cond| {
         let idx = resolve(&c.col)?;
         Ok::<_, String>(Cond {
@@ -344,12 +417,24 @@ pub(crate) fn derived_render(
     };
     let rows = &rows[start..end];
     // COUNT(*) 特判 (parse 已保证含 Agg 时必为孤 COUNT(*))
-    if items.iter().any(|i| matches!(i, sql::SelectItem::Agg { .. })) {
+    if items
+        .iter()
+        .any(|i| matches!(i, sql::SelectItem::Agg { .. }))
+    {
         let cref = [("COUNT(*)", ColType::I64)];
-        return sql_rows_bytes(proto, binary, &cref, &[vec![ColValue::I64(rows.len() as i64)]]);
+        return sql_rows_bytes(
+            proto,
+            binary,
+            &cref,
+            &[vec![ColValue::I64(rows.len() as i64)]],
+        );
     }
     // ⭐ compat: 标量函数投影 (SELECT NOW()/version()) — 常量单行
-    if items.iter().all(|i| matches!(i, sql::SelectItem::ScalarFn { .. })) && !items.is_empty() {
+    if items
+        .iter()
+        .all(|i| matches!(i, sql::SelectItem::ScalarFn { .. }))
+        && !items.is_empty()
+    {
         let (cref, row) = match scalar_fn_const_row(items) {
             Ok(v) => v,
             Err(e) => return sql_err_bytes(proto, &e),
@@ -371,12 +456,20 @@ pub(crate) fn derived_render(
             sql::SelectItem::Agg { .. } => unreachable!("孤 COUNT(*) 已在上方特判"),
             sql::SelectItem::ScalarFn { .. } => unreachable!("标量函数已在上方常量特判"),
             sql::SelectItem::Expr { .. } => {
-                return sql_err_bytes(proto, "expression projections in derived tables are not supported (v1)")
+                return sql_err_bytes(
+                    proto,
+                    "expression projections in derived tables are not supported (v1)",
+                );
             }
         }
     }
-    let cref: Vec<(&str, ColType)> = idxs.iter().map(|&i| (cols[i].0.as_str(), cols[i].1)).collect();
-    let proj: Vec<Vec<ColValue>> =
-        rows.iter().map(|r| idxs.iter().map(|&i| r[i].clone()).collect()).collect();
+    let cref: Vec<(&str, ColType)> = idxs
+        .iter()
+        .map(|&i| (cols[i].0.as_str(), cols[i].1))
+        .collect();
+    let proj: Vec<Vec<ColValue>> = rows
+        .iter()
+        .map(|r| idxs.iter().map(|&i| r[i].clone()).collect())
+        .collect();
     sql_rows_bytes(proto, binary, &cref, &proj)
 }

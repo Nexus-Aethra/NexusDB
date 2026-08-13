@@ -29,8 +29,7 @@ pub struct SqlSharedRoutes {
     cluster_ctl: std::sync::RwLock<Option<std::sync::Arc<shard_manager::ShardManager>>>,
     /// ⭐ PG 兼容 (FMT_VER 8): 外键反向引用 — (db, ref_table) → 引用它的表.
     /// 由 CREATE TABLE 注册 / DROP TABLE 移除; 级联删除按此分发.
-    fk_incoming:
-        std::sync::RwLock<HashMap<(std::sync::Arc<str>, String), Vec<FkIncoming>>>,
+    fk_incoming: std::sync::RwLock<HashMap<(std::sync::Arc<str>, String), Vec<FkIncoming>>>,
 }
 
 impl Default for SqlSharedRoutes {

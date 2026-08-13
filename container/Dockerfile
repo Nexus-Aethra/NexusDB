@@ -3,14 +3,16 @@
 # NexusDB 容器镜像 — 多阶段构建 (Rust builder -> debian-slim runtime)
 # ============================================================================
 #
-# 构建:  docker build -t nexusdb:latest .
+# 构建:  docker build -f container/Dockerfile -t nexusdb:latest .
+#        (build context 仍为仓库根; -f 指定 Dockerfile 路径)
 # 运行:  docker run --rm -p 6379:6379 -p 5434:5434 -p 5435:5435 -p 6778:6778 \
 #              -v nexusdb-data:/data nexusdb:latest
+# 一键:  docker compose -f container/docker-compose.yml up -d
 #
 # io_uring 说明: 默认配置用 io_uring 后端 (本项目核心设计)。若宿主内核较老
 # 或 Docker 默认 seccomp 拦截 io_uring 系统调用, 出现 I/O 报错时二选一:
 #   1) 挂载自定义配置把 io_backend 改成 "stdfs" (兼容任何内核):
-#        -v $PWD/my.toml:/etc/nexusdb/nexusdb.toml
+#        -v $PWD/container/docker-stdfs.toml:/etc/nexusdb/nexusdb.toml
 #   2) 放宽 seccomp: docker run --security-opt seccomp=unconfined ...
 # ----------------------------------------------------------------------------
 
@@ -51,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown -R nexus:nexus /data
 
 COPY --from=builder /usr/local/bin/NexusDB /usr/local/bin/NexusDB
-COPY deploy/nexusdb.docker.toml /etc/nexusdb/nexusdb.toml
+COPY container/docker.toml /etc/nexusdb/nexusdb.toml
 
 # 存储层 async fn poll frame 较大 (含多个 16KB page buffer), 提升线程栈避免溢出。
 ENV RUST_MIN_STACK=67108864

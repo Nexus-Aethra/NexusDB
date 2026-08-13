@@ -2,7 +2,7 @@
 
 > **语言 / Language**: [English](./GUIDE.md) | **简体中文**
 
-> 面向使用者的上手指南。设计与实现细节见 [`DESIGN.md`](../DESIGN.md);修复/演进历史见 [`CHANGELOG.md`](../CHANGELOG.md)。
+> 面向使用者的上手指南。设计与实现细节见 [`DESIGN.md`](./DESIGN.md);修复/演进历史见 [`CHANGELOG.md`](./CHANGELOG.md)。
 
 ## 目录
 1. [这是什么](#1-这是什么)
@@ -48,7 +48,7 @@ cargo build --release
 
 > 注:存储层 async 帧较大,运行/测试需要更大线程栈:`RUST_MIN_STACK=67108864`。
 
-### 最简配置 `nexusdb.toml`
+### 最简配置 (`config/nexusdb.toml`)
 ```toml
 [server]
 sql_addr = "127.0.0.1:5434"      # MySQL wire
@@ -65,12 +65,12 @@ default_table = "default"
 
 ### 启动
 ```bash
-RUST_MIN_STACK=67108864 ./target/release/NexusDB --config nexusdb.toml
+RUST_MIN_STACK=67108864 ./target/release/NexusDB --config config/nexusdb.toml
 ```
 启动后日志会打印各门面监听地址。任一门面 `addr` 留空即禁用该门面。
 
 ### Docker 部署
-镜像随仓库提供 [`Dockerfile`](../Dockerfile)(多阶段:Rust builder → debian-slim)+ [`docker-compose.yml`](../docker-compose.yml)+ 容器默认配置 [`deploy/nexusdb.docker.toml`](../deploy/nexusdb.docker.toml)。
+镜像随仓库提供 [`container/Dockerfile`](../container/Dockerfile)(多阶段:Rust builder → debian-slim)+ [`container/docker-compose.yml`](../container/docker-compose.yml)+ 容器默认配置 [`container/docker.toml`](../container/docker.toml)(受限 seccomp 环境备 [`container/docker-stdfs.toml`](../container/docker-stdfs.toml))。
 ```bash
 # 构建镜像
 docker build -t nexusdb:latest .
@@ -87,6 +87,80 @@ docker compose up -d
 - 覆盖配置:`-v /path/your.toml:/etc/nexusdb/nexusdb.toml`。
 - **io_uring 注意**:默认 `io_backend=io_uring`,需较新内核;若被宿主 seccomp 拦截而报 I/O 错,改配置为 `io_backend="stdfs"`(挂自定义配置),或 `docker run --security-opt seccomp=unconfined`。
 - 启用 TLS:挂证书目录并在配置里设置 `tls_cert`/`tls_key`。
+
+### Windows 部署 (Beta, 2026-08-13)
+
+原生 Windows 支持是 beta 阶段,在 `feat/resp-sql-schema-adapter` 分支。计划 + 踩坑
+见 [`docs/plans/2026-08-13-windows-portability.md`](./plans/2026-08-13-windows-portability.md) +
+[`docs/plans/2026-08-13-windows-iocp.md`](./plans/2026-08-13-windows-iocp.md)。
+
+```bash
+# 1) 工具链
+rustup default stable-x86_64-pc-windows-msvc
+
+# 2) 编译
+git clone https://github.com/Nexus-Aethra/NexusDB.git
+cd NexusDB
+cargo build --release --workspace
+```
+
+最小 `config/nexusdb-test.toml` (Windows 上自动纠正 `io_backend` 为 `stdfs`):
+
+```toml
+[server]
+listen_addr = "127.0.0.1:5433"     # Binary
+redis_addr  = "127.0.0.1:6380"     # RESP (用 6380 避开 win 自带的 redis-server)
+worker_count = 1
+sql_addr = ""                    # SQL/PG/HTTP 是 Linux 路径
+pg_addr   = ""
+http_addr = ""
+
+[storage]
+block_root = "./data-test"
+num_shards = 2
+io_backend = "stdfs"
+create_if_missing = true
+default_db = "default"
+default_table = "default"
+precreate_dbs = 1
+```
+
+运行 + smoke:
+
+```bash
+./target/release/NexusDB.exe --config config/nexusdb-test.toml
+# 另一个 shell (Redis.Redis 装在 Program Files 下):
+& "C:\Program Files\Redis\redis-cli.exe" -p 6380 PING             # PONG
+& "C:\Program Files\Redis\redis-cli.exe" -p 6380 SET user:1 alice # OK
+& "C:\Program Files\Redis\redis-cli.exe" -p 6380 GET user:1       # alice
+& "C:\Program Files\Redis\redis-cli.exe" -p 6380 DEL user:1       # 1
+```
+
+Windows 上能用的: Binary (5433) + RESP (6380), `PING`/`AUTH`/`SET`/`GET`/`DEL`/`MGET`/`MSET`/等, WAL 持久化 + 崩溃恢复, Ctrl-C 优雅停止。
+
+Windows 上还不能用的: MySQL / PostgreSQL / HTTP REST / TLS 门面, IOCP/RIO 性能路径,
+memtier 压测, 860+ 测试矩阵。`INCR`/`HSET`/`LPUSH`/`SADD`/`ZADD`/`DBSIZE`/`INFO`/`CLIENT LIST`
+在 dispatch 树上还没接 (Linux `portable.rs` 上同样没接, 是协议层本身的工作, 跟
+Windows runtime 无关)。
+
+踩坑:
+
+- **没有 `io_uring`**: Windows 上 `io_backend` 字段被忽略; 缺省 config 路径自动降级
+  到 `stdfs`, 也可以显式写 `io_backend = "stdfs"` 显式表达。
+- **6379 端口被自带 redis-server 占用**: `Redis.Redis` winget 包装的
+  `redis-server.exe` 跑在 SYSTEM 账户, 没 admin 杀不掉; 测试用 6380 (或任何空闲
+  端口) 避让。生产可改成自己 config 里的空闲端口。
+- **Listener `set_nonblocking(true)` 状态继承到 child socket**: acceptor 轮询 `stop`
+  atomic 需要这个, 但 winsock 会把 non-blocking 继承给 accept 出来的子 socket。
+  子连接线程的 read 把 `WSAEWOULDBLOCK` (10035) 和 `WSAETIMEDOUT` 当正常背压
+  (短 sleep + retry); **绝不能** `return Err` 关连接, 不然 client 在连发命令时
+  会看到 "An existing connection was forcibly closed"。
+- **`#[repr(C)]` 是 IOCP `OverlappedData` 的硬约束**: 以后再启用 IOCP 路径时,
+  `OVERLAPPED` 必须是第一个字段, struct 必须 `#[repr(C)]`。Rust 默认 `repr(Rust)`
+  会 reorder 字段, GQCS 拿到的 ptr 强转后会拿到错位的状态。
+- **`windows-sys = "0.61"` 类型细节**:
+  - `ACCEPTEX` 不存在, 是 `LPFN_ACCEPTEX` (`Option<unsafe extern "system" fn(...)>`)
+  - `setsockopt` 第 4 参是 `PSTR` (`*const u8`), 不是 `*const c_void`
 
 ---
 
@@ -379,4 +453,4 @@ default_table = "default"
 - **JSON**:文本存储,单行 < 64KB,不建 JSON 路径索引。
 - **时间**:统一 UTC 裸值,无时区转换。
 
-> 完整 gap 清单见 [`README-CN.md`](../README-CN.md) 的 "SQL gap" 段与 [`CHANGELOG.md`](../CHANGELOG.md)。
+> 完整 gap 清单见 [`README-CN.md`](../README-CN.md) 的 "SQL gap" 段与 [`CHANGELOG.md`](./CHANGELOG.md)。

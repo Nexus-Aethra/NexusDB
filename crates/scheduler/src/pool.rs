@@ -30,7 +30,6 @@ impl Default for Slot {
 pub struct Pool {
     slots: Box<[Slot; POOL_SIZE]>,
     free: VecDeque<usize>,
-    rr: usize,
     in_use: usize,
 }
 
@@ -39,28 +38,27 @@ impl Pool {
         let slots: Box<[Slot; POOL_SIZE]> = Box::new(std::array::from_fn(|_| Slot::default()));
         Self {
             slots,
-            free: VecDeque::new(),
-            rr: 0,
+            // 活跃 slot 绝不可回绕复用；所有 slot 从 free list 分配。
+            free: (0..POOL_SIZE).collect(),
             in_use: 0,
         }
     }
 
-    pub fn acquire(&mut self) -> usize {
-        if let Some(idx) = self.free.pop_front() {
-            self.in_use += 1;
-            return idx;
-        }
-        let idx = self.rr;
-        self.rr = (self.rr + 1) % POOL_SIZE;
+    /// 分配一个未被活跃 future 占用的 slot。
+    ///
+    /// 满载时由上层保留 task 在 admission queue 中等待，不能覆盖活跃 future。
+    pub fn acquire(&mut self) -> Option<usize> {
+        let idx = self.free.pop_front()?;
         self.in_use += 1;
-        idx
+        Some(idx)
     }
 
     pub fn release(&mut self, idx: usize) {
         debug_assert!(idx < POOL_SIZE);
         self.slots[idx].future = None;
         self.slots[idx].low_priority = false;
-        self.free.push_back(idx);
+        // 优先复用刚释放的 slot；它已完成 future/IO 清理，且不影响活跃 slot 的所有权。
+        self.free.push_front(idx);
         self.in_use -= 1;
     }
 
@@ -70,6 +68,10 @@ impl Pool {
 
     pub fn in_use(&self) -> usize {
         self.in_use
+    }
+
+    pub fn available(&self) -> usize {
+        self.free.len()
     }
 }
 

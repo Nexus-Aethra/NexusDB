@@ -20,16 +20,20 @@ struct QueuedTask {
 /// Task 专用 inbox: worker push, shard drain.
 pub struct TaskInbox {
     ring: ArrayQueue<QueuedTask>,
+    #[cfg(target_os = "linux")]
     eventfd: std::os::unix::io::RawFd,
     pending: AtomicU64,
 }
 
 impl TaskInbox {
     pub fn new() -> Self {
+        #[cfg(target_os = "linux")]
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        #[cfg(target_os = "linux")]
         assert!(fd >= 0, "eventfd creation failed");
         Self {
             ring: ArrayQueue::new(TASK_INBOX_CAPACITY),
+            #[cfg(target_os = "linux")]
             eventfd: fd,
             pending: AtomicU64::new(0),
         }
@@ -49,9 +53,12 @@ impl TaskInbox {
             return Err(rejected.task);
         }
         if self.pending.fetch_add(1, Ordering::AcqRel) == 0 {
-            let val: u64 = 1;
-            unsafe {
-                libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+            #[cfg(target_os = "linux")]
+            {
+                let val: u64 = 1;
+                unsafe {
+                    libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+                }
             }
         }
         Ok(())
@@ -96,9 +103,12 @@ impl TaskInbox {
             }
         }
         if self.pending.fetch_add(count, Ordering::AcqRel) == 0 {
-            let val: u64 = 1;
-            unsafe {
-                libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+            #[cfg(target_os = "linux")]
+            {
+                let val: u64 = 1;
+                unsafe {
+                    libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+                }
             }
         }
     }
@@ -138,9 +148,16 @@ impl TaskInbox {
 
     /// Shard 端: blocking wait (eventfd read).
     pub fn wait(&self) {
-        let mut val: u64 = 0;
-        unsafe {
-            libc::read(self.eventfd, &mut val as *mut u64 as *mut libc::c_void, 8);
+        #[cfg(target_os = "linux")]
+        {
+            let mut val: u64 = 0;
+            unsafe {
+                libc::read(self.eventfd, &mut val as *mut u64 as *mut libc::c_void, 8);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        while self.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -152,6 +169,7 @@ impl TaskInbox {
         self.ring.is_empty()
     }
 
+    #[cfg(target_os = "linux")]
     pub fn eventfd(&self) -> std::os::unix::io::RawFd {
         self.eventfd
     }
@@ -165,7 +183,10 @@ impl Default for TaskInbox {
 
 impl Drop for TaskInbox {
     fn drop(&mut self) {
-        unsafe { libc::close(self.eventfd); }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::close(self.eventfd);
+        }
     }
 }
 
@@ -207,11 +228,20 @@ mod tests {
         }
 
         let first = inbox.drain_up_to(2);
-        assert_eq!(first.iter().map(|task| task.req_id).collect::<Vec<_>>(), [0, 1]);
-        assert!(!inbox.is_empty(), "unserved task must remain visible to next turn");
+        assert_eq!(
+            first.iter().map(|task| task.req_id).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(
+            !inbox.is_empty(),
+            "unserved task must remain visible to next turn"
+        );
 
         let second = inbox.drain_up_to(2);
-        assert_eq!(second.iter().map(|task| task.req_id).collect::<Vec<_>>(), [2]);
+        assert_eq!(
+            second.iter().map(|task| task.req_id).collect::<Vec<_>>(),
+            [2]
+        );
         assert!(inbox.is_empty());
     }
 }

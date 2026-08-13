@@ -1,8 +1,9 @@
 // ⭐ 解耦 2026-08: StorageEngine 数据读写物理层 (从 engine.rs 拆出).
 // 职责: table_put/get/delete、物理页读写 (put_physical/get_physical)、批量读写.
 use super::engine::StorageEngine;
+use crate::file_at::FileAt;
 use crate::meta_cache::MetaCache;
-use crate::meta_page::{MetaPage, META_PID, META_VPID};
+use crate::meta_page::{META_PID, META_VPID, MetaPage};
 use crate::registry::{DbRegistry, RegistryError};
 use crate::types::DbId;
 use std::io;
@@ -166,8 +167,7 @@ impl StorageEngine {
             .open_table(&mut self.pager, table)
             .await?
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
-        let new_root =
-            crate::registry::table_put_many(&mut self.pager, table_vpid, pairs).await?;
+        let new_root = crate::registry::table_put_many(&mut self.pager, table_vpid, pairs).await?;
         // ⭐ WAL (F60): 批量记录 (一次遍历, flush 时共享后续 fsync)
         if let Some(w) = self.wal.as_mut() {
             for (pkey, value) in pairs {
@@ -201,10 +201,12 @@ impl StorageEngine {
             .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let existed = crate::registry::table_delete(&mut self.pager, table_vpid, pkey).await?;
         // ⭐ M3-1: 删除成功 → 近似行数 -1 (saturating 防下溢)
-        if existed {
-            if let Some(c) = self.row_counts.get_mut(&(db.to_string(), table.to_string())) {
-                *c = c.saturating_sub(1);
-            }
+        if existed
+            && let Some(c) = self
+                .row_counts
+                .get_mut(&(db.to_string(), table.to_string()))
+        {
+            *c = c.saturating_sub(1);
         }
         // ⭐ WAL (F60): 存在才记 (不存在的 delete 重放无意义)
         if existed && let Some(w) = self.wal.as_mut() {
@@ -256,7 +258,10 @@ impl StorageEngine {
         // ⭐ Phase K: 每个 key 编码为 [S][klen][key] 再交给 registry.
         // 编码后物理序 != 裸 key 序 (klen 前缀), 但 registry 内部按传入的
         // 物理 key 排序走 LeafGuide, 结果按输入索引还原 — 一致性成立.
-        let encoded: Vec<Vec<u8>> = keys.iter().map(|k| crate::keyspace::encode_string(k)).collect();
+        let encoded: Vec<Vec<u8>> = keys
+            .iter()
+            .map(|k| crate::keyspace::encode_string(k))
+            .collect();
         let refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
         crate::registry::table_get_many(&mut self.pager, table_vpid, &refs).await
     }
@@ -341,7 +346,9 @@ impl StorageEngine {
     /// ⭐ M3-1b: 持久化 CBO 统计 (row + distinct + range) 到 stats.bin (best-effort).
     pub(crate) fn save_stats(&self) {
         use std::io::Write;
-        let Ok(mut f) = std::fs::File::create(&self.stats_path) else { return };
+        let Ok(mut f) = std::fs::File::create(&self.stats_path) else {
+            return;
+        };
         let _ = f.write_all(b"NXTST1");
         // row_counts
         let _ = f.write_all(&(self.row_counts.len() as u32).to_le_bytes());
@@ -380,33 +387,47 @@ impl StorageEngine {
     /// ⭐ M3-1b: 加载 stats.bin (open 时; 缺失/损坏 → 空统计, 无碍).
     pub(crate) fn load_stats(&mut self) {
         use std::io::Read;
-        let Ok(mut f) = std::fs::File::open(&self.stats_path) else { return };
+        let Ok(mut f) = std::fs::File::open(&self.stats_path) else {
+            return;
+        };
         let mut buf = Vec::new();
         if f.read_to_end(&mut buf).is_err() || buf.len() < 6 || &buf[..6] != b"NXTST1" {
             return;
         }
         let mut p = 6usize;
         // row_counts
-        let Some(n) = st_u32(&buf, &mut p) else { return };
+        let Some(n) = st_u32(&buf, &mut p) else {
+            return;
+        };
         for _ in 0..n {
-            let (Some(db), Some(table), Some(c)) =
-                (st_str(&buf, &mut p), st_str(&buf, &mut p), st_u64(&buf, &mut p))
-            else { return };
+            let (Some(db), Some(table), Some(c)) = (
+                st_str(&buf, &mut p),
+                st_str(&buf, &mut p),
+                st_u64(&buf, &mut p),
+            ) else {
+                return;
+            };
             self.row_counts.insert((db, table), c);
         }
         // distinct_counts
-        let Some(n) = st_u32(&buf, &mut p) else { return };
+        let Some(n) = st_u32(&buf, &mut p) else {
+            return;
+        };
         for _ in 0..n {
             let (Some(db), Some(table), Some(iid), Some(c)) = (
                 st_str(&buf, &mut p),
                 st_str(&buf, &mut p),
                 st_u32(&buf, &mut p),
                 st_u64(&buf, &mut p),
-            ) else { return };
+            ) else {
+                return;
+            };
             self.distinct_counts.insert((db, table, iid), c);
         }
         // range_counts
-        let Some(n) = st_u32(&buf, &mut p) else { return };
+        let Some(n) = st_u32(&buf, &mut p) else {
+            return;
+        };
         for _ in 0..n {
             let (Some(db), Some(table), Some(iid), Some(lo), Some(hi)) = (
                 st_str(&buf, &mut p),
@@ -414,7 +435,9 @@ impl StorageEngine {
                 st_u32(&buf, &mut p),
                 st_bytes(&buf, &mut p),
                 st_bytes(&buf, &mut p),
-            ) else { return };
+            ) else {
+                return;
+            };
             self.range_counts.insert((db, table, iid), (lo, hi));
         }
     }
@@ -558,7 +581,6 @@ pub(crate) fn init_meta_page(block_dir: &std::path::Path, meta: &mut MetaCache) 
         .truncate(true)
         .open(&block_path)?;
     // use FileExt for write_all_at
-    use std::os::unix::fs::FileExt;
     f.write_all_at(&*bytes, 0)?;
     f.sync_all()?;
     drop(f);

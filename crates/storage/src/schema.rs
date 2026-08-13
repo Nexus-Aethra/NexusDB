@@ -111,6 +111,29 @@ pub enum FkAction {
     SetNull,
 }
 
+/// SQL 表是否将 RESP Hash 命令适配为行操作。
+///
+/// 没有 schema 的表始终是原生 KV 表；有 schema 的表始终是 SQL 表。
+/// 此标志只决定 SQL 表是否显式开放 RESP 行适配，默认关闭以避免 `HSET`
+/// 意外绕过原有的 WRONGTYPE 隔离。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum RespRowAdapter {
+    #[default]
+    Disabled = 0,
+    Enabled = 1,
+}
+
+impl RespRowAdapter {
+    fn from_byte(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+}
+
 /// ⭐ PG 兼容 (FMT_VER 8): 外键定义 — 本表 `col` 引用 `ref_table(ref_col)`.
 /// v1: 单列外键; ref_table/ref_col 按名存储 (跨表引用, 位置在引用表 schema).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +221,8 @@ pub struct TableSchema {
     pub dropped: Vec<u16>,
     /// ⭐ PG 兼容 (FMT_VER 8): 外键列表 (本表引用其他表; 反向查询在 worker 聚合).
     pub fks: Vec<FkDef>,
+    /// ⭐ RESP-SQL adapter (FMT_VER 9): 显式开放 `HGET/HSET` 到 SQL 行的适配.
+    pub resp_row_adapter: RespRowAdapter,
 }
 
 /// 序列化格式版本 (与 schema.version 无关, 是编码布局版本).
@@ -208,7 +233,8 @@ pub struct TableSchema {
 /// ⭐ PG 兼容: 5→6 每列追加 default 段; decode 兼容 v1-5 (default=None).
 /// ⭐ PG 兼容: 6→7 索引项追加 cols 列集; decode 兼容 v1-6 (cols=[col]).
 /// ⭐ PG 兼容: 7→8 表尾追加 fks 外键列表; decode 兼容 v1-7 (fks=[]).
-const FMT_VER: u8 = 8;
+/// ⭐ RESP-SQL adapter: 8→9 表尾追加 RESP 行适配开关; v1-8 默认关闭.
+const FMT_VER: u8 = 9;
 
 /// schema 反序列化错误.
 #[derive(Debug, PartialEq, Eq)]
@@ -305,6 +331,7 @@ impl TableSchema {
             next_iid,
             dropped: Vec::new(),
             fks: fks.to_vec(),
+            resp_row_adapter: RespRowAdapter::Disabled,
         })
     }
 
@@ -325,6 +352,7 @@ impl TableSchema {
             version_ncols,
             dropped: self.dropped.clone(),
             fks: self.fks.clone(),
+            resp_row_adapter: self.resp_row_adapter,
         })
     }
 
@@ -345,7 +373,19 @@ impl TableSchema {
             next_iid: self.next_iid,
             dropped,
             fks: self.fks.clone(),
+            resp_row_adapter: self.resp_row_adapter,
         })
+    }
+
+    /// 产出仅改变 RESP 行适配开关的新 schema；不改变行格式或 schema.version。
+    pub fn with_resp_row_adapter(&self, enabled: bool) -> Self {
+        let mut next = self.clone();
+        next.resp_row_adapter = if enabled {
+            RespRowAdapter::Enabled
+        } else {
+            RespRowAdapter::Disabled
+        };
+        next
     }
 
     /// ⭐ F79: 某行版本写入时的列数 (行首部 version 字节 → 列数). 未知版本回退当前列数.
@@ -435,6 +475,8 @@ impl TableSchema {
             out.extend_from_slice(rc);
             out.push(fk.on_delete as u8);
         }
+        // ⭐ RESP-SQL adapter (FMT_VER 9)
+        out.push(self.resp_row_adapter as u8);
         out
     }
 
@@ -450,6 +492,7 @@ impl TableSchema {
             && fmt != 5
             && fmt != 6
             && fmt != 7
+            && fmt != 8
         {
             return Err(SchemaError::BadFormat);
         }
@@ -560,6 +603,12 @@ impl TableSchema {
         } else {
             Vec::new()
         };
+        // ⭐ RESP-SQL adapter (FMT_VER 9): 老 schema 默认不向 RESP 开放.
+        let resp_row_adapter = if fmt >= 9 {
+            RespRowAdapter::from_byte(r.u8()?).ok_or(SchemaError::BadFormat)?
+        } else {
+            RespRowAdapter::Disabled
+        };
         Ok(Self {
             version,
             columns,
@@ -569,6 +618,7 @@ impl TableSchema {
             version_ncols,
             dropped,
             fks,
+            resp_row_adapter,
         })
     }
 }
@@ -647,6 +697,24 @@ mod tests {
         // ⭐ O3: unique 位随序列化 roundtrip
         assert_eq!(d.indexes[2], IndexDef { iid: 2, col: 3, cols: vec![3], unique: true, global: false });
         assert_eq!(d.next_iid, 3);
+    }
+
+    #[test]
+    fn resp_row_adapter_is_opt_in_and_v8_defaults_disabled() {
+        let s = demo_schema();
+        assert_eq!(s.resp_row_adapter, RespRowAdapter::Disabled);
+        let enabled = s.with_resp_row_adapter(true);
+        assert_eq!(enabled.resp_row_adapter, RespRowAdapter::Enabled);
+        assert_eq!(TableSchema::decode(&enabled.encode()).unwrap(), enabled);
+
+        // v8 的尾部刚好在 fks 后结束；旧库没有开关时必须保持安全默认值。
+        let mut v8 = s.encode();
+        v8[0] = 8;
+        v8.pop();
+        assert_eq!(
+            TableSchema::decode(&v8).unwrap().resp_row_adapter,
+            RespRowAdapter::Disabled
+        );
     }
 
     #[test]

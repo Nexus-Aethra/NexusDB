@@ -18,14 +18,25 @@
 //! 五种协议门面 (自家二进制 + RESP2 + MySQL wire + PostgreSQL wire + HTTP REST)
 //! 共享同一批 worker 与存储内核. TLS 支持 SQL/PG 门面 (STARTTLS).
 
+#[cfg(target_os = "linux")]
 pub mod acceptor;
 pub mod kv_to_shard;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[path = "portable.rs"]
+pub mod portable;
 pub mod protocol;
 pub mod reply_bus;
+#[cfg(target_os = "linux")]
 pub mod server;
 pub mod tls;
 pub mod value_codec;
+#[cfg(target_os = "linux")]
 pub mod worker;
+#[cfg(target_os = "windows")]
+pub mod runtime_iocp;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub use portable::{SqlSharedRoutes, new_sql_shared};
+#[cfg(target_os = "linux")]
 pub use worker::{SqlSharedRoutes, new_sql_shared};
 
 /// ⭐ H4: 进程级指标 (relaxed 原子, 热路径零锁; /metrics 导出).
@@ -85,12 +96,19 @@ pub mod geo_bridge {
     pub use storage::geo::{decode, encode, haversine_m, unit_factor};
 }
 
+#[cfg(target_os = "linux")]
 pub use acceptor::{Acceptor, AcceptorConfig, LbStrategy, NewConn};
 pub use kv_to_shard::dispatch_request;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub use portable::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 pub use protocol::{
     BinaryProtocol, DecodeOutcome, KvLimits, Protocol, ProtocolError, Request, RespCodec,
     RespCommand, Response, validate_request,
 };
 pub use reply_bus::{ReplyBusReceiver, ReplyBusSender, ReplyEnvelope};
+#[cfg(target_os = "linux")]
 pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
+#[cfg(target_os = "windows")]
+pub use runtime_iocp::{NetworkServer, NetworkServerConfig, ProtocolKind};
+#[cfg(target_os = "linux")]
 pub use worker::{WorkerConfig, WorkerPool};

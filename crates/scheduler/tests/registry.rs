@@ -50,3 +50,24 @@ fn user_data_is_unique_and_monotonic() {
     assert_ne!(a, b, "never reuse — even across take/re-register");
     assert!(b > a);
 }
+
+#[test]
+fn stats_distinguish_completion_cancellation_and_unknown_cqe() {
+    let mut reg = scheduler::IoRegistry::new();
+    let complete = reg.register(1, noop());
+    let cancel = reg.register(2, noop());
+    assert!(reg.mark_completed(complete, 7));
+    assert!(reg.cancel(cancel));
+    assert!(!reg.mark_completed(999, 0));
+    reg.record_unknown_cqe();
+
+    assert_eq!(
+        reg.stats(),
+        scheduler::IoRegistryStats {
+            registered: 2,
+            completed: 1,
+            cancelled: 1,
+            unknown_cqe: 1,
+        }
+    );
+}

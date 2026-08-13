@@ -27,21 +27,37 @@ pub(crate) fn pred_has_subquery(pred: &Pred<Cond>) -> bool {
 /// ⭐ F72: FROM 派生表 `(SELECT ...) [AS] alias [WHERE ...] [ORDER/LIMIT/OFFSET]`.
 /// 外层投影 items 已在 FROM 前解完 (传入). v1: 无聚合投影; 无别名报错;
 /// 外层 WHERE 不得含子查询 (双层编排留后).
-pub(crate) fn parse_derived(p: &mut P, items: Vec<SelectItem>, top: bool) -> Result<SqlStmt, String> {
+pub(crate) fn parse_derived(
+    p: &mut P,
+    items: Vec<SelectItem>,
+    top: bool,
+) -> Result<SqlStmt, String> {
     let inner = parse_paren_subselect(p)?;
-    let alias =
-        parse_opt_alias(p).ok_or_else(|| "every derived table must have its own alias".to_string())?;
+    let alias = parse_opt_alias(p)
+        .ok_or_else(|| "every derived table must have its own alias".to_string())?;
     // ⭐ F75: 派生表参与 JOIN — 别名后接 JOIN 子句 → 走 JOIN 主体 (from=派生表)
     if is_join_ahead(p) {
-        let from = TableRef { table: alias.clone(), alias };
+        let from = TableRef {
+            table: alias.clone(),
+            alias,
+        };
         return parse_join_from(p, items, from, Some(inner));
     }
     if items.iter().any(|i| matches!(i, SelectItem::Agg { .. })) {
         // v1 特判: 唯一投影项为 COUNT(*) 允许 (行数统计); 其余聚合拒
         let lone_count = items.len() == 1
-            && matches!(&items[0], SelectItem::Agg { func: AggFn::Count, arg: None, .. });
+            && matches!(
+                &items[0],
+                SelectItem::Agg {
+                    func: AggFn::Count,
+                    arg: None,
+                    ..
+                }
+            );
         if !lone_count {
-            return Err("aggregate on derived table is not supported (v1, except lone COUNT(*))".into());
+            return Err(
+                "aggregate on derived table is not supported (v1, except lone COUNT(*))".into(),
+            );
         }
     }
     let conds = parse_where(p)?;
@@ -50,7 +66,17 @@ pub(crate) fn parse_derived(p: &mut P, items: Vec<SelectItem>, top: bool) -> Res
     }
     let (order, limit, offset, limit_param, offset_param) = parse_select_tail(p)?;
     p.done_if(top)?;
-    Ok(SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset, limit_param, offset_param })
+    Ok(SqlStmt::SelectDerived {
+        inner,
+        alias,
+        items,
+        conds,
+        order,
+        limit,
+        offset,
+        limit_param,
+        offset_param,
+    })
 }
 
 /// WHERE 子句 (AND 平铺; caller 决定是否必带).
@@ -70,7 +96,11 @@ pub(crate) fn parse_or_expr(p: &mut P) -> Result<Pred<Cond>, String> {
     while p.try_kw("OR") {
         terms.push(parse_and_expr(p)?);
     }
-    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Pred::Or(terms) })
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        Pred::Or(terms)
+    })
 }
 
 /// ⭐ F69: AND 层.
@@ -79,7 +109,11 @@ pub(crate) fn parse_and_expr(p: &mut P) -> Result<Pred<Cond>, String> {
     while p.try_kw("AND") {
         terms.push(parse_not_expr(p)?);
     }
-    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Pred::And(terms) })
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        Pred::And(terms)
+    })
 }
 
 /// ⭐ F69: NOT 层.
@@ -129,13 +163,19 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             Tok::Le => CmpOp::Le,
             Tok::Ne => CmpOp::Ne,
             other => {
-                return Err(format!("expected comparison operator after constant, got {other:?}"))
+                return Err(format!(
+                    "expected comparison operator after constant, got {other:?}"
+                ));
             }
         };
         let rv = p.value()?;
         let rhs = fold_cond_arith(p, rv)?;
         let truthy = const_cmp(lhs, op, rhs)?;
-        return Ok(if truthy { Pred::And(vec![]) } else { Pred::Or(vec![]) });
+        return Ok(if truthy {
+            Pred::And(vec![])
+        } else {
+            Pred::Or(vec![])
+        });
     }
     let mut conds: Vec<Cond> = Vec::new();
     let col = p.ident()?;
@@ -151,7 +191,11 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
                 val: SqlValue::Subquery(stmt),
                 set: vec![],
             });
-            return Ok(if negated_in { Pred::Not(Box::new(leaf)) } else { leaf });
+            return Ok(if negated_in {
+                Pred::Not(Box::new(leaf))
+            } else {
+                leaf
+            });
         }
         // 字面量列表
         p.expect(&Tok::LParen, "(")?;
@@ -172,8 +216,17 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             return Err("empty IN list".into());
         }
         sort_in_set(&mut set); // ⭐ F73: 大集合求值二分化
-        let leaf = Pred::Leaf(Cond { col, op: CmpOp::In, val: SqlValue::Null, set });
-        return Ok(if negated_in { Pred::Not(Box::new(leaf)) } else { leaf });
+        let leaf = Pred::Leaf(Cond {
+            col,
+            op: CmpOp::In,
+            val: SqlValue::Null,
+            set,
+        });
+        return Ok(if negated_in {
+            Pred::Not(Box::new(leaf))
+        } else {
+            leaf
+        });
     } else if negated_in {
         return Err("expected IN after NOT".into());
     }
@@ -185,8 +238,18 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
         if a == SqlValue::Null || b == SqlValue::Null {
             return Err("NULL is not a valid comparison bound".into());
         }
-        conds.push(Cond { col: col.clone(), op: CmpOp::Ge, val: a, set: vec![] });
-        conds.push(Cond { col, op: CmpOp::Le, val: b, set: vec![] });
+        conds.push(Cond {
+            col: col.clone(),
+            op: CmpOp::Ge,
+            val: a,
+            set: vec![],
+        });
+        conds.push(Cond {
+            col,
+            op: CmpOp::Le,
+            val: b,
+            set: vec![],
+        });
     } else if p.try_kw("LIKE") {
         // 仅前缀模式 'p%' → [p, p+1) 字节范围 (与 starts_with 精确等价);
         // 无 '%' → 等值; 其它模式报错 (v1)
@@ -196,7 +259,12 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
         let pct = pat.iter().position(|&b| b == b'%');
         match pct {
             None => {
-                conds.push(Cond { col, op: CmpOp::Eq, val: SqlValue::Str(pat), set: vec![] });
+                conds.push(Cond {
+                    col,
+                    op: CmpOp::Eq,
+                    val: SqlValue::Str(pat),
+                    set: vec![],
+                });
             }
             Some(i) if i == pat.len() - 1 => {
                 let prefix = pat[..i].to_vec();
@@ -216,7 +284,12 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
                     }
                     if let Some(last) = hi.last_mut() {
                         *last += 1;
-                        conds.push(Cond { col, op: CmpOp::Lt, val: SqlValue::Str(hi), set: vec![] });
+                        conds.push(Cond {
+                            col,
+                            op: CmpOp::Lt,
+                            val: SqlValue::Str(hi),
+                            set: vec![],
+                        });
                     }
                 }
             }
@@ -239,11 +312,15 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
         if p.peek() == Some(&Tok::Question) {
             p.next()?;
             let key = p.value()?;
-            if key == SqlValue::Null || matches!(key, SqlValue::ColRef(_) | SqlValue::Subquery(_))
-            {
+            if key == SqlValue::Null || matches!(key, SqlValue::ColRef(_) | SqlValue::Subquery(_)) {
                 return Err("JSONB '?' key must be a literal".into());
             }
-            conds.push(Cond { col, op: CmpOp::JsonExists, val: key, set: vec![] });
+            conds.push(Cond {
+                col,
+                op: CmpOp::JsonExists,
+                val: key,
+                set: vec![],
+            });
         } else {
             let op = match p.next()? {
                 Tok::Eq => CmpOp::Eq,
@@ -257,7 +334,12 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             // ⭐ F71: col op (SELECT ...) — 标量子查询 (dispatch 前折叠为常量)
             if p.peek_paren_select() {
                 let stmt = parse_paren_subselect(p)?;
-                return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::Subquery(stmt), set: vec![] }));
+                return Ok(Pred::Leaf(Cond {
+                    col,
+                    op,
+                    val: SqlValue::Subquery(stmt),
+                    set: vec![],
+                }));
             }
             // ⭐ F74: col op ident (非 NULL) → ColRef (关联子查询相关列; decorrelate 前收集)
             // ⭐ F80: 但排除字面量前导关键字 (NULL/TRUE/FALSE 及 DATE|TIME|TIMESTAMP|DATETIME '...'),
@@ -269,7 +351,12 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
                 )
             {
                 let rhs = p.ident()?;
-                return Ok(Pred::Leaf(Cond { col, op, val: SqlValue::ColRef(rhs), set: vec![] }));
+                return Ok(Pred::Leaf(Cond {
+                    col,
+                    op,
+                    val: SqlValue::ColRef(rhs),
+                    set: vec![],
+                }));
             }
             // ⭐ P0-1: 字面量算术折叠 (`a = 1+2` → `a = 3`)
             let rv = p.value()?;
@@ -277,7 +364,12 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             if val == SqlValue::Null {
                 return Err("NULL is not a valid comparison bound".into());
             }
-            conds.push(Cond { col, op, val, set: vec![] });
+            conds.push(Cond {
+                col,
+                op,
+                val,
+                set: vec![],
+            });
         }
     }
     // 单条 → Leaf; 多条 (BETWEEN/LIKE desugar) → And; 空 (LIKE '%') → 恒真
@@ -334,8 +426,8 @@ pub(crate) fn eval_const_bin(op: ArithOp, l: SqlValue, r: SqlValue) -> Result<Sq
 
 /// ⭐ P0-1: 常量比较求值 (Int/Float/Str; 混合类型报错).
 pub(crate) fn const_cmp(l: SqlValue, op: CmpOp, r: SqlValue) -> Result<bool, String> {
-    use std::cmp::Ordering;
     use SqlValue::{Float, Int, Str};
+    use std::cmp::Ordering;
     let ord = match (l, r) {
         (Int(a), Int(b)) => a.cmp(&b),
         (Float(a), Float(b)) => a
@@ -485,7 +577,11 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
     } {
         p.next()?;
         let Ok(right) = atom(p) else { break };
-        acc = ScalarExpr::Bin { op, l: Box::new(acc), r: Box::new(right) };
+        acc = ScalarExpr::Bin {
+            op,
+            l: Box::new(acc),
+            r: Box::new(right),
+        };
         saw_op = true;
     }
     // 有算术 → 表达式; 无算术 → 折叠为原 SqlValue (列引用 / 字面量 / NOT)

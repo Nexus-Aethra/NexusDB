@@ -1,0 +1,13 @@
+[package]
+name = "platform"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# Compatibility baseline.  This feature deliberately does not select an OS;
+# cfg(target_os) always selects the executable platform implementation.
+default = ["portable"]
+portable = []
+linux-io-uring = []
+windows-iocp = []

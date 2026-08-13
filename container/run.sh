@@ -13,14 +13,14 @@
 #     导致 std::thread::sleep panic, acceptor 仍 Operation not permitted)。
 #   - 该容器只运行可信的自研 NexusDB 二进制, 无其它进程, unconfined + SYS_ADMIN
 #     风险可控, 且已验证完全健康。
-#   如对安全要求极高, 可退回 io_backend=stdfs (见 deploy/nexusdb.stdfs.toml)。
+#   如对安全要求极高, 可退回 io_backend=stdfs (见 container/docker-stdfs.toml)。
 #
 # 用法:
-#   ./deploy/run.sh           # 后台启动
-#   ./deploy/run.sh -d        # 后台启动
-#   ./deploy/run.sh -f        # 前台运行
-#   ./deploy/run.sh stop      # 停止
-#   ./deploy/run.sh logs      # 查看日志
+#   ./container/run.sh           # 后台启动
+#   ./container/run.sh -d        # 后台启动
+#   ./container/run.sh -f        # 前台运行
+#   ./container/run.sh stop      # 停止
+#   ./container/run.sh logs      # 查看日志
 # ============================================================================
 set -euo pipefail
 
@@ -28,6 +28,8 @@ NAME="nexusdb"
 IMAGE="nexusdb:local"
 VOLUME="nexusdb-data"
 PORTS=(-p 6379:6379 -p 5434:5434 -p 5435:5435 -p 6778:6778)
+# 仓库根目录 = 本脚本父目录的父目录; 镜像构建以仓库根为 context
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 log() { echo "[nexusdb] $*"; }
 
@@ -55,7 +57,7 @@ esac
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   log "image $IMAGE not found, building..."
-  docker build -t "$IMAGE" "$(dirname "$0")/.."
+  docker build -f "$REPO_ROOT/container/Dockerfile" -t "$IMAGE" "$REPO_ROOT"
 fi
 
 log "starting with io_uring support (seccomp=unconfined + SYS_ADMIN)..."

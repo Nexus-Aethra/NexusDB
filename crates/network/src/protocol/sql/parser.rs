@@ -351,7 +351,11 @@ impl P {
     }
 
     pub(crate) fn next(&mut self) -> Result<Tok, String> {
-        let t = self.toks.get(self.i).cloned().ok_or("unexpected end of statement")?;
+        let t = self
+            .toks
+            .get(self.i)
+            .cloned()
+            .ok_or("unexpected end of statement")?;
         self.i += 1;
         Ok(t)
     }
@@ -402,16 +406,24 @@ impl P {
 
     pub(crate) fn expect(&mut self, want: &Tok, what: &str) -> Result<(), String> {
         let t = self.next()?;
-        if &t == want { Ok(()) } else { Err(format!("expected {what}, got {t:?}")) }
+        if &t == want {
+            Ok(())
+        } else {
+            Err(format!("expected {what}, got {t:?}"))
+        }
     }
 
     pub(crate) fn value(&mut self) -> Result<SqlValue, String> {
         match self.next()? {
             Tok::Num(n) => {
                 if n.contains('.') {
-                    n.parse::<f64>().map(SqlValue::Float).map_err(|_| format!("bad number {n}"))
+                    n.parse::<f64>()
+                        .map(SqlValue::Float)
+                        .map_err(|_| format!("bad number {n}"))
                 } else {
-                    n.parse::<i64>().map(SqlValue::Int).map_err(|_| format!("bad integer {n}"))
+                    n.parse::<i64>()
+                        .map(SqlValue::Int)
+                        .map_err(|_| format!("bad integer {n}"))
                 }
             }
             Tok::Str(s) => Ok(SqlValue::Str(s)),
@@ -459,7 +471,10 @@ impl P {
         if self.i == self.toks.len() {
             Ok(())
         } else {
-            Err(format!("trailing tokens after statement: {:?}", &self.toks[self.i..]))
+            Err(format!(
+                "trailing tokens after statement: {:?}",
+                &self.toks[self.i..]
+            ))
         }
     }
 
@@ -636,7 +651,9 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
                 if bytes[i] == b'@' && i + 1 < bytes.len() && bytes[i + 1] == b'@' {
                     let mut j = i + 2;
                     while j < bytes.len()
-                        && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'.')
+                        && (bytes[j].is_ascii_alphanumeric()
+                            || bytes[j] == b'_'
+                            || bytes[j] == b'.')
                     {
                         j += 1;
                     }
@@ -667,7 +684,13 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
         };
         if body.starts_with("TRANSACTION") {
             let toks = tokenize(rest)?;
-            let mut p = P { toks, i: 0, next_param: 0, saw_question: false, saw_dollar: false };
+            let mut p = P {
+                toks,
+                i: 0,
+                next_param: 0,
+                saw_question: false,
+                saw_dollar: false,
+            };
             let _ = p.try_kw("SESSION");
             p.kw("TRANSACTION")?;
             let (iso, read_only) = parse_txn_attrs(&mut p)?;
@@ -677,12 +700,25 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
             }
             // MySQL 方言: SET TRANSACTION (无 SESSION) 作用于下一个/当前事务;
             // PG 同形态作用于当前事务 — worker 按 session 标志分流
-            return Ok((SqlStmt::SetTransaction { iso, read_only, session }, 0));
+            return Ok((
+                SqlStmt::SetTransaction {
+                    iso,
+                    read_only,
+                    session,
+                },
+                0,
+            ));
         }
         return Ok((SqlStmt::SetStub, 0));
     }
     let toks = tokenize(text)?;
-    let mut p = P { toks, i: 0, next_param: 0, saw_question: false, saw_dollar: false };
+    let mut p = P {
+        toks,
+        i: 0,
+        next_param: 0,
+        saw_question: false,
+        saw_dollar: false,
+    };
     let stmt = match p.peek() {
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("CREATE") => parse_create(&mut p),
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("INSERT") => parse_insert(&mut p),
@@ -765,7 +801,11 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
 
 /// ⭐ PG 兼容 (LIMIT/OFFSET $n): 解析 limit 字面量或其参数索引, bind 后填真实值.
 /// 参数值支持 Int / Str (数字串).
-fn resolve_limit(lit: Option<u32>, param: Option<u16>, params: &[SqlValue]) -> Result<Option<u32>, String> {
+fn resolve_limit(
+    lit: Option<u32>,
+    param: Option<u16>,
+    params: &[SqlValue],
+) -> Result<Option<u32>, String> {
     if let Some(i) = param {
         let v = params
             .get(i as usize)
@@ -776,7 +816,9 @@ fn resolve_limit(lit: Option<u32>, param: Option<u16>, params: &[SqlValue]) -> R
                 .map_err(|_| format!("LIMIT/OFFSET out of range: {x}")),
             SqlValue::Str(s) => {
                 let s = String::from_utf8_lossy(s).trim().to_string();
-                s.parse::<u32>().map(Some).map_err(|_| format!("bad LIMIT/OFFSET {s}"))
+                s.parse::<u32>()
+                    .map(Some)
+                    .map_err(|_| format!("bad LIMIT/OFFSET {s}"))
             }
             other => Err(format!("LIMIT/OFFSET must be integer, got {other:?}")),
         }
@@ -798,9 +840,7 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
                 .cloned()
                 .ok_or_else(|| format!("missing parameter {}", i + 1)),
             // ⭐ F71: 子查询内层递归绑定 (占位符编号全局连续, 同一 params)
-            SqlValue::Subquery(s) => {
-                Ok(SqlValue::Subquery(Box::new(bind_params(s, params)?)))
-            }
+            SqlValue::Subquery(s) => Ok(SqlValue::Subquery(Box::new(bind_params(s, params)?))),
             // ⭐ F74: 列引用原样 (decorrelate 前不参与绑定)
             SqlValue::ColRef(_) => Ok(v.clone()),
             other => Ok(other.clone()),
@@ -824,20 +864,29 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
                 .map(|r| r.iter().map(&subst).collect::<Result<_, _>>())
                 .collect::<Result<_, _>>()?,
         },
-        SqlStmt::Select { table, items, conds, limit, order, offset, group_by, having, limit_param, offset_param } => {
-            SqlStmt::Select {
-                table: table.clone(),
-                items: items.clone(),
-                conds: bind_conds(conds)?,
-                limit: resolve_limit(*limit, *limit_param, params)?,
-                order: order.clone(),
-                offset: resolve_limit(*offset, *offset_param, params)?,
-                group_by: group_by.clone(),
-                having: bind_conds(having)?,
-                limit_param: None,
-                offset_param: None,
-            }
-        }
+        SqlStmt::Select {
+            table,
+            items,
+            conds,
+            limit,
+            order,
+            offset,
+            group_by,
+            having,
+            limit_param,
+            offset_param,
+        } => SqlStmt::Select {
+            table: table.clone(),
+            items: items.clone(),
+            conds: bind_conds(conds)?,
+            limit: resolve_limit(*limit, *limit_param, params)?,
+            order: order.clone(),
+            offset: resolve_limit(*offset, *offset_param, params)?,
+            group_by: group_by.clone(),
+            having: bind_conds(having)?,
+            limit_param: None,
+            offset_param: None,
+        },
         SqlStmt::Delete { table, conds } => SqlStmt::Delete {
             table: table.clone(),
             conds: bind_conds(conds)?,
@@ -851,7 +900,18 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
             conds: bind_conds(conds)?,
         },
         // ⭐ F67/F68 (JOIN): 替换 WHERE 限定条件里的占位符 (ON/from/joins 无字面量)
-        SqlStmt::SelectJoin { from, from_inner, joins, items, conds, order, limit, offset, limit_param, offset_param } => {
+        SqlStmt::SelectJoin {
+            from,
+            from_inner,
+            joins,
+            items,
+            conds,
+            order,
+            limit,
+            offset,
+            limit_param,
+            offset_param,
+        } => {
             SqlStmt::SelectJoin {
                 from: from.clone(),
                 // ⭐ F75: 派生表内层递归绑定
@@ -877,37 +937,53 @@ pub fn bind_params(stmt: &SqlStmt, params: &[SqlValue]) -> Result<SqlStmt, Strin
             }
         }
         // ⭐ F72: 派生表 — 内层递归绑定 + 外层 WHERE 绑定
-        SqlStmt::SelectDerived { inner, alias, items, conds, order, limit, offset, limit_param, offset_param } => {
-            SqlStmt::SelectDerived {
-                inner: Box::new(bind_params(inner, params)?),
-                alias: alias.clone(),
-                items: items.clone(),
-                conds: bind_conds(conds)?,
-                order: order.clone(),
-                limit: resolve_limit(*limit, *limit_param, params)?,
-                offset: resolve_limit(*offset, *offset_param, params)?,
-                limit_param: None,
-                offset_param: None,
-            }
-        }
+        SqlStmt::SelectDerived {
+            inner,
+            alias,
+            items,
+            conds,
+            order,
+            limit,
+            offset,
+            limit_param,
+            offset_param,
+        } => SqlStmt::SelectDerived {
+            inner: Box::new(bind_params(inner, params)?),
+            alias: alias.clone(),
+            items: items.clone(),
+            conds: bind_conds(conds)?,
+            order: order.clone(),
+            limit: resolve_limit(*limit, *limit_param, params)?,
+            offset: resolve_limit(*offset, *offset_param, params)?,
+            limit_param: None,
+            offset_param: None,
+        },
         // ⭐ PG 兼容: SELECT EXISTS — 内层 (SystemQuery) 递归绑定 $n
         SqlStmt::ExistsStub { inner } => SqlStmt::ExistsStub {
             inner: Box::new(bind_params(inner, params)?),
         },
         // ⭐ F66: 系统表查询 — WHERE 条件支持 $n (migrator 探测)
-        SqlStmt::SystemQuery { catalog, table, cols, conds, order, limit, offset, limit_param, offset_param } => {
-            SqlStmt::SystemQuery {
-                catalog: catalog.clone(),
-                table: table.clone(),
-                cols: cols.clone(),
-                conds: bind_conds(conds)?,
-                order: order.clone(),
-                limit: resolve_limit(*limit, *limit_param, params)?,
-                offset: resolve_limit(*offset, *offset_param, params)?,
-                limit_param: None,
-                offset_param: None,
-            }
-        }
+        SqlStmt::SystemQuery {
+            catalog,
+            table,
+            cols,
+            conds,
+            order,
+            limit,
+            offset,
+            limit_param,
+            offset_param,
+        } => SqlStmt::SystemQuery {
+            catalog: catalog.clone(),
+            table: table.clone(),
+            cols: cols.clone(),
+            conds: bind_conds(conds)?,
+            order: order.clone(),
+            limit: resolve_limit(*limit, *limit_param, params)?,
+            offset: resolve_limit(*offset, *offset_param, params)?,
+            limit_param: None,
+            offset_param: None,
+        },
         // 无参数位的语句原样克隆
         other => other.clone(),
     })
@@ -984,7 +1060,11 @@ pub(crate) fn parse_scalar_expr(p: &mut P) -> Result<ScalarExpr, String> {
         };
         p.next()?;
         let rhs = parse_scalar_term(p)?;
-        lhs = ScalarExpr::Bin { op, l: Box::new(lhs), r: Box::new(rhs) };
+        lhs = ScalarExpr::Bin {
+            op,
+            l: Box::new(lhs),
+            r: Box::new(rhs),
+        };
     }
     Ok(lhs)
 }
@@ -999,7 +1079,11 @@ fn parse_scalar_term(p: &mut P) -> Result<ScalarExpr, String> {
         };
         p.next()?;
         let rhs = parse_scalar_factor(p)?;
-        lhs = ScalarExpr::Bin { op, l: Box::new(lhs), r: Box::new(rhs) };
+        lhs = ScalarExpr::Bin {
+            op,
+            l: Box::new(lhs),
+            r: Box::new(rhs),
+        };
     }
     Ok(lhs)
 }

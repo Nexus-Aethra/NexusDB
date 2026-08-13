@@ -45,7 +45,12 @@ pub(crate) fn sql_run_agg_select(
                         .to_string(),
                 );
             }
-            sql::SelectItem::Agg { func, arg, distinct, alias } => {
+            sql::SelectItem::Agg {
+                func,
+                arg,
+                distinct,
+                alias,
+            } => {
                 // ⭐ F78: 绑定表达式 (裸列退化) → (BoundExpr, 推导类型); COUNT(*) arg=None
                 let bound: Option<(BoundExpr, ColType)> = match arg {
                     Some(e) => match bind_scalar_expr(&schema, e) {
@@ -100,7 +105,10 @@ pub(crate) fn sql_run_agg_select(
                 });
             }
             sql::SelectItem::ScalarFn { .. } => {
-                return fail(conn, "scalar functions are not supported in aggregate queries (v1)".into())
+                return fail(
+                    conn,
+                    "scalar functions are not supported in aggregate queries (v1)".into(),
+                );
             }
         }
     }
@@ -114,10 +122,15 @@ pub(crate) fn sql_run_agg_select(
     }
     // 输出列定位 helper: label 大小写归一匹配
     let find_out = |name: &str| -> Option<usize> {
-        spec_items.iter().position(|it| it.label.eq_ignore_ascii_case(name))
+        spec_items
+            .iter()
+            .position(|it| it.label.eq_ignore_ascii_case(name))
     };
     // HAVING 谓词树 → (输出下标, op, val) 叶子树
-    let having_out = match having.try_map(&|h: &Cond| -> Result<(usize, sql::CmpOp, sql::SqlValue), String> {
+    let having_out = match having.try_map(&|h: &Cond| -> Result<
+        (usize, sql::CmpOp, sql::SqlValue),
+        String,
+    > {
         find_out(&h.col)
             .map(|idx| (idx, h.op, h.val.clone()))
             .ok_or_else(|| format!("HAVING column '{}' must appear in the select list", h.col))
@@ -136,7 +149,12 @@ pub(crate) fn sql_run_agg_select(
         };
         order_out.push((idx, *desc));
     }
-    let spec = AggSpec { items: spec_items, group_idx, having: having_out, order: order_out };
+    let spec = AggSpec {
+        items: spec_items,
+        group_idx,
+        having: having_out,
+        order: order_out,
+    };
     // 广播: 索引计划可用则 IndexScan (界下推), 否则 TableScan (含 PkGet 降级)
     let plan = sql_plan_select(&schema, &conds);
     conn.sql_select_agg.insert(
@@ -177,7 +195,11 @@ pub(crate) fn sql_run_agg_select(
                 limit: 0,
                 with_rows: true,
             },
-            _ => BatchOp::TableScan { db: db.clone(), table: table_arc.clone(), limit: 0 },
+            _ => BatchOp::TableScan {
+                db: db.clone(),
+                table: table_arc.clone(),
+                limit: 0,
+            },
         };
         push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
     }
@@ -205,16 +227,28 @@ pub(crate) enum AggItemKind {
     /// 组键列直出 (必 ∈ group_by, 解析层已校验).
     Col(u16),
     /// ⭐ F78: arg = 已绑定列号的表达式 (None = COUNT(*)).
-    Agg { func: sql::AggFn, arg: Option<BoundExpr>, distinct: bool },
+    Agg {
+        func: sql::AggFn,
+        arg: Option<BoundExpr>,
+        distinct: bool,
+    },
 }
 
 /// ⭐ F78: 已绑定 (列名→列号) 的聚合内标量表达式.
 pub(crate) enum BoundExpr {
     Col(u16),
     Lit(ColValue),
-    Bin { op: sql::ArithOp, l: Box<BoundExpr>, r: Box<BoundExpr> },
+    Bin {
+        op: sql::ArithOp,
+        l: Box<BoundExpr>,
+        r: Box<BoundExpr>,
+    },
     /// ⭐ compat: JSONB 取字段 (-> 保留文本 / ->> 输出文本; v1 均 Str 承载).
-    JsonGet { base: Box<BoundExpr>, key: Box<BoundExpr>, as_text: bool },
+    JsonGet {
+        base: Box<BoundExpr>,
+        key: Box<BoundExpr>,
+        as_text: bool,
+    },
     /// ⭐ PG 兼容 (UPDATE SET): 一元 NOT (布尔取反).
     Not(Box<BoundExpr>),
 }
@@ -355,7 +389,9 @@ pub(crate) fn bind_scalar_expr(
 ) -> Result<(BoundExpr, ColType), String> {
     match e {
         sql::ScalarExpr::Col(name) => {
-            let i = schema.col_by_name(name).ok_or_else(|| format!("unknown column '{name}'"))?;
+            let i = schema
+                .col_by_name(name)
+                .ok_or_else(|| format!("unknown column '{name}'"))?;
             Ok((BoundExpr::Col(i), schema.columns[i as usize].ty))
         }
         sql::ScalarExpr::Lit(v) => {
@@ -376,14 +412,25 @@ pub(crate) fn bind_scalar_expr(
             } else {
                 ColType::I64
             };
-            Ok((BoundExpr::Bin { op: *op, l: Box::new(lb), r: Box::new(rb) }, out_ty))
+            Ok((
+                BoundExpr::Bin {
+                    op: *op,
+                    l: Box::new(lb),
+                    r: Box::new(rb),
+                },
+                out_ty,
+            ))
         }
         sql::ScalarExpr::JsonGet { base, key, as_text } => {
             let (bb, _) = bind_scalar_expr(schema, base)?;
             let (kb, _) = bind_scalar_expr(schema, key)?;
             // v1: 输出按 Str 承载 (-> 保留 JSON 原文 / ->> 文本)
             Ok((
-                BoundExpr::JsonGet { base: Box::new(bb), key: Box::new(kb), as_text: *as_text },
+                BoundExpr::JsonGet {
+                    base: Box::new(bb),
+                    key: Box::new(kb),
+                    as_text: *as_text,
+                },
                 ColType::Str,
             ))
         }
@@ -400,11 +447,24 @@ pub(crate) enum Accum {
     CountCol(u64),
     /// ⭐ F77: COUNT(DISTINCT col) — 去重集 (类型标记编码, 不计 NULL).
     CountDistinct(std::collections::HashSet<Vec<u8>>),
-    SumI { acc: i64, seen: bool },
-    SumF { acc: f64, seen: bool },
+    SumI {
+        acc: i64,
+        seen: bool,
+    },
+    SumF {
+        acc: f64,
+        seen: bool,
+    },
     /// ⭐ F81: SUM(DECIMAL) → i128 定标累加, 输出同 scale Decimal.
-    SumDec { acc: i128, scale: u8, seen: bool },
-    Avg { sum: f64, n: u64 },
+    SumDec {
+        acc: i128,
+        scale: u8,
+        seen: bool,
+    },
+    Avg {
+        sum: f64,
+        n: u64,
+    },
     Min(Option<ColValue>),
     Max(Option<ColValue>),
 }
@@ -417,11 +477,19 @@ impl Accum {
             sql::AggFn::Count if is_star => Accum::CountStar(0),
             sql::AggFn::Count => Accum::CountCol(0),
             sql::AggFn::Sum => match col_ty {
-                Some(ColType::F64) => Accum::SumF { acc: 0.0, seen: false },
-                Some(ColType::Decimal { scale, .. }) => {
-                    Accum::SumDec { acc: 0, scale, seen: false }
-                }
-                _ => Accum::SumI { acc: 0, seen: false },
+                Some(ColType::F64) => Accum::SumF {
+                    acc: 0.0,
+                    seen: false,
+                },
+                Some(ColType::Decimal { scale, .. }) => Accum::SumDec {
+                    acc: 0,
+                    scale,
+                    seen: false,
+                },
+                _ => Accum::SumI {
+                    acc: 0,
+                    seen: false,
+                },
             },
             sql::AggFn::Avg => Accum::Avg { sum: 0.0, n: 0 },
             sql::AggFn::Min => Accum::Min(None),
@@ -635,7 +703,11 @@ pub(crate) fn materialize_agg_groups(
             .iter()
             .map(|it| match &it.kind {
                 AggItemKind::Col(_) => Accum::CountStar(0), // 占位不用 (代表值直出)
-                AggItemKind::Agg { func, arg, distinct } => {
+                AggItemKind::Agg {
+                    func,
+                    arg,
+                    distinct,
+                } => {
                     // ⭐ F81: 直接传 out_ty (含 Decimal{scale}), 让 Accum 选 SumDec/SumF/SumI
                     Accum::new(*func, arg.is_none(), Some(it.out_ty), *distinct)
                 }
@@ -710,15 +782,22 @@ pub(crate) fn materialize_agg_groups(
         None => out.len(),
     };
     // 合成结果集 (render_sql_count 同源路径, 三门面统一)
-    let cols: Vec<(String, ColType)> =
-        spec.items.iter().map(|it| (it.label.clone(), it.out_ty)).collect();
+    let cols: Vec<(String, ColType)> = spec
+        .items
+        .iter()
+        .map(|it| (it.label.clone(), it.out_ty))
+        .collect();
     Ok((cols, out[start..end].to_vec()))
 }
 
 /// SELECT 聚合完成渲染: (val, pk) 排序 → 覆盖重建或 decode → 残余过滤
 /// → ⭐ S2: ORDER BY → OFFSET → LIMIT → 投影/COUNT 结果集.
 /// (⭐ O3: 早停时提前调用, agg.rows 取走清空)
-pub(crate) fn render_select_agg(proto: ProtocolKind, binary: bool, agg: &mut SqlSelectAgg) -> Vec<u8> {
+pub(crate) fn render_select_agg(
+    proto: ProtocolKind,
+    binary: bool,
+    agg: &mut SqlSelectAgg,
+) -> Vec<u8> {
     match materialize_select_agg(agg) {
         Ok((cols, rows)) => {
             let cref: Vec<(&str, ColType)> = cols.iter().map(|(n, t)| (n.as_str(), *t)).collect();
@@ -730,9 +809,7 @@ pub(crate) fn render_select_agg(proto: ProtocolKind, binary: bool, agg: &mut Sql
 
 /// ⭐ F71: SELECT 完成点物化 (不渲染) — 返回最终投影列定义 + 行集.
 /// 供子查询捕获 (materialize) 与正常渲染 (render_select_agg) 共用.
-pub(crate) fn materialize_select_agg(
-    agg: &mut SqlSelectAgg,
-) -> MatResult {
+pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
     if let Some(e) = agg.error.take() {
         return Err(e);
     }
@@ -776,14 +853,12 @@ pub(crate) fn materialize_select_agg(
         // ⭐ M2b: sorted=true 时行序已按 (val,pk) 索引序排列 (= ORDER BY 序),
         // 残余过滤不破坏相对顺序 → 过滤后取前 limit+offset 即可早停.
         // (未消排的排序必须全量收集后再 sql_order_cmp, 禁用 early_cut.)
-        let early_cut: Option<usize> = if agg.count
-            || (!agg.order.is_empty() && !agg.sorted)
-            || agg.agg_spec.is_some()
-        {
-            None
-        } else {
-            agg.limit.map(|l| (l + agg.offset) as usize)
-        };
+        let early_cut: Option<usize> =
+            if agg.count || (!agg.order.is_empty() && !agg.sorted) || agg.agg_spec.is_some() {
+                None
+            } else {
+                agg.limit.map(|l| (l + agg.offset) as usize)
+            };
         for (val, pk, rb) in &rows {
             let decoded = if let Some((idx_col, pk_col)) = agg.cover {
                 let n = agg.schema.columns.len();
@@ -840,13 +915,8 @@ pub(crate) fn materialize_select_agg(
             let mut cols: Vec<(String, ColType)> = Vec::new();
             let mut rows: Vec<Vec<ColValue>> = Vec::new();
             for r in &out_rows[start..end] {
-                let (c, v) = project_output_row(
-                    &agg.schema,
-                    &agg.proj,
-                    &agg.expr_proj,
-                    &agg.out_names,
-                    r,
-                );
+                let (c, v) =
+                    project_output_row(&agg.schema, &agg.proj, &agg.expr_proj, &agg.out_names, r);
                 if cols.is_empty() {
                     cols = c;
                 }
@@ -880,4 +950,3 @@ pub(crate) fn materialize_select_agg(
 // =====================================================================
 // ⭐ Z2 (MySQL wire 门面): 帧循环 — 握手/登录状态机 + COM_QUERY
 // =====================================================================
-

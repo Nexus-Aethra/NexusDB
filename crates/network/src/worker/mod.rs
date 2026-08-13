@@ -20,7 +20,7 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::thread;
 
 use crossbeam_channel::Receiver;
-use shard_manager::{BatchOp, BatchResult, SharedTaskInbox, SharedTaskReplyBus, ShardTask};
+use shard_manager::{BatchOp, BatchResult, ShardTask, SharedTaskInbox, SharedTaskReplyBus};
 
 use crate::acceptor::NewConn;
 use crate::protocol::sql::{
@@ -41,24 +41,30 @@ use sql_util::*;
 mod sql_agg;
 /// ⭐ PG 兼容 (FMT_VER 8): 外键级联删除编排.
 mod sql_cascade;
-pub(crate) use sql_cascade::{cascade_job_done, cascade_kickoff, is_cascade_seq, CascadeJob};
+pub(crate) use sql_cascade::{CascadeJob, cascade_job_done, cascade_kickoff, is_cascade_seq};
 /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检.
 mod sql_fk;
 pub(crate) use sql_fk::{all_parents_cached, sql_fk_on_reply, sql_fk_start};
 /// ⭐ ORM-B2 (解耦 2026-08): 进程级共享路由缓存 (SqlSharedRoutes/FkIncoming).
 mod sql_routes;
-pub use sql_routes::{new_sql_shared, FkIncoming, SqlSharedRoutes};
+pub use sql_routes::{FkIncoming, SqlSharedRoutes, new_sql_shared};
 /// ⭐ 解耦 2026-08: RESP 跨 shard 聚合状态结构体.
 mod resp_agg;
 pub(crate) use resp_agg::{
-    BitCtx, DelAgg, ExistsAgg, GeoCtx, GetKind, MembersKind, MGetAgg, MSetAgg, MSetNxAgg,
+    BitCtx, DelAgg, ExistsAgg, GeoCtx, GetKind, MGetAgg, MSetAgg, MSetNxAgg, MembersKind,
     PairsKind, SetAlgAgg, StoreFinishAgg, ZStoreAgg,
 };
-/// ⭐ 解耦 2026-08: SQL 规划/执行状态结构体 (事务/聚合/JOIN/规划/schema 缓存).
-mod sql_state;
 /// ⭐ 解耦 2026-08: RESP 命令分发 + 跨 shard 回包处理.
 mod resp_dispatch;
-pub(crate) use resp_dispatch::{getrange_slice, hash_route_key, push_task, push_task_grouped};
+/// ⭐ 解耦 2026-08: SQL 规划/执行状态结构体 (事务/聚合/JOIN/规划/schema 缓存).
+mod sql_state;
+pub(crate) use resp_dispatch::{
+    getrange_slice, hash_route_key, push_task, push_task_grouped, resp_sql_delete_with_schema,
+    resp_sql_hdel_with_schema, resp_sql_hget_with_schema, resp_sql_hset_with_schema,
+    resp_sql_hsetnx_with_schema, resp_sql_incr_with_schema, try_dispatch_resp_sql_delete,
+    try_dispatch_resp_sql_hdel, try_dispatch_resp_sql_hget, try_dispatch_resp_sql_hset,
+    try_dispatch_resp_sql_hsetnx, try_dispatch_resp_sql_incr, try_dispatch_resp_sql_read,
+};
 /// ⭐ 解耦 2026-08: RESP 命令分发主函数 (拆自 resp_dispatch).
 mod resp_dispatch_cmd;
 pub(crate) use resp_dispatch_cmd::dispatch_resp_command;
@@ -68,47 +74,43 @@ pub(crate) use resp_shard::handle_resp_shard_result;
 /// ⭐ 解耦 2026-08: 协议 wire 入口 (HTTP 处理).
 mod protocol_io;
 pub(crate) use protocol_io::{
-    mysql_err_packet, process_http_input, process_pg_input,
-    process_sql_input,
+    mysql_err_packet, process_http_input, process_pg_input, process_sql_input,
 };
 pub(crate) use sql_state::{
-    DerivedCtx, MatResult, MultiStmt, PendingSql, SharedSqlCache, SqlDmlAgg, SqlFkIns,
-    SqlPlan, SqlRowCtx, SqlTxnAgg, SqlUniqueIns, SqlWorkerCache, SubqCtx, TxnState,
-    UniquePhase, EST_SKIP_STATS_ROWS, SUBQ_IN_MAX, TXN_MAX_BYTES, TXN_MAX_OPS,
+    DerivedCtx, EST_SKIP_STATS_ROWS, MatResult, MultiStmt, PendingRespSqlDelete,
+    PendingRespSqlHDel, PendingRespSqlHGet, PendingRespSqlHSet, PendingRespSqlHSetNx,
+    PendingRespSqlIncr, PendingSql, RespHQueryCtx, RespSqlHGetCtx, RespSqlHSetCtx,
+    RespSqlIncrDelta, RespSqlReadMode, SUBQ_IN_MAX, SharedSqlCache, SqlDmlAgg, SqlFkIns, SqlPlan,
+    SqlRowCtx, SqlTxnAgg, SqlUniqueIns, SqlWorkerCache, SubqCtx, TXN_MAX_BYTES, TXN_MAX_OPS,
+    TxnState, UniquePhase,
 };
 /// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
 mod sql_dispatch;
 /// ⭐ 解耦 2026-08: DML 执行 (从 sql_dispatch 拆出).
 mod sql_dml;
-/// ⭐ 解耦 2026-08: JOIN 编排 (从 sql_dispatch 拆出).
-mod sql_join;
-/// ⭐ 解耦 2026-08: 全局 UNIQUE 约束 INSERT 编排 (从 sql_dispatch 拆出).
-mod sql_unique;
-/// ⭐ 解耦 2026-08: 系统表查询虚拟表合成 (从 sql_dispatch 拆出).
-mod sql_sysquery;
 /// ⭐ 拆分 (2026-08): SQL 值评估/比较/行构建/协议字节.
 mod sql_eval;
+/// ⭐ 解耦 2026-08: JOIN 编排 (从 sql_dispatch 拆出).
+mod sql_join;
+/// ⭐ 解耦 2026-08: 系统表查询虚拟表合成 (从 sql_dispatch 拆出).
+mod sql_sysquery;
+/// ⭐ 解耦 2026-08: 全局 UNIQUE 约束 INSERT 编排 (从 sql_dispatch 拆出).
+mod sql_unique;
 pub(crate) use sql_agg::{
-    bind_scalar_expr, cmp_colvalue, eval_bound_expr, eval_json_exists, materialize_select_agg,
-    render_select_agg, sql_run_agg_select, AggSpec, BoundExpr,
+    AggSpec, BoundExpr, bind_scalar_expr, cmp_colvalue, eval_bound_expr, eval_json_exists,
+    materialize_select_agg, render_select_agg, sql_run_agg_select,
 };
 pub(crate) use sql_dispatch::{sql_dispatch_stmt, sql_plan_select};
 pub(crate) use sql_dml::sql_run_dml;
-pub(crate) use sql_join::{sql_join_drive, sql_join_kickoff};
-pub(crate) use sql_sysquery::{
-    coltype_sql_name, sysq_render_catalog,
-    SysQuerySpec,
-};
-pub(crate) use sql_unique::{
-    sql_unique_drive,
-    sql_unique_ins_start,
-};
 pub(crate) use sql_eval::{
-    col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq,
+    HIDDEN_ROWID, col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq,
     project_output_row, render_sql_count, render_sql_rows, scalar_fn_const_row, sql_build_row,
-    sql_cmp, sql_dml_op, sql_err_bytes, sql_ok_bytes, sql_order_cmp, sql_pk_bytes,
-    sql_rows_bytes, sql_to_col, visible_cols, HIDDEN_ROWID,
+    sql_cmp, sql_dml_op, sql_err_bytes, sql_ok_bytes, sql_order_cmp, sql_pk_bytes, sql_rows_bytes,
+    sql_to_col, visible_cols,
 };
+pub(crate) use sql_join::{sql_join_drive, sql_join_kickoff};
+pub(crate) use sql_sysquery::{SysQuerySpec, coltype_sql_name, sysq_render_catalog};
+pub(crate) use sql_unique::{sql_unique_drive, sql_unique_ins_start};
 /// ⭐ 拆分 (2026-08): SQL 值编码/解码工具 (日期/时间/UUID/Decimal).
 mod sql_encode;
 use sql_encode::*;
@@ -121,8 +123,7 @@ pub(crate) use sql_encode::{
 /// ⭐ 解耦 2026-08: SQL derived table (子查询) 物化与渲染 (拆自 mod.rs).
 mod worker_derived;
 pub(crate) use worker_derived::{
-    derived_capture_rowctx, finish_derived, sql_subq_advance,
-    sql_subq_start,
+    derived_capture_rowctx, finish_derived, sql_subq_advance, sql_subq_start,
 };
 /// ⭐ 解耦 2026-08: ConnState 核心方法 (拆自 mod.rs). impl 方法无需 re-export.
 mod worker_conn;
@@ -185,10 +186,16 @@ impl WorkerPool {
         let mut handles = Vec::with_capacity(configs.len());
         // ⭐ 协程化开关 (2026-08): `NEXUS_CORO_WORKER=1` 启用协程 worker (每连接一协程 +
         // io_uring), 否则用 epoll worker. 默认 epoll (可回退, 保证稳定).
-        let coro = std::env::var("NEXUS_CORO_WORKER").map(|v| v == "1").unwrap_or(false);
+        let coro = std::env::var("NEXUS_CORO_WORKER")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         for cfg in configs {
             let wid = cfg.worker_id;
-            let name = if coro { "network-worker-coro" } else { "network-worker" };
+            let name = if coro {
+                "network-worker-coro"
+            } else {
+                "network-worker"
+            };
             let join = thread::Builder::new()
                 .name(format!("{name}-{wid}"))
                 .stack_size(4 * 1024 * 1024)
@@ -207,7 +214,8 @@ impl WorkerPool {
 
     pub fn join(self) -> std::io::Result<()> {
         for h in self.handles {
-            h.join().map_err(|_| std::io::Error::other("worker panicked"))?;
+            h.join()
+                .map_err(|_| std::io::Error::other("worker panicked"))?;
         }
         Ok(())
     }
@@ -483,6 +491,19 @@ pub(crate) struct ConnState {
     sql_row_ctx: HashMap<u64, SqlRowCtx>,
     /// ⭐ X3: schema miss 挂起的语句 (seq → 语句; GetSchemaOp 回来后续跑).
     sql_pending: HashMap<u64, PendingSql>,
+    /// RESP 行适配: schema miss 后等待判定/回落的 HGET.
+    resp_sql_pending_hget: HashMap<u64, PendingRespSqlHGet>,
+    /// RESP 行适配: schema miss 后等待判定/回落的 HSET/HMSET.
+    resp_sql_pending_hset: HashMap<u64, PendingRespSqlHSet>,
+    resp_sql_pending_hdel: HashMap<u64, PendingRespSqlHDel>,
+    resp_sql_pending_hsetnx: HashMap<u64, PendingRespSqlHSetNx>,
+    resp_sql_pending_delete: HashMap<u64, PendingRespSqlDelete>,
+    resp_sql_pending_incr: HashMap<u64, PendingRespSqlIncr>,
+    /// RESP 行适配: RowGet 回包的 field 投影上下文.
+    resp_sql_hget: HashMap<u64, RespSqlHGetCtx>,
+    /// RESP 行适配: RowUpdate 回包的 HSET/HMSET 结果上下文.
+    resp_sql_hset: HashMap<u64, RespSqlHSetCtx>,
+    resp_hquery: HashMap<u64, RespHQueryCtx>,
     /// ⭐ Z2 (MySQL wire): Sql conn 的握手/登录状态 (非 Sql conn 为 None).
     mysql: Option<MysqlState>,
     /// ⭐ S4: PG wire 状态 (0 = 等 startup, 1 = 等 password/SASL, 2 = 已认证).
@@ -586,7 +607,11 @@ fn split_table_key(raw: &[u8]) -> Option<usize> {
         .then_some(pos)
 }
 
-fn request_to_batch_op(req: Request, db: &std::sync::Arc<str>, table: &std::sync::Arc<str>) -> BatchOp {
+fn request_to_batch_op(
+    req: Request,
+    db: &std::sync::Arc<str>,
+    table: &std::sync::Arc<str>,
+) -> BatchOp {
     match req {
         Request::Put { key, value } => BatchOp::Put {
             db: db.clone(),
@@ -669,7 +694,7 @@ fn render_geo(codec: &RespCodec, ctx: GeoCtx, result: &BatchResult) -> Vec<u8> {
         // GEOPOS: 每 member → [lon, lat] 或 nil array
         GeoCtx::Pos => {
             let BatchResult::Values(vs) = result else {
-            return codec.encode_error("unexpected result");
+                return codec.encode_error("unexpected result");
             };
             let mut out = format!("*{}\r\n", vs.len()).into_bytes();
             for v in vs {
@@ -703,7 +728,15 @@ fn render_geo(codec: &RespCodec, ctx: GeoCtx, result: &BatchResult) -> Vec<u8> {
             }
         }
         // GEOSEARCH: 解码全量 (member, score) → 距离过滤 + 排序 + COUNT
-        GeoCtx::Search { lon, lat, radius_m, asc, count, withcoord, withdist } => {
+        GeoCtx::Search {
+            lon,
+            lat,
+            radius_m,
+            asc,
+            count,
+            withcoord,
+            withdist,
+        } => {
             let BatchResult::Members(ms) = result else {
                 return codec.encode_error("unexpected result");
             };
@@ -830,7 +863,6 @@ fn render_bit(codec: &RespCodec, ctx: BitCtx, result: &BatchResult) -> Vec<u8> {
 // ⭐ X3 (SQL 落地): 规划 / 执行 / 过滤 / 渲染
 // =====================================================================
 
-
 /// ⭐ W2/事务 v1: RowPut 喂进程级路由 bloom (value → shard).
 /// 事务缓冲时也喂 — rollback 后只多假阳性 (只增语义无害);
 /// commit 时不重复喂.
@@ -847,7 +879,9 @@ pub(crate) fn feed_route_bloom(
     if !sh.created_here.read().unwrap().contains(&ckey) {
         return;
     }
-    let BatchOp::RowPut { values, .. } = op else { return };
+    let BatchOp::RowPut { values, .. } = op else {
+        return;
+    };
     for idx in schema.indexes.iter() {
         if let Some(enc) = storage::sql_rows::index_vals_bytes(&schema, idx, &values) {
             let entry = sh
@@ -908,7 +942,9 @@ fn resolve_ryow(txn: &TxnState, tkey: &(String, String, Vec<u8>)) -> Option<Ryow
                 // 旧行求值, 事务内退化为不支持 — 由 worker 在非事务路径处理).
                 if let Some(v) = cur.as_mut() {
                     for (ci, sv) in sets {
-                        let Some(slot) = v.get_mut(*ci as usize) else { continue };
+                        let Some(slot) = v.get_mut(*ci as usize) else {
+                            continue;
+                        };
                         if let storage::row::SetVal::Val(cv) = sv {
                             *slot = cv.clone();
                         }
@@ -970,20 +1006,6 @@ fn txn_buffer_op(conn: &mut ConnState, op: BatchOp) -> Result<(), String> {
 // =====================================================================
 // ⭐ F71 (子查询): 非关联 WHERE 子查询编排
 // =====================================================================
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// ⭐ G2 (F63): 广义聚合 SELECT — 列名解析/类型校验/计划构建后广播
 /// (索引可用时 IndexScan, 否则 TableScan; PkGet 也降级广播 — 聚合需全量行,

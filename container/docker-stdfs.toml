@@ -1,6 +1,6 @@
 # NexusDB 容器配置 — stdfs 变体 (兼容 Docker 默认 seccomp, 禁用 io_uring)
 # 用途: 挂载覆盖 /etc/nexusdb/nexusdb.toml
-#   -v $PWD/deploy/nexusdb.stdfs.toml:/etc/nexusdb/nexusdb.toml
+#   -v $PWD/container/docker-stdfs.toml:/etc/nexusdb/nexusdb.toml
 # io_uring 被 Docker seccomp 拦截时使用 (Operation not permitted 的解法)
 
 [server]

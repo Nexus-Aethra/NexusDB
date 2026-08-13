@@ -18,13 +18,13 @@
 
 At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + per-core thread + io_uring async I/O + a hand-written coroutine scheduler, no tokio), a **complete SQL subset** (JOIN / subqueries / aggregation / GROUP BY / transactions) coexisting with **Redis data structures**, and **production-grade reliability** (crash recovery, WAL durability, 860+ tests, clippy 0 warnings).
 
-> Architecture: [DESIGN.md](./DESIGN.md) · handoff / progress: [AGENTS.md](./AGENTS.md) · fix history: [CHANGELOG.md](./CHANGELOG.md)
+> Architecture: [docs/DESIGN.md](./docs/DESIGN.md) · handoff / progress: [docs/AGENTS.md](./docs/AGENTS.md) · fix history: [docs/CHANGELOG.md](./docs/CHANGELOG.md)
 >
 > 📖 **User getting-started guide (features + per-driver access + SQL/type/security examples + performance): [docs/GUIDE.md](./docs/GUIDE.md)**
 
 ---
 
-**[Core Features](#core-features) · [Quick Start](#quick-start) · [Performance](#performance) · [Architecture](#architecture) · [GC & Space Reclamation](#gc--space-reclamation) · [Large-Value Overflow Pages](#large-value-overflow-pages) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [Dev Commands](#dev-commands) · [Troubleshooting](#troubleshooting)**
+**[Core Features](#core-features) · [Quick Start](#quick-start) · [Windows (Beta)](#windows-beta) · [Performance](#performance) · [Architecture](#architecture) · [GC & Space Reclamation](#gc--space-reclamation) · [Large-Value Overflow Pages](#large-value-overflow-pages) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [Dev Commands](#dev-commands) · [Troubleshooting](#troubleshooting)**
 
 ---
 
@@ -77,7 +77,7 @@ At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + p
 ```bash
 git clone <repo-url> && cd NexusDB
 cargo build --release --workspace        # first build ~2min
-cp nexusdb.toml /tmp/nexus.toml          # adjust listen_addr / block_root as needed
+cp config/nexusdb.toml /tmp/nexus.toml          # adjust listen_addr / block_root as needed
 ./target/release/NexusDB --config /tmp/nexus.toml
 ```
 
@@ -102,7 +102,125 @@ Binary protocol port (5433) test cases: [`crates/network/tests/end_to_end.rs`](.
 cargo test --workspace --no-fail-fast    # ~30s, expect 0 failed
 ```
 
-> Docker packaging is available (see [Dockerfile](./Dockerfile) + [docker-compose.yml](./docker-compose.yml)); details in [docs/GUIDE.md](./docs/GUIDE.md#docker-deployment).
+> Docker packaging is available (see [container/Dockerfile](./container/Dockerfile) + [container/docker-compose.yml](./container/docker-compose.yml)); details in [docs/GUIDE.md](./docs/GUIDE.md#docker-deployment).
+
+---
+
+## Windows (Beta)
+
+> **Status (2026-08-13)**: `feat/resp-sql-schema-adapter` branch. The Windows
+> build runs end-to-end with `std::net::TcpListener` + one `std::thread` per
+> connection. Linux keeps io_uring + epoll + coroutine scheduler.  Full
+> design and gotchas: [docs/plans/2026-08-13-windows-portability.md](./docs/plans/2026-08-13-windows-portability.md) + [docs/plans/2026-08-13-windows-iocp.md](./docs/plans/2026-08-13-windows-iocp.md).
+
+### What works on Windows today
+
+- **Binary protocol** (port 5433) + **RESP2** (port 6380) — same dispatch
+  path as Linux's `portable.rs` fallback.
+- RESP commands: `PING`, `AUTH`, `SELECT`, `SET`, `GET`, `DEL`, `MGET`, `MSET`,
+  `EXISTS`, `STRLEN`, `TYPE`, `INCR` family, `APPEND`, `SETNX`, `GETSET`, etc.
+  `INCR` / `HSET` / `LPUSH` / `SADD` / `ZADD` / `DBSIZE` / `INFO` /
+  `CLIENT LIST` are not yet wired in the dispatch tree (same gap on Linux
+  `portable.rs`; tracked separately).
+- **WAL persistence** + crash recovery — same on-disk format as Linux, so
+  you can copy a Linux `data/` tree to Windows and replay.
+- **Ctrl-C graceful shutdown** via `SetConsoleCtrlHandler` — stops the
+  acceptor, joins all connection threads, then closes `ShardManager` so
+  WAL gets a final flush.
+- **Default `stdfs` IO backend** — Windows has no `io_uring`; missing or
+  `io_uring` config is auto-corrected to `stdfs`.
+
+### What does not (yet)
+
+- MySQL / PostgreSQL / HTTP REST / TLS facades are Linux-only paths.
+- IOCP / RIO completion port runtime (planned for a later perf pass; the
+  blocker is documented in the design doc).
+- `io_uring` IO backend, perf benchmarks, and the 860-test matrix are
+  Linux-only.
+
+### Build
+
+```bash
+# 1) toolchain
+rustup default stable-x86_64-pc-windows-msvc
+
+# 2) clone + build
+git clone https://github.com/Nexus-Aethra/NexusDB.git
+cd NexusDB
+cargo build --release --workspace
+```
+
+### Run
+
+```bash
+# minimal config (auto-corrects io_backend to stdfs on Windows)
+cat > config/nexusdb-test.toml <<'TOML'
+[server]
+listen_addr = "127.0.0.1:5433"     # Binary
+redis_addr  = "127.0.0.1:6380"     # RESP (use 6380 to avoid clashing with
+                                  # the SYSTEM-account redis-server on 6379
+                                  # that ships with the Redis.Redis winget
+                                  # package)
+worker_count = 1
+sql_addr = ""                    # disable SQL/PG on Windows
+pg_addr   = ""
+http_addr = ""
+sql_password = ""
+redis_password = ""
+
+[storage]
+block_root = "./data-test"
+num_shards = 2
+io_backend = "stdfs"
+create_if_missing = true
+default_db = "default"
+default_table = "default"
+precreate_dbs = 1
+TOML
+
+./target/release/NexusDB.exe --config config/nexusdb-test.toml
+```
+
+### Smoke (redis-cli)
+
+```bash
+redis-cli -p 6380 PING                # PONG
+redis-cli -p 6380 SET user:1 alice    # OK
+redis-cli -p 6380 GET user:1          # alice
+redis-cli -p 6380 DEL user:1          # 1
+```
+
+### Gotchas
+
+- **`redis-server` on 6379**: the `Redis.Redis` winget package installs a
+  `redis-server.exe` running as SYSTEM on port 6379. Without admin you
+  cannot stop it; use 6380 for the smoke. Production: pick a free port
+  in your own config.
+- **No `io_uring`**: `io_backend` in the config is ignored on Windows
+  (silently downgraded to `stdfs` when the missing-config path is taken,
+  or you can pin `io_backend = "stdfs"` explicitly).
+- **Listener `set_nonblocking(true)`** is needed so the acceptor can poll
+  the `stop` atomic, but winsock inherits that flag to accepted child
+  sockets. The per-connection thread treats `WSAEWOULDBLOCK` /
+  `WSAETIMEDOUT` on read as transient back-pressure and retries; never
+  close the conn on those errors or clients will see
+  "An existing connection was forcibly closed" between back-to-back
+  commands.
+- **`#[repr(C)]` on `OverlappedData`**: if you ever re-enable the IOCP
+  path, the `OVERLAPPED` field MUST be the first field and the struct
+  MUST be `#[repr(C)]`. Rust's default `repr(Rust)` will reorder fields
+  and GQCS will hand you the wrong dispatch state.
+- **`windows-sys = "0.61"`**: `ACCEPTEX` does not exist; the type is
+  `LPFN_ACCEPTEX` (an `Option<unsafe extern "system" fn(...)>`).
+  `setsockopt`'s 4th argument is `PSTR` (`*const u8`), not
+  `*const c_void`.
+
+### Performance
+
+Not measured on Windows yet. M2 uses one `std::thread` per connection,
+which is fine for development + single-node demo. Higher concurrency
+requires going back to IOCP (see design doc gotchas) or RIO. The Linux
+memtier numbers in [Performance](#performance) do not apply.
 
 ---
 
@@ -209,7 +327,7 @@ Key design points:
 - **Ordering invariant**: data chunk write confirmed → meta window write → pid.state, a three-stage closed loop; any stage can be retried on failure.
 - **GC & large values**: see the two sections below.
 
-Full breakdown: [DESIGN.md](./DESIGN.md) (10 sections).
+Full breakdown: [docs/DESIGN.md](./docs/DESIGN.md) (10 sections).
 
 ### Platform dependencies
 
@@ -307,7 +425,7 @@ Implementation: [`crates/storage/src/overflow.rs`](./crates/storage/src/overflow
 | **MySQL (wire)** | **5434** | ✅ SQL subset | **`mysql` CLI direct connect** + `mysql_native_password` / `caching_sha2_password` fast-auth login + **TLS (opt-in)**; syntax in the SQL facade section below |
 | **PostgreSQL (wire)** | **5435** | ✅ SQL subset | **`psql` direct connect** + **SCRAM-SHA-256 auth** + **TLS (opt-in, SSLRequest→'S')**; **shares the kernel** with MySQL facade, same-db read/write |
 | Binary (custom) | 5433 | ⚠️ Internal | internal protocol (test/bench tools); use REST/RESP/SQL for external access, disabled by default in future versions |
-| MongoDB (BSON) | - | 🚧 Roadmap | see [DESIGN.md §10](./DESIGN.md) |
+| MongoDB (BSON) | - | 🚧 Roadmap | see [docs/DESIGN.md §10](./docs/DESIGN.md) |
 
 ### RESP command surface (2026-07-28)
 
@@ -424,7 +542,7 @@ Design philosophy: **unified record encoding + value type tag** is reserved (`TA
 
 ## Configuration
 
-Full field comments in [`nexusdb.toml`](./nexusdb.toml). Key sections:
+Full field comments in [`config/nexusdb.toml`](./config/nexusdb.toml). Key sections:
 
 ```toml
 [server]
@@ -476,7 +594,7 @@ stderr = true
 | [`crates/network`](./crates/network) | five-protocol facades (Binary + RESP2 + MySQL/PG wire + HTTP REST) + **global shared worker pool** (thread count = config, not multiplied by protocols; per-worker coroutine Scheduler or epoll) + `KvLimits` + `tls` | ✅ |
 | [`crates/shard_manager`](./crates/shard_manager) | multi-shard controller (`ShardManager`/`Router`/`Inbox`/`TaskReplyBus`) + `latency_probe` + stress bench | ✅ |
 | [`crates/config`](./crates/config) | TOML config loading | ✅ |
-| root `src/main.rs` | server entry: `nexusdb --config nexusdb.toml`, graceful shutdown on signal | ✅ |
+| root `src/main.rs` | server entry: `nexusdb --config config/nexusdb.toml`, graceful shutdown on signal | ✅ |
 
 Active plans, incident reports, and archived implementation records: [docs index](./docs/README.md).
 
@@ -495,10 +613,10 @@ cargo clippy --workspace --all-targets
 cargo build --release
 
 # start (production)
-RUST_MIN_STACK=8388608 ./target/release/NexusDB --config nexusdb.toml
+RUST_MIN_STACK=8388608 ./target/release/NexusDB --config config/nexusdb.toml
 
 # start + probe (perf tuning, histogram dumped to stderr on SIGTERM)
-NLOG_PROBE=1 ./target/release/NexusDB --config nexusdb.toml
+NLOG_PROBE=1 ./target/release/NexusDB --config config/nexusdb.toml
 
 # single-crate test (fast dev iteration)
 cargo test -p storage --lib
@@ -512,7 +630,7 @@ redis-cli -p 6379 -x SET bigkey < /dev/urandom   # 1024B..1MB auto overflow
 redis-cli -p 6379 GET bigkey                     # byte-identical
 ```
 
-Debugging tips and gotchas: [AGENTS.md](./AGENTS.md).
+Debugging tips and gotchas: [docs/AGENTS.md](./docs/AGENTS.md).
 
 ---
 
@@ -520,11 +638,11 @@ Debugging tips and gotchas: [AGENTS.md](./AGENTS.md).
 
 | Symptom | Likely cause / action |
 |---|---|
-| startup `permission denied` / `disk full` | `block_root` path permission / disk space; check [nexusdb.toml](./nexusdb.toml) `[storage].block_root` |
+| startup `permission denied` / `disk full` | `block_root` path permission / disk space; check [config/nexusdb.toml](./config/nexusdb.toml) `[storage].block_root` |
 | startup hangs at io_uring init | container/sandbox without io_uring support; set `io_backend = "stdfs"` to work around |
-| `RST_STREAM` tail-latency spikes | network-layer TCP_NODELAY caveats; see [AGENTS.md](./AGENTS.md) |
+| `RST_STREAM` tail-latency spikes | network-layer TCP_NODELAY caveats; see [docs/AGENTS.md](./docs/AGENTS.md) |
 | p99 spikes to ms level | usually disk fsync queuing; switch to NVMe / use `NLOG_PROBE=1` for a probe comparison |
-| large-value GET returns `ERR ... value too long` | payload exceeds `max_value_bytes` (default 1 MB); check [nexusdb.toml](./nexusdb.toml) or the client→server path |
+| large-value GET returns `ERR ... value too long` | payload exceeds `max_value_bytes` (default 1 MB); check [config/nexusdb.toml](./config/nexusdb.toml) or the client→server path |
 | p99 jumps from 3 ms to 6 ms | usually in-flight 8 cap degrading to sync writes; lower `[storage].num_shards` or upgrade SSD |
 | data not found | multi-db switching: confirm the db name used on SET (`SELECT dbname`); the default db is always valid |
 
@@ -553,9 +671,9 @@ Start with `NLOG_PROBE=1` → on SIGTERM, a 16-bucket histogram is dumped to std
 | Reader | Doc |
 |---|---|
 | Evaluation / day one | this README (+ [docs/GUIDE.md](./docs/GUIDE.md) usage guide) |
-| Architecture | [DESIGN.md](./DESIGN.md) (10 sections) |
-| Development handoff (progress / gotchas / TODO) | [AGENTS.md](./AGENTS.md) |
-| Fix history (F1-F…) | [CHANGELOG.md](./CHANGELOG.md) |
+| Architecture | [docs/DESIGN.md](./docs/DESIGN.md) (10 sections) |
+| Development handoff (progress / gotchas / TODO) | [docs/AGENTS.md](./docs/AGENTS.md) |
+| Fix history (F1-F…) | [docs/CHANGELOG.md](./docs/CHANGELOG.md) |
 | Active plans, incident reports, and historical records | [docs index](./docs/README.md) |
 | Bug root-cause investigation example | [`docs/bug-report-btree-split-routing.md`](./docs/bug-report-btree-split-routing.md) |
 

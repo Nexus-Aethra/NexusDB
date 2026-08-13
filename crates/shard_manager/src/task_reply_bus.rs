@@ -24,6 +24,7 @@ struct QueuedResult {
 pub struct TaskReplyBus {
     ring: ArrayQueue<QueuedResult>,
     /// eventfd: shard push 后通知 worker 有回复可发.
+    #[cfg(target_os = "linux")]
     eventfd: std::os::unix::io::RawFd,
     /// ⭐ 通知合并: 自上次 drain 以来的 pending 计数.
     /// 首条 push (0→1) 才写 eventfd, 后续搭车 —— shard 一轮回 N 条
@@ -33,10 +34,13 @@ pub struct TaskReplyBus {
 
 impl TaskReplyBus {
     pub fn new() -> Self {
+        #[cfg(target_os = "linux")]
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        #[cfg(target_os = "linux")]
         assert!(fd >= 0, "eventfd creation failed");
         Self {
             ring: ArrayQueue::new(REPLY_BUS_CAPACITY),
+            #[cfg(target_os = "linux")]
             eventfd: fd,
             pending: AtomicU64::new(0),
         }
@@ -60,9 +64,12 @@ impl TaskReplyBus {
         }
         // ⭐ 合并通知: 首条才写 eventfd, 后续搭车
         if self.pending.fetch_add(1, Ordering::AcqRel) == 0 {
-            let val: u64 = 1;
-            unsafe {
-                libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+            #[cfg(target_os = "linux")]
+            {
+                let val: u64 = 1;
+                unsafe {
+                    libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+                }
             }
         }
     }
@@ -80,9 +87,12 @@ impl TaskReplyBus {
     /// Worker 端: drain 到调用方复用的缓冲，避免每次 eventfd 唤醒分配 Vec。
     pub fn drain_into(&self, results: &mut Vec<TaskResult>) {
         // 先 read eventfd (消耗通知计数)
-        let mut val: u64 = 0;
-        unsafe {
-            libc::read(self.eventfd, &mut val as *mut u64 as *mut libc::c_void, 8);
+        #[cfg(target_os = "linux")]
+        {
+            let mut val: u64 = 0;
+            unsafe {
+                libc::read(self.eventfd, &mut val as *mut u64 as *mut libc::c_void, 8);
+            }
         }
         self.pending.store(0, Ordering::Release);
         results.clear();
@@ -111,6 +121,7 @@ impl TaskReplyBus {
     }
 
     /// 获取 eventfd fd (供 epoll 注册).
+    #[cfg(target_os = "linux")]
     pub fn eventfd(&self) -> std::os::unix::io::RawFd {
         self.eventfd
     }
@@ -133,7 +144,10 @@ impl Default for TaskReplyBus {
 
 impl Drop for TaskReplyBus {
     fn drop(&mut self) {
-        unsafe { libc::close(self.eventfd); }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::close(self.eventfd);
+        }
     }
 }
 

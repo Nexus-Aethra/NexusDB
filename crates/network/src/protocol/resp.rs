@@ -40,7 +40,11 @@ pub enum RespCommand {
     /// ⭐ GETRANGE key start end → Get 后切片 (支持负索引), 回 bulk
     GetRange { key: Vec<u8>, start: i64, end: i64 },
     /// ⭐ SETRANGE key offset value → BatchOp::SetRange, 回 :len
-    SetRange { key: Vec<u8>, offset: u32, data: Vec<u8> },
+    SetRange {
+        key: Vec<u8>,
+        offset: u32,
+        data: Vec<u8>,
+    },
     /// ⭐ GETDEL key → BatchOp::GetDel, 回旧值 bulk / nil
     GetDel { key: Vec<u8> },
     /// ⭐ GETSET key value → BatchOp::GetSet (value 带 tag), 回旧值 bulk / nil
@@ -49,9 +53,17 @@ pub enum RespCommand {
     MSetNx { pairs: Vec<(Vec<u8>, Vec<u8>)> },
     // ---- ⭐ Phase H: Hash ----
     /// HSET/HMSET key f v [f v ...] → BatchOp::HSet; HSET 回 :新增数, HMSET 回 +OK
-    HSet { key: Vec<u8>, pairs: Vec<(Vec<u8>, Vec<u8>)>, reply_ok: bool },
+    HSet {
+        key: Vec<u8>,
+        pairs: Vec<(Vec<u8>, Vec<u8>)>,
+        reply_ok: bool,
+    },
     /// HSETNX key field value → 回 :0|:1
-    HSetNx { key: Vec<u8>, field: Vec<u8>, value: Vec<u8> },
+    HSetNx {
+        key: Vec<u8>,
+        field: Vec<u8>,
+        value: Vec<u8>,
+    },
     /// HGET key field → 回 bulk / nil
     HGet { key: Vec<u8>, field: Vec<u8> },
     /// HMGET key f [f ...] → 回 *N 数组
@@ -71,9 +83,24 @@ pub enum RespCommand {
     /// HSCAN key cursor […] → v1 单次全量, 回 ["0", *2N]
     HScan { key: Vec<u8> },
     /// HINCRBY key field n → 回 :新值
-    HIncrBy { key: Vec<u8>, field: Vec<u8>, delta: i64 },
+    HIncrBy {
+        key: Vec<u8>,
+        field: Vec<u8>,
+        delta: i64,
+    },
     /// HINCRBYFLOAT key field f → 回 bulk 新值
-    HIncrByFloat { key: Vec<u8>, field: Vec<u8>, delta: f64 },
+    HIncrByFloat {
+        key: Vec<u8>,
+        field: Vec<u8>,
+        delta: f64,
+    },
+    /// Nexus extension: HQUERY table WHERE col op value [AND ...] FIELDS col... LIMIT n.
+    HQuery {
+        table: Vec<u8>,
+        terms: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        fields: Vec<Vec<u8>>,
+        limit: u32,
+    },
     // ---- ⭐ Phase Set: Set ----
     /// SADD key m [m ...] → 回 :新增数
     SAdd { key: Vec<u8>, members: Vec<Vec<u8>> },
@@ -98,14 +125,30 @@ pub enum RespCommand {
     /// SINTER/SUNION/SDIFF key [key ...] → 跨 shard 取成员 + worker 端代数
     SetAlg { op: SetAlgOp, keys: Vec<Vec<u8>> },
     /// ⭐ C3: SINTERSTORE/SUNIONSTORE/SDIFFSTORE dst key... → :card (非原子)
-    SetAlgStore { op: SetAlgOp, dst: Vec<u8>, keys: Vec<Vec<u8>> },
+    SetAlgStore {
+        op: SetAlgOp,
+        dst: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+    },
     /// ⭐ C3: ZINTERSTORE/ZUNIONSTORE dst numkeys key... (无 weights, SUM) → :card
-    ZSetStore { inter: bool, dst: Vec<u8>, keys: Vec<Vec<u8>> },
+    ZSetStore {
+        inter: bool,
+        dst: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+    },
     // ---- ⭐ Phase L: List ----
     /// LPUSH/RPUSH key v [v ...] → 回 :新长度
-    LPush { key: Vec<u8>, values: Vec<Vec<u8>>, left: bool },
+    LPush {
+        key: Vec<u8>,
+        values: Vec<Vec<u8>>,
+        left: bool,
+    },
     /// LPOP/RPOP key [count] → count 缺省回单 bulk/nil, 否则回 *N
-    LPop { key: Vec<u8>, left: bool, count: Option<u32> },
+    LPop {
+        key: Vec<u8>,
+        left: bool,
+        count: Option<u32>,
+    },
     /// LLEN key → :n
     LLen { key: Vec<u8> },
     /// LRANGE key start end → *N
@@ -113,19 +156,40 @@ pub enum RespCommand {
     /// LINDEX key idx → bulk / nil
     LIndex { key: Vec<u8>, idx: i64 },
     /// LSET key idx val → +OK / -ERR index out of range
-    LSet { key: Vec<u8>, idx: i64, value: Vec<u8> },
+    LSet {
+        key: Vec<u8>,
+        idx: i64,
+        value: Vec<u8>,
+    },
     // ---- ⭐ C2: List 中段操作 ----
     /// LREM key count element → :实删数
-    LRem { key: Vec<u8>, count: i64, value: Vec<u8> },
+    LRem {
+        key: Vec<u8>,
+        count: i64,
+        value: Vec<u8>,
+    },
     /// LTRIM key start stop → +OK
     LTrim { key: Vec<u8>, start: i64, stop: i64 },
     /// LPOS key element [RANK r] [COUNT n] → :idx / nil / *N
-    LPos { key: Vec<u8>, value: Vec<u8>, rank: i64, count: Option<u32> },
+    LPos {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        rank: i64,
+        count: Option<u32>,
+    },
     /// LINSERT key BEFORE|AFTER pivot element → :新长度 / :-1 / :0
-    LInsert { key: Vec<u8>, before: bool, pivot: Vec<u8>, value: Vec<u8> },
+    LInsert {
+        key: Vec<u8>,
+        before: bool,
+        pivot: Vec<u8>,
+        value: Vec<u8>,
+    },
     // ---- ⭐ Phase Z: ZSet ----
     /// ZADD key score member [score member ...] → :新增数
-    ZAdd { key: Vec<u8>, pairs: Vec<(f64, Vec<u8>)> },
+    ZAdd {
+        key: Vec<u8>,
+        pairs: Vec<(f64, Vec<u8>)>,
+    },
     /// ZREM key m [m ...] → :实删数
     ZRem { key: Vec<u8>, members: Vec<Vec<u8>> },
     /// ZSCORE key member → bulk / nil
@@ -133,13 +197,32 @@ pub enum RespCommand {
     /// ZCARD key → :n
     ZCard { key: Vec<u8> },
     /// ZINCRBY key delta member → bulk 新 score
-    ZIncrBy { key: Vec<u8>, delta: f64, member: Vec<u8> },
+    ZIncrBy {
+        key: Vec<u8>,
+        delta: f64,
+        member: Vec<u8>,
+    },
     /// ZRANGE/ZREVRANGE key start end [WITHSCORES] → *N
-    ZRange { key: Vec<u8>, start: i64, end: i64, rev: bool, withscores: bool },
+    ZRange {
+        key: Vec<u8>,
+        start: i64,
+        end: i64,
+        rev: bool,
+        withscores: bool,
+    },
     /// ZRANGEBYSCORE key min max [WITHSCORES] → *N
-    ZRangeByScore { key: Vec<u8>, min: f64, max: f64, withscores: bool },
+    ZRangeByScore {
+        key: Vec<u8>,
+        min: f64,
+        max: f64,
+        withscores: bool,
+    },
     /// ZRANK/ZREVRANK key member → :rank / nil
-    ZRank { key: Vec<u8>, member: Vec<u8>, rev: bool },
+    ZRank {
+        key: Vec<u8>,
+        member: Vec<u8>,
+        rev: bool,
+    },
     /// ZCOUNT key min max → :闭区间成员数
     ZCount { key: Vec<u8>, min: f64, max: f64 },
     /// ZMSCORE key m... → *N 个 bulk score / nil
@@ -150,12 +233,21 @@ pub enum RespCommand {
     /// HSTRLEN key field → :len (HGet 转长度)
     HStrlen { key: Vec<u8>, field: Vec<u8> },
     /// HRANDFIELD key [count [WITHVALUES]] → 无 count 单 bulk; 有 count *N / *2N
-    HRandField { key: Vec<u8>, count: Option<u32>, withvalues: bool },
+    HRandField {
+        key: Vec<u8>,
+        count: Option<u32>,
+        withvalues: bool,
+    },
     // ---- ⭐ Phase G: Geo (复用 ZSet: score = 52-bit geohash) ----
     /// GEOPOS key m... → *N 个 [lon, lat] / nil (复用 ZMScore + 渲染钩子)
     GeoPos { key: Vec<u8>, members: Vec<Vec<u8>> },
     /// GEODIST key m1 m2 [unit] → bulk 距离 / nil (复用 ZMScore)
-    GeoDist { key: Vec<u8>, m1: Vec<u8>, m2: Vec<u8>, factor: f64 },
+    GeoDist {
+        key: Vec<u8>,
+        m1: Vec<u8>,
+        m2: Vec<u8>,
+        factor: f64,
+    },
     /// GEOSEARCH key FROMLONLAT lon lat BYRADIUS r unit [...] (复用 ZRange 全扫)
     GeoSearch {
         key: Vec<u8>,
@@ -169,13 +261,22 @@ pub enum RespCommand {
     },
     // ---- ⭐ Phase B: Bitmap (String 字节) ----
     /// SETBIT key offset 0|1 → :旧bit (shard RMW)
-    SetBit { key: Vec<u8>, offset: u64, bit: bool },
+    SetBit {
+        key: Vec<u8>,
+        offset: u64,
+        bit: bool,
+    },
     /// GETBIT key offset → :0|:1 (Get + worker 取位)
     GetBit { key: Vec<u8>, offset: u64 },
     /// BITCOUNT key [start end] (BYTE 语义) → :n
     BitCount { key: Vec<u8>, start: i64, end: i64 },
     /// BITPOS key bit [start [end]] (BYTE 语义) → :pos / :-1
-    BitPos { key: Vec<u8>, bit: bool, start: i64, end: Option<i64> },
+    BitPos {
+        key: Vec<u8>,
+        bit: bool,
+        start: i64,
+        end: Option<i64>,
+    },
     /// PING [msg] → 本地回 +PONG / $msg
     Ping(Option<Vec<u8>>),
     /// ECHO msg → 本地回 $msg
@@ -241,10 +342,7 @@ impl RespCodec {
     ///
     /// 协议错误 (非法前缀/超限) 返回 Err(错误消息) — caller 应回 -ERR 并断开连接
     /// (RESP 流一旦错位无法重新同步).
-    pub fn decode_command(
-        &self,
-        buf: &[u8],
-    ) -> Result<DecodeOutcome<RespCommand>, String> {
+    pub fn decode_command(&self, buf: &[u8]) -> Result<DecodeOutcome<RespCommand>, String> {
         if buf.is_empty() {
             return Ok(DecodeOutcome::NeedMore);
         }
@@ -401,10 +499,7 @@ pub(crate) fn parse_int_line(buf: &[u8], start: usize) -> Result<Option<(i64, us
                 return Ok(Some((if neg { -val } else { val }, i + 2)));
             }
             other => {
-                return Err(format!(
-                    "protocol error: invalid digit {:?}",
-                    other as char
-                ));
+                return Err(format!("protocol error: invalid digit {:?}", other as char));
             }
         }
         // 防超长数字行 (正常 len 不会超过 8 位数字)
@@ -442,7 +537,12 @@ mod tests {
         );
 
         let (_, cmd) = decode_full(b"*2\r\n$3\r\nget\r\n$2\r\nk1\r\n");
-        assert_eq!(cmd, RespCommand::Get { key: b"k1".to_vec() });
+        assert_eq!(
+            cmd,
+            RespCommand::Get {
+                key: b"k1".to_vec()
+            }
+        );
 
         let (_, cmd) = decode_full(b"*3\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\nb\r\n");
         assert_eq!(

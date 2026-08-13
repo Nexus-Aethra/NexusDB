@@ -21,6 +21,8 @@ default = []
 scheduler-trace = []
 
 [dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6"
 libc = "0.2"
 

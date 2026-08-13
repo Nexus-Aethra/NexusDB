@@ -444,7 +444,7 @@ pub(crate) fn drain_async_flush(
     flush_done: &FlushDoneSlot,
 ) {
     loop {
-        let _ = drive_async_flush(engine, rt, flush_done, 256, usize::MAX, true);
+        drive_async_flush(engine, rt, flush_done, 256, usize::MAX, true);
         let drained = {
             let mut e_borrow = engine.borrow_mut();
             match e_borrow.as_mut() {
@@ -577,6 +577,7 @@ pub(crate) fn shard_thread_main(
             if spins >= SPIN_ROUNDS_BEFORE_PARK {
                 // 慢速路径: poll() 阻塞等两个 eventfd (零 CPU, 精确唤醒).
                 // timeout 10ms: 周期性醒来驱动自动持久化检查.
+                #[cfg(target_os = "linux")]
                 let mut fds = [
                     libc::pollfd {
                         fd: inbox.eventfd(),
@@ -589,17 +590,20 @@ pub(crate) fn shard_thread_main(
                         revents: 0,
                     },
                 ];
+                #[cfg(target_os = "linux")]
                 unsafe {
                     libc::poll(fds.as_mut_ptr(), 2, 10);
                 }
                 // 消耗 eventfd 计数 (仅在 POLLIN 时读; eventfd 是 blocking 模式,
                 // 计数为 0 时读会阻塞)
+                #[cfg(target_os = "linux")]
                 if fds[0].revents & libc::POLLIN != 0 {
                     let mut v: u64 = 0;
                     unsafe {
                         libc::read(inbox.eventfd(), &mut v as *mut u64 as *mut libc::c_void, 8);
                     }
                 }
+                #[cfg(target_os = "linux")]
                 if fds[1].revents & libc::POLLIN != 0 {
                     let mut v: u64 = 0;
                     unsafe {
@@ -610,6 +614,8 @@ pub(crate) fn shard_thread_main(
                         );
                     }
                 }
+                #[cfg(not(target_os = "linux"))]
+                std::thread::sleep(std::time::Duration::from_millis(1));
                 let b = inbox.drain();
                 let t = if deferred_tasks.is_empty() {
                     task_inbox.drain_up_to(task_window.limit())
@@ -622,7 +628,7 @@ pub(crate) fn shard_thread_main(
                     break (b, t);
                 }
                 // timeout 醒来无数据: 驱动异步落盘 + 周期刷盘后继续睡
-                let _ = drive_async_flush(&engine, &rt, &flush_done, 256, usize::MAX, true);
+                drive_async_flush(&engine, &rt, &flush_done, 256, usize::MAX, true);
                 spins = 0;
                 continue;
             }
@@ -1253,6 +1259,55 @@ pub(crate) fn shard_thread_main(
                                     sets,
                                 } => match block_on_io(e.row_update(&db, &table, &pk, &sets)) {
                                     Ok(updated) => BatchResult::DeleteExisted(updated),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::RowUnset {
+                                    db,
+                                    table,
+                                    pk,
+                                    cols,
+                                } => match block_on_io(e.row_unset(&db, &table, &pk, &cols)) {
+                                    Ok(changed) => BatchResult::Integer(changed),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::RowSetNx {
+                                    db,
+                                    table,
+                                    pk,
+                                    col,
+                                    val,
+                                } => match block_on_io(e.row_set_nx(&db, &table, &pk, col, val)) {
+                                    Ok(set) => BatchResult::Integer(i64::from(set)),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::RowPatchUpsert {
+                                    db,
+                                    table,
+                                    pk,
+                                    sets,
+                                    insert_values,
+                                } => match block_on_io(e.row_patch_upsert(
+                                    &db,
+                                    &table,
+                                    &pk,
+                                    &sets,
+                                    &insert_values,
+                                )) {
+                                    Ok(added) => BatchResult::Integer(added),
+                                    Err(err) => BatchResult::Error(err.to_string()),
+                                },
+                                BatchOp::RowIncr {
+                                    db,
+                                    table,
+                                    pk,
+                                    col,
+                                    delta,
+                                } => match block_on_io(e.row_incr(&db, &table, &pk, col, delta)) {
+                                    Ok(storage::row::ColValue::I64(v)) => BatchResult::Integer(v),
+                                    Ok(storage::row::ColValue::F64(v)) => BatchResult::Double(v),
+                                    Ok(_) => BatchResult::Error(
+                                        "row increment returned non-numeric value".into(),
+                                    ),
                                     Err(err) => BatchResult::Error(err.to_string()),
                                 },
                                 BatchOp::DropTableOp { db, table } => {

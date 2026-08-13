@@ -201,7 +201,14 @@ pub(crate) fn sql_join_drive(
                     let c = conn.sql_join.get(&seq).unwrap();
                     let go = &c.gather_order;
                     if go.is_empty() {
-                        (if idx + 1 < ntables { Some(idx + 1) } else { None }, idx + 1 >= ntables)
+                        (
+                            if idx + 1 < ntables {
+                                Some(idx + 1)
+                            } else {
+                                None
+                            },
+                            idx + 1 >= ntables,
+                        )
                     } else {
                         let pos = go.iter().position(|&x| x == idx).unwrap();
                         (go.get(pos + 1).copied(), pos + 1 >= go.len())
@@ -214,7 +221,15 @@ pub(crate) fn sql_join_drive(
                         c.remaining = num_shards;
                         c.tables[ni].rows.clear();
                     }
-                    sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, ni);
+                    sql_join_broadcast(
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        shard_inboxes,
+                        num_shards,
+                        ni,
+                    );
                 } else if is_last {
                     sql_join_finish(conn, seq);
                 }
@@ -277,7 +292,7 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
                     for &ri in cands {
                         let mut w = Vec::with_capacity(col_offset[2]);
                         w.extend_from_slice(&p_rows[ri]); // tables[0] 列
-                        w.extend_from_slice(d_row);       // tables[1] 列
+                        w.extend_from_slice(d_row); // tables[1] 列
                         out.push(w);
                     }
                 }
@@ -296,104 +311,111 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
         // 原左深迭代 hash join (tables[0] 驱动, tables[1..] key_set/全量)
         acc = ctx.tables[0].rows.clone();
         for (ji, jc) in ctx.joins.iter().enumerate() {
-        let rt = ji + 1;
-        let acc_w = col_offset[rt];
-        let right_pw = ctx.tables[rt].proj.len();
-        // ON 等值键: (acc 宽位, right proj 位); ON 非等值残余: Cmp
-        let mut eq_keys: Vec<(usize, usize)> = Vec::new();
-        for on in &jc.on {
-            if let sql::OnPred::Eq(l, r) = on {
-                let (lt, li) = sql_join_resolve_on(&ctx, l, rt).unwrap();
-                let (_rtt, ri) = sql_join_resolve_on(&ctx, r, rt).unwrap();
-                if lt == rt {
-                    // l 属新表, r 属 acc
-                    eq_keys.push((wide_pos(_rtt, ri), pos_in(rt, li)));
-                } else {
-                    // l 属 acc, r 属新表
-                    eq_keys.push((wide_pos(lt, li), pos_in(rt, ri)));
-                }
-            }
-        }
-        // 右表建 hash: 组合键 → 右行下标
-        let right_rows = &ctx.tables[rt].rows;
-        let mut hash: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-        if !eq_keys.is_empty() {
-            for (ri, row) in right_rows.iter().enumerate() {
-                if let Some(k) = join_key_multi(row, eq_keys.iter().map(|&(_, rp)| rp)) {
-                    hash.entry(k).or_default().push(ri);
-                }
-            }
-        }
-        // ON 残余 Cmp 判定 (acc_row + right_row)
-        let on_cmp_pass = |acc_row: &[ColValue], right_row: &[ColValue]| -> bool {
+            let rt = ji + 1;
+            let acc_w = col_offset[rt];
+            let right_pw = ctx.tables[rt].proj.len();
+            // ON 等值键: (acc 宽位, right proj 位); ON 非等值残余: Cmp
+            let mut eq_keys: Vec<(usize, usize)> = Vec::new();
             for on in &jc.on {
-                if let sql::OnPred::Cmp { left, op, right } = on {
-                    let (lt, li) = sql_join_resolve_on(&ctx, left, rt).unwrap();
-                    let (rtt, ri) = sql_join_resolve_on(&ctx, right, rt).unwrap();
-                    let lv = if lt == rt { &right_row[pos_in(rt, li)] } else { &acc_row[wide_pos(lt, li)] };
-                    let rv = if rtt == rt { &right_row[pos_in(rt, ri)] } else { &acc_row[wide_pos(rtt, ri)] };
-                    if !join_cmp_cols(lv, *op, rv) {
-                        return false;
+                if let sql::OnPred::Eq(l, r) = on {
+                    let (lt, li) = sql_join_resolve_on(&ctx, l, rt).unwrap();
+                    let (_rtt, ri) = sql_join_resolve_on(&ctx, r, rt).unwrap();
+                    if lt == rt {
+                        // l 属新表, r 属 acc
+                        eq_keys.push((wide_pos(_rtt, ri), pos_in(rt, li)));
+                    } else {
+                        // l 属 acc, r 属新表
+                        eq_keys.push((wide_pos(lt, li), pos_in(rt, ri)));
                     }
                 }
             }
-            true
-        };
-        let extend = |acc_row: &[ColValue], right_row: Option<&Vec<ColValue>>| -> Vec<ColValue> {
-            let mut w = Vec::with_capacity(acc_w + right_pw);
-            w.extend_from_slice(acc_row);
-            match right_row {
-                Some(r) => w.extend_from_slice(r),
-                None => w.extend(std::iter::repeat_n(ColValue::Null, right_pw)),
-            }
-            w
-        };
-        let mut new_acc: Vec<Vec<ColValue>> = Vec::new();
-        let mut matched_right = vec![false; right_rows.len()];
-        for acc_row in &acc {
-            if jc.kind == JoinKind::Cross {
-                for right_row in right_rows.iter() {
-                    new_acc.push(extend(acc_row, Some(right_row)));
-                }
-                continue;
-            }
-            let key = join_key_multi(acc_row, eq_keys.iter().map(|&(ap, _)| ap));
-            let mut any = false;
-            if let Some(k) = key
-                && let Some(cands) = hash.get(&k)
-            {
-                for &ri in cands {
-                    if on_cmp_pass(acc_row, &right_rows[ri]) {
-                        new_acc.push(extend(acc_row, Some(&right_rows[ri])));
-                        matched_right[ri] = true;
-                        any = true;
+            // 右表建 hash: 组合键 → 右行下标
+            let right_rows = &ctx.tables[rt].rows;
+            let mut hash: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+            if !eq_keys.is_empty() {
+                for (ri, row) in right_rows.iter().enumerate() {
+                    if let Some(k) = join_key_multi(row, eq_keys.iter().map(|&(_, rp)| rp)) {
+                        hash.entry(k).or_default().push(ri);
                     }
                 }
             }
-            if !any
-                && matches!(jc.kind, JoinKind::Left | JoinKind::Full)
-            {
-                new_acc.push(extend(acc_row, None));
-            }
-        }
-        // RIGHT/FULL: 未匹配右行 → NULL acc 前缀 + 右行
-        if matches!(jc.kind, JoinKind::Right | JoinKind::Full) {
-            for (ri, m) in matched_right.iter().enumerate() {
-                if !*m {
-                    let mut w = vec![ColValue::Null; acc_w];
-                    w.extend_from_slice(&right_rows[ri]);
-                    new_acc.push(w);
+            // ON 残余 Cmp 判定 (acc_row + right_row)
+            let on_cmp_pass = |acc_row: &[ColValue], right_row: &[ColValue]| -> bool {
+                for on in &jc.on {
+                    if let sql::OnPred::Cmp { left, op, right } = on {
+                        let (lt, li) = sql_join_resolve_on(&ctx, left, rt).unwrap();
+                        let (rtt, ri) = sql_join_resolve_on(&ctx, right, rt).unwrap();
+                        let lv = if lt == rt {
+                            &right_row[pos_in(rt, li)]
+                        } else {
+                            &acc_row[wide_pos(lt, li)]
+                        };
+                        let rv = if rtt == rt {
+                            &right_row[pos_in(rt, ri)]
+                        } else {
+                            &acc_row[wide_pos(rtt, ri)]
+                        };
+                        if !join_cmp_cols(lv, *op, rv) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            };
+            let extend =
+                |acc_row: &[ColValue], right_row: Option<&Vec<ColValue>>| -> Vec<ColValue> {
+                    let mut w = Vec::with_capacity(acc_w + right_pw);
+                    w.extend_from_slice(acc_row);
+                    match right_row {
+                        Some(r) => w.extend_from_slice(r),
+                        None => w.extend(std::iter::repeat_n(ColValue::Null, right_pw)),
+                    }
+                    w
+                };
+            let mut new_acc: Vec<Vec<ColValue>> = Vec::new();
+            let mut matched_right = vec![false; right_rows.len()];
+            for acc_row in &acc {
+                if jc.kind == JoinKind::Cross {
+                    for right_row in right_rows.iter() {
+                        new_acc.push(extend(acc_row, Some(right_row)));
+                    }
+                    continue;
+                }
+                let key = join_key_multi(acc_row, eq_keys.iter().map(|&(ap, _)| ap));
+                let mut any = false;
+                if let Some(k) = key
+                    && let Some(cands) = hash.get(&k)
+                {
+                    for &ri in cands {
+                        if on_cmp_pass(acc_row, &right_rows[ri]) {
+                            new_acc.push(extend(acc_row, Some(&right_rows[ri])));
+                            matched_right[ri] = true;
+                            any = true;
+                        }
+                    }
+                }
+                if !any && matches!(jc.kind, JoinKind::Left | JoinKind::Full) {
+                    new_acc.push(extend(acc_row, None));
                 }
             }
-        }
-        if new_acc.len() > JOIN_MAX_ROWS {
-            conn.resp_complete(
-                seq,
-                sql_err_bytes(conn.proto, "JOIN result too large (row cap exceeded)"),
-            );
-            return;
-        }
-        acc = new_acc;
+            // RIGHT/FULL: 未匹配右行 → NULL acc 前缀 + 右行
+            if matches!(jc.kind, JoinKind::Right | JoinKind::Full) {
+                for (ri, m) in matched_right.iter().enumerate() {
+                    if !*m {
+                        let mut w = vec![ColValue::Null; acc_w];
+                        w.extend_from_slice(&right_rows[ri]);
+                        new_acc.push(w);
+                    }
+                }
+            }
+            if new_acc.len() > JOIN_MAX_ROWS {
+                conn.resp_complete(
+                    seq,
+                    sql_err_bytes(conn.proto, "JOIN result too large (row cap exceeded)"),
+                );
+                return;
+            }
+            acc = new_acc;
         }
     }
 
@@ -448,8 +470,10 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
         let cidx = ctx.tables[t].proj[local];
         ctx.tables[t].schema.as_ref().unwrap().columns[cidx as usize].ty
     };
-    let cols: Vec<(&str, ColType)> =
-        out_plan.iter().map(|(label, wp)| (label.as_str(), ty_of(*wp))).collect();
+    let cols: Vec<(&str, ColType)> = out_plan
+        .iter()
+        .map(|(label, wp)| (label.as_str(), ty_of(*wp)))
+        .collect();
     let rows: Vec<Vec<ColValue>> = out_rows
         .iter()
         .map(|row| out_plan.iter().map(|(_, wp)| row[*wp].clone()).collect())
@@ -507,7 +531,10 @@ pub(crate) fn join_key(cv: &ColValue) -> Option<Vec<u8>> {
 pub(crate) fn join_cond_pass(cv: &ColValue, cond: &JoinCond) -> bool {
     use std::cmp::Ordering;
     if cond.op == CmpOp::In {
-        return cond.set.iter().any(|v| sql_cmp(cv, v) == Some(Ordering::Equal));
+        return cond
+            .set
+            .iter()
+            .any(|v| sql_cmp(cv, v) == Some(Ordering::Equal));
     }
     // ⭐ compat: JSONB '?' — 列含顶层键
     if cond.op == CmpOp::JsonExists {
@@ -610,7 +637,11 @@ pub(crate) fn sql_join_resolve(ctx: &SqlJoinCtx, qc: &QualCol) -> Result<(usize,
 
 /// ⭐ F68 (JOIN): ON 操作数解析 (未限定名优先前序表, 支持 USING 糖糖).
 /// rt = 本次新表下标; 限定名 → 常规解析; 未限定 → tables[0..rt] 取最后一个, 否则 rt.
-pub(crate) fn sql_join_resolve_on(ctx: &SqlJoinCtx, qc: &QualCol, rt: usize) -> Result<(usize, u16), String> {
+pub(crate) fn sql_join_resolve_on(
+    ctx: &SqlJoinCtx,
+    qc: &QualCol,
+    rt: usize,
+) -> Result<(usize, u16), String> {
     if qc.qualifier.is_some() {
         return sql_join_resolve(ctx, qc);
     }
@@ -744,7 +775,10 @@ pub(crate) fn sql_join_kickoff(
                         c.tables.len() == 2
                             && c.tables.iter().all(|t| !t.prefilled)
                             && matches!(c.joins[0].kind, JoinKind::Inner)
-                            && c.joins[0].on.iter().all(|o| matches!(o, sql::OnPred::Eq(..)))
+                            && c.joins[0]
+                                .on
+                                .iter()
+                                .all(|o| matches!(o, sql::OnPred::Eq(..)))
                     };
                     if est_ok {
                         // ⭐ 方案 A (调优): 两表行数合并一轮广播 (group 0=tables[0], 1=tables[1]),
@@ -765,17 +799,35 @@ pub(crate) fn sql_join_kickoff(
                             ];
                             c.remaining = 2 * num_shards;
                             c.gather_order = vec![0, 1]; // swapped 时改为 [1, 0]
-                            (c.db.clone(), c.tables[0].table.clone(), c.tables[1].table.clone())
+                            (
+                                c.db.clone(),
+                                c.tables[0].table.clone(),
+                                c.tables[1].table.clone(),
+                            )
                         };
                         for sid in 0..num_shards {
                             push_task_grouped(
-                                conn_id, seq, worker_id, 0, sid,
-                                BatchOp::EstimateRowCount { db: db.clone(), table: t0.clone() },
+                                conn_id,
+                                seq,
+                                worker_id,
+                                0,
+                                sid,
+                                BatchOp::EstimateRowCount {
+                                    db: db.clone(),
+                                    table: t0.clone(),
+                                },
                                 shard_inboxes,
                             );
                             push_task_grouped(
-                                conn_id, seq, worker_id, 1, sid,
-                                BatchOp::EstimateRowCount { db: db.clone(), table: t1.clone() },
+                                conn_id,
+                                seq,
+                                worker_id,
+                                1,
+                                sid,
+                                BatchOp::EstimateRowCount {
+                                    db: db.clone(),
+                                    table: t1.clone(),
+                                },
                                 shard_inboxes,
                             );
                         }
@@ -789,7 +841,15 @@ pub(crate) fn sql_join_kickoff(
                         c.remaining = num_shards;
                         c.tables[idx].rows.clear();
                     }
-                    sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, idx);
+                    sql_join_broadcast(
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        shard_inboxes,
+                        num_shards,
+                        idx,
+                    );
                 }
                 // 全部预填 (理论不可达: joins 非空) → 直接 finish
                 None => sql_join_finish(conn, seq),
@@ -819,7 +879,9 @@ pub(crate) fn sql_join_broadcast(
         // 让含 OR 的 AND 谓词重新进入 AND 下推路径
         let nconds = sql::or_eq_to_in::<sql::JoinCond>(&c.conds);
         for cond in nconds.as_conjuncts().unwrap_or_default() {
-            let Ok((ti, cidx)) = sql_join_resolve(c, &cond.col) else { continue };
+            let Ok((ti, cidx)) = sql_join_resolve(c, &cond.col) else {
+                continue;
+            };
             if ti != idx {
                 continue;
             }
@@ -839,13 +901,26 @@ pub(crate) fn sql_join_broadcast(
                 CmpOp::JsonExists => unreachable!("上续 continue"),
             };
             if cond.op == CmpOp::In {
-                let set: Vec<ColValue> =
-                    cond.set.iter().filter_map(|v| sql_to_col(ty, v).ok()).collect();
+                let set: Vec<ColValue> = cond
+                    .set
+                    .iter()
+                    .filter_map(|v| sql_to_col(ty, v).ok())
+                    .collect();
                 if set.len() == cond.set.len() {
-                    preds.push(shard_manager::ScanPred { col: cidx, op, val: ColValue::Null, set });
+                    preds.push(shard_manager::ScanPred {
+                        col: cidx,
+                        op,
+                        val: ColValue::Null,
+                        set,
+                    });
                 }
             } else if let Ok(val) = sql_to_col(ty, &cond.val) {
-                preds.push(shard_manager::ScanPred { col: cidx, op, val, set: Vec::new() });
+                preds.push(shard_manager::ScanPred {
+                    col: cidx,
+                    op,
+                    val,
+                    set: Vec::new(),
+                });
             }
         }
         (c.db.clone(), t.table.clone(), preds, t.proj.clone())
@@ -894,8 +969,10 @@ fn range_ratio(
     let Some((lo_b, hi_b)) = ctx.join_ranges.get(idx).and_then(|m| m.get(&iid)) else {
         return 1.0;
     };
-    let (Some(lo), Some(hi)) = (col_from_ordered_bytes(ty, lo_b), col_from_ordered_bytes(ty, hi_b))
-    else {
+    let (Some(lo), Some(hi)) = (
+        col_from_ordered_bytes(ty, lo_b),
+        col_from_ordered_bytes(ty, hi_b),
+    ) else {
         return 1.0;
     };
     let num = |c: &ColValue| -> Option<f64> {
@@ -911,19 +988,27 @@ fn range_ratio(
     if h <= l {
         return 1.0;
     }
-    let r = if is_gt { (h - x) / (h - l) } else { (x - l) / (h - l) };
+    let r = if is_gt {
+        (h - x) / (h - l)
+    } else {
+        (x - l) / (h - l)
+    };
     r.clamp(0.0, 1.0)
 }
 
 /// ⭐ M3-4: 表 idx 的候选 Eq 索引列 (conds 中该表等值谓词列 → (列号, iid), 去重).
 fn join_candidate_eq_iids(ctx: &SqlJoinCtx, idx: usize) -> Vec<(u16, u32)> {
-    let Some(schema) = ctx.tables[idx].schema.as_ref() else { return Vec::new() };
+    let Some(schema) = ctx.tables[idx].schema.as_ref() else {
+        return Vec::new();
+    };
     let mut out: Vec<(u16, u32)> = Vec::new();
     for cond in ctx.conds.as_conjuncts().unwrap_or_default() {
         if cond.op != CmpOp::Eq {
             continue;
         }
-        let Ok((ti, cidx)) = sql_join_resolve(ctx, &cond.col) else { continue };
+        let Ok((ti, cidx)) = sql_join_resolve(ctx, &cond.col) else {
+            continue;
+        };
         if ti != idx {
             continue;
         }
@@ -958,10 +1043,21 @@ fn sql_join_est_decide(
         c.remaining = num_shards;
         c.tables[gather_idx].rows.clear();
     }
-    sql_join_broadcast(conn, conn_id, seq, worker_id, shard_inboxes, num_shards, gather_idx);
+    sql_join_broadcast(
+        conn,
+        conn_id,
+        seq,
+        worker_id,
+        shard_inboxes,
+        num_shards,
+        gather_idx,
+    );
 }
 
-pub(crate) fn sql_join_keyset_hint(ctx: &SqlJoinCtx, idx: usize) -> Option<shard_manager::KeySetHint> {
+pub(crate) fn sql_join_keyset_hint(
+    ctx: &SqlJoinCtx,
+    idx: usize,
+) -> Option<shard_manager::KeySetHint> {
     // ⭐ M3-2: swapped 双表 — 仅被驱动表 tables[0] 用 key_set (来源 joins[0] + tables[1]),
     // 驱动表 tables[1] 保持全量 (idx=1 → None). 普通多表 — idx==0 全量, idx>=1 用 joins[idx-1].
     let (jc, prev_gt_ok) = if ctx.swapped {
@@ -979,12 +1075,17 @@ pub(crate) fn sql_join_keyset_hint(ctx: &SqlJoinCtx, idx: usize) -> Option<shard
         return None;
     }
     // 息含单个 Eq
-    let eqs: Vec<&sql::OnPred> =
-        jc.on.iter().filter(|o| matches!(o, sql::OnPred::Eq(..))).collect();
+    let eqs: Vec<&sql::OnPred> = jc
+        .on
+        .iter()
+        .filter(|o| matches!(o, sql::OnPred::Eq(..)))
+        .collect();
     if eqs.len() != 1 {
         return None;
     }
-    let sql::OnPred::Eq(l, r) = eqs[0] else { return None };
+    let sql::OnPred::Eq(l, r) = eqs[0] else {
+        return None;
+    };
     // resolve 两侧 → (表下标, 列号)
     let (lt, li) = sql_join_resolve_on(ctx, l, idx).ok()?;
     let (rt, ri) = sql_join_resolve_on(ctx, r, idx).ok()?;
@@ -998,7 +1099,11 @@ pub(crate) fn sql_join_keyset_hint(ctx: &SqlJoinCtx, idx: usize) -> Option<shard
     };
     // 新表 join 列需有普通二级索引
     let schema = ctx.tables[idx].schema.as_ref()?;
-    let iid = schema.indexes.iter().find(|i| i.col == new_col).map(|i| i.iid)?;
+    let iid = schema
+        .indexes
+        .iter()
+        .find(|i| i.col == new_col)
+        .map(|i| i.iid)?;
     // 前序表 prev_col 在其 proj 中的位置
     let prev_tab = &ctx.tables[prev_ti];
     let pos = prev_tab.proj.iter().position(|&c| c == prev_col)?;
@@ -1032,13 +1137,17 @@ pub(crate) fn sql_join_index_hint(
     // ⭐ M3-5: 多个范围候选 → 选 min/max 区间占比最小 (最窄)
     let mut best_range: Option<(f64, shard_manager::IndexHint)> = None;
     for cond in ctx.conds.as_conjuncts().unwrap_or_default() {
-        let Ok((ti, cidx)) = sql_join_resolve(ctx, &cond.col) else { continue };
+        let Ok((ti, cidx)) = sql_join_resolve(ctx, &cond.col) else {
+            continue;
+        };
         if ti != idx {
             continue;
         }
         let Some(iid) = iid_of(cidx) else { continue };
         let ty = schema.columns[cidx as usize].ty;
-        let Ok(v) = sql_to_col(ty, &cond.val) else { continue };
+        let Ok(v) = sql_to_col(ty, &cond.val) else {
+            continue;
+        };
         match cond.op {
             CmpOp::Eq => {
                 let d = ctx
@@ -1050,7 +1159,12 @@ pub(crate) fn sql_join_index_hint(
                 if best_eq.is_none() || d > best_eq.as_ref().unwrap().0 {
                     best_eq = Some((
                         d,
-                        shard_manager::IndexHint { iid, lo: Some(v.clone()), hi: Some(v), pk: false },
+                        shard_manager::IndexHint {
+                            iid,
+                            lo: Some(v.clone()),
+                            hi: Some(v),
+                            pk: false,
+                        },
                     ));
                 }
             }
@@ -1058,13 +1172,29 @@ pub(crate) fn sql_join_index_hint(
             CmpOp::Gt | CmpOp::Ge => {
                 let ratio = range_ratio(ctx, idx, iid, &v, ty, true);
                 if best_range.is_none() || ratio < best_range.as_ref().unwrap().0 {
-                    best_range = Some((ratio, shard_manager::IndexHint { iid, lo: Some(v), hi: None, pk: false }));
+                    best_range = Some((
+                        ratio,
+                        shard_manager::IndexHint {
+                            iid,
+                            lo: Some(v),
+                            hi: None,
+                            pk: false,
+                        },
+                    ));
                 }
             }
             CmpOp::Lt | CmpOp::Le => {
                 let ratio = range_ratio(ctx, idx, iid, &v, ty, false);
                 if best_range.is_none() || ratio < best_range.as_ref().unwrap().0 {
-                    best_range = Some((ratio, shard_manager::IndexHint { iid, lo: None, hi: Some(v), pk: false }));
+                    best_range = Some((
+                        ratio,
+                        shard_manager::IndexHint {
+                            iid,
+                            lo: None,
+                            hi: Some(v),
+                            pk: false,
+                        },
+                    ));
                 }
             }
             _ => {}
@@ -1072,4 +1202,3 @@ pub(crate) fn sql_join_index_hint(
     }
     best_eq.map(|(_, h)| h).or(best_range.map(|(_, h)| h))
 }
-

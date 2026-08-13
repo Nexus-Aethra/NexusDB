@@ -8,7 +8,7 @@
 //!
 //! 原则: 所有规则确定性、幂等 (对结果再应用不改变); 便于与执行结果一致性对比。
 
-use super::ast::{sort_in_set, CmpOp, Cond, JoinCond, Pred, SqlValue};
+use super::ast::{CmpOp, Cond, JoinCond, Pred, SqlValue, sort_in_set};
 
 /// 归一化谓词树 — 展开单元素集合 / 消 NOT NOT / 德摩根 / 恒真恒假标记.
 /// 返回 (归一后的谓词, 是否恒假).
@@ -111,7 +111,9 @@ pub fn as_disjuncts<C>(pred: &Pred<C>) -> Option<Vec<&C>>
 where
     C: Clone,
 {
-    let Pred::Or(branches) = pred else { return None };
+    let Pred::Or(branches) = pred else {
+        return None;
+    };
     let mut out = Vec::with_capacity(branches.len());
     for b in branches {
         match b {
@@ -166,7 +168,12 @@ impl OrEqInLeaf for Cond {
         &self.col
     }
     fn build_in(col: &Self, set: Vec<SqlValue>) -> Self {
-        Cond { col: col.col.clone(), op: CmpOp::In, val: SqlValue::Null, set }
+        Cond {
+            col: col.col.clone(),
+            op: CmpOp::In,
+            val: SqlValue::Null,
+            set,
+        }
     }
 }
 
@@ -184,7 +191,12 @@ impl OrEqInLeaf for JoinCond {
         &self.col.col
     }
     fn build_in(col: &Self, set: Vec<SqlValue>) -> Self {
-        JoinCond { col: col.col.clone(), op: CmpOp::In, val: SqlValue::Null, set }
+        JoinCond {
+            col: col.col.clone(),
+            op: CmpOp::In,
+            val: SqlValue::Null,
+            set,
+        }
     }
 }
 
@@ -272,9 +284,7 @@ fn push_not_to_leaf(pred: &Pred<Cond>) -> Pred<Cond> {
                 Some(nc) => Pred::Leaf(nc),
                 None => pred.clone(),
             },
-            Pred::And(v) => Pred::And(
-                v.iter().map(|p| push_not_to_leaf(p)).collect(),
-            ),
+            Pred::And(v) => Pred::And(v.iter().map(|p| push_not_to_leaf(p)).collect()),
             Pred::Or(v) => Pred::Or(v.iter().map(|p| push_not_to_leaf(p)).collect()),
             Pred::Not(b) => push_not_to_leaf(b),
         },
@@ -286,8 +296,8 @@ fn push_not_to_leaf(pred: &Pred<Cond>) -> Pred<Cond> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ast::SqlValue;
+    use super::*;
 
     fn cond(col: &str, op: CmpOp, val: i64) -> Cond {
         Cond {
@@ -361,9 +371,11 @@ mod tests {
         match np {
             Pred::And(children) => {
                 assert_eq!(children.len(), 2);
-                assert!(children
-                    .iter()
-                    .all(|c| matches!(c, Pred::Leaf(cc) if cc.op == CmpOp::Ne)));
+                assert!(
+                    children
+                        .iter()
+                        .all(|c| matches!(c, Pred::Leaf(cc) if cc.op == CmpOp::Ne))
+                );
             }
             other => panic!("expected And after de morgan, got {other:?}"),
         }
@@ -430,9 +442,11 @@ mod tests {
         match np {
             Pred::And(children) => {
                 assert_eq!(children.len(), 2);
-                assert!(children
-                    .iter()
-                    .any(|c| matches!(c, Pred::Leaf(cc) if cc.op == CmpOp::In)));
+                assert!(
+                    children
+                        .iter()
+                        .any(|c| matches!(c, Pred::Leaf(cc) if cc.op == CmpOp::In))
+                );
             }
             other => panic!("expected And, got {other:?}"),
         }
@@ -441,10 +455,7 @@ mod tests {
     #[test]
     fn or_eq_in_mixed_structure_keeps_or() {
         // a=1 OR (a=2 AND b=3): AND 分支不能并入 IN
-        let p = Pred::Or(vec![
-            eq("a", 1),
-            Pred::And(vec![eq("a", 2), eq("b", 3)]),
-        ]);
+        let p = Pred::Or(vec![eq("a", 1), Pred::And(vec![eq("a", 2), eq("b", 3)])]);
         let (np, _) = normalize_pred_cond(&p);
         assert!(matches!(np, Pred::Or(_)), "嵌套 AND 分支不合并: {np:?}");
     }

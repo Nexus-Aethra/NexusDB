@@ -1,8 +1,6 @@
 // ⭐ 解耦 2026-08: RESP 命令参数解析 (从 resp.rs 拆出).
 // 职责: RESP2 数组参数 → RespCommand (args_to_command + 命令族辅助).
-use super::resp::{
-    parse_f64, parse_i64, parse_score_bound, RespCommand, SetAlgOp,
-};
+use super::resp::{RespCommand, SetAlgOp, parse_f64, parse_i64, parse_score_bound};
 
 pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespCommand {
     let arg = |i: usize| -> &[u8] {
@@ -92,7 +90,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             };
             RespCommand::Incr {
                 key: owned(1),
-                delta: if name == "INCRBY" { n } else { n.wrapping_neg() },
+                delta: if name == "INCRBY" {
+                    n
+                } else {
+                    n.wrapping_neg()
+                },
             }
         }
         "INCRBYFLOAT" => {
@@ -160,7 +162,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let (Some(start), Some(end)) = (parse_i64(arg(2)), parse_i64(arg(3))) else {
                 return RespCommand::InvalidInt(name.to_ascii_lowercase());
             };
-            RespCommand::GetRange { key: owned(1), start, end }
+            RespCommand::GetRange {
+                key: owned(1),
+                start,
+                end,
+            }
         }
         "SETRANGE" => {
             if arity != 4 {
@@ -169,7 +175,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let Some(offset) = parse_i64(arg(2)).filter(|&o| o >= 0).map(|o| o as u32) else {
                 return RespCommand::InvalidInt("setrange".into());
             };
-            RespCommand::SetRange { key: owned(1), offset, data: owned(3) }
+            RespCommand::SetRange {
+                key: owned(1),
+                offset,
+                data: owned(3),
+            }
         }
         "GETDEL" => {
             if arity != 2 {
@@ -185,7 +195,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let mut value = Vec::with_capacity(1 + payload.len());
             value.push(crate::value_codec::TAG_RAW);
             value.extend_from_slice(payload);
-            RespCommand::GetSet { key: owned(1), value }
+            RespCommand::GetSet {
+                key: owned(1),
+                value,
+            }
         }
         "MSETNX" => {
             if arity < 3 || !(arity - 1).is_multiple_of(2) {
@@ -241,7 +254,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             if arity != 3 {
                 return RespCommand::WrongArity("hget".into());
             }
-            RespCommand::HGet { key: owned(1), field: owned(2) }
+            RespCommand::HGet {
+                key: owned(1),
+                field: owned(2),
+            }
         }
         "HMGET" => {
             if arity < 3 {
@@ -261,11 +277,65 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
                 fields: (2..arity).map(owned).collect(),
             }
         }
+        "HQUERY" => {
+            // Strict grammar: HQUERY table WHERE c op v [AND c op v ...] FIELDS f... LIMIT n
+            if arity < 8 || !arg(2).eq_ignore_ascii_case(b"WHERE") {
+                return RespCommand::WrongArity("hquery".into());
+            }
+            let mut i = 3;
+            let mut terms = Vec::new();
+            loop {
+                if i + 2 >= arity {
+                    return RespCommand::WrongArity("hquery".into());
+                }
+                let op = arg(i + 1);
+                if !matches!(op, b"=" | b">" | b">=" | b"<" | b"<=") {
+                    return RespCommand::Unknown("HQUERY only supports =, >, >=, <, <=".into());
+                }
+                terms.push((owned(i), owned(i + 1), owned(i + 2)));
+                i += 3;
+                if i >= arity {
+                    return RespCommand::WrongArity("hquery".into());
+                }
+                if arg(i).eq_ignore_ascii_case(b"AND") {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            if !arg(i).eq_ignore_ascii_case(b"FIELDS") {
+                return RespCommand::WrongArity("hquery".into());
+            }
+            i += 1;
+            let fields_start = i;
+            while i < arity && !arg(i).eq_ignore_ascii_case(b"LIMIT") {
+                i += 1;
+            }
+            if i == fields_start || i + 1 != arity - 1 || !arg(i).eq_ignore_ascii_case(b"LIMIT") {
+                return RespCommand::WrongArity("hquery".into());
+            }
+            let Some(limit) = std::str::from_utf8(arg(i + 1))
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|n| *n > 0 && *n <= 10_000)
+            else {
+                return RespCommand::InvalidInt("hquery limit".into());
+            };
+            RespCommand::HQuery {
+                table: owned(1),
+                terms,
+                fields: (fields_start..i).map(owned).collect(),
+                limit,
+            }
+        }
         "HEXISTS" => {
             if arity != 3 {
                 return RespCommand::WrongArity("hexists".into());
             }
-            RespCommand::HExists { key: owned(1), field: owned(2) }
+            RespCommand::HExists {
+                key: owned(1),
+                field: owned(2),
+            }
         }
         "HLEN" => {
             if arity != 2 {
@@ -350,7 +420,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             if arity != 3 {
                 return RespCommand::WrongArity("sismember".into());
             }
-            RespCommand::SIsMember { key: owned(1), member: owned(2) }
+            RespCommand::SIsMember {
+                key: owned(1),
+                member: owned(2),
+            }
         }
         "SCARD" => {
             if arity != 2 {
@@ -382,7 +455,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             } else {
                 None
             };
-            RespCommand::SPop { key: owned(1), count }
+            RespCommand::SPop {
+                key: owned(1),
+                count,
+            }
         }
         "SRANDMEMBER" => {
             if arity != 2 && arity != 3 {
@@ -397,7 +473,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             } else {
                 None
             };
-            RespCommand::SRandMember { key: owned(1), count }
+            RespCommand::SRandMember {
+                key: owned(1),
+                count,
+            }
         }
         "SMISMEMBER" => {
             if arity < 3 {
@@ -423,7 +502,9 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             // 可选 LIMIT n
             let mut limit = 0usize;
             if arity >= 2 + numkeys + 2 && arg(2 + numkeys).eq_ignore_ascii_case(b"LIMIT") {
-                let Some(l) = parse_i64(arg(2 + numkeys + 1)).filter(|&l| l >= 0).map(|l| l as usize)
+                let Some(l) = parse_i64(arg(2 + numkeys + 1))
+                    .filter(|&l| l >= 0)
+                    .map(|l| l as usize)
                 else {
                     return RespCommand::InvalidInt("sintercard".into());
                 };
@@ -528,7 +609,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let (Some(start), Some(end)) = (parse_i64(arg(2)), parse_i64(arg(3))) else {
                 return RespCommand::InvalidInt("lrange".into());
             };
-            RespCommand::LRange { key: owned(1), start, end }
+            RespCommand::LRange {
+                key: owned(1),
+                start,
+                end,
+            }
         }
         "LINDEX" => {
             if arity != 3 {
@@ -550,7 +635,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let mut value = Vec::with_capacity(1 + payload.len());
             value.push(crate::value_codec::TAG_RAW);
             value.extend_from_slice(payload);
-            RespCommand::LSet { key: owned(1), idx, value }
+            RespCommand::LSet {
+                key: owned(1),
+                idx,
+                value,
+            }
         }
         "LREM" => {
             if arity != 4 {
@@ -563,7 +652,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let mut value = Vec::with_capacity(1 + payload.len());
             value.push(crate::value_codec::TAG_RAW);
             value.extend_from_slice(payload);
-            RespCommand::LRem { key: owned(1), count, value }
+            RespCommand::LRem {
+                key: owned(1),
+                count,
+                value,
+            }
         }
         "LTRIM" => {
             if arity != 4 {
@@ -572,7 +665,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let (Some(start), Some(stop)) = (parse_i64(arg(2)), parse_i64(arg(3))) else {
                 return RespCommand::InvalidInt("ltrim".into());
             };
-            RespCommand::LTrim { key: owned(1), start, stop }
+            RespCommand::LTrim {
+                key: owned(1),
+                start,
+                stop,
+            }
         }
         "LPOS" => {
             // LPOS key element [RANK r] [COUNT n]
@@ -602,7 +699,12 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
                 }
                 i += 2;
             }
-            RespCommand::LPos { key: owned(1), value, rank, count }
+            RespCommand::LPos {
+                key: owned(1),
+                value,
+                rank,
+                count,
+            }
         }
         "LINSERT" => {
             if arity != 5 {
@@ -621,7 +723,12 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let mut value = Vec::with_capacity(1 + arg(4).len());
             value.push(crate::value_codec::TAG_RAW);
             value.extend_from_slice(arg(4));
-            RespCommand::LInsert { key: owned(1), before, pivot, value }
+            RespCommand::LInsert {
+                key: owned(1),
+                before,
+                pivot,
+                value,
+            }
         }
         "ZADD" => {
             if arity < 4 || !(arity - 2).is_multiple_of(2) {
@@ -640,7 +747,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
                 pairs.push((score, owned(i + 1)));
                 i += 2;
             }
-            RespCommand::ZAdd { key: owned(1), pairs }
+            RespCommand::ZAdd {
+                key: owned(1),
+                pairs,
+            }
         }
         "ZREM" => {
             if arity < 3 {
@@ -655,7 +765,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             if arity != 3 {
                 return RespCommand::WrongArity("zscore".into());
             }
-            RespCommand::ZScore { key: owned(1), member: owned(2) }
+            RespCommand::ZScore {
+                key: owned(1),
+                member: owned(2),
+            }
         }
         "ZCARD" => {
             if arity != 2 {
@@ -674,7 +787,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             else {
                 return RespCommand::InvalidFloat("zincrby".into());
             };
-            RespCommand::ZIncrBy { key: owned(1), delta, member: owned(3) }
+            RespCommand::ZIncrBy {
+                key: owned(1),
+                delta,
+                member: owned(3),
+            }
         }
         "ZRANGE" | "ZREVRANGE" => {
             if arity != 4 && arity != 5 {
@@ -683,8 +800,7 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let (Some(start), Some(end)) = (parse_i64(arg(2)), parse_i64(arg(3))) else {
                 return RespCommand::InvalidInt(name.to_ascii_lowercase());
             };
-            let withscores = arity == 5
-                && arg(4).eq_ignore_ascii_case(b"WITHSCORES");
+            let withscores = arity == 5 && arg(4).eq_ignore_ascii_case(b"WITHSCORES");
             RespCommand::ZRange {
                 key: owned(1),
                 start,
@@ -702,7 +818,12 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
                 return RespCommand::InvalidFloat("zrangebyscore".into());
             };
             let withscores = arity == 5 && arg(4).eq_ignore_ascii_case(b"WITHSCORES");
-            RespCommand::ZRangeByScore { key: owned(1), min, max, withscores }
+            RespCommand::ZRangeByScore {
+                key: owned(1),
+                min,
+                max,
+                withscores,
+            }
         }
         "ZRANK" | "ZREVRANK" => {
             if arity != 3 {
@@ -732,7 +853,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
                 i += 3;
             }
             // ⭐ 直接复用 ZAdd 全链路 (score = geohash), 回 :新增数 (Redis 同)
-            RespCommand::ZAdd { key: owned(1), pairs }
+            RespCommand::ZAdd {
+                key: owned(1),
+                pairs,
+            }
         }
         "GEOPOS" => {
             if arity < 3 {
@@ -824,7 +948,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             else {
                 return RespCommand::InvalidFloat("zcount".into());
             };
-            RespCommand::ZCount { key: owned(1), min, max }
+            RespCommand::ZCount {
+                key: owned(1),
+                min,
+                max,
+            }
         }
         "ZMSCORE" => {
             if arity < 3 {
@@ -857,7 +985,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             if arity != 3 {
                 return RespCommand::WrongArity("hstrlen".into());
             }
-            RespCommand::HStrlen { key: owned(1), field: owned(2) }
+            RespCommand::HStrlen {
+                key: owned(1),
+                field: owned(2),
+            }
         }
         "SETBIT" => {
             if arity != 4 {
@@ -871,7 +1002,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
                 b"1" => true,
                 _ => return RespCommand::InvalidInt("setbit".into()),
             };
-            RespCommand::SetBit { key: owned(1), offset, bit }
+            RespCommand::SetBit {
+                key: owned(1),
+                offset,
+                bit,
+            }
         }
         "GETBIT" => {
             if arity != 3 {
@@ -880,7 +1015,10 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             let Some(offset) = parse_i64(arg(2)).filter(|&o| o >= 0).map(|o| o as u64) else {
                 return RespCommand::InvalidInt("getbit".into());
             };
-            RespCommand::GetBit { key: owned(1), offset }
+            RespCommand::GetBit {
+                key: owned(1),
+                offset,
+            }
         }
         "BITCOUNT" => {
             // BITCOUNT key [start end [BYTE]] (BIT 粒度本轮不支持)
@@ -898,7 +1036,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             } else {
                 (0, -1)
             };
-            RespCommand::BitCount { key: owned(1), start, end }
+            RespCommand::BitCount {
+                key: owned(1),
+                start,
+                end,
+            }
         }
         "BITPOS" => {
             // BITPOS key bit [start [end [BYTE]]]
@@ -929,7 +1071,12 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
             } else {
                 None
             };
-            RespCommand::BitPos { key: owned(1), bit, start, end }
+            RespCommand::BitPos {
+                key: owned(1),
+                bit,
+                start,
+                end,
+            }
         }
         "HRANDFIELD" => {
             if !(2..=4).contains(&arity) {
@@ -945,7 +1092,11 @@ pub(crate) fn args_to_command(buf: &[u8], args: &[(usize, usize)]) -> RespComman
                 None
             };
             let withvalues = arity == 4 && arg(3).eq_ignore_ascii_case(b"WITHVALUES");
-            RespCommand::HRandField { key: owned(1), count, withvalues }
+            RespCommand::HRandField {
+                key: owned(1),
+                count,
+                withvalues,
+            }
         }
         "ECHO" => {
             if arity != 2 {

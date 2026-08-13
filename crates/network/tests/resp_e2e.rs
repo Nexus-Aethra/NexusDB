@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use network::{KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind};
-use shard_manager::{ShardManager, ShardManagerOptions};
+use shard_manager::{BatchOp, ShardManager, ShardManagerOptions};
+use storage::row::ColValue;
+use storage::schema::{ColType, Column, TableSchema};
 use storage::{IoBackend, IoBackendConfig};
 
 // ===== helpers =====
@@ -53,8 +55,12 @@ fn start_server(auth_password: Option<&str>) -> (NetworkServer, Arc<ShardManager
 
 fn connect(server: &NetworkServer) -> TcpStream {
     let stream = TcpStream::connect(server.local_addr()).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream.set_nodelay(true).unwrap();
     stream
 }
@@ -176,12 +182,20 @@ fn resp_auth_flow() {
     // 未认证发 SET → NOAUTH
     s.write_all(&cmd(&[b"SET", b"k", b"v"])).unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"-NOAUTH"), "{:?}", String::from_utf8_lossy(&r[0]));
+    assert!(
+        r[0].starts_with(b"-NOAUTH"),
+        "{:?}",
+        String::from_utf8_lossy(&r[0])
+    );
 
     // 错密码 → WRONGPASS
     s.write_all(&cmd(&[b"AUTH", b"wrong"])).unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"-WRONGPASS"), "{:?}", String::from_utf8_lossy(&r[0]));
+    assert!(
+        r[0].starts_with(b"-WRONGPASS"),
+        "{:?}",
+        String::from_utf8_lossy(&r[0])
+    );
 
     // 对密码 → +OK, 之后 SET/GET 正常
     s.write_all(&cmd(&[b"AUTH", b"s3cret"])).unwrap();
@@ -193,7 +207,8 @@ fn resp_auth_flow() {
     assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nv\r\n");
 
     // AUTH user 形式 (user=default)
-    s.write_all(&cmd(&[b"AUTH", b"default", b"s3cret"])).unwrap();
+    s.write_all(&cmd(&[b"AUTH", b"default", b"s3cret"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
 
     drop(s);
@@ -400,12 +415,20 @@ fn resp_misc_commands() {
     // HELLO 3 → NOPROTO (只支持 RESP2)
     s.write_all(&cmd(&[b"HELLO", b"3"])).unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"-NOPROTO"), "{:?}", String::from_utf8_lossy(&r[0]));
+    assert!(
+        r[0].starts_with(b"-NOPROTO"),
+        "{:?}",
+        String::from_utf8_lossy(&r[0])
+    );
 
     // 未知命令
     s.write_all(&cmd(&[b"FLUSHALL"])).unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"-ERR unknown command"), "{:?}", String::from_utf8_lossy(&r[0]));
+    assert!(
+        r[0].starts_with(b"-ERR unknown command"),
+        "{:?}",
+        String::from_utf8_lossy(&r[0])
+    );
 
     drop(s);
     server.shutdown().unwrap();
@@ -429,7 +452,8 @@ fn resp_mset_mget_cross_shard() {
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
 
     // MGET: 乱序 + 混入 miss key, 断言按请求顺序返回
-    s.write_all(&cmd(&[b"MGET", b"mk7", b"nope", b"mk0", b"mk3"])).unwrap();
+    s.write_all(&cmd(&[b"MGET", b"mk7", b"nope", b"mk0", b"mk3"]))
+        .unwrap();
     let r = read_replies(&mut s, 1);
     assert_eq!(
         r[0],
@@ -439,15 +463,21 @@ fn resp_mset_mget_cross_shard() {
     );
 
     // MSET 同 key 重复: 后者覆盖 (Redis 语义)
-    s.write_all(&cmd(&[b"MSET", b"dup", b"first", b"dup", b"second"])).unwrap();
+    s.write_all(&cmd(&[b"MSET", b"dup", b"first", b"dup", b"second"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
     s.write_all(&cmd(&[b"GET", b"dup"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$6\r\nsecond\r\n");
 
     // MSET 奇数参数 → WrongArity
-    s.write_all(&cmd(&[b"MSET", b"k", b"v", b"orphan"])).unwrap();
+    s.write_all(&cmd(&[b"MSET", b"k", b"v", b"orphan"]))
+        .unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"-ERR wrong number"), "{:?}", String::from_utf8_lossy(&r[0]));
+    assert!(
+        r[0].starts_with(b"-ERR wrong number"),
+        "{:?}",
+        String::from_utf8_lossy(&r[0])
+    );
 
     // 与 pipeline 的单 op 混排 (seq 重排缓冲正确性)
     let mut buf = Vec::new();
@@ -490,11 +520,19 @@ fn resp_string_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
     s.write_all(&cmd(&[b"INCR", b"strk"])).unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"-ERR value is not an integer"), "{:?}", String::from_utf8_lossy(&r[0]));
+    assert!(
+        r[0].starts_with(b"-ERR value is not an integer"),
+        "{:?}",
+        String::from_utf8_lossy(&r[0])
+    );
     // INCRBY 非法数字参数 → error
     s.write_all(&cmd(&[b"INCRBY", b"cnt", b"xyz"])).unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"-ERR value is not an integer"), "{:?}", String::from_utf8_lossy(&r[0]));
+    assert!(
+        r[0].starts_with(b"-ERR value is not an integer"),
+        "{:?}",
+        String::from_utf8_lossy(&r[0])
+    );
 
     // APPEND: miss → 创建, 返回新长度
     s.write_all(&cmd(&[b"APPEND", b"app", b"Hello"])).unwrap();
@@ -513,7 +551,8 @@ fn resp_string_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\nv1\r\n");
 
     // EXISTS: 多 key + 重复 key 重复计 (Redis 语义)
-    s.write_all(&cmd(&[b"EXISTS", b"nx", b"missing", b"nx", b"cnt"])).unwrap();
+    s.write_all(&cmd(&[b"EXISTS", b"nx", b"missing", b"nx", b"cnt"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
 
     // STRLEN: 命中/未命中
@@ -556,23 +595,33 @@ fn resp_typed_num_render() {
     s.write_all(&cmd(&[b"GET", b"tf"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$4\r\n3200\r\n");
     // 小数渲染
-    s.write_all(&cmd(&[b"INCRBYFLOAT", b"tf", b"0.25"])).unwrap();
+    s.write_all(&cmd(&[b"INCRBYFLOAT", b"tf", b"0.25"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$7\r\n3200.25\r\n");
 
     // F64 上 INCR → not an integer
     s.write_all(&cmd(&[b"INCR", b"tf"])).unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"-ERR value is not an integer"), "{:?}", String::from_utf8_lossy(&r[0]));
+    assert!(
+        r[0].starts_with(b"-ERR value is not an integer"),
+        "{:?}",
+        String::from_utf8_lossy(&r[0])
+    );
 
     // INCRBYFLOAT 非法参数
     s.write_all(&cmd(&[b"INCRBYFLOAT", b"tf", b"abc"])).unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"-ERR value is not a valid float"), "{:?}", String::from_utf8_lossy(&r[0]));
+    assert!(
+        r[0].starts_with(b"-ERR value is not a valid float"),
+        "{:?}",
+        String::from_utf8_lossy(&r[0])
+    );
 
     // MGET 混合渲染: RAW + I64 + F64
     s.write_all(&cmd(&[b"SET", b"traw", b"hello"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
-    s.write_all(&cmd(&[b"MGET", b"traw", b"tn", b"tf"])).unwrap();
+    s.write_all(&cmd(&[b"MGET", b"traw", b"tn", b"tf"]))
+        .unwrap();
     assert_eq!(
         read_replies(&mut s, 1)[0],
         b"*3\r\n$5\r\nhello\r\n$1\r\n1\r\n$7\r\n3200.25\r\n".to_vec()
@@ -613,35 +662,47 @@ fn resp_string_range_and_misc() {
     assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
 
     // GETRANGE: Redis 文档用例 "This is a string"
-    s.write_all(&cmd(&[b"SET", b"gr", b"This is a string"])).unwrap();
+    s.write_all(&cmd(&[b"SET", b"gr", b"This is a string"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
-    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"0", b"3"])).unwrap();
+    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"0", b"3"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$4\r\nThis\r\n");
-    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"-3", b"-1"])).unwrap();
+    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"-3", b"-1"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\ning\r\n");
-    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"0", b"-1"])).unwrap();
+    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"0", b"-1"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$16\r\nThis is a string\r\n");
     // start > end → 空
-    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"10", b"2"])).unwrap();
+    s.write_all(&cmd(&[b"GETRANGE", b"gr", b"10", b"2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$0\r\n\r\n");
 
     // SETRANGE: 覆盖写 + 返回新长度; Redis 文档用例
     s.write_all(&cmd(&[b"SET", b"sr", b"Hello World"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
-    s.write_all(&cmd(&[b"SETRANGE", b"sr", b"6", b"Redis"])).unwrap();
+    s.write_all(&cmd(&[b"SETRANGE", b"sr", b"6", b"Redis"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":11\r\n");
     s.write_all(&cmd(&[b"GET", b"sr"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$11\r\nHello Redis\r\n");
     // SETRANGE 零扩展 (新 key, offset 5)
-    s.write_all(&cmd(&[b"SETRANGE", b"sr2", b"5", b"abc"])).unwrap();
+    s.write_all(&cmd(&[b"SETRANGE", b"sr2", b"5", b"abc"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":8\r\n");
     s.write_all(&cmd(&[b"GET", b"sr2"])).unwrap();
-    assert_eq!(read_replies(&mut s, 1)[0], b"$8\r\n\x00\x00\x00\x00\x00abc\r\n");
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"$8\r\n\x00\x00\x00\x00\x00abc\r\n"
+    );
 
     // MSETNX: 全不存在 → :1; 任一存在 → :0 (且不覆盖已存在的)
-    s.write_all(&cmd(&[b"MSETNX", b"nx1", b"a", b"nx2", b"b"])).unwrap();
+    s.write_all(&cmd(&[b"MSETNX", b"nx1", b"a", b"nx2", b"b"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
-    s.write_all(&cmd(&[b"MSETNX", b"nx2", b"x", b"nx3", b"c"])).unwrap();
+    s.write_all(&cmd(&[b"MSETNX", b"nx2", b"x", b"nx3", b"c"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
     s.write_all(&cmd(&[b"GET", b"nx1"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\na\r\n");
@@ -658,7 +719,8 @@ fn resp_hash_commands() {
     let mut s = connect(&server);
 
     // HSET 多 field → 新增数; 重复 HSET 更新 → :0
-    s.write_all(&cmd(&[b"HSET", b"h1", b"f1", b"v1", b"f2", b"v2"])).unwrap();
+    s.write_all(&cmd(&[b"HSET", b"h1", b"f1", b"v1", b"f2", b"v2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
     s.write_all(&cmd(&[b"HSET", b"h1", b"f1", b"v1x"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
@@ -676,7 +738,8 @@ fn resp_hash_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
 
     // HMGET 按输入序 (含 miss)
-    s.write_all(&cmd(&[b"HMGET", b"h1", b"f2", b"nope", b"f1"])).unwrap();
+    s.write_all(&cmd(&[b"HMGET", b"h1", b"f2", b"nope", b"f1"]))
+        .unwrap();
     assert_eq!(
         read_replies(&mut s, 1)[0],
         b"*3\r\n$2\r\nv2\r\n$-1\r\n$3\r\nv1x\r\n"
@@ -689,9 +752,15 @@ fn resp_hash_commands() {
         b"*4\r\n$2\r\nf1\r\n$3\r\nv1x\r\n$2\r\nf2\r\n$2\r\nv2\r\n"
     );
     s.write_all(&cmd(&[b"HKEYS", b"h1"])).unwrap();
-    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$2\r\nf1\r\n$2\r\nf2\r\n");
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*2\r\n$2\r\nf1\r\n$2\r\nf2\r\n"
+    );
     s.write_all(&cmd(&[b"HVALS", b"h1"])).unwrap();
-    assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$3\r\nv1x\r\n$2\r\nv2\r\n");
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*2\r\n$3\r\nv1x\r\n$2\r\nv2\r\n"
+    );
 
     // HSCAN v1: 单次全量, cursor "0"
     s.write_all(&cmd(&[b"HSCAN", b"h1", b"0"])).unwrap();
@@ -701,27 +770,34 @@ fn resp_hash_commands() {
     );
 
     // HSETNX: 已存在 :0, 新 field :1
-    s.write_all(&cmd(&[b"HSETNX", b"h1", b"f1", b"zzz"])).unwrap();
+    s.write_all(&cmd(&[b"HSETNX", b"h1", b"f1", b"zzz"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
-    s.write_all(&cmd(&[b"HSETNX", b"h1", b"f3", b"v3"])).unwrap();
+    s.write_all(&cmd(&[b"HSETNX", b"h1", b"f3", b"v3"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
 
     // HINCRBY / HINCRBYFLOAT (原生二进制数值, 渲染回字符串)
-    s.write_all(&cmd(&[b"HINCRBY", b"h1", b"cnt", b"5"])).unwrap();
+    s.write_all(&cmd(&[b"HINCRBY", b"h1", b"cnt", b"5"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
-    s.write_all(&cmd(&[b"HINCRBY", b"h1", b"cnt", b"-2"])).unwrap();
+    s.write_all(&cmd(&[b"HINCRBY", b"h1", b"cnt", b"-2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
     s.write_all(&cmd(&[b"HGET", b"h1", b"cnt"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\n3\r\n");
-    s.write_all(&cmd(&[b"HINCRBYFLOAT", b"h1", b"fl", b"1.5"])).unwrap();
+    s.write_all(&cmd(&[b"HINCRBYFLOAT", b"h1", b"fl", b"1.5"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\n1.5\r\n");
 
     // HMSET → +OK
-    s.write_all(&cmd(&[b"HMSET", b"h2", b"a", b"1", b"b", b"2"])).unwrap();
+    s.write_all(&cmd(&[b"HMSET", b"h2", b"a", b"1", b"b", b"2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
 
     // HDEL 多 field (含 miss) → 实删数; count 归 0 后 HLEN=0
-    s.write_all(&cmd(&[b"HDEL", b"h2", b"a", b"nope", b"b"])).unwrap();
+    s.write_all(&cmd(&[b"HDEL", b"h2", b"a", b"nope", b"b"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
     s.write_all(&cmd(&[b"HLEN", b"h2"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
@@ -741,6 +817,332 @@ fn resp_hash_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b"*0\r\n");
     s.write_all(&cmd(&[b"HLEN", b"h1"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// SQL 表显式开启 adapter 后，`table:pk` 的 HGET 走 RowGet；未开 schema 的同形
+/// key 仍按原生 Hash 处理，覆盖 schema miss 回落与 RESP 文本投影。
+#[test]
+fn resp_sql_row_adapter_hget_primary_key() {
+    let (server, mgr) = start_server(None);
+    mgr.create_table("app", "users").unwrap();
+    let schema = TableSchema::new(
+        vec![
+            Column {
+                name: "id".into(),
+                ty: ColType::I64,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "name".into(),
+                ty: ColType::Str,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "active".into(),
+                ty: ColType::Bool,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "count".into(),
+                ty: ColType::I64,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "score".into(),
+                ty: ColType::F64,
+                nullable: false,
+                default: None,
+            },
+        ],
+        0,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap()
+    .with_resp_row_adapter(true);
+    mgr.set_table_schema("app", "users", &schema).unwrap();
+    let pk = storage::keyspace::encode_idx(5).to_vec();
+    let out = mgr.batch_ops(&[BatchOp::RowPut {
+        db: Arc::from("app"),
+        table: Arc::from("users"),
+        pk,
+        values: vec![
+            ColValue::I64(5),
+            ColValue::Bytes(b"alice".to_vec()),
+            ColValue::I64(1),
+            ColValue::I64(10),
+            ColValue::F64(1.5),
+        ],
+    }]);
+    assert!(matches!(
+        out.as_slice(),
+        [shard_manager::BatchResult::PutOk]
+    ));
+
+    let mut s = connect(&server);
+    s.write_all(&cmd(&[b"HGET", b"users:5", b"name"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$5\r\nalice\r\n");
+    s.write_all(&cmd(&[b"HGET", b"users:5", b"active"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\n1\r\n");
+    // HSET 多列由 RowUpdate 一次完成；SQL 表中的既有列不计为 Redis "new field"。
+    s.write_all(&cmd(&[
+        b"HSET", b"users:5", b"name", b"beth", b"active", b"0",
+    ]))
+    .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"HMSET", b"users:5", b"name", b"cara"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
+    s.write_all(&cmd(&[b"HGET", b"users:5", b"name"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$4\r\ncara\r\n");
+    s.write_all(&cmd(&[b"HINCRBY", b"users:5", b"count", b"7"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":17\r\n");
+    s.write_all(&cmd(&[b"HINCRBYFLOAT", b"users:5", b"score", b"0.25"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$4\r\n1.75\r\n");
+    s.write_all(&cmd(&[
+        b"HMGET", b"users:5", b"name", b"missing", b"active",
+    ]))
+    .unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$4\r\ncara\r\n$-1\r\n$1\r\n0\r\n"
+    );
+    s.write_all(&cmd(&[b"HGETALL", b"users:5"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*10\r\n$2\r\nid\r\n$1\r\n5\r\n$4\r\nname\r\n$4\r\ncara\r\n$6\r\nactive\r\n$1\r\n0\r\n$5\r\ncount\r\n$2\r\n17\r\n$5\r\nscore\r\n$4\r\n1.75\r\n"
+    );
+    s.write_all(&cmd(&[b"HKEYS", b"users:5"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*5\r\n$2\r\nid\r\n$4\r\nname\r\n$6\r\nactive\r\n$5\r\ncount\r\n$5\r\nscore\r\n"
+    );
+    s.write_all(&cmd(&[b"HVALS", b"users:5"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*5\r\n$1\r\n5\r\n$4\r\ncara\r\n$1\r\n0\r\n$2\r\n17\r\n$4\r\n1.75\r\n"
+    );
+    s.write_all(&cmd(&[b"HLEN", b"users:5"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
+    s.write_all(&cmd(&[b"HEXISTS", b"users:5", b"name"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"HEXISTS", b"users:5", b"missing"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"HSTRLEN", b"users:5", b"name"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":4\r\n");
+    // SQL row 的字段顺序是 schema 顺序；HRANDFIELD v1 取其中确定的前 N 项。
+    s.write_all(&cmd(&[b"HRANDFIELD", b"users:5", b"2", b"WITHVALUES"]))
+        .unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*4\r\n$2\r\nid\r\n$1\r\n5\r\n$4\r\nname\r\n$4\r\ncara\r\n"
+    );
+    s.write_all(&cmd(&[b"HSCAN", b"users:5", b"0"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*2\r\n$1\r\n0\r\n*10\r\n$2\r\nid\r\n$1\r\n5\r\n$4\r\nname\r\n$4\r\ncara\r\n$6\r\nactive\r\n$1\r\n0\r\n$5\r\ncount\r\n$2\r\n17\r\n$5\r\nscore\r\n$4\r\n1.75\r\n"
+    );
+    // 反向核验：RESP patch 的唯一真相源仍是 SQL row，不存在 Hash 镜像。
+    let out = mgr.batch_ops(&[BatchOp::RowGet {
+        db: Arc::from("app"),
+        table: Arc::from("users"),
+        pk: storage::keyspace::encode_idx(5).to_vec(),
+    }]);
+    let row = match out.as_slice() {
+        [shard_manager::BatchResult::GetValue(Some(row))] => row,
+        other => panic!("unexpected row reply: {other:?}"),
+    };
+    let values = storage::row::decode_row(&schema, row).unwrap();
+    assert_eq!(values[1], ColValue::Bytes(b"cara".to_vec()));
+    assert_eq!(values[2], ColValue::I64(0));
+    assert_eq!(values[3], ColValue::I64(17));
+    assert_eq!(values[4], ColValue::F64(1.75));
+    s.write_all(&cmd(&[b"DEL", b"users:5"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"HGET", b"users:5", b"name"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    s.write_all(&cmd(&[b"HGET", b"users:6", b"name"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    // 主键类型不匹配必须报错，不能退化为 Hash miss 或扫描。
+    s.write_all(&cmd(&[b"HGET", b"users:not-a-number", b"id"]))
+        .unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
+
+    // 无 schema 的 table:key:subkey 保持既有分表 + Hash 语义。
+    s.write_all(&cmd(&[b"HSET", b"legacy:key:sub", b"f", b"v"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"HGET", b"legacy:key:sub", b"f"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nv\r\n");
+
+    drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// SQL adapter 的 HDEL 是字段级 NULL 更新，不删除整行；仅允许 nullable 非主键列。
+#[test]
+fn resp_sql_row_adapter_hdel_unsets_nullable_column() {
+    let (server, mgr) = start_server(None);
+    mgr.create_table("app", "profiles").unwrap();
+    let schema = TableSchema::new(
+        vec![
+            Column {
+                name: "id".into(),
+                ty: ColType::I64,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "name".into(),
+                ty: ColType::Str,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "nickname".into(),
+                ty: ColType::Str,
+                nullable: true,
+                default: None,
+            },
+        ],
+        0,
+        &[1],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap()
+    .with_resp_row_adapter(true);
+    mgr.set_table_schema("app", "profiles", &schema).unwrap();
+    let out = mgr.batch_ops(&[BatchOp::RowPut {
+        db: Arc::from("app"),
+        table: Arc::from("profiles"),
+        pk: storage::keyspace::encode_idx(7).to_vec(),
+        values: vec![
+            ColValue::I64(7),
+            ColValue::Bytes(b"alice".to_vec()),
+            ColValue::Bytes(b"ally".to_vec()),
+        ],
+    }]);
+    assert!(matches!(
+        out.as_slice(),
+        [shard_manager::BatchResult::PutOk]
+    ));
+
+    let mut s = connect(&server);
+    s.write_all(&cmd(&[b"HDEL", b"profiles:7", b"nickname"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"HGET", b"profiles:7", b"nickname"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
+    // NULL 在 RESP Hash 视图中就是字段不存在，聚合命令不再枚举它。
+    s.write_all(&cmd(&[b"HLEN", b"profiles:7"])).unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"HGETALL", b"profiles:7"])).unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*4\r\n$2\r\nid\r\n$1\r\n7\r\n$4\r\nname\r\n$5\r\nalice\r\n"
+    );
+    // HSETNX 的“是否为空”判断与写入必须在同一 shard 原子完成。
+    s.write_all(&cmd(&[b"HSETNX", b"profiles:7", b"nickname", b"ally"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"HSETNX", b"profiles:7", b"nickname", b"other"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"HGET", b"profiles:7", b"nickname"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$4\r\nally\r\n");
+    // 缺行 HSET 走 core 内原子 UPSERT；必须提供所有无默认的 NOT NULL 列。
+    s.write_all(&cmd(&[
+        b"HSET",
+        b"profiles:8",
+        b"name",
+        b"bob",
+        b"nickname",
+        b"bobby",
+    ]))
+    .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
+    s.write_all(&cmd(&[b"HGET", b"profiles:8", b"name"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\nbob\r\n");
+    // HQUERY 复用 SQL 查询路径：主键点查与普通条件扫描均以二维 RESP 数组返回。
+    s.write_all(&cmd(&[
+        b"HQUERY",
+        b"profiles",
+        b"WHERE",
+        b"id",
+        b"=",
+        b"8",
+        b"FIELDS",
+        b"id",
+        b"name",
+        b"LIMIT",
+        b"10",
+    ]))
+    .unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*1\r\n*2\r\n$1\r\n8\r\n$3\r\nbob\r\n"
+    );
+    s.write_all(&cmd(&[
+        b"HQUERY",
+        b"profiles",
+        b"WHERE",
+        b"name",
+        b">=",
+        b"alice",
+        b"FIELDS",
+        b"id",
+        b"name",
+        b"LIMIT",
+        b"10",
+    ]))
+    .unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*2\r\n*2\r\n$1\r\n7\r\n$5\r\nalice\r\n*2\r\n$1\r\n8\r\n$3\r\nbob\r\n"
+    );
+    s.write_all(&cmd(&[b"HSET", b"profiles:9", b"nickname", b"no-name"]))
+        .unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
+    // 写回后首次 HDEL 计数为 1，重复 HDEL 才是 0，整行仍然存在。
+    s.write_all(&cmd(&[b"HDEL", b"profiles:7", b"nickname", b"nickname"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
+    s.write_all(&cmd(&[b"HDEL", b"profiles:7", b"nickname"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
+    s.write_all(&cmd(&[b"HGET", b"profiles:7", b"name"]))
+        .unwrap();
+    assert_eq!(read_replies(&mut s, 1)[0], b"$5\r\nalice\r\n");
+    s.write_all(&cmd(&[b"HDEL", b"profiles:7", b"name"]))
+        .unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR cannot HDEL NOT NULL"));
+    s.write_all(&cmd(&[b"HDEL", b"profiles:7", b"id"])).unwrap();
+    assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR cannot HDEL SQL primary key"));
 
     drop(s);
     server.shutdown().unwrap();
@@ -797,9 +1199,11 @@ fn resp_set_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
 
     // 代数: SINTER / SUNION / SDIFF (跨 shard 聚合)
-    s.write_all(&cmd(&[b"SADD", b"x1", b"a", b"b", b"c"])).unwrap();
+    s.write_all(&cmd(&[b"SADD", b"x1", b"a", b"b", b"c"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
-    s.write_all(&cmd(&[b"SADD", b"x2", b"b", b"c", b"d"])).unwrap();
+    s.write_all(&cmd(&[b"SADD", b"x2", b"b", b"c", b"d"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
     s.write_all(&cmd(&[b"SINTER", b"x1", b"x2"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
@@ -837,7 +1241,8 @@ fn resp_list_commands() {
     let mut s = connect(&server);
 
     // RPUSH a b c → [a,b,c]; LPUSH x y → [y,x,a,b,c]
-    s.write_all(&cmd(&[b"RPUSH", b"l1", b"a", b"b", b"c"])).unwrap();
+    s.write_all(&cmd(&[b"RPUSH", b"l1", b"a", b"b", b"c"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
     s.write_all(&cmd(&[b"LPUSH", b"l1", b"x", b"y"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n"); // [y,x,a,b,c]
@@ -910,7 +1315,8 @@ fn resp_zset_commands() {
     let mut s = connect(&server);
 
     // ZADD 3 成员 (乱序 score); 更新已存在成员 score → 新增 0
-    s.write_all(&cmd(&[b"ZADD", b"z1", b"3", b"c", b"1", b"a", b"2", b"b"])).unwrap();
+    s.write_all(&cmd(&[b"ZADD", b"z1", b"3", b"c", b"1", b"a", b"2", b"b"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
     s.write_all(&cmd(&[b"ZADD", b"z1", b"5", b"a"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
@@ -930,22 +1336,26 @@ fn resp_zset_commands() {
         b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\na\r\n"
     );
     // WITHSCORES
-    s.write_all(&cmd(&[b"ZRANGE", b"z1", b"0", b"1", b"WITHSCORES"])).unwrap();
+    s.write_all(&cmd(&[b"ZRANGE", b"z1", b"0", b"1", b"WITHSCORES"]))
+        .unwrap();
     assert_eq!(
         read_replies(&mut s, 1)[0],
         b"*4\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n"
     );
     // ZREVRANGE
-    s.write_all(&cmd(&[b"ZREVRANGE", b"z1", b"0", b"-1"])).unwrap();
+    s.write_all(&cmd(&[b"ZREVRANGE", b"z1", b"0", b"-1"]))
+        .unwrap();
     assert_eq!(
         read_replies(&mut s, 1)[0],
         b"*3\r\n$1\r\na\r\n$1\r\nc\r\n$1\r\nb\r\n"
     );
 
     // ZRANGEBYSCORE
-    s.write_all(&cmd(&[b"ZRANGEBYSCORE", b"z1", b"2", b"3"])).unwrap();
+    s.write_all(&cmd(&[b"ZRANGEBYSCORE", b"z1", b"2", b"3"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
-    s.write_all(&cmd(&[b"ZRANGEBYSCORE", b"z1", b"-inf", b"+inf"])).unwrap();
+    s.write_all(&cmd(&[b"ZRANGEBYSCORE", b"z1", b"-inf", b"+inf"]))
+        .unwrap();
     assert_eq!(
         read_replies(&mut s, 1)[0],
         b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\na\r\n"
@@ -962,7 +1372,8 @@ fn resp_zset_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
 
     // ZINCRBY: b 2 → 4.5
-    s.write_all(&cmd(&[b"ZINCRBY", b"z1", b"2.5", b"b"])).unwrap();
+    s.write_all(&cmd(&[b"ZINCRBY", b"z1", b"2.5", b"b"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\n4.5\r\n");
     s.write_all(&cmd(&[b"ZSCORE", b"z1", b"b"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$3\r\n4.5\r\n");
@@ -999,12 +1410,18 @@ fn resp_c1_command_holes() {
     let mut s = connect(&server);
 
     // ---- ZSet ----
-    s.write_all(&cmd(&[b"ZADD", b"cz", b"1", b"a", b"2", b"b", b"3", b"c"])).unwrap();
+    s.write_all(&cmd(&[b"ZADD", b"cz", b"1", b"a", b"2", b"b", b"3", b"c"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
-    s.write_all(&cmd(&[b"ZCOUNT", b"cz", b"2", b"+inf"])).unwrap();
+    s.write_all(&cmd(&[b"ZCOUNT", b"cz", b"2", b"+inf"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
-    s.write_all(&cmd(&[b"ZMSCORE", b"cz", b"a", b"nope", b"c"])).unwrap();
-    assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n");
+    s.write_all(&cmd(&[b"ZMSCORE", b"cz", b"a", b"nope", b"c"]))
+        .unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n"
+    );
     // ZPOPMIN 弹最小 (member+score)
     s.write_all(&cmd(&[b"ZPOPMIN", b"cz"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\na\r\n$1\r\n1\r\n");
@@ -1018,20 +1435,29 @@ fn resp_c1_command_holes() {
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
 
     // ---- Set ----
-    s.write_all(&cmd(&[b"SADD", b"cs1", b"a", b"b", b"c"])).unwrap();
+    s.write_all(&cmd(&[b"SADD", b"cs1", b"a", b"b", b"c"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
-    s.write_all(&cmd(&[b"SMISMEMBER", b"cs1", b"a", b"x", b"c"])).unwrap();
+    s.write_all(&cmd(&[b"SMISMEMBER", b"cs1", b"a", b"x", b"c"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n:1\r\n:0\r\n:1\r\n");
-    s.write_all(&cmd(&[b"SADD", b"cs2", b"b", b"c", b"d"])).unwrap();
+    s.write_all(&cmd(&[b"SADD", b"cs2", b"b", b"c", b"d"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
-    s.write_all(&cmd(&[b"SINTERCARD", b"2", b"cs1", b"cs2"])).unwrap();
+    s.write_all(&cmd(&[b"SINTERCARD", b"2", b"cs1", b"cs2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
-    s.write_all(&cmd(&[b"SINTERCARD", b"2", b"cs1", b"cs2", b"LIMIT", b"1"])).unwrap();
+    s.write_all(&cmd(&[b"SINTERCARD", b"2", b"cs1", b"cs2", b"LIMIT", b"1"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
     // SRANDMEMBER count (不删) + SPOP count (删)
     s.write_all(&cmd(&[b"SRANDMEMBER", b"cs1", b"2"])).unwrap();
     let r = read_replies(&mut s, 1);
-    assert!(r[0].starts_with(b"*2\r\n"), "SRANDMEMBER 2 应回 2 项: {:?}", r[0]);
+    assert!(
+        r[0].starts_with(b"*2\r\n"),
+        "SRANDMEMBER 2 应回 2 项: {:?}",
+        r[0]
+    );
     s.write_all(&cmd(&[b"SCARD", b"cs1"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
     s.write_all(&cmd(&[b"SPOP", b"cs1", b"2"])).unwrap();
@@ -1041,7 +1467,8 @@ fn resp_c1_command_holes() {
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
 
     // ---- Hash ----
-    s.write_all(&cmd(&[b"HSET", b"ch", b"f1", b"hello", b"f2", b"world!"])).unwrap();
+    s.write_all(&cmd(&[b"HSET", b"ch", b"f1", b"hello", b"f2", b"world!"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
     s.write_all(&cmd(&[b"HSTRLEN", b"ch", b"f2"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":6\r\n");
@@ -1053,7 +1480,8 @@ fn resp_c1_command_holes() {
     assert!(r[0].starts_with(b"$2\r\nf"), "单 field bulk: {:?}", r[0]);
     s.write_all(&cmd(&[b"HRANDFIELD", b"ch", b"2"])).unwrap();
     assert!(read_replies(&mut s, 1)[0].starts_with(b"*2\r\n"));
-    s.write_all(&cmd(&[b"HRANDFIELD", b"ch", b"2", b"WITHVALUES"])).unwrap();
+    s.write_all(&cmd(&[b"HRANDFIELD", b"ch", b"2", b"WITHVALUES"]))
+        .unwrap();
     assert!(read_replies(&mut s, 1)[0].starts_with(b"*4\r\n"));
     // 不存在 key: HRANDFIELD → nil / *0
     s.write_all(&cmd(&[b"HRANDFIELD", b"nokey"])).unwrap();
@@ -1071,15 +1499,18 @@ fn resp_c2_list_mid_ops() {
     let mut s = connect(&server);
 
     // [a, b, a, c, a]
-    s.write_all(&cmd(&[b"RPUSH", b"ml", b"a", b"b", b"a", b"c", b"a"])).unwrap();
+    s.write_all(&cmd(&[b"RPUSH", b"ml", b"a", b"b", b"a", b"c", b"a"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
 
     // LPOS
     s.write_all(&cmd(&[b"LPOS", b"ml", b"a"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
-    s.write_all(&cmd(&[b"LPOS", b"ml", b"a", b"COUNT", b"0"])).unwrap();
+    s.write_all(&cmd(&[b"LPOS", b"ml", b"a", b"COUNT", b"0"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n:0\r\n:2\r\n:4\r\n");
-    s.write_all(&cmd(&[b"LPOS", b"ml", b"a", b"RANK", b"-1"])).unwrap();
+    s.write_all(&cmd(&[b"LPOS", b"ml", b"a", b"RANK", b"-1"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":4\r\n");
     s.write_all(&cmd(&[b"LPOS", b"ml", b"nope"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
@@ -1094,9 +1525,11 @@ fn resp_c2_list_mid_ops() {
     );
 
     // LINSERT AFTER b → [a, b, x, a, c]
-    s.write_all(&cmd(&[b"LINSERT", b"ml", b"AFTER", b"b", b"x"])).unwrap();
+    s.write_all(&cmd(&[b"LINSERT", b"ml", b"AFTER", b"b", b"x"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":5\r\n");
-    s.write_all(&cmd(&[b"LINSERT", b"ml", b"BEFORE", b"nope", b"y"])).unwrap();
+    s.write_all(&cmd(&[b"LINSERT", b"ml", b"BEFORE", b"nope", b"y"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":-1\r\n");
 
     // LTRIM 1..=3 → [b, x, a]
@@ -1126,58 +1559,79 @@ fn resp_c3_store_variants() {
     let (server, mgr) = start_server(None);
     let mut s = connect(&server);
 
-    s.write_all(&cmd(&[b"SADD", b"st1", b"a", b"b", b"c"])).unwrap();
+    s.write_all(&cmd(&[b"SADD", b"st1", b"a", b"b", b"c"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
-    s.write_all(&cmd(&[b"SADD", b"st2", b"b", b"c", b"d"])).unwrap();
+    s.write_all(&cmd(&[b"SADD", b"st2", b"b", b"c", b"d"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
 
     // SINTERSTORE → {b, c}
-    s.write_all(&cmd(&[b"SINTERSTORE", b"sti", b"st1", b"st2"])).unwrap();
+    s.write_all(&cmd(&[b"SINTERSTORE", b"sti", b"st1", b"st2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
     s.write_all(&cmd(&[b"SMEMBERS", b"sti"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
 
     // SUNIONSTORE 覆盖旧 dst → {a,b,c,d}
-    s.write_all(&cmd(&[b"SUNIONSTORE", b"sti", b"st1", b"st2"])).unwrap();
+    s.write_all(&cmd(&[b"SUNIONSTORE", b"sti", b"st1", b"st2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":4\r\n");
     s.write_all(&cmd(&[b"SCARD", b"sti"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":4\r\n");
 
     // SDIFFSTORE → {a}
-    s.write_all(&cmd(&[b"SDIFFSTORE", b"std", b"st1", b"st2"])).unwrap();
+    s.write_all(&cmd(&[b"SDIFFSTORE", b"std", b"st1", b"st2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
     s.write_all(&cmd(&[b"SMEMBERS", b"std"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*1\r\n$1\r\na\r\n");
 
     // 空结果 → dst 被清空
-    s.write_all(&cmd(&[b"SDIFFSTORE", b"sti", b"st1", b"st1"])).unwrap();
+    s.write_all(&cmd(&[b"SDIFFSTORE", b"sti", b"st1", b"st1"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
     s.write_all(&cmd(&[b"EXISTS", b"sti"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
 
     // ---- ZSet STORE ----
-    s.write_all(&cmd(&[b"ZADD", b"zt1", b"1", b"a", b"2", b"b"])).unwrap();
+    s.write_all(&cmd(&[b"ZADD", b"zt1", b"1", b"a", b"2", b"b"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
-    s.write_all(&cmd(&[b"ZADD", b"zt2", b"10", b"b", b"20", b"c"])).unwrap();
+    s.write_all(&cmd(&[b"ZADD", b"zt2", b"10", b"b", b"20", b"c"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
 
     // ZINTERSTORE → {b: 2+10=12}
-    s.write_all(&cmd(&[b"ZINTERSTORE", b"zti", b"2", b"zt1", b"zt2"])).unwrap();
+    s.write_all(&cmd(&[b"ZINTERSTORE", b"zti", b"2", b"zt1", b"zt2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
     s.write_all(&cmd(&[b"ZSCORE", b"zti", b"b"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\n12\r\n");
 
     // ZUNIONSTORE → {a:1, b:12, c:20} 按 score 排序
-    s.write_all(&cmd(&[b"ZUNIONSTORE", b"ztu", b"2", b"zt1", b"zt2"])).unwrap();
+    s.write_all(&cmd(&[b"ZUNIONSTORE", b"ztu", b"2", b"zt1", b"zt2"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
-    s.write_all(&cmd(&[b"ZRANGE", b"ztu", b"0", b"-1", b"WITHSCORES"])).unwrap();
+    s.write_all(&cmd(&[b"ZRANGE", b"ztu", b"0", b"-1", b"WITHSCORES"]))
+        .unwrap();
     assert_eq!(
         read_replies(&mut s, 1)[0],
         b"*6\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$2\r\n12\r\n$1\r\nc\r\n$2\r\n20\r\n"
     );
 
     // WEIGHTS 拒绝 (本轮不支持)
-    s.write_all(&cmd(&[b"ZUNIONSTORE", b"ztw", b"2", b"zt1", b"zt2", b"WEIGHTS", b"2", b"3"])).unwrap();
+    s.write_all(&cmd(&[
+        b"ZUNIONSTORE",
+        b"ztw",
+        b"2",
+        b"zt1",
+        b"zt2",
+        b"WEIGHTS",
+        b"2",
+        b"3",
+    ]))
+    .unwrap();
     assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
 
     drop(s);
@@ -1193,8 +1647,17 @@ fn resp_g_geo_commands() {
 
     // 北京 / 上海 / 广州
     s.write_all(&cmd(&[
-        b"GEOADD", b"geo", b"116.397128", b"39.916527", b"beijing",
-        b"121.4737", b"31.2304", b"shanghai", b"113.2644", b"23.1291", b"guangzhou",
+        b"GEOADD",
+        b"geo",
+        b"116.397128",
+        b"39.916527",
+        b"beijing",
+        b"121.4737",
+        b"31.2304",
+        b"shanghai",
+        b"113.2644",
+        b"23.1291",
+        b"guangzhou",
     ]))
     .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
@@ -1204,7 +1667,8 @@ fn resp_g_geo_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b":3\r\n");
 
     // GEOPOS: 坐标 roundtrip 误差 < 0.001 度
-    s.write_all(&cmd(&[b"GEOPOS", b"geo", b"beijing", b"nowhere"])).unwrap();
+    s.write_all(&cmd(&[b"GEOPOS", b"geo", b"beijing", b"nowhere"]))
+        .unwrap();
     let r = String::from_utf8(read_replies(&mut s, 1)[0].clone()).unwrap();
     assert!(r.starts_with("*2\r\n*2\r\n"), "首项坐标对: {r}");
     assert!(r.contains("116.39"), "lon 近似: {r}");
@@ -1212,24 +1676,43 @@ fn resp_g_geo_commands() {
     assert!(r.ends_with("*-1\r\n"), "缺失成员 → nil array: {r}");
 
     // GEODIST 北京↔上海 ≈ 1067km (±1%)
-    s.write_all(&cmd(&[b"GEODIST", b"geo", b"beijing", b"shanghai", b"km"])).unwrap();
+    s.write_all(&cmd(&[b"GEODIST", b"geo", b"beijing", b"shanghai", b"km"]))
+        .unwrap();
     let r = String::from_utf8(read_replies(&mut s, 1)[0].clone()).unwrap();
     let d: f64 = r.split("\r\n").nth(1).unwrap().parse().unwrap();
     assert!((d - 1067.0).abs() < 15.0, "北京-上海 {d}km");
-    s.write_all(&cmd(&[b"GEODIST", b"geo", b"beijing", b"nowhere"])).unwrap();
+    s.write_all(&cmd(&[b"GEODIST", b"geo", b"beijing", b"nowhere"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
 
     // GEOSEARCH 上海为心 400km → 只有 shanghai
     s.write_all(&cmd(&[
-        b"GEOSEARCH", b"geo", b"FROMLONLAT", b"121.5", b"31.2", b"BYRADIUS", b"400", b"km",
+        b"GEOSEARCH",
+        b"geo",
+        b"FROMLONLAT",
+        b"121.5",
+        b"31.2",
+        b"BYRADIUS",
+        b"400",
+        b"km",
     ]))
     .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*1\r\n$8\r\nshanghai\r\n");
 
     // 1500km → 三城全中, ASC 距离序: shanghai, beijing, guangzhou; COUNT 2 截断
     s.write_all(&cmd(&[
-        b"GEOSEARCH", b"geo", b"FROMLONLAT", b"121.5", b"31.2", b"BYRADIUS", b"1500", b"km",
-        b"ASC", b"COUNT", b"2", b"WITHDIST",
+        b"GEOSEARCH",
+        b"geo",
+        b"FROMLONLAT",
+        b"121.5",
+        b"31.2",
+        b"BYRADIUS",
+        b"1500",
+        b"km",
+        b"ASC",
+        b"COUNT",
+        b"2",
+        b"WITHDIST",
     ]))
     .unwrap();
     let r = String::from_utf8(read_replies(&mut s, 1)[0].clone()).unwrap();
@@ -1267,7 +1750,8 @@ fn resp_b_bitmap_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
 
     // 零扩展: 置位 100 → 长度 13 字节
-    s.write_all(&cmd(&[b"SETBIT", b"bm", b"100", b"1"])).unwrap();
+    s.write_all(&cmd(&[b"SETBIT", b"bm", b"100", b"1"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
     s.write_all(&cmd(&[b"STRLEN", b"bm"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":13\r\n");
@@ -1277,7 +1761,8 @@ fn resp_b_bitmap_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
     s.write_all(&cmd(&[b"BITCOUNT", b"bstr"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":26\r\n");
-    s.write_all(&cmd(&[b"BITCOUNT", b"bstr", b"1", b"1"])).unwrap();
+    s.write_all(&cmd(&[b"BITCOUNT", b"bstr", b"1", b"1"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":6\r\n");
     s.write_all(&cmd(&[b"BITCOUNT", b"nobm"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
@@ -1297,7 +1782,8 @@ fn resp_b_bitmap_commands() {
     assert_eq!(read_replies(&mut s, 1)[0], b":0\r\n");
 
     // 越界 offset 拒绝 (max_value_bytes 默认 1MB)
-    s.write_all(&cmd(&[b"SETBIT", b"bm", b"99999999999", b"1"])).unwrap();
+    s.write_all(&cmd(&[b"SETBIT", b"bm", b"99999999999", b"1"]))
+        .unwrap();
     assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));
 
     drop(s);
@@ -1332,13 +1818,15 @@ fn resp_t_table_routing() {
     assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\nb\r\n");
 
     // 只拆第一个冒号: user:1000:profile → 表 user, key "1000:profile"
-    s.write_all(&cmd(&[b"SET", b"user:1000:profile", b"p"])).unwrap();
+    s.write_all(&cmd(&[b"SET", b"user:1000:profile", b"p"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
     s.write_all(&cmd(&[b"GET", b"user:1000:profile"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$1\r\np\r\n");
 
     // 复合结构带前缀
-    s.write_all(&cmd(&[b"HSET", b"user:1000", b"f", b"v"])).unwrap();
+    s.write_all(&cmd(&[b"HSET", b"user:1000", b"f", b"v"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
     s.write_all(&cmd(&[b"HGETALL", b"user:1000"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*2\r\n$1\r\nf\r\n$1\r\nv\r\n");
@@ -1348,20 +1836,30 @@ fn resp_t_table_routing() {
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
 
     // 跨表 MGET (混合前缀 + 无前缀, 按输入序回填)
-    s.write_all(&cmd(&[b"MGET", b"order:1", b"1", b"user:1"])).unwrap();
-    assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$-1\r\n");
+    s.write_all(&cmd(&[b"MGET", b"order:1", b"1", b"user:1"]))
+        .unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$-1\r\n"
+    );
     // 跨表 MSET
-    s.write_all(&cmd(&[b"MSET", b"m1:k", b"x", b"m2:k", b"y", b"k", b"z"])).unwrap();
+    s.write_all(&cmd(&[b"MSET", b"m1:k", b"x", b"m2:k", b"y", b"k", b"z"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
-    s.write_all(&cmd(&[b"MGET", b"m1:k", b"m2:k", b"k"])).unwrap();
-    assert_eq!(read_replies(&mut s, 1)[0], b"*3\r\n$1\r\nx\r\n$1\r\ny\r\n$1\r\nz\r\n");
+    s.write_all(&cmd(&[b"MGET", b"m1:k", b"m2:k", b"k"]))
+        .unwrap();
+    assert_eq!(
+        read_replies(&mut s, 1)[0],
+        b"*3\r\n$1\r\nx\r\n$1\r\ny\r\n$1\r\nz\r\n"
+    );
 
     // *STORE 带前缀 dst + 跨表源
     s.write_all(&cmd(&[b"SADD", b"sa:s", b"a", b"b"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
     s.write_all(&cmd(&[b"SADD", b"sb:s", b"b", b"c"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":2\r\n");
-    s.write_all(&cmd(&[b"SINTERSTORE", b"out:r", b"sa:s", b"sb:s"])).unwrap();
+    s.write_all(&cmd(&[b"SINTERSTORE", b"out:r", b"sa:s", b"sb:s"]))
+        .unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b":1\r\n");
     s.write_all(&cmd(&[b"SMEMBERS", b"out:r"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"*1\r\n$1\r\nb\r\n");
@@ -1373,7 +1871,8 @@ fn resp_t_table_routing() {
     assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\ne1\r\n");
     s.write_all(&cmd(&[b"GET", b"x"])).unwrap(); // 不是 "x" (未剥前缀)
     assert_eq!(read_replies(&mut s, 1)[0], b"$-1\r\n");
-    s.write_all(&cmd(&[b"SET", b"\xff\x01:bin", b"e2"])).unwrap(); // 二进制前缀
+    s.write_all(&cmd(&[b"SET", b"\xff\x01:bin", b"e2"]))
+        .unwrap(); // 二进制前缀
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
     s.write_all(&cmd(&[b"GET", b"\xff\x01:bin"])).unwrap();
     assert_eq!(read_replies(&mut s, 1)[0], b"$2\r\ne2\r\n");
@@ -1455,13 +1954,18 @@ fn resp_sql_removed_pure_redis_semantics() {
     let mut s = connect(&server);
 
     // CREATE / INSERT → unknown command
-    s.write_all(&cmd(&[b"CREATE", b"TABLE", b"t", b"(a", b"INT", b"PRIMARY", b"KEY)"])).unwrap();
+    s.write_all(&cmd(&[
+        b"CREATE", b"TABLE", b"t", b"(a", b"INT", b"PRIMARY", b"KEY)",
+    ]))
+    .unwrap();
     assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR unknown command 'create'"));
-    s.write_all(&cmd(&[b"INSERT", b"INTO", b"t", b"VALUES", b"(1)"])).unwrap();
+    s.write_all(&cmd(&[b"INSERT", b"INTO", b"t", b"VALUES", b"(1)"]))
+        .unwrap();
     assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR unknown command 'insert'"));
 
     // SELECT 恢复严格 arity=2 整数
-    s.write_all(&cmd(&[b"SELECT", b"*", b"FROM", b"t"])).unwrap();
+    s.write_all(&cmd(&[b"SELECT", b"*", b"FROM", b"t"]))
+        .unwrap();
     assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR wrong number of arguments"));
     s.write_all(&cmd(&[b"SELECT", b"abc"])).unwrap();
     assert!(read_replies(&mut s, 1)[0].starts_with(b"-ERR"));

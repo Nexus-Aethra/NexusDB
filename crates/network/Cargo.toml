@@ -10,11 +10,21 @@ shard_manager = { path = "../shard_manager" }
 storage = { path = "../storage" }
 nlog = { path = "../logging" }
 crossbeam-channel = "0.5"
-libc = "0.2"
 thiserror = "2"
 serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 # ⭐ F83: TLS (SQL 门面传输加密). ring 后端 (纯 Rust + 少量汇编, 免 aws-lc 的 cmake C 构建).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# ⭐ M1: Windows IOCP runtime (NetworkServer on Windows).  windows-sys 0.61
+# is already pulled in transitively by other crates (see Cargo.lock); we
+# declare it here for direct use in runtime_iocp.rs.  0.61+ uses newtype
+# struct constants (e.g. `SOCKET::default()`) which is more ergonomic than
+# the older type-alias API.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [dev-dependencies]
 tempfile = "3"

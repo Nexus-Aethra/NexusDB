@@ -18,13 +18,13 @@
 
 核心上它兼具**写密集友好的架构**(Share-Nothing + per-core thread + io_uring 异步 I/O + 自研协程调度器, 不依赖 tokio)、**完整的 SQL 子集**(JOIN / 子查询 / 聚合 / GROUP BY / 事务)与 **Redis 数据结构**并存, 以及**生产级可靠性**(崩溃恢复、WAL 持久、860+ 测试、clippy 0 警告)。
 
-> 设计架构见 [DESIGN.md](./DESIGN.md); 接手 / 进度 见 [AGENTS.md](./AGENTS.md); 修复历史 见 [CHANGELOG.md](./CHANGELOG.md).
+> 设计架构见 [docs/DESIGN.md](./docs/DESIGN.md); 接手 / 进度 见 [docs/AGENTS.md](./docs/AGENTS.md); 修复历史 见 [docs/CHANGELOG.md](./docs/CHANGELOG.md).
 >
 > 📖 **使用者上手指南 (功能介绍 + 各驱动接入 + SQL/类型/安全示例 + 性能): [docs/GUIDE-CN.md](./docs/GUIDE-CN.md)**
 
 ---
 
-**[核心特性](#核心特性) · [快速开始](#快速开始) · [性能](#性能) · [架构总览](#架构总览) · [GC 与空间回收](#gc-与空间回收) · [大 value 溢出页](#大-value-溢出页) · [支持的协议](#支持的协议) · [配置](#配置) · [开发命令](#开发命令) · [故障排查](#故障排查)**
+**[核心特性](#核心特性) · [快速开始](#快速开始) · [Windows (Beta)](#windows-beta) · [性能](#性能) · [架构总览](#架构总览) · [GC 与空间回收](#gc-与空间回收) · [大 value 溢出页](#大-value-溢出页) · [支持的协议](#支持的协议) · [配置](#配置) · [开发命令](#开发命令) · [故障排查](#故障排查)**
 
 ---
 
@@ -77,7 +77,7 @@
 ```bash
 git clone <repo-url> && cd NexusDB
 cargo build --release --workspace        # 首次 ~2min
-cp nexusdb.toml /tmp/nexus.toml          # 按需修改 listen_addr / block_root
+cp config/nexusdb.toml /tmp/nexus.toml          # 按需修改 listen_addr / block_root
 ./target/release/NexusDB --config /tmp/nexus.toml
 ```
 
@@ -101,6 +101,108 @@ Binary 协议端口 (5433) 测试用例见 [`crates/network/tests/end_to_end.rs`
 ```bash
 cargo test --workspace --no-fail-fast    # ~30s, 0 failed 预期
 ```
+
+---
+
+## Windows (Beta)
+
+> **状态 (2026-08-13)**: `feat/resp-sql-schema-adapter` 分支。Windows 构建端到端跑通
+> (`std::net::TcpListener` + 每连接一个 `std::thread`)。Linux 继续 io_uring + epoll +
+> 协程调度器。完整设计与踩坑见 [docs/plans/2026-08-13-windows-portability.md](./docs/plans/2026-08-13-windows-portability.md) + [docs/plans/2026-08-13-windows-iocp.md](./docs/plans/2026-08-13-windows-iocp.md)。
+
+### Windows 上目前能用的功能
+
+- **Binary 协议** (端口 5433) + **RESP2** (端口 6380) — 跟 Linux `portable.rs` 走同一条 dispatch。
+- RESP 命令: `PING`, `AUTH`, `SELECT`, `SET`, `GET`, `DEL`, `MGET`, `MSET`,
+  `EXISTS`, `STRLEN`, `TYPE`, `INCR` 系列, `APPEND`, `SETNX`, `GETSET` 等。
+  `INCR` / `HSET` / `LPUSH` / `SADD` / `ZADD` / `DBSIZE` / `INFO` /
+  `CLIENT LIST` 在 dispatch 树上还没接上 (Linux `portable.rs` 上同样没接, 是
+  协议层本身没实现, 不是 Windows runtime 缺)。
+- **WAL 持久化** + 崩溃恢复 — 跟 Linux 用同一份磁盘格式, 可以把 Linux 的
+  `data/` 目录拷到 Windows 上直接 replay。
+- **Ctrl-C 优雅停止** (`SetConsoleCtrlHandler`) — 停 acceptor, join 所有连接线程,
+  再关 `ShardManager` 触发 WAL final flush。
+- **默认 `stdfs` IO 后端** — Windows 没有 `io_uring`; 配置缺失或写 `io_uring`
+  会被自动纠正为 `stdfs`。
+
+### Windows 上目前还不能用的
+
+- MySQL / PostgreSQL / HTTP REST / TLS 门面仍是 Linux 路径, Windows 不启动。
+- IOCP / RIO 完成端口 runtime (后续 perf 阶段再上; 设计文档里有完整踩坑记录)。
+- `io_uring` IO 后端、memtier 压测、860+ 测试跨平台矩阵都只在 Linux 上跑。
+
+### 编译
+
+```bash
+# 1) 工具链
+rustup default stable-x86_64-pc-windows-msvc
+
+# 2) clone + build
+git clone https://github.com/Nexus-Aethra/NexusDB.git
+cd NexusDB
+cargo build --release --workspace
+```
+
+### 运行
+
+```bash
+# 最小 config (Windows 上会自动把 io_backend 纠正为 stdfs)
+cat > config/nexusdb-test.toml <<'TOML'
+[server]
+listen_addr = "127.0.0.1:5433"     # Binary
+redis_addr  = "127.0.0.1:6380"     # RESP (用 6380 避开自带的 redis-server)
+worker_count = 1
+sql_addr = ""                    # Windows 关掉 SQL/PG
+pg_addr   = ""
+http_addr = ""
+sql_password = ""
+redis_password = ""
+
+[storage]
+block_root = "./data-test"
+num_shards = 2
+io_backend = "stdfs"
+create_if_missing = true
+default_db = "default"
+default_table = "default"
+precreate_dbs = 1
+TOML
+
+./target/release/NexusDB.exe --config config/nexusdb-test.toml
+```
+
+### Smoke 测试 (redis-cli)
+
+```bash
+redis-cli -p 6380 PING                # PONG
+redis-cli -p 6380 SET user:1 alice    # OK
+redis-cli -p 6380 GET user:1          # alice
+redis-cli -p 6380 DEL user:1          # 1
+```
+
+### 踩坑 / Gotchas
+
+- **`redis-server` 占着 6379**: `Redis.Redis` winget 包安装的
+  `redis-server.exe` 跑在 SYSTEM 账户监听 6379, 没 admin 杀不掉; 测试用 6380
+  避让。生产可改成自己 config 里的空闲端口。
+- **没有 `io_uring`**: Windows 上 `io_backend` 字段被忽略 (缺省 config 时自动
+  降级到 `stdfs`, 也可以直接显式写 `io_backend = "stdfs"`)。
+- **Listener `set_nonblocking(true)` 状态继承到 child**: acceptor 需要靠它
+  轮询 `stop` atomic, 但 winsock 会把这个 flag 继承给 accept 出来的子 socket。
+  每个连接线程把 `WSAEWOULDBLOCK` / `WSAETIMEDOUT` 当成正常背压, 短 sleep
+  后 retry; **绝不能** `return Err` 关连接, 不然 client 在连发命令时
+  会看到 "An existing connection was forcibly closed"。
+- **`#[repr(C)]` 是 IOCP `OverlappedData` 的硬约束**: 以后再启用 IOCP 路径时,
+  `OVERLAPPED` 必须是第一个字段, struct 必须 `#[repr(C)]`。Rust 默认
+  `repr(Rust)` 会 reorder 字段, GQCS 拿到的 ptr 强转后会拿到错位的状态。
+- **`windows-sys = "0.61"` 类型细节**:
+  - `ACCEPTEX` 不存在, 是 `LPFN_ACCEPTEX` (`Option<unsafe extern "system" fn(...)>`)
+  - `setsockopt` 第 4 参是 `PSTR` (`*const u8`), 不是 `*const c_void`
+
+### 性能
+
+Windows 上未测。M2 用每连接 `std::thread`, 适合开发 + 单机 demo。更高并发
+需要回到 IOCP (见设计文档) 或 RIO。Linux 上的 memtier 数字不适用于 Windows。
 
 ---
 
@@ -208,7 +310,7 @@ cargo test --workspace --no-fail-fast    # ~30s, 0 failed 预期
 - **顺序不变量**: data chunk 写盘确认 → meta window 写盘 → pid.state 三段闭环, 任何一段失败均可重试
 - **GC 与大 value**: 见下两节
 
-完整分节: [DESIGN.md](./DESIGN.md) (10 节).
+完整分节: [docs/DESIGN.md](./docs/DESIGN.md) (10 节).
 
 ### 平台依赖
 
@@ -306,7 +408,7 @@ Overflow 数据页:
 | **MySQL (wire)** | **5434** | ✅ SQL 子集 | **mysql cli 直连** + `mysql_native_password` / `caching_sha2_password` fast-auth 登录 + **TLS (opt-in)**; 语法见下方 SQL 门面节 |
 | **PostgreSQL (wire)** | **5435** | ✅ SQL 子集 | **psql 直连** + **SCRAM-SHA-256 认证** + **TLS (opt-in, SSLRequest→'S')**; 与 MySQL 门面**共内核**, 同库互读写 |
 | Binary (自研) | 5433 | ⚠️ 内部 | 内部协议 (测试/压测工具); 对外接入请用 REST/RESP/SQL 门面, 后续版本默认禁用 |
-| MongoDB (BSON) | - | 🚧 设计路线 | 见 [DESIGN.md §10](./DESIGN.md) |
+| MongoDB (BSON) | - | 🚧 设计路线 | 见 [docs/DESIGN.md §10](./docs/DESIGN.md) |
 
 ### RESP 命令面 (2026-07-28)
 
@@ -429,7 +531,7 @@ redis-cli set counter 5              # 默认库, default 表
 
 ## 配置
 
-完整字段注释见 [`nexusdb.toml`](./nexusdb.toml). 重点 section:
+完整字段注释见 [`config/nexusdb.toml`](./config/nexusdb.toml). 重点 section:
 
 ```toml
 [server]
@@ -482,7 +584,7 @@ stderr = true
 | [`crates/network`](./crates/network) | 五协议门面 (Binary + RESP2 + MySQL wire + PostgreSQL wire + HTTP REST) + **全局共享 worker 池** (线程数=配置, 不随协议数膨胀; 每 worker 协程 Scheduler 或 epoll) + `KvLimits` | ✅ |
 | [`crates/shard_manager`](./crates/shard_manager) | 多 shard 控制器 (`ShardManager`/`Router`/`Inbox`/`TaskReplyBus`) + `latency_probe` 探针 + stress 基准 | ✅ |
 | [`crates/config`](./crates/config) | TOML 配置加载 | ✅ |
-| 根 `src/main.rs` | 服务器入口: `nexusdb --config nexusdb.toml`, 信号优雅退出 | ✅ |
+| 根 `src/main.rs` | 服务器入口: `nexusdb --config config/nexusdb.toml`, 信号优雅退出 | ✅ |
 
 活跃计划、故障报告与历史实施记录见[文档索引](./docs/README.md)。
 
@@ -501,10 +603,10 @@ cargo clippy --workspace --all-targets
 cargo build --release
 
 # 启动 (生产)
-RUST_MIN_STACK=8388608 ./target/release/NexusDB --config nexusdb.toml
+RUST_MIN_STACK=8388608 ./target/release/NexusDB --config config/nexusdb.toml
 
 # 启动 + 探针 (性能调优, 直方图 dump 到 stderr, SIGTERM 时)
-NLOG_PROBE=1 ./target/release/NexusDB --config nexusdb.toml
+NLOG_PROBE=1 ./target/release/NexusDB --config config/nexusdb.toml
 
 # 单 crate 测 (开发时快速迭代)
 cargo test -p storage --lib
@@ -518,7 +620,7 @@ redis-cli -p 6379 -x SET bigkey < /dev/urandom   # 1024B..1MB 自动溢出
 redis-cli -p 6379 GET bigkey                     # 字节一致回
 ```
 
-调试技巧与 gotchas 见 [AGENTS.md](./AGENTS.md).
+调试技巧与 gotchas 见 [docs/AGENTS.md](./docs/AGENTS.md).
 
 ---
 
@@ -526,11 +628,11 @@ redis-cli -p 6379 GET bigkey                     # 字节一致回
 
 | 现象 | 可能原因 / 处置 |
 |---|---|
-| 启动报 `permission denied` / `disk full` | `block_root` 路径权限 / 磁盘空间; 检查 [nexusdb.toml](./nexusdb.toml) `[storage].block_root` |
+| 启动报 `permission denied` / `disk full` | `block_root` 路径权限 / 磁盘空间; 检查 [config/nexusdb.toml](./config/nexusdb.toml) `[storage].block_root` |
 | 启动 hang 在 io_uring 初始化 | 容器 / 沙箱无 io_uring 支持; 改 `io_backend = "stdfs"` 临时规避 |
-| `RST_STREAM` 长尾突增 | 网络层 TCP_NODELAY 注意事项; 见 [AGENTS.md](./AGENTS.md) |
+| `RST_STREAM` 长尾突增 | 网络层 TCP_NODELAY 注意事项; 见 [docs/AGENTS.md](./docs/AGENTS.md) |
 | p99 突刺 ~ ms 级 | 多为磁盘 fsync 排队; 切换 NVMe / `NLOG_PROBE=1` 拿探针对照 |
-| 大 value GET 拿到 `ERR ... value too long` | payload 超过 `max_value_bytes` (默认 1 MB); 检查 [nexusdb.toml](./nexusdb.toml) 或 `client->server` 中 |
+| 大 value GET 拿到 `ERR ... value too long` | payload 超过 `max_value_bytes` (默认 1 MB); 检查 [config/nexusdb.toml](./config/nexusdb.toml) 或 `client->server` 中 |
 | p99 从 3 ms 跳到 6 ms | 多为 in-flight 8 触顶退化同步写; 降 `[storage].num_shards` 或升 SSD |
 | 数据读不到 | 多 db 切换: 确认 SET 时使用的 db 名 (`SELECT dbname`); 默认 db 始终有效 |
 
@@ -559,9 +661,9 @@ redis-cli -p 6379 GET bigkey                     # 字节一致回
 | 读者 | 文档 |
 |---|---|
 | 评估 / 第一天 | 本 README |
-| 架构理解 | [DESIGN.md](./DESIGN.md) (10 节) |
-| 接手开发 (进度 / gotchas / 待办) | [AGENTS.md](./AGENTS.md) |
-| 修复历史 (F1-F…) | [CHANGELOG.md](./CHANGELOG.md) |
+| 架构理解 | [docs/DESIGN.md](./docs/DESIGN.md) (10 节) |
+| 接手开发 (进度 / gotchas / 待办) | [docs/AGENTS.md](./docs/AGENTS.md) |
+| 修复历史 (F1-F…) | [docs/CHANGELOG.md](./docs/CHANGELOG.md) |
 | 活跃计划、故障报告与历史实施记录 | [文档索引](./docs/README.md) |
 | Bug 根因调查示例 | [`docs/bug-report-btree-split-routing.md`](./docs/bug-report-btree-split-routing.md) |
 

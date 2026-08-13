@@ -2,7 +2,7 @@
 
 > **语言 / Language**: **English** | [简体中文](./GUIDE-CN.md)
 
-> A user-facing getting-started guide. For design & implementation details see [`DESIGN.md`](../DESIGN.md); for fix/evolution history see [`CHANGELOG.md`](../CHANGELOG.md).
+> A user-facing getting-started guide. For design & implementation details see [`DESIGN.md`](./DESIGN.md); for fix/evolution history see [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## Table of Contents
 1. [What It Is](#1-what-it-is)
@@ -48,7 +48,7 @@ cargo build --release
 
 > Note: the storage layer's async frames are large; running/testing needs a bigger thread stack: `RUST_MIN_STACK=67108864`.
 
-### Minimal config `nexusdb.toml`
+### Minimal config (`config/nexusdb.toml`)
 ```toml
 [server]
 sql_addr = "127.0.0.1:5434"      # MySQL wire
@@ -65,12 +65,12 @@ default_table = "default"
 
 ### Start
 ```bash
-RUST_MIN_STACK=67108864 ./target/release/NexusDB --config nexusdb.toml
+RUST_MIN_STACK=67108864 ./target/release/NexusDB --config config/nexusdb.toml
 ```
 On startup the log prints each facade's listen address. Leaving any facade's `addr` empty disables that facade.
 
 ### Docker Deployment
-The repo ships a [`Dockerfile`](../Dockerfile) (multi-stage: Rust builder → debian-slim) + [`docker-compose.yml`](../docker-compose.yml) + a container default config [`deploy/nexusdb.docker.toml`](../deploy/nexusdb.docker.toml).
+The repo ships a [`container/Dockerfile`](../container/Dockerfile) (multi-stage: Rust builder → debian-slim) + [`container/docker-compose.yml`](../container/docker-compose.yml) + a container default config [`container/docker.toml`](../container/docker.toml) (with the `container/docker-stdfs.toml` variant for seccomp-restricted hosts).
 ```bash
 # build image
 docker build -t nexusdb:latest .
@@ -87,6 +87,69 @@ docker compose up -d
 - Override config: `-v /path/your.toml:/etc/nexusdb/nexusdb.toml`.
 - **io_uring note**: default `io_backend=io_uring` needs a recent kernel; if the host seccomp blocks it and I/O errors appear, set `io_backend="stdfs"` (mount a custom config) or `docker run --security-opt seccomp=unconfined`.
 - Enable TLS: mount a cert directory and set `tls_cert`/`tls_key` in the config.
+
+### Windows Deployment (Beta, 2026-08-13)
+
+Native Windows support is in beta on the `feat/resp-sql-schema-adapter`
+branch.  Plan + gotchas:
+[`docs/plans/2026-08-13-windows-portability.md`](./plans/2026-08-13-windows-portability.md) +
+[`docs/plans/2026-08-13-windows-iocp.md`](./plans/2026-08-13-windows-iocp.md).
+
+```bash
+# 1) toolchain
+rustup default stable-x86_64-pc-windows-msvc
+
+# 2) build
+git clone https://github.com/Nexus-Aethra/NexusDB.git
+cd NexusDB
+cargo build --release --workspace
+```
+
+Minimal `config/nexusdb-test.toml` (auto-corrects `io_backend` to `stdfs`):
+
+```toml
+[server]
+listen_addr = "127.0.0.1:5433"     # Binary
+redis_addr  = "127.0.0.1:6380"     # RESP (6380 to avoid clashing with the
+                                  # SYSTEM-account redis-server on 6379 that
+                                  # ships with the Redis.Redis winget package)
+worker_count = 1
+sql_addr = ""                    # SQL/PG/HTTP are Linux-only paths
+pg_addr   = ""
+http_addr = ""
+
+[storage]
+block_root = "./data-test"
+num_shards = 2
+io_backend = "stdfs"
+create_if_missing = true
+default_db = "default"
+default_table = "default"
+precreate_dbs = 1
+```
+
+Run + smoke:
+
+```bash
+./target/release/NexusDB.exe --config config/nexusdb-test.toml
+# in another shell (assuming Redis.Redis installed under Program Files):
+& "C:\Program Files\Redis\redis-cli.exe" -p 6380 PING             # PONG
+& "C:\Program Files\Redis\redis-cli.exe" -p 6380 SET user:1 alice # OK
+& "C:\Program Files\Redis\redis-cli.exe" -p 6380 GET user:1       # alice
+& "C:\Program Files\Redis\redis-cli.exe" -p 6380 DEL user:1       # 1
+```
+
+What works on Windows: Binary (5433) + RESP (6380), `PING`/`AUTH`/`SET`/`GET`/`DEL`/`MGET`/`MSET`/etc., WAL persistence + crash recovery, Ctrl-C graceful shutdown.
+
+What does not: MySQL / PostgreSQL / HTTP REST / TLS facades, IOCP/RIO perf path, memtier benchmarks, the 860-test matrix. `INCR`/`HSET`/`LPUSH`/`SADD`/`ZADD`/`DBSIZE`/`INFO`/`CLIENT LIST` are not yet wired in the dispatch tree (same gap on Linux's `portable.rs`; protocol-layer work tracked separately).
+
+Gotchas:
+
+- **No `io_uring`**: `io_backend` is ignored on Windows; missing-config path silently downgrades to `stdfs`. Pin `io_backend = "stdfs"` to be explicit.
+- **Port 6379 occupied by the OS-bundled `redis-server`**: `Redis.Redis` winget package installs `redis-server.exe` running as SYSTEM on 6379; you cannot stop it without admin. Use 6380 (or any free port) for testing. Production: pick your own port.
+- **Listener `set_nonblocking(true)` propagates to child sockets**: per-connection read must treat `WSAEWOULDBLOCK` (10035) and `WSAETIMEDOUT` as transient back-pressure (retry + short sleep). Returning `Err` on those errors breaks the conn for the client (`"An existing connection was forcibly closed"`).
+- **`#[repr(C)]` on `OverlappedData`**: if you ever re-enable the IOCP path, the `OVERLAPPED` field MUST be the first field and the struct MUST be `#[repr(C)]`. Rust's default `repr(Rust)` will reorder fields and GQCS will hand you the wrong dispatch state.
+- **`windows-sys = "0.61"`**: `ACCEPTEX` does not exist; the type is `LPFN_ACCEPTEX` (an `Option<unsafe extern "system" fn(...)>`). `setsockopt`'s 4th argument is `PSTR` (`*const u8`), not `*const c_void`.
 
 ---
 
@@ -379,4 +442,4 @@ Delivered but with v1 limitations — keep in mind when evaluating/using:
 - **JSON**: text storage, single row < 64KB, no JSON path index.
 - **Time**: unified naive UTC, no timezone conversion.
 
-> Full gap list: the "SQL gap" section of [`README.md`](../README.md) and [`CHANGELOG.md`](../CHANGELOG.md).
+> Full gap list: the "SQL gap" section of [`README.md`](../README.md) and [`CHANGELOG.md`](./CHANGELOG.md).

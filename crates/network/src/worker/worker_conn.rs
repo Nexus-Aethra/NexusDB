@@ -96,6 +96,15 @@ impl ConnState {
             sql_select_agg: HashMap::new(),
             sql_row_ctx: HashMap::new(),
             sql_pending: HashMap::new(),
+            resp_sql_pending_hget: HashMap::new(),
+            resp_sql_pending_hset: HashMap::new(),
+            resp_sql_pending_hdel: HashMap::new(),
+            resp_sql_pending_hsetnx: HashMap::new(),
+            resp_sql_pending_delete: HashMap::new(),
+            resp_sql_pending_incr: HashMap::new(),
+            resp_sql_hget: HashMap::new(),
+            resp_sql_hset: HashMap::new(),
+            resp_hquery: HashMap::new(),
             mysql: None,
             pg_phase: 0,
             pg_scram: None,
@@ -357,18 +366,20 @@ impl ConnState {
         // 到这里 → 此处推进下一条.
         if self.multi_sub_seq.contains_key(&seq) {
             let orig = self.multi_sub_seq.get(&seq).cloned().unwrap_or(seq);
-            let conn_id = self
-                .multi_stmt
-                .get(&orig)
-                .map(|m| m.conn_id)
-                .unwrap_or(0);
+            let conn_id = self.multi_stmt.get(&orig).map(|m| m.conn_id).unwrap_or(0);
             let worker_id = self.reply_worker_id;
             let num_shards = self.reply_num_shards;
             let default_db = self.reply_default_db.clone();
             let db_view = self.reply_db_view.clone();
             let shard_inboxes = self.reply_shard_inboxes.clone();
             self.multi_step(
-                seq, conn_id, worker_id, &default_db, &db_view, &shard_inboxes, num_shards,
+                seq,
+                conn_id,
+                worker_id,
+                &default_db,
+                &db_view,
+                &shard_inboxes,
+                num_shards,
             );
             return;
         }
@@ -464,9 +475,11 @@ impl ConnState {
             Ok(stmt) => {
                 // 记录类型
                 let kind = match &stmt {
-                    SqlStmt::CreateTable { .. } | SqlStmt::AlterTable { .. } => 1u8, // DDL
+                    SqlStmt::CreateTable { .. }
+                    | SqlStmt::AlterTable { .. }
+                    | SqlStmt::SetRespRowAdapter { .. } => 1u8, // DDL
                     SqlStmt::DropTable { .. } => 1u8, // DDL (DROP 走 dml_agg? 见下)
-                    _ => 0u8, // 同步/其他 (SELECT/SET/USE 等同步回包)
+                    _ => 0u8,                         // 同步/其他 (SELECT/SET/USE 等同步回包)
                 };
                 if let Some(orig) = self.multi_sub_seq.get(&sub_seq).cloned() {
                     if let Some(m) = self.multi_stmt.get_mut(&orig) {
@@ -474,8 +487,16 @@ impl ConnState {
                     }
                 }
                 sql_dispatch_stmt(
-                    self, conn_id, sub_seq, worker_id, &cur_db, default_db, db_view,
-                    shard_inboxes, num_shards, stmt,
+                    self,
+                    conn_id,
+                    sub_seq,
+                    worker_id,
+                    &cur_db,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    stmt,
                 );
             }
         }
@@ -492,17 +513,22 @@ impl ConnState {
         shard_inboxes: &[SharedTaskInbox],
         num_shards: usize,
     ) {
-        let Some(orig) = self.multi_sub_seq.get(&sub_seq).cloned() else { return };
+        let Some(orig) = self.multi_sub_seq.get(&sub_seq).cloned() else {
+            return;
+        };
         let mut done = false;
         let mut next: Option<String> = None;
         let mut error: Option<String> = None;
         {
             // ⭐ 防御: 同 sub_seq 可能被 DDL agg 完成 + resp_complete 守卫双触发,
             // multi 状态可能已移除 → 安全返回 (防 worker panic / 连接关闭)
-            let Some(m) = self.multi_stmt.get_mut(&orig) else { return };
+            let Some(m) = self.multi_stmt.get_mut(&orig) else {
+                return;
+            };
             // ⭐ PG 兼容: 每条语句回一个 CommandComplete (multi-statement 需逐条
             // 响应, 否则 pgx 等不足 N 个 CommandComplete 而挂起)
-            m.cmd_bytes.extend_from_slice(&crate::protocol::pg::build_command_complete("SELECT 1"));
+            m.cmd_bytes
+                .extend_from_slice(&crate::protocol::pg::build_command_complete("SELECT 1"));
             m.dispatched += 1;
             if m.error.is_some() {
                 error = m.error.clone();
@@ -526,8 +552,14 @@ impl ConnState {
             self.multi_sub_seq.insert(next_sub_seq, orig);
             let text = nxt;
             self.dispatch_multi_one(
-                conn_id, worker_id, next_sub_seq, &text, default_db, db_view,
-                shard_inboxes, num_shards,
+                conn_id,
+                worker_id,
+                next_sub_seq,
+                &text,
+                default_db,
+                db_view,
+                shard_inboxes,
+                num_shards,
             );
         } else if done {
             self.multi_sub_seq.remove(&sub_seq);
@@ -538,7 +570,9 @@ impl ConnState {
     /// ⭐ PG 兼容 (multi-statement): 全部完成 → 用原 seq 回逐条 CommandComplete
     /// + ReadyForQuery (PG 协议要求每条语句一个 CommandComplete).
     pub(crate) fn multi_finish(&mut self, orig: u64) {
-        let Some(m) = self.multi_stmt.remove(&orig) else { return };
+        let Some(m) = self.multi_stmt.remove(&orig) else {
+            return;
+        };
         // ⭐ 修复 (2026-08): multi 子语句占用了客户端 seq 区间 [base, base+N),
         // 但回包只发 orig 一个 seq. resp_complete(orig) 后 next_to_send 停在
         // orig+1(=base), 而 base..base+N-1 的子 seq 无单独 pending 包 → 顺序
@@ -580,7 +614,10 @@ impl ConnState {
     /// ⭐ P3 (portal): 续跑挂起的 PG Parse — GetSchemaOp 回包到达后, 用 schema
     /// 推断参数 OID, 插入 pg_stmts, 回 ParseComplete+ParameterDescription+NoData
     /// +ReadyForQuery (pgx 的 Prepare 是独立往返 Parse+Describe+Sync, 此时回包即可).
-    pub(crate) fn resume_pg_pending_parse(&mut self, schema: std::sync::Arc<storage::schema::TableSchema>) {
+    pub(crate) fn resume_pg_pending_parse(
+        &mut self,
+        schema: std::sync::Arc<storage::schema::TableSchema>,
+    ) {
         // 填入 worker schema 缓存 (供 infer_param_oids 重推)
         let prepares = std::mem::take(&mut self.pg_pending_prepares);
         for (name, p) in prepares {
@@ -589,17 +626,19 @@ impl ConnState {
                 crate::protocol::sql::SqlStmt::Insert { table, .. }
                 | crate::protocol::sql::SqlStmt::Select { table, .. }
                 | crate::protocol::sql::SqlStmt::SystemQuery { table, .. } => Some(table.clone()),
-                crate::protocol::sql::SqlStmt::SelectJoin { from, .. } => {
-                    Some(from.table.clone())
-                }
+                crate::protocol::sql::SqlStmt::SelectJoin { from, .. } => Some(from.table.clone()),
                 _ => None,
             };
             if let Some(table) = table {
                 let key = (self.current_db.as_ref().to_string(), table);
-                self.sql_cache.borrow_mut().schemas.insert(key, schema.clone());
+                self.sql_cache
+                    .borrow_mut()
+                    .schemas
+                    .insert(key, schema.clone());
             }
             // 重推参数 OID (schema 已缓存)
-            let (inferred, _) = crate::worker::protocol_io::infer_param_oids(self, &p.stmt, p.params);
+            let (inferred, _) =
+                crate::worker::protocol_io::infer_param_oids(self, &p.stmt, p.params);
             let mut oids = p.oids;
             for (i, o) in inferred.iter().enumerate() {
                 if i < oids.len() && oids[i] == 0 {
@@ -613,7 +652,9 @@ impl ConnState {
             // next_to_send 追上来而卡死). 直接用 next_to_send 保证立即发出.
             let mut out = Vec::with_capacity(64);
             out.extend_from_slice(&crate::protocol::pg::build_parse_complete());
-            out.extend_from_slice(&crate::protocol::pg::build_param_description(&oids, p.params));
+            out.extend_from_slice(&crate::protocol::pg::build_param_description(
+                &oids, p.params,
+            ));
             out.extend_from_slice(&crate::protocol::pg::build_no_data());
             out.extend_from_slice(&crate::protocol::pg::build_ready());
             // ⭐ 用 next_to_send 作为 seq: resp_complete 内部 resp_flush_ready 从
@@ -623,7 +664,14 @@ impl ConnState {
                 self.next_seq = seq + 1;
             }
             self.resp_complete(seq, out);
-            self.pg_stmts.insert(name, PgPrepared { stmt: p.stmt, params: p.params, oids });
+            self.pg_stmts.insert(
+                name,
+                PgPrepared {
+                    stmt: p.stmt,
+                    params: p.params,
+                    oids,
+                },
+            );
         }
         // 复位等待标志并清空残留批次 (挂起时未 take 的 pg_batch)
         self.pg_waiting_schema = false;

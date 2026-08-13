@@ -48,7 +48,9 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(usize, HttpRequest)>, HttpPar
         return Err((431, "request header too large"));
     }
     let head = &buf[..head_end];
-    let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let mut lines = head
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let request_line = lines.next().ok_or((400, "empty request"))?;
     let mut parts = request_line.split(|&b| b == b' ').filter(|s| !s.is_empty());
     let method = std::str::from_utf8(parts.next().ok_or((400, "bad request line"))?)
@@ -138,7 +140,8 @@ pub fn percent_decode(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len()
+        if b[i] == b'%'
+            && i + 2 < b.len()
             && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
         {
             out.push((h << 4) | l);
@@ -194,9 +197,7 @@ pub fn build_response(
     }
     out.extend_from_slice(format!("Content-Length: {}\r\n", json_body.len()).as_bytes());
     if let Some(origin) = cors_origin {
-        out.extend_from_slice(
-            format!("Access-Control-Allow-Origin: {origin}\r\n").as_bytes(),
-        );
+        out.extend_from_slice(format!("Access-Control-Allow-Origin: {origin}\r\n").as_bytes());
     }
     out.extend_from_slice(if keep_alive {
         b"Connection: keep-alive\r\n".as_slice()
@@ -258,12 +259,24 @@ pub fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -281,7 +294,10 @@ mod tests {
         }
         let (n, req) = parse_request(full).unwrap().unwrap();
         assert_eq!(n, full.len());
-        assert_eq!((req.method.as_str(), req.path.as_str()), ("GET", "/v1/kv/t/k"));
+        assert_eq!(
+            (req.method.as_str(), req.path.as_str()),
+            ("GET", "/v1/kv/t/k")
+        );
         assert_eq!(query_param(&req.query, "db"), Some("app"));
         assert_eq!(req.origin.as_deref(), Some("http://a.b"));
         assert!(req.keep_alive, "HTTP/1.1 默认 keep-alive");
@@ -308,7 +324,10 @@ mod tests {
         huge.extend(std::iter::repeat_n(b'a', MAX_HEAD_BYTES + 1));
         assert_eq!(parse_request(&huge).unwrap_err().0, 431);
         // body 超限
-        let big = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY_BYTES + 1);
+        let big = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
         assert_eq!(parse_request(big.as_bytes()).unwrap_err().0, 413);
         // chunked 拒绝
         let ch = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";

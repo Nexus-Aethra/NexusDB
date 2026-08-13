@@ -22,9 +22,7 @@ pub(crate) fn exec_incr(
         Some(stored) => match value_num::parse_num_int_only(stored) {
             Some(n) => n,
             None => {
-                return BatchResult::Error(
-                    "value is not an integer or out of range".to_string(),
-                );
+                return BatchResult::Error("value is not an integer or out of range".to_string());
             }
         },
     };
@@ -313,14 +311,20 @@ pub(crate) fn exec_txn_apply(
         if let Err(err) = block_on_io(e.ensure_table(db, table)) {
             return BatchResult::Error(err.to_string());
         }
-        if let BatchOp::RowPut { db, table, pk, values } = op {
+        if let BatchOp::RowPut {
+            db,
+            table,
+            pk,
+            values,
+        } = op
+        {
             if let Err(err) = block_on_io(e.row_put_check(db, table, pk, values)) {
                 return BatchResult::Error(err.to_string());
             }
             // 批内自冲突 (盘上探测看不见未应用的同批写)
             if let Ok(Some(schema)) = block_on_io(e.get_schema(db, table)) {
                 for idx in schema.indexes.iter().filter(|i| i.unique) {
-                    if let Some(nv) = storage::sql_rows::index_vals_bytes(&schema, idx, &values) {
+                    if let Some(nv) = storage::sql_rows::index_vals_bytes(&schema, idx, values) {
                         let key = (format!("{db}\u{0}{table}"), idx.iid, nv);
                         if let Some(prev) = batch_uniques.insert(key, pk.clone())
                             && &prev != pk
@@ -356,20 +360,31 @@ pub(crate) fn exec_task_op(
     op: crate::request::BatchOp,
 ) -> crate::request::BatchResult {
     match op {
-        crate::request::BatchOp::Put { ref db, ref table, ref key, ref val } => {
-            match block_on_io(e.table_put(db, table, key, val)) {
-                Ok(_) => crate::request::BatchResult::PutOk,
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::Get { ref db, ref table, ref key } => {
+        crate::request::BatchOp::Put {
+            ref db,
+            ref table,
+            ref key,
+            ref val,
+        } => match block_on_io(e.table_put(db, table, key, val)) {
+            Ok(_) => crate::request::BatchResult::PutOk,
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::Get {
+            ref db,
+            ref table,
+            ref key,
+        } => {
             // ⭐ Phase H: 类型感知 (hash key → WRONGTYPE)
             match block_on_io(e.table_get_typed(db, table, key)) {
                 Ok(v) => crate::request::BatchResult::GetValue(v),
                 Err(err) => crate::request::BatchResult::Error(err.to_string()),
             }
         }
-        crate::request::BatchOp::Delete { ref db, ref table, ref key } => {
+        crate::request::BatchOp::Delete {
+            ref db,
+            ref table,
+            ref key,
+        } => {
             // ⭐ Phase H: 类型感知 (顺带清 hash 全部行/孤儿行)
             match block_on_io(e.key_delete_any(db, table, key)) {
                 Ok(b) => crate::request::BatchResult::DeleteExisted(b),
@@ -377,387 +392,667 @@ pub(crate) fn exec_task_op(
             }
         }
         // ⭐ MGET/MSET 分片: shard 内 LeafGuide 区间复用批量执行
-        crate::request::BatchOp::MultiGet { ref db, ref table, ref keys } => {
+        crate::request::BatchOp::MultiGet {
+            ref db,
+            ref table,
+            ref keys,
+        } => {
             let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
             match block_on_io(e.table_get_many(db, table, &refs)) {
                 Ok(vs) => crate::request::BatchResult::Values(vs),
                 Err(err) => crate::request::BatchResult::Error(err.to_string()),
             }
         }
-        crate::request::BatchOp::MultiPut { ref db, ref table, ref pairs } => {
-            match block_on_io(e.table_put_many(db, table, pairs)) {
-                Ok(_) => crate::request::BatchResult::MultiPutOk,
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::MultiPutNx { ref db, ref table, ref pairs } => {
-            exec_multiputnx(e, db, table, pairs)
-        }
+        crate::request::BatchOp::MultiPut {
+            ref db,
+            ref table,
+            ref pairs,
+        } => match block_on_io(e.table_put_many(db, table, pairs)) {
+            Ok(_) => crate::request::BatchResult::MultiPutOk,
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::MultiPutNx {
+            ref db,
+            ref table,
+            ref pairs,
+        } => exec_multiputnx(e, db, table, pairs),
         // ⭐ String RMW (shard 单线程内天然原子)
-        crate::request::BatchOp::Incr { ref db, ref table, ref key, delta } => {
-            exec_incr(e, db, table, key, delta)
-        }
-        crate::request::BatchOp::IncrFloat { ref db, ref table, ref key, delta } => {
-            exec_incr_float(e, db, table, key, delta)
-        }
-        crate::request::BatchOp::Append { ref db, ref table, ref key, ref suffix } => {
-            exec_append(e, db, table, key, suffix)
-        }
-        crate::request::BatchOp::SetNx { ref db, ref table, ref key, ref val } => {
-            exec_setnx(e, db, table, key, val)
-        }
-        crate::request::BatchOp::GetDel { ref db, ref table, ref key } => {
-            exec_getdel(e, db, table, key)
-        }
-        crate::request::BatchOp::GetSet { ref db, ref table, ref key, ref val } => {
-            exec_getset(e, db, table, key, val)
-        }
-        crate::request::BatchOp::SetRange { ref db, ref table, ref key, offset, ref data } => {
-            exec_setrange(e, db, table, key, offset, data)
-        }
+        crate::request::BatchOp::Incr {
+            ref db,
+            ref table,
+            ref key,
+            delta,
+        } => exec_incr(e, db, table, key, delta),
+        crate::request::BatchOp::IncrFloat {
+            ref db,
+            ref table,
+            ref key,
+            delta,
+        } => exec_incr_float(e, db, table, key, delta),
+        crate::request::BatchOp::Append {
+            ref db,
+            ref table,
+            ref key,
+            ref suffix,
+        } => exec_append(e, db, table, key, suffix),
+        crate::request::BatchOp::SetNx {
+            ref db,
+            ref table,
+            ref key,
+            ref val,
+        } => exec_setnx(e, db, table, key, val),
+        crate::request::BatchOp::GetDel {
+            ref db,
+            ref table,
+            ref key,
+        } => exec_getdel(e, db, table, key),
+        crate::request::BatchOp::GetSet {
+            ref db,
+            ref table,
+            ref key,
+            ref val,
+        } => exec_getset(e, db, table, key, val),
+        crate::request::BatchOp::SetRange {
+            ref db,
+            ref table,
+            ref key,
+            offset,
+            ref data,
+        } => exec_setrange(e, db, table, key, offset, data),
         // ⭐ M3-2 (CBO): 表近似行数 (内存增量统计; 未统计=0)
         crate::request::BatchOp::EstimateRowCount { ref db, ref table } => {
-            crate::request::BatchResult::RowCount(
-                e.estimate_row_count(db, table).unwrap_or(0),
-            )
+            crate::request::BatchResult::RowCount(e.estimate_row_count(db, table).unwrap_or(0))
         }
         // ⭐ M3-4 (CBO): 索引列 distinct (worker 已算好 iid; 未统计=0)
-        crate::request::BatchOp::EstimateDistinct { ref db, ref table, ref iids } => {
-            crate::request::BatchResult::DistinctCounts(
-                iids.iter()
-                    .map(|iid| e.estimate_distinct(db, table, *iid).unwrap_or(0))
-                    .collect(),
-            )
-        }
+        crate::request::BatchOp::EstimateDistinct {
+            ref db,
+            ref table,
+            ref iids,
+        } => crate::request::BatchResult::DistinctCounts(
+            iids.iter()
+                .map(|iid| e.estimate_distinct(db, table, *iid).unwrap_or(0))
+                .collect(),
+        ),
         // ⭐ M3-5 (CBO): 索引列 (min, max) 有序字节 (未统计 = (None, None))
-        crate::request::BatchOp::EstimateRanges { ref db, ref table, ref iids } => {
-            crate::request::BatchResult::RangeBounds(
-                iids.iter()
-                    .map(|iid| {
-                        e.estimate_range(db, table, *iid)
-                            .map(|(lo, hi)| (Some(lo), Some(hi)))
-                            .unwrap_or((None, None))
-                    })
-                    .collect(),
-            )
-        }
+        crate::request::BatchOp::EstimateRanges {
+            ref db,
+            ref table,
+            ref iids,
+        } => crate::request::BatchResult::RangeBounds(
+            iids.iter()
+                .map(|iid| {
+                    e.estimate_range(db, table, *iid)
+                        .map(|(lo, hi)| (Some(lo), Some(hi)))
+                        .unwrap_or((None, None))
+                })
+                .collect(),
+        ),
         // ⭐ Phase H: Hash ops (单 key 单 shard, 无需聚合)
-        crate::request::BatchOp::HSet { ref db, ref table, ref key, ref pairs } => {
-            match block_on_io(e.hash_set(db, table, key, pairs)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::HSetNx { ref db, ref table, ref key, ref field, ref val } => {
-            match block_on_io(e.hash_set_nx(db, table, key, field, val)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::HGet { ref db, ref table, ref key, ref field } => {
-            match block_on_io(e.hash_get(db, table, key, field)) {
-                Ok(v) => crate::request::BatchResult::GetValue(v),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::HMGet { ref db, ref table, ref key, ref fields } => {
-            match block_on_io(e.hash_get_many(db, table, key, fields)) {
-                Ok(vs) => crate::request::BatchResult::Values(vs),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::HDel { ref db, ref table, ref key, ref fields } => {
-            match block_on_io(e.hash_del(db, table, key, fields)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::HLen { ref db, ref table, ref key } => {
-            match block_on_io(e.hash_len(db, table, key)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::HGetAll { ref db, ref table, ref key } => {
-            match block_on_io(e.hash_get_all(db, table, key)) {
-                Ok(ps) => crate::request::BatchResult::Pairs(ps),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::HIncrBy { ref db, ref table, ref key, ref field, delta } => {
-            exec_hincrby(e, db, table, key, field, delta)
-        }
-        crate::request::BatchOp::HIncrByFloat { ref db, ref table, ref key, ref field, delta } => {
-            exec_hincrbyfloat(e, db, table, key, field, delta)
-        }
+        crate::request::BatchOp::HSet {
+            ref db,
+            ref table,
+            ref key,
+            ref pairs,
+        } => match block_on_io(e.hash_set(db, table, key, pairs)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::HSetNx {
+            ref db,
+            ref table,
+            ref key,
+            ref field,
+            ref val,
+        } => match block_on_io(e.hash_set_nx(db, table, key, field, val)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::HGet {
+            ref db,
+            ref table,
+            ref key,
+            ref field,
+        } => match block_on_io(e.hash_get(db, table, key, field)) {
+            Ok(v) => crate::request::BatchResult::GetValue(v),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::HMGet {
+            ref db,
+            ref table,
+            ref key,
+            ref fields,
+        } => match block_on_io(e.hash_get_many(db, table, key, fields)) {
+            Ok(vs) => crate::request::BatchResult::Values(vs),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::HDel {
+            ref db,
+            ref table,
+            ref key,
+            ref fields,
+        } => match block_on_io(e.hash_del(db, table, key, fields)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::HLen {
+            ref db,
+            ref table,
+            ref key,
+        } => match block_on_io(e.hash_len(db, table, key)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::HGetAll {
+            ref db,
+            ref table,
+            ref key,
+        } => match block_on_io(e.hash_get_all(db, table, key)) {
+            Ok(ps) => crate::request::BatchResult::Pairs(ps),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::HIncrBy {
+            ref db,
+            ref table,
+            ref key,
+            ref field,
+            delta,
+        } => exec_hincrby(e, db, table, key, field, delta),
+        crate::request::BatchOp::HIncrByFloat {
+            ref db,
+            ref table,
+            ref key,
+            ref field,
+            delta,
+        } => exec_hincrbyfloat(e, db, table, key, field, delta),
         // ⭐ Phase Set: Set ops
-        crate::request::BatchOp::SAdd { ref db, ref table, ref key, ref members } => {
-            match block_on_io(e.set_add(db, table, key, members)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::SRem { ref db, ref table, ref key, ref members } => {
-            match block_on_io(e.set_rem(db, table, key, members)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::SIsMember { ref db, ref table, ref key, ref member } => {
-            match block_on_io(e.set_is_member(db, table, key, member)) {
-                Ok(b) => crate::request::BatchResult::Integer(i64::from(b)),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::SCard { ref db, ref table, ref key } => {
-            match block_on_io(e.set_card(db, table, key)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::SMembers { ref db, ref table, ref key } => {
-            match block_on_io(e.set_members(db, table, key)) {
-                Ok(ms) => crate::request::BatchResult::Members(ms),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::SPop { ref db, ref table, ref key } => {
-            exec_spop(e, db, table, key)
-        }
-        crate::request::BatchOp::SRandMember { ref db, ref table, ref key } => {
-            match block_on_io(e.set_pick_one(db, table, key)) {
-                Ok(m) => crate::request::BatchResult::Members(m.into_iter().collect()),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
+        crate::request::BatchOp::SAdd {
+            ref db,
+            ref table,
+            ref key,
+            ref members,
+        } => match block_on_io(e.set_add(db, table, key, members)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::SRem {
+            ref db,
+            ref table,
+            ref key,
+            ref members,
+        } => match block_on_io(e.set_rem(db, table, key, members)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::SIsMember {
+            ref db,
+            ref table,
+            ref key,
+            ref member,
+        } => match block_on_io(e.set_is_member(db, table, key, member)) {
+            Ok(b) => crate::request::BatchResult::Integer(i64::from(b)),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::SCard {
+            ref db,
+            ref table,
+            ref key,
+        } => match block_on_io(e.set_card(db, table, key)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::SMembers {
+            ref db,
+            ref table,
+            ref key,
+        } => match block_on_io(e.set_members(db, table, key)) {
+            Ok(ms) => crate::request::BatchResult::Members(ms),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::SPop {
+            ref db,
+            ref table,
+            ref key,
+        } => exec_spop(e, db, table, key),
+        crate::request::BatchOp::SRandMember {
+            ref db,
+            ref table,
+            ref key,
+        } => match block_on_io(e.set_pick_one(db, table, key)) {
+            Ok(m) => crate::request::BatchResult::Members(m.into_iter().collect()),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
         // ⭐ Phase L: List ops
-        crate::request::BatchOp::LPush { ref db, ref table, ref key, ref values, left } => {
-            match block_on_io(e.list_push(db, table, key, values, left)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::LPop { ref db, ref table, ref key, left, count } => {
-            exec_lpop(e, db, table, key, left, count as usize)
-        }
-        crate::request::BatchOp::LLen { ref db, ref table, ref key } => {
-            match block_on_io(e.list_len(db, table, key)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::LRange { ref db, ref table, ref key, start, end } => {
-            exec_lrange(e, db, table, key, start, end)
-        }
-        crate::request::BatchOp::LIndex { ref db, ref table, ref key, idx } => {
-            match block_on_io(e.list_index(db, table, key, idx)) {
-                Ok(v) => crate::request::BatchResult::GetValue(v),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::LSet { ref db, ref table, ref key, idx, ref val } => {
-            exec_lset(e, db, table, key, idx, val)
-        }
+        crate::request::BatchOp::LPush {
+            ref db,
+            ref table,
+            ref key,
+            ref values,
+            left,
+        } => match block_on_io(e.list_push(db, table, key, values, left)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::LPop {
+            ref db,
+            ref table,
+            ref key,
+            left,
+            count,
+        } => exec_lpop(e, db, table, key, left, count as usize),
+        crate::request::BatchOp::LLen {
+            ref db,
+            ref table,
+            ref key,
+        } => match block_on_io(e.list_len(db, table, key)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::LRange {
+            ref db,
+            ref table,
+            ref key,
+            start,
+            end,
+        } => exec_lrange(e, db, table, key, start, end),
+        crate::request::BatchOp::LIndex {
+            ref db,
+            ref table,
+            ref key,
+            idx,
+        } => match block_on_io(e.list_index(db, table, key, idx)) {
+            Ok(v) => crate::request::BatchResult::GetValue(v),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::LSet {
+            ref db,
+            ref table,
+            ref key,
+            idx,
+            ref val,
+        } => exec_lset(e, db, table, key, idx, val),
         // ⭐ Phase Z: ZSet ops
-        crate::request::BatchOp::ZAdd { ref db, ref table, ref key, ref pairs } => {
-            match block_on_io(e.zset_add(db, table, key, pairs)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZRem { ref db, ref table, ref key, ref members } => {
-            match block_on_io(e.zset_rem(db, table, key, members)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZScore { ref db, ref table, ref key, ref member } => {
-            match block_on_io(e.zset_score(db, table, key, member)) {
-                Ok(s) => crate::request::BatchResult::OptMember(s.map(fmt_score)),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZCard { ref db, ref table, ref key } => {
-            match block_on_io(e.zset_card(db, table, key)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZIncrBy { ref db, ref table, ref key, delta, ref member } => {
-            match block_on_io(e.zset_incr(db, table, key, delta, member)) {
-                Ok(s) => crate::request::BatchResult::Double(s),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZRange { ref db, ref table, ref key, start, end, rev, withscores } => {
-            match block_on_io(e.zset_range(db, table, key, start, end, rev)) {
-                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZRangeByScore { ref db, ref table, ref key, min, max, withscores } => {
-            match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
-                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZRank { ref db, ref table, ref key, ref member, rev } => {
-            match block_on_io(e.zset_rank(db, table, key, member, rev)) {
-                Ok(Some(r)) => crate::request::BatchResult::Integer(r),
-                Ok(None) => crate::request::BatchResult::OptMember(None),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZCount { ref db, ref table, ref key, min, max } => {
-            match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
-                Ok(rows) => crate::request::BatchResult::Integer(rows.len() as i64),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZMScore { ref db, ref table, ref key, ref members } => {
-            match block_on_io(e.zset_mscore(db, table, key, members)) {
-                Ok(scores) => crate::request::BatchResult::Values(
-                    scores.into_iter().map(|s| s.map(fmt_score)).collect(),
-                ),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ZPop { ref db, ref table, ref key, rev, count } => {
-            match block_on_io(e.zset_pop(db, table, key, rev, count as usize)) {
-                Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, true)),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::SMisMember { ref db, ref table, ref key, ref members } => {
-            match block_on_io(e.set_mismember(db, table, key, members)) {
-                Ok(bs) => crate::request::BatchResult::IntList(
-                    bs.into_iter().map(i64::from).collect(),
-                ),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::SPopN { ref db, ref table, ref key, count } => {
-            match block_on_io(e.set_pop_n(db, table, key, count as usize)) {
-                Ok(ms) => crate::request::BatchResult::Members(ms),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::SRandCount { ref db, ref table, ref key, count } => {
-            match block_on_io(e.set_rand_n(db, table, key, count as usize)) {
-                Ok(ms) => crate::request::BatchResult::Members(ms),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::HRandField { ref db, ref table, ref key, count, .. } => {
-            match block_on_io(e.hash_rand(db, table, key, count as usize)) {
-                Ok(ps) => crate::request::BatchResult::Pairs(ps),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::LRem { ref db, ref table, ref key, count, ref val } => {
-            match block_on_io(e.list_rem(db, table, key, count, val)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::LTrim { ref db, ref table, ref key, start, stop } => {
-            match block_on_io(e.list_trim(db, table, key, start, stop)) {
-                Ok(()) => crate::request::BatchResult::Integer(1),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::LPos { ref db, ref table, ref key, ref val, rank, count } => {
-            exec_lpos(e, db, table, key, val, rank, count)
-        }
-        crate::request::BatchOp::LInsert { ref db, ref table, ref key, before, ref pivot, ref val } => {
-            match block_on_io(e.list_insert(db, table, key, before, pivot, val)) {
-                Ok(n) => crate::request::BatchResult::Integer(n),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::SetBit { ref db, ref table, ref key, offset, bit } => {
-            exec_setbit(e, db, table, key, offset, bit)
-        }
+        crate::request::BatchOp::ZAdd {
+            ref db,
+            ref table,
+            ref key,
+            ref pairs,
+        } => match block_on_io(e.zset_add(db, table, key, pairs)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZRem {
+            ref db,
+            ref table,
+            ref key,
+            ref members,
+        } => match block_on_io(e.zset_rem(db, table, key, members)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZScore {
+            ref db,
+            ref table,
+            ref key,
+            ref member,
+        } => match block_on_io(e.zset_score(db, table, key, member)) {
+            Ok(s) => crate::request::BatchResult::OptMember(s.map(fmt_score)),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZCard {
+            ref db,
+            ref table,
+            ref key,
+        } => match block_on_io(e.zset_card(db, table, key)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZIncrBy {
+            ref db,
+            ref table,
+            ref key,
+            delta,
+            ref member,
+        } => match block_on_io(e.zset_incr(db, table, key, delta, member)) {
+            Ok(s) => crate::request::BatchResult::Double(s),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZRange {
+            ref db,
+            ref table,
+            ref key,
+            start,
+            end,
+            rev,
+            withscores,
+        } => match block_on_io(e.zset_range(db, table, key, start, end, rev)) {
+            Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZRangeByScore {
+            ref db,
+            ref table,
+            ref key,
+            min,
+            max,
+            withscores,
+        } => match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
+            Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, withscores)),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZRank {
+            ref db,
+            ref table,
+            ref key,
+            ref member,
+            rev,
+        } => match block_on_io(e.zset_rank(db, table, key, member, rev)) {
+            Ok(Some(r)) => crate::request::BatchResult::Integer(r),
+            Ok(None) => crate::request::BatchResult::OptMember(None),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZCount {
+            ref db,
+            ref table,
+            ref key,
+            min,
+            max,
+        } => match block_on_io(e.zset_range_by_score(db, table, key, min, max)) {
+            Ok(rows) => crate::request::BatchResult::Integer(rows.len() as i64),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZMScore {
+            ref db,
+            ref table,
+            ref key,
+            ref members,
+        } => match block_on_io(e.zset_mscore(db, table, key, members)) {
+            Ok(scores) => crate::request::BatchResult::Values(
+                scores.into_iter().map(|s| s.map(fmt_score)).collect(),
+            ),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ZPop {
+            ref db,
+            ref table,
+            ref key,
+            rev,
+            count,
+        } => match block_on_io(e.zset_pop(db, table, key, rev, count as usize)) {
+            Ok(rows) => crate::request::BatchResult::Members(zrows_to_members(rows, true)),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::SMisMember {
+            ref db,
+            ref table,
+            ref key,
+            ref members,
+        } => match block_on_io(e.set_mismember(db, table, key, members)) {
+            Ok(bs) => crate::request::BatchResult::IntList(bs.into_iter().map(i64::from).collect()),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::SPopN {
+            ref db,
+            ref table,
+            ref key,
+            count,
+        } => match block_on_io(e.set_pop_n(db, table, key, count as usize)) {
+            Ok(ms) => crate::request::BatchResult::Members(ms),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::SRandCount {
+            ref db,
+            ref table,
+            ref key,
+            count,
+        } => match block_on_io(e.set_rand_n(db, table, key, count as usize)) {
+            Ok(ms) => crate::request::BatchResult::Members(ms),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::HRandField {
+            ref db,
+            ref table,
+            ref key,
+            count,
+            ..
+        } => match block_on_io(e.hash_rand(db, table, key, count as usize)) {
+            Ok(ps) => crate::request::BatchResult::Pairs(ps),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::LRem {
+            ref db,
+            ref table,
+            ref key,
+            count,
+            ref val,
+        } => match block_on_io(e.list_rem(db, table, key, count, val)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::LTrim {
+            ref db,
+            ref table,
+            ref key,
+            start,
+            stop,
+        } => match block_on_io(e.list_trim(db, table, key, start, stop)) {
+            Ok(()) => crate::request::BatchResult::Integer(1),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::LPos {
+            ref db,
+            ref table,
+            ref key,
+            ref val,
+            rank,
+            count,
+        } => exec_lpos(e, db, table, key, val, rank, count),
+        crate::request::BatchOp::LInsert {
+            ref db,
+            ref table,
+            ref key,
+            before,
+            ref pivot,
+            ref val,
+        } => match block_on_io(e.list_insert(db, table, key, before, pivot, val)) {
+            Ok(n) => crate::request::BatchResult::Integer(n),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::SetBit {
+            ref db,
+            ref table,
+            ref key,
+            offset,
+            bit,
+        } => exec_setbit(e, db, table, key, offset, bit),
         // ---- ⭐ Q5: SQL row 表 ----
-        crate::request::BatchOp::RowPut { ref db, ref table, ref pk, ref values } => {
-            exec_row_put(e, db, table, pk, values)
-        }
-        crate::request::BatchOp::RowGet { ref db, ref table, ref pk } => {
-            match block_on_io(e.row_get(db, table, pk)) {
-                Ok(v) => crate::request::BatchResult::GetValue(v),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::RowDelete { ref db, ref table, ref pk } => {
-            match block_on_io(e.row_delete(db, table, pk)) {
-                Ok(existed) => crate::request::BatchResult::DeleteExisted(existed),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::RowUpdate { ref db, ref table, ref pk, ref sets } => {
-            match block_on_io(e.row_update(db, table, pk, sets)) {
-                Ok(updated) => crate::request::BatchResult::DeleteExisted(updated),
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
+        crate::request::BatchOp::RowPut {
+            ref db,
+            ref table,
+            ref pk,
+            ref values,
+        } => exec_row_put(e, db, table, pk, values),
+        crate::request::BatchOp::RowGet {
+            ref db,
+            ref table,
+            ref pk,
+        } => match block_on_io(e.row_get(db, table, pk)) {
+            Ok(v) => crate::request::BatchResult::GetValue(v),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::RowDelete {
+            ref db,
+            ref table,
+            ref pk,
+        } => match block_on_io(e.row_delete(db, table, pk)) {
+            Ok(existed) => crate::request::BatchResult::DeleteExisted(existed),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::RowUpdate {
+            ref db,
+            ref table,
+            ref pk,
+            ref sets,
+        } => match block_on_io(e.row_update(db, table, pk, sets)) {
+            Ok(updated) => crate::request::BatchResult::DeleteExisted(updated),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::RowUnset {
+            ref db,
+            ref table,
+            ref pk,
+            ref cols,
+        } => match block_on_io(e.row_unset(db, table, pk, cols)) {
+            Ok(changed) => crate::request::BatchResult::Integer(changed),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::RowSetNx {
+            ref db,
+            ref table,
+            ref pk,
+            col,
+            ref val,
+        } => match block_on_io(e.row_set_nx(db, table, pk, col, val.clone())) {
+            Ok(set) => crate::request::BatchResult::Integer(i64::from(set)),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::RowPatchUpsert {
+            ref db,
+            ref table,
+            ref pk,
+            ref sets,
+            ref insert_values,
+        } => match block_on_io(e.row_patch_upsert(db, table, pk, sets, insert_values)) {
+            Ok(added) => crate::request::BatchResult::Integer(added),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::RowIncr {
+            ref db,
+            ref table,
+            ref pk,
+            col,
+            delta,
+        } => match block_on_io(e.row_incr(db, table, pk, col, delta)) {
+            Ok(storage::row::ColValue::I64(v)) => crate::request::BatchResult::Integer(v),
+            Ok(storage::row::ColValue::F64(v)) => crate::request::BatchResult::Double(v),
+            Ok(_) => crate::request::BatchResult::Error(
+                "row increment returned non-numeric value".into(),
+            ),
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
         crate::request::BatchOp::DropTableOp { ref db, ref table } => {
             match block_on_io(e.drop_table_sql(db, table)) {
                 Ok(_) => crate::request::BatchResult::PutOk,
                 Err(err) => crate::request::BatchResult::Error(err.to_string()),
             }
         }
-        crate::request::BatchOp::TableScan { ref db, ref table, limit } => {
-            exec_table_scan(e, db, table, limit)
-        }
-        crate::request::BatchOp::ScanFiltered { ref db, ref table, ref preds, ref proj, ref index_hint, ref key_set_hint, limit } => {
-            exec_scan_filtered(e, db, table, preds, proj, index_hint.as_ref(), key_set_hint.as_ref(), limit)
-        }
-        crate::request::BatchOp::ScanFilteredRows { ref db, ref table, ref index_hint, limit } => {
-            exec_scan_filtered_rows(e, db, table, index_hint.as_ref(), limit)
-        }
-        crate::request::BatchOp::IndexScan {
-            ref db, ref table, iid, ref lo, ref hi, limit, with_rows,
-        } => exec_index_scan(
-            e, db, table, iid, lo.as_ref(), hi.as_ref(), limit, with_rows,
+        crate::request::BatchOp::TableScan {
+            ref db,
+            ref table,
+            limit,
+        } => exec_table_scan(e, db, table, limit),
+        crate::request::BatchOp::ScanFiltered {
+            ref db,
+            ref table,
+            ref preds,
+            ref proj,
+            ref index_hint,
+            ref key_set_hint,
+            limit,
+        } => exec_scan_filtered(
+            e,
+            db,
+            table,
+            preds,
+            proj,
+            index_hint.as_ref(),
+            key_set_hint.as_ref(),
+            limit,
         ),
-        crate::request::BatchOp::SetSchemaOp { ref db, ref table, ref bytes } => {
-            exec_set_schema(e, db, table, bytes)
-        }
-        crate::request::BatchOp::GetSchemaOp { ref db, ref table } => {
-            exec_get_schema(e, db, table)
-        }
+        crate::request::BatchOp::ScanFilteredRows {
+            ref db,
+            ref table,
+            ref index_hint,
+            limit,
+        } => exec_scan_filtered_rows(e, db, table, index_hint.as_ref(), limit),
+        crate::request::BatchOp::IndexScan {
+            ref db,
+            ref table,
+            iid,
+            ref lo,
+            ref hi,
+            limit,
+            with_rows,
+        } => exec_index_scan(
+            e,
+            db,
+            table,
+            iid,
+            lo.as_ref(),
+            hi.as_ref(),
+            limit,
+            with_rows,
+        ),
+        crate::request::BatchOp::SetSchemaOp {
+            ref db,
+            ref table,
+            ref bytes,
+        } => exec_set_schema(e, db, table, bytes),
+        crate::request::BatchOp::GetSchemaOp { ref db, ref table } => exec_get_schema(e, db, table),
         // ⭐ 事务 v1 (F61): COMMIT 原子批 — 先验后写 + 逐 op 应用.
         // shard 单线程 = 批内零并发穿插; 预检失败整批拒绝 (零部分应用);
         // wal_barrier 由 caller (ShardTask 臂) 在回复前统一执行.
         crate::request::BatchOp::TxnApply { ops, read_set } => exec_txn_apply(e, ops, read_set),
         // ⭐ F65: 全局 UNIQUE 占坑原语 (email-shard 单线程原子)
-        crate::request::BatchOp::ReserveUnique { db, table, iid, enc_val, pk, txn_id } => {
-            match block_on_io(e.unique_reserve(&db, &table, iid, &enc_val, &pk, txn_id)) {
-                Ok(None) => crate::request::BatchResult::ReserveOk,
-                Ok(Some((state, holder_txn, holder_pk))) => {
-                    crate::request::BatchResult::ReserveConflict { state, holder_txn, holder_pk }
+        crate::request::BatchOp::ReserveUnique {
+            db,
+            table,
+            iid,
+            enc_val,
+            pk,
+            txn_id,
+        } => match block_on_io(e.unique_reserve(&db, &table, iid, &enc_val, &pk, txn_id)) {
+            Ok(None) => crate::request::BatchResult::ReserveOk,
+            Ok(Some((state, holder_txn, holder_pk))) => {
+                crate::request::BatchResult::ReserveConflict {
+                    state,
+                    holder_txn,
+                    holder_pk,
                 }
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
             }
-        }
-        crate::request::BatchOp::StealUnique { db, table, iid, enc_val, pk, txn_id } => {
-            match block_on_io(e.unique_steal(&db, &table, iid, &enc_val, &pk, txn_id)) {
-                Ok(()) => crate::request::BatchResult::ReserveOk,
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ConfirmUnique { db, table, iid, enc_val, pk, txn_id } => {
-            match block_on_io(e.unique_confirm(&db, &table, iid, &enc_val, &pk, txn_id)) {
-                Ok(()) => crate::request::BatchResult::PutOk,
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
-        crate::request::BatchOp::ReleaseUnique { db, table, iid, enc_val, txn_id } => {
-            match block_on_io(e.unique_release(&db, &table, iid, &enc_val, txn_id)) {
-                Ok(()) => crate::request::BatchResult::PutOk,
-                Err(err) => crate::request::BatchResult::Error(err.to_string()),
-            }
-        }
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::StealUnique {
+            db,
+            table,
+            iid,
+            enc_val,
+            pk,
+            txn_id,
+        } => match block_on_io(e.unique_steal(&db, &table, iid, &enc_val, &pk, txn_id)) {
+            Ok(()) => crate::request::BatchResult::ReserveOk,
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ConfirmUnique {
+            db,
+            table,
+            iid,
+            enc_val,
+            pk,
+            txn_id,
+        } => match block_on_io(e.unique_confirm(&db, &table, iid, &enc_val, &pk, txn_id)) {
+            Ok(()) => crate::request::BatchResult::PutOk,
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
+        crate::request::BatchOp::ReleaseUnique {
+            db,
+            table,
+            iid,
+            enc_val,
+            txn_id,
+        } => match block_on_io(e.unique_release(&db, &table, iid, &enc_val, txn_id)) {
+            Ok(()) => crate::request::BatchResult::PutOk,
+            Err(err) => crate::request::BatchResult::Error(err.to_string()),
+        },
         // ⭐ F66: catalog 快照 — 列当前 db 全表 + schema (任意单 shard).
         crate::request::BatchOp::CatalogDump { db } => {
             let tables = match e.list_tables(&db) {
@@ -807,7 +1102,14 @@ pub(crate) fn exec_scan_filtered(
     use crate::request::BatchResult;
     let mut out = Vec::new();
     match block_on_io(e.table_scan_filtered_local(
-        db, table, preds, proj, index_hint, key_set_hint, limit as usize, &mut out,
+        db,
+        table,
+        preds,
+        proj,
+        index_hint,
+        key_set_hint,
+        limit as usize,
+        &mut out,
     )) {
         Ok(()) => BatchResult::ProjRows(out),
         Err(err) => BatchResult::Error(err.to_string()),
@@ -826,7 +1128,11 @@ pub(crate) fn exec_scan_filtered_rows(
     use crate::request::BatchResult;
     let mut out: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
     match block_on_io(e.table_scan_filtered_rows_local(
-        db, table, index_hint, limit as usize, &mut out,
+        db,
+        table,
+        index_hint,
+        limit as usize,
+        &mut out,
     )) {
         Ok(()) => BatchResult::Rows(out),
         Err(err) => BatchResult::Error(err.to_string()),
@@ -1018,9 +1324,11 @@ pub(crate) fn exec_lpop(
     use crate::request::BatchResult;
     use crate::value_num;
     match block_on_io(e.list_pop(db, table, key, left, count)) {
-        Ok(vs) => {
-            BatchResult::Members(vs.iter().map(|v| value_num::render(v).into_owned()).collect())
-        }
+        Ok(vs) => BatchResult::Members(
+            vs.iter()
+                .map(|v| value_num::render(v).into_owned())
+                .collect(),
+        ),
         Err(err) => BatchResult::Error(err.to_string()),
     }
 }
@@ -1037,9 +1345,11 @@ pub(crate) fn exec_lrange(
     use crate::request::BatchResult;
     use crate::value_num;
     match block_on_io(e.list_range(db, table, key, start, end)) {
-        Ok(vs) => {
-            BatchResult::Members(vs.iter().map(|v| value_num::render(v).into_owned()).collect())
-        }
+        Ok(vs) => BatchResult::Members(
+            vs.iter()
+                .map(|v| value_num::render(v).into_owned())
+                .collect(),
+        ),
         Err(err) => BatchResult::Error(err.to_string()),
     }
 }
@@ -1068,7 +1378,11 @@ pub(crate) fn fmt_score(s: f64) -> Vec<u8> {
 
 /// ⭐ Phase Z: (member, score) 列表 → Members (withscores 时 member/score 交替).
 pub(crate) fn zrows_to_members(rows: Vec<(Vec<u8>, f64)>, withscores: bool) -> Vec<Vec<u8>> {
-    let mut out = Vec::with_capacity(if withscores { rows.len() * 2 } else { rows.len() });
+    let mut out = Vec::with_capacity(if withscores {
+        rows.len() * 2
+    } else {
+        rows.len()
+    });
     for (m, sc) in rows {
         out.push(m);
         if withscores {

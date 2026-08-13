@@ -1,8 +1,8 @@
 //! SQL 纯工具函数 — 不依赖 ConnState 状态, 仅参数/全局类型.
 //! 从 worker/mod.rs 拆分 (2026-08) — 子模块可见父模块私有项.
 
-use super::*;
 use super::sql_encode::render_decimal;
+use super::*;
 
 /// 语句分派: CREATE 广播 schema; INSERT/SELECT 需 schema (缓存 miss 先拉).
 /// ⭐ 事务 v1 (F61): PG 帧流中是否含 ErrorResponse ('E' 帧) —
@@ -50,11 +50,35 @@ pub(crate) fn stmt_where_conds(stmt: &SqlStmt) -> Option<&Pred<Cond>> {
 /// 重建 stmt 替换 conds (折叠后重跑外层用).
 pub(crate) fn stmt_replace_conds(stmt: SqlStmt, new: Pred<Cond>) -> SqlStmt {
     match stmt {
-        SqlStmt::Select { table, items, limit, order, offset, group_by, having, limit_param, offset_param, .. } => {
-            SqlStmt::Select { table, items, conds: new, limit, order, offset, group_by, having, limit_param, offset_param }
-        }
+        SqlStmt::Select {
+            table,
+            items,
+            limit,
+            order,
+            offset,
+            group_by,
+            having,
+            limit_param,
+            offset_param,
+            ..
+        } => SqlStmt::Select {
+            table,
+            items,
+            conds: new,
+            limit,
+            order,
+            offset,
+            group_by,
+            having,
+            limit_param,
+            offset_param,
+        },
         SqlStmt::Delete { table, .. } => SqlStmt::Delete { table, conds: new },
-        SqlStmt::Update { table, sets, .. } => SqlStmt::Update { table, sets, conds: new },
+        SqlStmt::Update { table, sets, .. } => SqlStmt::Update {
+            table,
+            sets,
+            conds: new,
+        },
         other => other,
     }
 }
@@ -82,7 +106,11 @@ pub(crate) fn false_pred() -> Pred<Cond> {
 
 /// ⭐ F74: 该子查询 stmt 的 WHERE 是否含相关列 (ColRef) — 判定关联性.
 pub(crate) fn subquery_has_colref(inner: &SqlStmt) -> bool {
-    stmt_where_conds(inner).is_some_and(|p| p.leaves().iter().any(|c| matches!(c.val, SqlValue::ColRef(_))))
+    stmt_where_conds(inner).is_some_and(|p| {
+        p.leaves()
+            .iter()
+            .any(|c| matches!(c.val, SqlValue::ColRef(_)))
+    })
 }
 
 /// ⭐ F74: 相关等值两侧分类 → (外层列名, 内层列名). 一侧外层一侧内层, 否则 Err.
@@ -93,7 +121,9 @@ pub(crate) fn classify_corr(
     b: &QualCol,
 ) -> Result<(String, String), String> {
     let is_outer = |q: &QualCol| {
-        q.qualifier.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(outer_table))
+        q.qualifier
+            .as_deref()
+            .is_some_and(|x| x.eq_ignore_ascii_case(outer_table))
     };
     let is_inner = |q: &QualCol| match &q.qualifier {
         Some(x) => x.eq_ignore_ascii_case(inner_table),
@@ -110,7 +140,12 @@ pub(crate) fn classify_corr(
 
 /// ⭐ F74: 单个关联 EXISTS 内层 → 非关联 IN 叶 (`外层列 IN (SELECT 内层列 FROM .. WHERE 剩余)`).
 pub(crate) fn decorrelate_exists(outer_table: &str, inner: &SqlStmt) -> Result<Pred<Cond>, String> {
-    let SqlStmt::Select { table: inner_table, conds, .. } = inner else {
+    let SqlStmt::Select {
+        table: inner_table,
+        conds,
+        ..
+    } = inner
+    else {
         return Err("correlated EXISTS inner must be a simple SELECT (v1)".into());
     };
     let Some(conjuncts) = conds.as_conjuncts() else {
@@ -147,7 +182,10 @@ pub(crate) fn decorrelate_exists(outer_table: &str, inner: &SqlStmt) -> Result<P
     };
     let new_inner = SqlStmt::Select {
         table: inner_table.clone(),
-        items: vec![sql::SelectItem::Col { name: inner_col, alias: None }],
+        items: vec![sql::SelectItem::Col {
+            name: inner_col,
+            alias: None,
+        }],
         conds: new_conds,
         limit: None,
         order: vec![],
@@ -191,10 +229,14 @@ pub(crate) fn decorrelate_pred(outer_table: &str, pred: &Pred<Cond>) -> Result<P
     match pred {
         Pred::Leaf(c) => decorrelate_leaf(outer_table, c),
         Pred::And(v) => Ok(Pred::And(
-            v.iter().map(|p| decorrelate_pred(outer_table, p)).collect::<Result<_, _>>()?,
+            v.iter()
+                .map(|p| decorrelate_pred(outer_table, p))
+                .collect::<Result<_, _>>()?,
         )),
         Pred::Or(v) => Ok(Pred::Or(
-            v.iter().map(|p| decorrelate_pred(outer_table, p)).collect::<Result<_, _>>()?,
+            v.iter()
+                .map(|p| decorrelate_pred(outer_table, p))
+                .collect::<Result<_, _>>()?,
         )),
         Pred::Not(b) => Ok(Pred::Not(Box::new(decorrelate_pred(outer_table, b)?))),
     }
@@ -217,7 +259,11 @@ pub(crate) fn decorrelate_stmt(stmt: &SqlStmt) -> Result<SqlStmt, String> {
 pub(crate) fn fold_one_subq(c: &Cond, rows: &[Vec<ColValue>]) -> Result<Pred<Cond>, String> {
     // EXISTS: 哨兵空列名 → 非空真/空假
     if c.col == sql::EXISTS_SENTINEL_COL {
-        return Ok(if rows.is_empty() { false_pred() } else { true_pred() });
+        return Ok(if rows.is_empty() {
+            false_pred()
+        } else {
+            true_pred()
+        });
     }
     // IN 子查询: 各行首列 → set (跳 NULL); 空集 → 恒假
     if c.op == CmpOp::In {
@@ -238,17 +284,30 @@ pub(crate) fn fold_one_subq(c: &Cond, rows: &[Vec<ColValue>]) -> Result<Pred<Con
                 set.len()
             ));
         }
-        return Ok(Pred::Leaf(Cond { col: c.col.clone(), op: CmpOp::In, val: SqlValue::Null, set }));
+        return Ok(Pred::Leaf(Cond {
+            col: c.col.clone(),
+            op: CmpOp::In,
+            val: SqlValue::Null,
+            set,
+        }));
     }
     // 标量子查询: 0 行→假, 1 行→常量, >1→错
     match rows.len() {
         0 => Ok(false_pred()),
         1 => {
-            let sv = rows[0].first().map(colval_to_sqlval).unwrap_or(SqlValue::Null);
+            let sv = rows[0]
+                .first()
+                .map(colval_to_sqlval)
+                .unwrap_or(SqlValue::Null);
             if sv == SqlValue::Null {
                 return Ok(false_pred());
             }
-            Ok(Pred::Leaf(Cond { col: c.col.clone(), op: c.op, val: sv, set: vec![] }))
+            Ok(Pred::Leaf(Cond {
+                col: c.col.clone(),
+                op: c.op,
+                val: sv,
+                set: vec![],
+            }))
         }
         _ => Err("subquery returns more than one row".into()),
     }
@@ -268,12 +327,16 @@ pub(crate) fn fold_pred_subq(
                 Ok(Pred::Leaf(c.clone()))
             }
         }
-        Pred::And(v) => {
-            Ok(Pred::And(v.iter().map(|p| fold_pred_subq(p, it)).collect::<Result<_, _>>()?))
-        }
-        Pred::Or(v) => {
-            Ok(Pred::Or(v.iter().map(|p| fold_pred_subq(p, it)).collect::<Result<_, _>>()?))
-        }
+        Pred::And(v) => Ok(Pred::And(
+            v.iter()
+                .map(|p| fold_pred_subq(p, it))
+                .collect::<Result<_, _>>()?,
+        )),
+        Pred::Or(v) => Ok(Pred::Or(
+            v.iter()
+                .map(|p| fold_pred_subq(p, it))
+                .collect::<Result<_, _>>()?,
+        )),
         Pred::Not(b) => Ok(Pred::Not(Box::new(fold_pred_subq(b, it)?))),
     }
 }

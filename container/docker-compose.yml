@@ -1,8 +1,13 @@
 # NexusDB docker-compose — 一键起库 + 持久化卷
-# 用法:  docker compose up -d   /   docker compose logs -f   /   docker compose down
+# 用法:  docker compose -f container/docker-compose.yml up -d
+#        docker compose -f container/docker-compose.yml logs -f
+#        docker compose -f container/docker-compose.yml down
+# (build context 固定为仓库根, -f 指向本 compose 文件)
 services:
   nexusdb:
-    build: .
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
     image: nexusdb:latest
     container_name: nexusdb
     restart: unless-stopped
@@ -17,9 +22,9 @@ services:
       # - ./certs:/etc/nexusdb/certs:ro
     # ⭐ 让 NexusDB 在容器内使用 io_uring:
     #   compose 的 security_opt 内联 JSON 会因过长触发 "file name too long",
-    #   因此用 docker run 脚本 (deploy/run.sh) 启动, 由 daemon 直接读取 profile 文件。
+    #   因此用 docker run 脚本 (container/run.sh) 启动, 由 daemon 直接读取 profile 文件。
     #   docker run 支持 seccomp=<file> 由 daemon 读文件, 无长度限制。
-    #   参考 deploy/run.sh 的完整启动命令。
+    #   参考 container/run.sh 的完整启动命令。
     cap_add:
       - SYS_ADMIN
     healthcheck:

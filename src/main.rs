@@ -7,21 +7,38 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use network::{KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind};
-use shard_manager::{ShardManager, ShardManagerOptions};
+use shard_manager::ShardManager;
+#[cfg(target_os = "linux")]
+use shard_manager::ShardManagerOptions;
 
 /// 信号标志 (SIGINT/SIGTERM → true).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
 extern "C" fn on_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn console_handler(_ctrl_type: u32) -> i32 {
+    SHUTDOWN.store(true, Ordering::Release);
+    1
+}
+
+#[cfg(target_os = "linux")]
 fn main() {
-    let mut config_path = PathBuf::from("./nexusdb.toml");
+    // 默认查找: ./nexusdb.toml → 找不到则 ./config/nexusdb.toml (新结构)
+    // 用户显式 --config 时, 严格用指定路径 (不静默回退; 找不到就报错)
+    let legacy_default = PathBuf::from("./nexusdb.toml");
+    let mut config_path = legacy_default.clone();
     let mut args = std::env::args().skip(1);
+    let mut user_explicit = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" | "-c" => {
@@ -29,6 +46,7 @@ fn main() {
                     eprintln!("--config requires a path");
                     std::process::exit(2);
                 }));
+                user_explicit = true;
             }
             "--version" | "-V" => {
                 println!("NexusDB {}", env!("CARGO_PKG_VERSION"));
@@ -43,6 +61,13 @@ fn main() {
     }
 
     // 1. 加载配置 (文件不存在 → 默认值)
+    //    仅在默认路径时回退: ./nexusdb.toml 不在则查 ./config/nexusdb.toml
+    if !user_explicit && config_path == legacy_default && !config_path.exists() {
+        let candidate = PathBuf::from("./config/nexusdb.toml");
+        if candidate.exists() {
+            config_path = candidate;
+        }
+    }
     let (cfg, from_file) = match config::NexusConfig::load_or_default(&config_path) {
         Ok(v) => v,
         Err(e) => {
@@ -105,8 +130,7 @@ fn main() {
         // reply_bus 数 = 共享池 worker 数 (worker_id 0..total_workers-1).
         reply_bus_count: Some(total_workers.max(cfg.storage.num_shards)),
         // ⭐ WAL (F60): off | periodic (默认) | strict (validate 已挡非法值)
-        wal_mode: storage::wal::WalMode::parse(&cfg.storage.wal_mode)
-            .unwrap_or_default(),
+        wal_mode: storage::wal::WalMode::parse(&cfg.storage.wal_mode).unwrap_or_default(),
     };
     let mgr = match ShardManager::open(opts) {
         Ok(m) => Arc::new(m),
@@ -192,8 +216,8 @@ fn main() {
         limits,
         auth_password: None,
         worker_id_base: 0,
-            sql_shared: sql_shared.clone(),
-            tls_config: None,
+        sql_shared: sql_shared.clone(),
+        tls_config: None,
         shared_workers: Some(shared_pool.clone()),
     }) {
         Ok(s) => s,
@@ -242,7 +266,10 @@ fn main() {
     };
 
     // 6c. ⭐ Z2: SQL 门面 (MySQL wire protocol, mysql cli 直连)
-    let sql_enabled = !cfg.server.sql_addr.is_empty();
+    // Windows P1 currently exposes the Binary + RESP facades through the
+    // portable socket runtime. SQL/PG/HTTP remain on the Linux reactor until
+    // the IOCP worker lands, so do not let default config make Windows exit.
+    let sql_enabled = cfg!(target_os = "linux") && !cfg.server.sql_addr.is_empty();
     let sql_server = if sql_enabled {
         let sql_addr = cfg.server.sql_addr.parse().expect("validated sql addr");
         // 空密码 = 免密登录
@@ -281,7 +308,7 @@ fn main() {
     };
 
     // 6d. ⭐ S4: PostgreSQL wire 门面 (psql 直连; 密码复用 sql_password)
-    let pg_enabled = !cfg.server.pg_addr.is_empty();
+    let pg_enabled = cfg!(target_os = "linux") && !cfg.server.pg_addr.is_empty();
     let pg_server = if pg_enabled {
         let pg_addr = cfg.server.pg_addr.parse().expect("validated pg addr");
         let pg_password = if cfg.server.sql_password.is_empty() {
@@ -305,7 +332,11 @@ fn main() {
             shared_workers: Some(shared_pool.clone()),
         }) {
             Ok(s) => {
-                nlog::info!("main", "SQL (PostgreSQL wire) listening on {}", s.local_addr());
+                nlog::info!(
+                    "main",
+                    "SQL (PostgreSQL wire) listening on {}",
+                    s.local_addr()
+                );
                 Some(s)
             }
             Err(e) => {
@@ -320,7 +351,7 @@ fn main() {
 
     // 6e. ⭐ H1: HTTP REST 门面 (JSON + CORS + /metrics)
     network::metrics::init_start_time();
-    let http_enabled = !cfg.server.http_addr.is_empty();
+    let http_enabled = cfg!(target_os = "linux") && !cfg.server.http_addr.is_empty();
     let http_server = if http_enabled {
         let http_addr = cfg.server.http_addr.parse().expect("validated http addr");
         network::http_config::set_cors_origin(Some(cfg.server.http_cors_origin.clone()));
@@ -442,4 +473,182 @@ fn ensure_catalog(mgr: &ShardManager, db: &str, table: &str) {
             }
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn main() {
+    use network::{KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind};
+    use shard_manager::{ShardManager, ShardManagerOptions};
+    use std::time::Duration;
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // Keep the same CLI contract as Linux.  A missing config is still usable
+    // on Windows by selecting the portable stdfs default below.
+    // 默认查找顺序: ./config/nexusdb.toml; 找不到就用内置默认 (stdfs + 全 facade 关闭)
+    // 用户显式 --config 时, 严格用指定路径 (不静默回退; 找不到就报错)
+    let default_path = PathBuf::from("./config/nexusdb.toml");
+    let mut config_path = default_path.clone();
+    let mut args = std::env::args().skip(1);
+    let mut user_explicit = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" | "-c" => {
+                config_path = PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("--config requires a path");
+                    std::process::exit(2);
+                }));
+                user_explicit = true;
+            }
+            "--version" | "-V" => {
+                println!("NexusDB {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                eprintln!("usage: nexusdb [--config <path>] [--version]");
+                std::process::exit(2);
+            }
+        }
+    }
+    // 仅在默认路径时回退: ./config/nexusdb.toml 不存在 → ./nexusdb-test.toml (老 M2 验证)
+    // 都不在就用内置默认 (stdfs + 全 facade 关闭)
+    if !user_explicit && config_path == default_path && !config_path.exists() {
+        let legacy = PathBuf::from("./nexusdb-test.toml");
+        if legacy.exists() {
+            eprintln!(
+                "[nexusdb] WARN: {} not found, falling back to legacy {}",
+                config_path.display(),
+                legacy.display()
+            );
+            config_path = legacy;
+        }
+    }
+    let (mut cfg, from_file) = match config::NexusConfig::load_or_default(&config_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[nexusdb] config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "[nexusdb] Windows M2: config {} (from_file={from_file}, data={})",
+        config_path.display(),
+        cfg.storage.block_root.display()
+    );
+    if !from_file {
+        // Linux defaults to io_uring.  Windows has no such backend, so the
+        // absence of a config means the portable storage default rather than
+        // an immediately rejected Linux-only default.
+        cfg.storage.io_backend = "stdfs".to_string();
+    }
+
+    // 2. 启动 ShardManager (io_backend = "stdfs" 走 std fs, 不依赖 io_uring)
+    let io_backend = cfg.storage.io_backend().expect("validated backend");
+    let total_workers = cfg.server.worker_count.max(1);
+    let opts = ShardManagerOptions {
+        num_shards: cfg.storage.num_shards,
+        block_root: cfg.storage.block_root.clone(),
+        create_if_missing: cfg.storage.create_if_missing,
+        io_backend,
+        io_config: storage::IoBackendConfig {
+            backend: io_backend,
+            ..Default::default()
+        },
+        chunk_cache_size: cfg.storage.chunk_cache_size,
+        reply_bus_count: Some(total_workers.max(cfg.storage.num_shards)),
+        wal_mode: storage::wal::WalMode::parse(&cfg.storage.wal_mode).unwrap_or_default(),
+    };
+    let mgr = match ShardManager::open(opts) {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            eprintln!("[nexusdb] shard manager open failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 3. 确保默认 db/table 存在
+    ensure_catalog(&mgr, &cfg.storage.default_db, &cfg.storage.default_table);
+
+    // 4. 启动 Binary 端口 (M2)
+    let limits = KvLimits {
+        max_key_bytes: cfg.server.max_key_bytes,
+        max_value_bytes: cfg.server.max_value_bytes,
+    };
+    let listen_addr: std::net::SocketAddr = cfg.server.listen_addr.parse().expect("validated addr");
+    let binary_server = match NetworkServer::start(NetworkServerConfig {
+        listen_addr,
+        protocol: ProtocolKind::Binary,
+        worker_count: total_workers,
+        limits,
+        shard_manager: mgr.clone(),
+        default_db: cfg.storage.default_db.clone(),
+        default_table: cfg.storage.default_table.clone(),
+        auth_password: None,
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[nexusdb] Binary server start failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "[nexusdb] Binary listening on {}",
+        binary_server.local_addr()
+    );
+
+    // 5. 启动 RESP 端口 (M2)
+    let resp_server = if !cfg.server.redis_addr.is_empty() {
+        let resp_addr: std::net::SocketAddr =
+            cfg.server.redis_addr.parse().expect("validated redis addr");
+        let auth_password = if cfg.server.redis_password.is_empty() {
+            None
+        } else {
+            Some(cfg.server.redis_password.clone())
+        };
+        match NetworkServer::start(NetworkServerConfig {
+            listen_addr: resp_addr,
+            protocol: ProtocolKind::Resp,
+            worker_count: total_workers,
+            limits,
+            shard_manager: mgr.clone(),
+            default_db: cfg.storage.default_db.clone(),
+            default_table: cfg.storage.default_table.clone(),
+            auth_password,
+        }) {
+            Ok(s) => {
+                eprintln!("[nexusdb] RESP listening on {}", s.local_addr());
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("[nexusdb] RESP server start failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // 6. 等 Ctrl-C
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(console_handler), 1);
+    }
+    eprintln!("[nexusdb] running (Ctrl-C to quit)");
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!("[nexusdb] shutdown requested");
+
+    let _ = binary_server.shutdown();
+    if let Some(s) = resp_server {
+        let _ = s.shutdown();
+    }
+    match Arc::try_unwrap(mgr) {
+        Ok(m) => {
+            if let Err(e) = m.close() {
+                eprintln!("[nexusdb] shard manager close failed: {e}");
+            }
+        }
+        Err(_) => eprintln!("[nexusdb] shard manager still referenced after network shutdown"),
+    }
+    eprintln!("[nexusdb] shutdown complete");
 }

@@ -17,15 +17,19 @@
 //! - 背压策略: 队列满时 Debug/Trace 丢弃计数, Error/Warn 自旋重试 — 绝不阻塞数据路径
 //! - Error/Warn 额外直通 stderr (低频, 保障故障可见)
 
-use std::cell::RefCell;
 use std::fmt;
 use std::io;
-use std::os::unix::io::{IntoRawFd, RawFd};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "linux")]
+use std::cell::RefCell;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::{IntoRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::rc::Rc;
 
 use crossbeam_queue::ArrayQueue;
 
@@ -92,6 +96,7 @@ const DEFAULT_QUEUE_CAP: usize = 16384;
 /// 多生产者无锁日志队列. 前端 push, log 线程 drain.
 pub struct LogQueue {
     ring: ArrayQueue<String>,
+    #[cfg(target_os = "linux")]
     eventfd: RawFd,
     /// coalesced 通知计数: 首条 push (0→1) 才写 eventfd, 后续搭车.
     pending: AtomicU64,
@@ -101,10 +106,13 @@ pub struct LogQueue {
 
 impl LogQueue {
     pub fn with_capacity(cap: usize) -> Self {
+        #[cfg(target_os = "linux")]
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        #[cfg(target_os = "linux")]
         assert!(fd >= 0, "eventfd creation failed");
         Self {
             ring: ArrayQueue::new(cap),
+            #[cfg(target_os = "linux")]
             eventfd: fd,
             pending: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -136,9 +144,12 @@ impl LogQueue {
 
     /// 无条件写 eventfd (shutdown 唤醒用).
     pub fn notify(&self) {
-        let val: u64 = 1;
-        unsafe {
-            libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+        #[cfg(target_os = "linux")]
+        {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+            }
         }
     }
 
@@ -162,6 +173,7 @@ impl LogQueue {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn eventfd(&self) -> RawFd {
         self.eventfd
     }
@@ -169,6 +181,7 @@ impl LogQueue {
 
 impl Drop for LogQueue {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         unsafe {
             libc::close(self.eventfd);
         }
@@ -211,7 +224,9 @@ impl Backend {
             .truncate(false) // append 语义: 自管 offset 续写, 不截断历史日志
             .write(true)
             .open(&cfg.file)?;
+        #[cfg(target_os = "linux")]
         let start_offset = file.metadata()?.len();
+        #[cfg(target_os = "linux")]
         let fd = file.into_raw_fd();
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -219,7 +234,12 @@ impl Backend {
         let queue2 = queue.clone();
         let join = std::thread::Builder::new()
             .name("nlog-flusher".to_string())
-            .spawn(move || backend_main(fd, start_offset, cfg, queue2, stop2))
+            .spawn(move || {
+                #[cfg(target_os = "linux")]
+                backend_main(fd, start_offset, cfg, queue2, stop2);
+                #[cfg(not(target_os = "linux"))]
+                backend_main_portable(file, cfg, queue2, stop2);
+            })
             .map_err(|e| io::Error::other(format!("spawn nlog-flusher: {e}")))?;
 
         Ok(Self {
@@ -241,6 +261,7 @@ impl Backend {
 
 /// log 线程主函数: 自建 Scheduler (独立 io_uring ring), 遵守
 /// "spawn/drive 全在本线程" 的多线程契约 (同 shard_thread_main).
+#[cfg(target_os = "linux")]
 fn backend_main(
     fd: RawFd,
     start_offset: u64,
@@ -296,6 +317,7 @@ fn backend_main(
 
 /// 用 io_uring 协程把 buf 写入 fd (write_all + fsync).
 /// 写盘期间双缓冲: 继续 drain 新日志进 next_acc.
+#[cfg(target_os = "linux")]
 fn flush_uring(
     rt: &scheduler::SchedHandle,
     fd: RawFd,
@@ -332,6 +354,42 @@ fn flush_uring(
         rt.clone().drive_until_idle(256);
         // 双缓冲: 写盘等待期间继续吸收新日志
         queue.drain_into(next_acc);
+    }
+}
+
+/// 非 Linux 后端：保持同一无锁队列和批量语义，以短轮询替代 eventfd/io_uring。
+/// 这条路径优先保证 Windows 原生可运行和退出时落盘；Linux 仍使用原有零空转路径。
+#[cfg(not(target_os = "linux"))]
+fn backend_main_portable(
+    mut file: std::fs::File,
+    cfg: BackendConfig,
+    queue: Arc<LogQueue>,
+    stop: Arc<AtomicBool>,
+) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let _ = file.seek(SeekFrom::End(0));
+    let mut acc = Vec::with_capacity(cfg.buffer_bytes.saturating_mul(2));
+    let mut last_flush = Instant::now();
+    // 保持唤醒上界小而固定；Windows MVP 不让日志后台线程忙等。
+    let wait = cfg.flush_interval.min(Duration::from_millis(10));
+    loop {
+        let stopping = stop.load(Ordering::Acquire);
+        queue.drain_into(&mut acc);
+        let timed_out = last_flush.elapsed() >= cfg.flush_interval;
+        if !acc.is_empty() && (stopping || acc.len() >= cfg.buffer_bytes || timed_out) {
+            if file.write_all(&acc).is_ok() {
+                let _ = file.sync_data();
+            }
+            acc.clear();
+            last_flush = Instant::now();
+        }
+        if stopping && queue.is_empty() && acc.is_empty() {
+            break;
+        }
+        if !stopping {
+            std::thread::sleep(wait);
+        }
     }
 }
 
@@ -426,6 +484,7 @@ pub fn log(level: Level, module: &str, args: fmt::Arguments) {
 }
 
 /// 格式化: `[2026-07-24 01:23:45.678][INFO][module] msg\n`
+#[cfg(target_os = "linux")]
 fn format_line(level: Level, module: &str, args: fmt::Arguments) -> String {
     let (tm, millis) = now_tm();
     format!(
@@ -443,6 +502,7 @@ fn format_line(level: Level, module: &str, args: fmt::Arguments) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn now_tm() -> (libc::tm, u32) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -455,9 +515,36 @@ fn now_tm() -> (libc::tm, u32) {
     (tm, now.subsec_millis())
 }
 
+#[cfg(target_os = "linux")]
 fn today_yyyymmdd() -> String {
     let (tm, _) = now_tm();
-    format!("{:04}{:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
+    format!(
+        "{:04}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn format_line(level: Level, module: &str, args: fmt::Arguments) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "[unix-{}.{:03}][{}][{}] {}\n",
+        now.as_secs(),
+        now.subsec_millis(),
+        level.as_str(),
+        module,
+        args
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn today_yyyymmdd() -> String {
+    // 保持文件名稳定且不引入平台特定时间 API；记录本身带精确 epoch 时间戳。
+    "current".to_string()
 }
 
 // ===== 宏 =====

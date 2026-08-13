@@ -1283,7 +1283,7 @@ NexusDB 通过 **把并发问题变成消息传递问题**，彻底回避这一�
 ### 启动服务器
 
 ```bash
-RUST_MIN_STACK=67108864 cargo run --release -- --config nexusdb.toml
+RUST_MIN_STACK=67108864 cargo run --release -- --config config/nexusdb.toml
 ```
 
 默认监听:
@@ -1296,7 +1296,7 @@ RUST_MIN_STACK=67108864 cargo run --release -- --config nexusdb.toml
 - **memtier_benchmark**: 标准 Redis 压测工具, 全流程可用
 - **自家客户端**: `crates/network/src/protocol/binary.rs` 是 codec 参考实现
 
-### 配置 `nexusdb.toml`
+### 配置 `config/nexusdb.toml`
 
 ```toml
 [server]

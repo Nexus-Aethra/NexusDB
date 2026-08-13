@@ -10,6 +10,148 @@
 
 ---
 
+## 2026-08-13 会话二十三 (根目录文档归类: AGENTS/CHANGELOG/DESIGN → docs/)
+
+动机: 根目录除了 `README.md` / `README-CN.md` 还剩 `AGENTS.md` / `CHANGELOG.md` / `DESIGN.md` 三个项目级 md, 跟用户/开发两类读者都相关但没归类到一起。统一搬到 `docs/` 下, 仓库根只留面向用户的两份 README。
+
+**变更**:
+- `AGENTS.md` → `docs/AGENTS.md`
+- `CHANGELOG.md` → `docs/CHANGELOG.md`
+- `DESIGN.md` → `docs/DESIGN.md`
+- `LICENSE` 不动 (项目元数据, 非文档)
+- `README.md` / `README-CN.md` 留根 (用户第一眼看到的入口)
+
+**引用同步**:
+- `README.md` / `README-CN.md` 内 `[./DESIGN.md]` → `[./docs/DESIGN.md]` 等
+- `docs/README.md` 内 `../DESIGN.md` → `./DESIGN.md` 等 (现在与目标同层)
+- `docs/GUIDE.md` / `docs/GUIDE-CN.md` 内 `../DESIGN.md` → `./DESIGN.md` 等
+- `container/README.md` 内 `../AGENTS.md` → `../docs/AGENTS.md` 等
+- `docs/archive/specs/2026-07-17-scheduler-crate-design.md` 内 `../../../DESIGN.md` → `../../DESIGN.md` (从根移走后的 broken 链接修复)
+- `docs/archive/plans/*` 内 `../../DESIGN.md` 自动指向新位置, 不用改
+- `docs/CHANGELOG.md` / `docs/DESIGN.md` / `docs/AGENTS.md` 内部纯文本引用保持原样 (历史快照, 描述性)
+
+**build 验证**: `cargo build --release` 0 errors (纯文档改动, 没碰代码)。
+
+---
+
+## 2026-08-13 会话二十二 (目录重组: config/ + container/)
+
+动机: 根目录散落 `nexusdb.toml` / `Dockerfile` / `docker-compose.yml` / `deploy/*` / `scripts/bench.toml` / `scripts/smoke.toml`, 看着乱。
+
+**变更**:
+- `nexusdb.toml`, `nexusdb-test.toml` 从仓库根移入 `config/`
+- `scripts/bench.toml`, `scripts/smoke.toml` 从 `scripts/` 移入 `config/`(精简命名: `config/bench.toml`, `config/smoke.toml`)
+- `Dockerfile`, `docker-compose.yml`, `.dockerignore` 从仓库根移入 `container/`
+- `deploy/` 整目录移入 `container/` 并精简命名:
+  - `deploy/nexusdb.docker.toml` → `container/docker.toml`
+  - `deploy/nexusdb.stdfs.toml` → `container/docker-stdfs.toml`
+  - `deploy/run.sh` → `container/run.sh`
+  - `deploy/seccomp-io_uring.json` → `container/seccomp-io_uring.json`
+- `scripts/` 保留 `.sh` / `.py` 脚本(只移走 toml)
+- `main.rs` 默认 config 路径:
+  - Linux: `./nexusdb.toml` → 找不到时回退 `./config/nexusdb.toml`
+  - Windows: `./config/nexusdb.toml` → 找不到时回退 `./nexusdb-test.toml` (老 M2 验证配置)
+  - **用户显式 `--config <path>` 时不静默回退**; 路径不存在直接报错
+- `container/docker-compose.yml` 改用 `build.context = ".."` + `dockerfile = "container/Dockerfile"`(build context 仍是仓库根)
+- `container/run.sh` 同步更新 `docker build -f` 路径
+- `config/README.md` + `container/README.md` 新增, 列出每个文件用途
+
+**README/GUIDE/AGENTS/DESIGN**: 所有路径引用同步更新(`./nexusdb.toml` → `config/nexusdb.toml` 等)。CHANGELOG 历史记录保留原文件名作为事件快照。
+
+**build 验证**: `cargo build --release` 0 errors。
+
+---
+
+## 2026-08-13 会话二十一 (Windows 可移植性 — P1 MVP 跑通 + IOCP 尝试回退)
+
+目标: 让 NexusDB 在 Windows 原生可运行, redis-cli 直连能 SET/GET/DEL。计划见
+`docs/plans/2026-08-13-windows-portability.md` + `docs/plans/2026-08-13-windows-iocp.md`。
+
+### 路线决定
+
+- **P1 落地**: `runtime_iocp.rs` 实际采用 `std::net::TcpListener` + 每连接 `std::thread` 阻塞
+  IO, 不再追 raw `WSASocketW` + `AcceptEx` 的 IOCP 完成端口路径 (M1/M2 写完编译通过,
+  但碰到 Win10/11 `AcceptEx` 同步返回 TRUE 但 child 仍 pre-alloc 的 OS 怪异行为, 详见
+  IOCP 设计文档踩坑记录)。`#[cfg(target_os = "windows")]` 入口在 `lib.rs` 已就位, 后续
+  切 IOCP 只需替换 acceptor / run_conn 内部实现, 上层协议 / shard 入口不动。
+- **P2 暂缓**: IOCP / RIO 性能优化挪到 P3 之后; 重新启用时必须先解决 `AcceptEx` 同步
+  成功但 child pre-alloc 行为 (复现 + 定位 OS 行为 + 备选 wepoll / winsock catalog)。
+- **Windows runtime 主推 P1**: Binary 5433 + RESP 6380, 其余 SQL/PG/HTTP/TLS 暂只在
+  Linux 路径上工作。
+
+### 关键改动
+
+- **P1 路径 (已合并)**: `crates/network/src/runtime_iocp.rs` 全量重写 (~250 LoC), 用
+  `std::net::TcpListener::incoming()` + 每 conn `std::thread` 跑同步 read/write +
+  RESP/Binary dispatch。`#[cfg(target_os = "windows")]` 隔离, Linux 路径完全不动。
+- **CLI 合约 (Windows)**: `nexusdb [--config <path>] [--version]`, 跟 Linux 一致;
+  缺省 config 自动用 `stdfs` 后端 (Linux 默认 `io_uring` 在 Windows 不可用), 不会
+  启动时因 backend 拒绝而崩。
+- **依赖**: Cargo.toml 加 `windows-sys = "0.61"` (Windows-only, 用于
+  `SetConsoleCtrlHandler` 处理 Ctrl-C)。
+- **优雅停止**: `NetworkServer::shutdown` 调 `stream.shutdown(Shutdown::Both)` 唤醒
+  阻塞的 conn thread, join 所有 conn, 释放 `Arc<ShardManager>`, 调 `mgr.close()`
+  flush WAL; acceptor 端持续 `reap_finished_connections` 回收已结束 conn 的
+  JoinHandle, 避免长时间运行后句柄堆积。
+- **测试**: `cargo test -p network --lib` 17/17 通过 (协议层 / crypto / value_codec);
+  workspace `cargo build --release` 0 错误 (Windows 原机)。
+- **smoke 验证** (原机 `nexusdb.exe --config nexusdb-test.toml`):
+  ```
+  PING              → PONG
+  SET user:1 alice  → OK
+  GET user:1        → alice
+  SET user:2 bob    → OK
+  GET user:2        → bob
+  DEL user:1        → 1
+  GET user:1        → (nil)
+  SET counter 100   → OK
+  GET counter       → 100
+  ```
+  INCR / HSET / LPUSH / SADD / ZADD / DBSIZE / INFO / CLIENT LIST 返回 "runtime_iocp
+  does not yet support" 错误 — 跟 Linux `portable.rs` 行为完全一致 (协议层本身没
+  实现这些命令, 不是 Windows runtime 缺); 下一阶段优先补 RESP dispatch 树。
+- **WAL 持久化**: 关闭后重启 `[storage] WAL replay: N applied` 自动恢复 SET/GET 数据。
+
+### 踩坑 / gotchas (跨项目有用, 写入 agent memory)
+
+- **AcceptEx 在 Win10/11 overlapped listener + 没 client 时同步返回 TRUE with bytes=0**,
+  OS 投递完成事件到 IOCP, 但 child socket 仍是 pre-alloc 状态。
+  - 症状: GQCS 立刻拿到 `key=ACCEPT_KEY` 事件; `SO_UPDATE_ACCEPT_CONTEXT` 失败 10057
+    WSAENOTCONN; `WSARecv` 在 child 上失败 10057; `closesocket(child) + re-arm` 触发 OS
+    复用 handle 编号, 整个 acceptor 进入每秒数十万次的 re-arm 死循环。
+  - 解决: 暂不追 IOCP, 改用 std::net blocking path。
+- **`#[repr(C)]` 在 IOCP `OverlappedData` 是硬要求**: Rust 默认 `repr(Rust)` 允许
+  字段重排, OVERLAPPED 不在 offset 0 时 GQCS 拿到的 ptr 强转 `*mut OverlappedData`
+  拿到错位数据, 导致 dispatch 错乱。结构体必须 `#[repr(C)]` + 第一个字段是
+  `overlapped: OVERLAPPED`。
+- **`windows-sys = "0.61"` 类型细节**:
+  - `ACCEPTEX` 不存在, 是 `LPFN_ACCEPTEX` (type alias `Option<unsafe extern "system" fn(...)>`)
+  - `setsockopt` 第 4 参是 `PSTR` (`*const u8`), 不是 `*const c_void`
+  - `WSASocketW` 必须传 `WSA_FLAG_OVERLAPPED` 才能配合 IOCP
+- **Listener non-blocking 状态继承 child**: `set_nonblocking(true)` on listener
+  (用于 `stop` atomic poll) 会被 winsock 继承到 accepted child socket。child 的 read
+  在无数据时返回 `WSAEWOULDBLOCK` (10035) 或 `WSAETIMEDOUT` — **必须**在 read loop
+  retry + 短 sleep, **不能** `return Err`, 否则 client 看到 "An existing connection
+  was forcibly closed"。
+
+### 环境备注 (这台 Windows 测试机)
+
+- `redis-server` (`Redis.Redis` winget 包) 默认监听 6379, 跑在 SYSTEM 账户, 没 admin
+  杀不掉; `nexusdb-test.toml` 把 RESP 端口改成 6380 避让。生产部署可改回 6379。
+- Rust 工具链在 `D:\.cargo` + `D:\.rustup` (从 C 盘迁过来, 1.68 GB 节省 C 盘空间);
+  `D:\.cargo\config.toml` 用 USTC sparse 镜像, 实测 312 ms vs crates.io 5.3 s。
+
+### 边界 / 未做
+
+- 协议层 INCR/HSET/LPUSH/SADD/ZADD/DBSIZE/INFO/CLIENT LIST 在 `portable.rs` (Linux
+  fallback) 也是 "does not yet support", 跟 Windows runtime 无关; 下一阶段优先
+  补 RESP dispatch 树 (M2.5), 不切 IOCP。
+- MySQL wire (5434) / PostgreSQL wire (5435) / HTTP REST (6778) / TLS 仍仅 Linux
+  路径; Windows 启动只 bind Binary + RESP。
+- memtier 压测 / 860+ tests 跨平台矩阵 / RST_STREAM 调优 都不在 P1 验收范围。
+
+---
+
 ## 2026-08-03 会话二十 (Portal 存储引擎替换 — PG 门面实测打通 2 大阻塞 + 参数 OID 推断)
 
 目标: 用 NexusDB 替换 PostgreSQL 作为 Nexus-Portal 存储引擎。实测复现 portal 启动卡死, 用真实 pgx 客户端 (宿主机 + 容器双路径) + tcpdump 抓包定位并修复 2 大阻塞, portal 完整启动 (迁移 + JWT + admin 引导 + 登录) 且幂等重启稳定。
