@@ -228,6 +228,18 @@ Linux 路径上 `sql_dispatch::sql_dispatch_stmt` 调 `ShardManager` 的 API,API
 - 接 auth 处理、INCR、DEL 聚合、ZSet 渲染
 - 验证:之前完整跑过的 redis-cli smoke (SET/GET/DEL/INCR/HSET/LPUSH/SADD/ZADD/DBSIZE/INFO/CLIENT LIST)
 
+#### M2 当前实现边界（2026-08-13）
+
+当前 Windows M2 先采用每连接阻塞线程来交付 Binary/RESP 基础读写，不是 IOCP
+completion worker。关闭流程会停止 acceptor、`shutdown(Shutdown::Both)` 中断所有阻塞连接、
+join 连接线程后才释放 `ShardManager`，确保 WAL/存储的 final close 能执行；已结束连接的
+join handle 在 acceptor 中持续回收。Windows 保持 `nexusdb [--config <path>] [--version]`
+CLI 合约，缺省配置自动使用 `stdfs`，而 `nexusdb-test.toml` 仅是显式 smoke 示例。
+
+现有 `crates/network/tests` 大多为 Linux epoll/SQL 集成测试，尚未按 target gate；因此它们
+不能作为 Windows `--tests` 交叉编译套件。Windows 当前验收为 workspace check + 原机
+Binary/RESP smoke，跨平台集成测试矩阵是后续 M3 前需要补齐的工作。
+
 ### M3 — Binary 协议 (1 天)
 
 **目标**:Binary 协议 smoke 通。

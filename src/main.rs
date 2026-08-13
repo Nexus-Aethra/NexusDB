@@ -7,10 +7,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use network::{KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind};
-use shard_manager::{ShardManager, ShardManagerOptions};
+use shard_manager::ShardManager;
+#[cfg(target_os = "linux")]
+use shard_manager::ShardManagerOptions;
 
 /// 信号标志 (SIGINT/SIGTERM → true).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -461,14 +465,35 @@ fn ensure_catalog(mgr: &ShardManager, db: &str, table: &str) {
 
 #[cfg(target_os = "windows")]
 fn main() {
-    use std::time::Duration;
     use network::{KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind};
     use shard_manager::{ShardManager, ShardManagerOptions};
+    use std::time::Duration;
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 
-    // 1. 加载 config (default path: ./nexusdb-test.toml)
-    let config_path = PathBuf::from("./nexusdb-test.toml");
-    let (cfg, from_file) = match config::NexusConfig::load_or_default(&config_path) {
+    // Keep the same CLI contract as Linux.  A missing config is still usable
+    // on Windows by selecting the portable stdfs default below.
+    let mut config_path = PathBuf::from("./nexusdb.toml");
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" | "-c" => {
+                config_path = PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("--config requires a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--version" | "-V" => {
+                println!("NexusDB {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                eprintln!("usage: nexusdb [--config <path>] [--version]");
+                std::process::exit(2);
+            }
+        }
+    }
+    let (mut cfg, from_file) = match config::NexusConfig::load_or_default(&config_path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[nexusdb] config error: {e}");
@@ -476,9 +501,16 @@ fn main() {
         }
     };
     eprintln!(
-        "[nexusdb] Windows M2: config loaded (from_file={from_file}, data={})",
+        "[nexusdb] Windows M2: config {} (from_file={from_file}, data={})",
+        config_path.display(),
         cfg.storage.block_root.display()
     );
+    if !from_file {
+        // Linux defaults to io_uring.  Windows has no such backend, so the
+        // absence of a config means the portable storage default rather than
+        // an immediately rejected Linux-only default.
+        cfg.storage.io_backend = "stdfs".to_string();
+    }
 
     // 2. 启动 ShardManager (io_backend = "stdfs" 走 std fs, 不依赖 io_uring)
     let io_backend = cfg.storage.io_backend().expect("validated backend");
@@ -512,8 +544,7 @@ fn main() {
         max_key_bytes: cfg.server.max_key_bytes,
         max_value_bytes: cfg.server.max_value_bytes,
     };
-    let listen_addr: std::net::SocketAddr =
-        cfg.server.listen_addr.parse().expect("validated addr");
+    let listen_addr: std::net::SocketAddr = cfg.server.listen_addr.parse().expect("validated addr");
     let binary_server = match NetworkServer::start(NetworkServerConfig {
         listen_addr,
         protocol: ProtocolKind::Binary,
@@ -580,6 +611,14 @@ fn main() {
     let _ = binary_server.shutdown();
     if let Some(s) = resp_server {
         let _ = s.shutdown();
+    }
+    match Arc::try_unwrap(mgr) {
+        Ok(m) => {
+            if let Err(e) = m.close() {
+                eprintln!("[nexusdb] shard manager close failed: {e}");
+            }
+        }
+        Err(_) => eprintln!("[nexusdb] shard manager still referenced after network shutdown"),
     }
     eprintln!("[nexusdb] shutdown complete");
 }

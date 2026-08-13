@@ -12,10 +12,11 @@
 
 #![cfg(target_os = "windows")]
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -65,6 +66,12 @@ pub struct NetworkServer {
     /// Held so the OS socket is only closed when we explicitly shut down;
     /// the acceptor thread observes `stop` and exits.
     acceptor_handle: Option<thread::JoinHandle<()>>,
+    /// Cloned socket handles let shutdown unblock connection threads that are
+    /// waiting in a blocking read.
+    connection_streams: Arc<Mutex<HashMap<u64, TcpStream>>>,
+    /// Every spawned connection is joined during shutdown.  This makes the
+    /// manager lifetime explicit instead of letting live connections retain it.
+    connection_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 }
 
 impl NetworkServer {
@@ -90,15 +97,33 @@ impl NetworkServer {
         let stop_thread = stop.clone();
         let shared_thread = shared.clone();
         let protocol = config.protocol;
+        let connection_streams = Arc::new(Mutex::new(HashMap::new()));
+        let connection_handles = Arc::new(Mutex::new(Vec::new()));
+        let next_connection_id = Arc::new(AtomicU64::new(1));
+        let streams_thread = connection_streams.clone();
+        let handles_thread = connection_handles.clone();
+        let ids_thread = next_connection_id.clone();
         let acceptor_handle = thread::Builder::new()
             .name(format!("runtime-acceptor-{protocol:?}"))
-            .spawn(move || acceptor_main(listener, stop_thread, shared_thread, protocol))
+            .spawn(move || {
+                acceptor_main(
+                    listener,
+                    stop_thread,
+                    shared_thread,
+                    protocol,
+                    streams_thread,
+                    handles_thread,
+                    ids_thread,
+                )
+            })
             .map_err(|e| std::io::Error::other(format!("spawn acceptor: {e}")))?;
 
         Ok(Self {
             local_addr,
             stop,
             acceptor_handle: Some(acceptor_handle),
+            connection_streams,
+            connection_handles,
         })
     }
 
@@ -108,23 +133,27 @@ impl NetworkServer {
 
     pub fn shutdown(mut self) -> std::io::Result<()> {
         self.stop.store(true, Ordering::Release);
-        // Closing the listener requires owning the TcpListener, which lives
-        // in the acceptor thread.  We can't drop it from here; instead the
-        // shutdown path is:
-        //   1. main thread sets stop = true
-        //   2. main thread drops the NetworkServer, which is currently
-        //      impossible because we just consumed `self` by-value.
-        //   3. acceptor thread loops with non-blocking accept and checks
-        //      stop each iteration.  After observing stop, it returns and
-        //      drops the listener, which then closes the OS socket.
-        //
-        // We need the accept() to time out so the loop can re-check `stop`.
-        // So we set the listener to non-blocking and accept with a short
-        // poll interval.  To make that work, we set non-blocking BEFORE
-        // handing the listener to the thread.
-        // (Done in acceptor_main via `set_nonblocking`.)
         if let Some(h) = self.acceptor_handle.take() {
             let _ = h.join();
+        }
+        // The acceptor has stopped, so its handle list is complete.  Force
+        // every blocking `read` to return before joining connection threads.
+        let streams = std::mem::take(
+            &mut *self
+                .connection_streams
+                .lock()
+                .expect("connection streams lock"),
+        );
+        for (_, stream) in streams {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        for handle in self
+            .connection_handles
+            .lock()
+            .expect("connection handles lock")
+            .drain(..)
+        {
+            let _ = handle.join();
         }
         Ok(())
     }
@@ -135,6 +164,9 @@ fn acceptor_main(
     stop: Arc<AtomicBool>,
     shared: Arc<ConnShared>,
     protocol: ProtocolKind,
+    connection_streams: Arc<Mutex<HashMap<u64, TcpStream>>>,
+    connection_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    next_connection_id: Arc<AtomicU64>,
 ) {
     // Make accept() non-blocking so we can poll `stop` and break out
     // promptly on shutdown.  Per-conn threads are the heavy lifters; this
@@ -144,18 +176,48 @@ fn acceptor_main(
     }
     let local = listener.local_addr().ok();
     while !stop.load(Ordering::Acquire) {
+        reap_finished_connections(&connection_handles);
         match listener.accept() {
             Ok((stream, _addr)) => {
+                let shutdown_stream = match stream.try_clone() {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        eprintln!("[runtime] clone connection for shutdown failed: {e}");
+                        continue;
+                    }
+                };
                 let shared_thread = shared.clone();
                 let proto_thread = protocol;
                 let name = format!("runtime-conn-{proto_thread:?}");
-                let _ = thread::Builder::new()
-                    .name(name)
-                    .spawn(move || {
-                        if let Err(e) = run_conn(stream, shared_thread, proto_thread) {
-                            eprintln!("[runtime] conn ended: {e}");
-                        }
-                    });
+                let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
+                connection_streams
+                    .lock()
+                    .expect("connection streams lock")
+                    .insert(connection_id, shutdown_stream);
+                let streams_thread = connection_streams.clone();
+                match thread::Builder::new().name(name).spawn(move || {
+                    if let Err(e) = run_conn(stream, shared_thread, proto_thread) {
+                        eprintln!("[runtime] conn ended: {e}");
+                    }
+                    streams_thread
+                        .lock()
+                        .expect("connection streams lock")
+                        .remove(&connection_id);
+                }) {
+                    Ok(handle) => {
+                        connection_handles
+                            .lock()
+                            .expect("connection handles lock")
+                            .push(handle);
+                    }
+                    Err(e) => {
+                        connection_streams
+                            .lock()
+                            .expect("connection streams lock")
+                            .remove(&connection_id);
+                        eprintln!("[runtime] spawn connection failed: {e}");
+                    }
+                }
             }
             Err(e) => match e.kind() {
                 std::io::ErrorKind::WouldBlock => {
@@ -172,6 +234,22 @@ fn acceptor_main(
     if let Some(addr) = local {
         eprintln!("[runtime] acceptor for {addr} exiting");
     }
+}
+
+/// A completed thread must be joined to release its OS handle.  M2 uses one
+/// blocking thread per connection, so reclaim them in the acceptor instead of
+/// retaining one join handle for every historical client connection.
+fn reap_finished_connections(handles: &Mutex<Vec<thread::JoinHandle<()>>>) {
+    let mut handles = handles.lock().expect("connection handles lock");
+    let mut live = Vec::with_capacity(handles.len());
+    for handle in handles.drain(..) {
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            live.push(handle);
+        }
+    }
+    *handles = live;
 }
 
 fn run_conn(
@@ -272,14 +350,10 @@ fn dispatch_resp(authed: &mut bool, shared: &ConnShared, cmd: RespCommand) -> Ve
         _ if !*authed => c.encode_error("NOAUTH Authentication required."),
         RespCommand::Ping(v) => v.map_or_else(|| c.encode_simple("PONG"), |v| c.encode_bulk(&v)),
         RespCommand::Command => c.encode_empty_array(),
-        RespCommand::Set { key, value } => reply_resp(
-            &c,
-            dispatch_limited(shared, Request::Put { key, value }),
-        ),
-        RespCommand::Get { key } => reply_resp(
-            &c,
-            dispatch_limited(shared, Request::Get { key }),
-        ),
+        RespCommand::Set { key, value } => {
+            reply_resp(&c, dispatch_limited(shared, Request::Put { key, value }))
+        }
+        RespCommand::Get { key } => reply_resp(&c, dispatch_limited(shared, Request::Get { key })),
         RespCommand::Del { keys } => {
             let mut n = 0;
             for key in keys {
@@ -297,10 +371,9 @@ fn dispatch_resp(authed: &mut bool, shared: &ConnShared, cmd: RespCommand) -> Ve
 }
 
 fn dispatch_limited(shared: &ConnShared, req: Request) -> Response {
-    validate_request(&req, &shared.limits)
-        .map_or_else(Response::Error, |_| {
-            dispatch_request(&shared.mgr, &shared.default_db, &shared.default_table, req)
-        })
+    validate_request(&req, &shared.limits).map_or_else(Response::Error, |_| {
+        dispatch_request(&shared.mgr, &shared.default_db, &shared.default_table, req)
+    })
 }
 
 fn reply_resp(c: &RespCodec, response: Response) -> Vec<u8> {
