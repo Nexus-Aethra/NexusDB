@@ -15,7 +15,8 @@ nexusdb = { path = "../NexusDB" }
 ```
 
 The public entry points are `NexusDb`, `EmbeddedOptions`, `EmbeddedIoBackend`,
-`Database`, `Table`, `EmbeddedError`, and `EmbeddedResult`.
+`Database`, `Table`, `TypedValue`, `TypedEntry`, `EmbeddedError`, and
+`EmbeddedResult`.
 
 ## Open, select, and use a table
 
@@ -54,7 +55,9 @@ the original application bytes.
 ## Async and batched calls
 
 The async methods are runtime-agnostic futures: use them from Tokio, async-std,
-or any other executor. They are `set_async`, `get_async`, and `del_async`.
+or any other executor. They are `set_async`, `get_async`, `del_async`, plus
+batched variants `set_many_async`, `get_many_async`, and the type-aware
+`get_many_typed_async`.
 
 ```rust
 async fn update(cache: &nexusdb::Table) -> nexusdb::EmbeddedResult<()> {
@@ -76,6 +79,99 @@ let values = cache.get_many(&[b"b", b"missing", b"a"]);
 assert_eq!(values[0].as_ref().unwrap(), &Some(b"2".to_vec()));
 assert_eq!(values[1].as_ref().unwrap(), &None);
 ```
+
+## Listing and range scans
+
+The embedded API exposes BTree-ordered scans at the storage boundary through
+`Table`. Scans only touch the String keyspace — they do not return Hash fields,
+Set members, List indices, or ZSet members, so a single `Table` may safely mix
+plain keys with composite structures created via other interfaces (currently
+RESP). All scan methods return keys (or `Vec<TypedEntry>` for the typed
+variants) in BTree byte order.
+
+| Method | What it returns |
+|---|---|
+| `list()` | All keys, ascending |
+| `list_prefix(p)` | Keys with user-key byte prefix `p` |
+| `list_limit(n)` | First `n` keys (`n = 0` means unlimited) |
+| `list_range(start, end, limit)` | Closed-open `[start, end)` in BTree order |
+| `list_range_prefix(start, end, prefix, limit)` | Range + prefix filter |
+| `list_typed()`, `list_typed_limit(n)`, `list_typed_range(...)`, etc. | Same shape but returns `(key, TypedValue)` pairs |
+| `get_typed(key)` | Type-aware single-point read |
+
+Every method has an `*_async` counterpart (`list_async`, `list_range_async`,
+`list_typed_range_async`, …). The async variants are runtime-agnostic futures
+built on `std::future::Future`.
+
+```rust
+use nexusdb::{EmbeddedOptions, NexusDb, TypedValue};
+
+let db = NexusDb::open(EmbeddedOptions::new("./app-data"))?;
+let app = db.ensure_database("users")?;
+let users = app.create_table("name_to_id")?;
+
+// "List a group of names and look up each id" — one round-trip
+users.set_many(&[(b"alice", b"1001"), (b"bob", b"1002"), (b"carol", b"1003")])?;
+for (name, typed) in users.list_typed()? {
+    let id = typed.as_bytes().unwrap();
+    println!("{name:?} -> {id:?}");
+}
+
+// Range scan over the BTree-ordered key space
+let in_window = users.list_range(b"bob", b"dave", 0)?;
+assert_eq!(in_window, vec![b"bob".to_vec(), b"carol".to_vec()]);
+
+// Pagination
+let page = users.list_range(b"a", b"z", 2)?;
+```
+
+### Range semantics
+
+- **`start` empty**: scan from the first key
+- **`end` empty**: scan to the last key
+- **`start == end`**: empty range (closed-open means the end is exclusive)
+- **`start` does not exist**: BTree order still applies — e.g. `[bb, d)` over
+  `[a, b, c, d, e]` returns `[c]`
+- **Cross-shard correctness**: shards report their local slice in BTree order,
+  the manager concatenates and sorts the global result, and a `HashSet` removes
+  any duplicate that a routing change might surface
+- **Composite structures are not enumerated**: only the `[S][klen][user_key]`
+  prefix is walked, so the same `Table` can host a hash alongside plain keys
+  without the scan returning hash fields
+
+## Type-aware reads
+
+Internally NexusDB stores every value as `[tag u8][payload]`, with the tag
+distinguishing `TAG_RAW` (0x01), `TAG_I64` (0x02), `TAG_F64` (0x03),
+`TAG_STR` (0x04), `TAG_DOC` (0x05), and `TAG_F32` (0x06). The single-key
+`get` and the bulk `get_many` strip the tag for backwards compatibility.
+The type-aware variants return the tag interpretation as a strongly-typed
+`TypedValue`:
+
+```rust
+pub enum TypedValue {
+    Raw(Vec<u8>),    // TAG_RAW
+    Int(i64),        // TAG_I64
+    Float(f64),      // TAG_F64
+    Float32(f32),    // TAG_F32
+    Str(Vec<u8>),    // TAG_STR (UTF-8 validated)
+    Doc(Vec<u8>),    // TAG_DOC (opaque payload)
+    Unknown { tag: u8, raw_bytes: Vec<u8> },  // unknown tag or length error
+}
+
+impl TypedValue {
+    pub fn as_i64(&self) -> Option<i64>;       // strong-typed unwrap
+    pub fn as_f64(&self) -> Option<f64>;       // Float + Float32 both
+    pub fn as_bytes(&self) -> Option<&[u8]>;    // Raw + Str
+    pub fn type_name(&self) -> &'static str;   // "raw" / "int" / ...
+    pub fn raw_bytes(&self) -> &[u8];          // stored bytes incl. tag
+}
+```
+
+A table may hold mixed types in practice (e.g. write `set("counter", b"0")`
+and then promote it with `INCR` through the network layer — but for an
+embedded-only workflow, `set` always writes `TAG_RAW`). `list_typed*` returns
+the actual stored interpretation per key.
 
 ## Lifecycle and durability
 

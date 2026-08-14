@@ -111,28 +111,48 @@ cargo test --workspace --no-fail-fast    # ~30s, expect 0 failed
 ## Embedded Library
 
 Use the `nexusdb` library target when an application needs the same shard,
-storage, and WAL engine in-process without opening network listeners. It
-provides synchronous and runtime-agnostic async `set` / `get` / `del`, plus
-same-table `set_many` / `get_many`. `EmbeddedOptions` configures shard-thread
-count, per-shard cache capacity, WAL mode, and either portable `StdFs` or Linux
-`io_uring` persistence.
+storage, and WAL engine in-process without opening network listeners. The
+embedded API gives applications full access to the storage layer through
+synchronous and runtime-agnostic async methods:
+
+- **Point KV**: `set` / `get` / `del` (sync + async)
+- **Batched KV**: `set_many` / `get_many` (sync + async)
+- **Type-aware reads**: `get_typed` / `get_many_typed_async` interpret the
+  internal value tag (`TAG_RAW` / `TAG_I64` / `TAG_F64` / `TAG_F32` / `TAG_STR`
+  / `TAG_DOC`) at the API boundary so callers receive strongly-typed
+  `TypedValue` values
+- **Listing and range scans**: `list` / `list_prefix` / `list_limit` /
+  `list_range(start, end, limit)` / `list_range_prefix` (sync + async), and
+  type-aware variants `list_typed` / `list_typed_range` / etc. for "list a
+  group of keys and look up each value" patterns in a single round-trip
+
+`EmbeddedOptions` configures shard-thread count, per-shard cache capacity,
+WAL mode, and either portable `StdFs` or Linux `io_uring` persistence.
 
 ```rust
-use nexusdb::{EmbeddedOptions, NexusDb};
+use nexusdb::{EmbeddedOptions, NexusDb, TypedValue};
 
 let db = NexusDb::open(EmbeddedOptions::new("./app-data"))?;
 let app = db.ensure_database("app")?;
-let cache = app.create_table("cache")?;
-cache.set(b"greeting", b"hello")?;
-assert_eq!(cache.get(b"greeting")?, Some(b"hello".to_vec()));
+let cache = app.create_table("name_to_id")?;
+
+// Batch write + type-aware scan in one round-trip
+cache.set_many(&[(b"alice", b"1001"), (b"bob", b"1002")])?;
+for (name, typed) in cache.list_typed()? {
+    let id = typed.as_bytes().unwrap();  // raw payload, no tag
+    println!("{name:?} -> {id:?}");
+}
+
+// Range scan: closed-open [b, d) over the key space
+let range = cache.list_range(b"b", b"d", 0)?;
 drop(cache);
 drop(app);
 db.close()?;
 ```
 
 See [Embedded KV API](./docs/EMBEDDED-KV.md) for dependency setup, table
-provisioning versus selection, async and batched operations, lifecycle rules,
-and Windows compatibility.
+provisioning versus selection, async and batched operations, listing/range
+scans, type-aware reads, lifecycle rules, and Windows compatibility.
 
 ---
 

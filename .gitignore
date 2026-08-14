@@ -23,6 +23,7 @@ target
 data/
 logs/
 bench_tmp/
+embedded-data/
 .config/
 .cargo/
 .linker/

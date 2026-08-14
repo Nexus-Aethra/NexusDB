@@ -1591,6 +1591,10 @@ pub(crate) fn handle_resp_shard_result(
         BatchResult::DistinctCounts(_) => codec.encode_error("unexpected distinct reply"),
         // ⭐ M3-5: min/max 估计只出现在 worker 内部 (JOIN 范围选择)
         BatchResult::RangeBounds(_) => codec.encode_error("unexpected range reply"),
+        // ⭐ Phase Scan: 列表扫描只暴露给嵌入式 API, 不走 RESP 门面
+        BatchResult::Keys(_) | BatchResult::KeysWithValues(_) => {
+            codec.encode_error("scan keys not supported on RESP facade")
+        }
         // ⭐ F65: 占坑结果只出现在 SQL 门面 (sql_unique_drive 已拦截)
         BatchResult::ReserveOk | BatchResult::ReserveConflict { .. } => {
             codec.encode_error("unexpected unique reply")

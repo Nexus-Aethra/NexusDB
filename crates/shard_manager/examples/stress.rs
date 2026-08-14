@@ -217,6 +217,8 @@ fn main() {
                                     | BatchResult::RowCount(_)
                                     | BatchResult::DistinctCounts(_)
                                     | BatchResult::RangeBounds(_)
+                                    | BatchResult::Keys(_)
+                                    | BatchResult::KeysWithValues(_)
                                     | BatchResult::MultiPutOk => {
                                         match op_type {
                                             0 => { total_put.fetch_add(1, Ordering::Relaxed); }
