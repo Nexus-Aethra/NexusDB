@@ -6,7 +6,9 @@
 //! catastrophic failure". Per-page errors are surfaced inline in the output
 //! stream; they never propagate as `Err`.
 
+pub mod blame;
 pub mod dbs;
 pub mod header;
+pub mod rescue;
 pub mod verify;
 pub mod vpid;

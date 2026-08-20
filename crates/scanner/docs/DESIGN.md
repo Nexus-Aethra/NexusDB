@@ -1,6 +1,6 @@
 # NexusDBScanner — Design
 
-> Status: **PR2 in progress**. PR1 (dbs/header/vpid) and PR2.1-2.2 (layout auto-discovery, tree traversal, verify) are committed. PR2.3-2.6 (header --neighbors, blame, rescue, integration test) are pending.
+> Status: **PR2 complete**. All PR1 commands (dbs/header/vpid) and PR2 commands (layout auto-discovery, verify, header --neighbors, blame, rescue) are committed. PR3 (export + merge) is next.
 
 This document is the contract. Implementation PRs (PR1..PR5) are expected to
 honour every "must" clause below. Any deviation needs a written rationale
@@ -456,10 +456,10 @@ figuring out *why* the engine refused to open it.
 | PR1 | Design docs + skeleton + `dbs`/`header`/`vpid` commands | 2026-08-21 | committed (`bc3018e`, `ba06683`) |
 | PR2.1 | dir module split + layout auto-discovery (L1/L2/L3/L4) | 2026-08-21 | committed (`77950b2`) |
 | PR2.2 | `tree.rs` (BFS traversal) + `verify` command | 2026-08-21 | committed (`4f1a7fd`) |
-| PR2.3 | `header --neighbors` | pending | reading same-chunk neighbour pages |
-| PR2.4 | `commands/blame.rs` | pending | bad page → tree path → impact range |
-| PR2.5 | `commands/rescue.rs` | pending | one-shot diagnosis pipeline |
-| PR2.6 | Integration test | pending | synthetic corrupt directory → rescue report |
+| PR2.3 | `header --neighbors` | 2026-08-21 | committed | reading same-chunk neighbour pages |
+| PR2.4 | `commands/blame.rs` | 2026-08-21 | committed | bad page → tree path → impact range |
+| PR2.5 | `commands/rescue.rs` | 2026-08-21 | committed | one-shot diagnosis pipeline |
+| PR2.6 | Integration test | 2026-08-21 | committed | synthetic corrupt directory → walk detects bad page |
 | PR3 | `export` + `merge` + `verify` repair mode | deferred | data rescue pipeline |
 | PR4 | `wal list`/`dump` + `merge --include-wal` | deferred | WAL replay + export |
 | PR5 | `map` + `lookup` + `range` | deferred | fine-grained tree navigation |

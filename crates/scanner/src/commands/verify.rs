@@ -24,7 +24,7 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, mut out: W) -> Result<u8
         })?;
     let locate = Locate::open(shard)?;
 
-    let summary: WalkSummary = match globals.output_mode() {
+    match globals.output_mode() {
         crate::output::OutputMode::Human => {
             let columns: &[ColumnName] = &[
                 "vpid",

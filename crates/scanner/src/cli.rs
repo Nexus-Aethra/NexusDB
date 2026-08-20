@@ -90,9 +90,6 @@ impl Globals {
 }
 
 /// Every subcommand the scanner supports in PR1 + PR2.
-///
-/// Additional commands (`walk`, `lookup`, `range`, `export`,
-/// `wal ...`, `merge`, `map`, `blame`, `rescue`) arrive in later PRs.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// List tables (the `dbs` command from the design doc).
@@ -103,6 +100,12 @@ pub enum Command {
         /// vpid to inspect.
         #[arg(value_parser = clap::value_parser!(u64).range(0..))]
         vpid: u64,
+
+        /// Also read and report on the neighbouring vpids (N-1, N+1, and
+        /// the first/last page of the same chunk). Useful for diagnosing
+        /// whether a bad page is isolated or part of a wider corruption.
+        #[arg(long)]
+        neighbors: bool,
     },
 
     /// Full decode of a single page (the `vpid` command).
@@ -122,6 +125,21 @@ pub enum Command {
         #[arg(value_parser = clap::value_parser!(u64).range(0..))]
         root: u64,
     },
+
+    /// Diagnose a bad page's context within a tree.
+    Blame {
+        /// vpid of the suspected bad page.
+        #[arg(value_parser = clap::value_parser!(u64).range(0..))]
+        vpid: u64,
+
+        /// Optional: if provided, search only within this tree.
+        #[arg(short, long, value_parser = clap::value_parser!(u64).range(0..))]
+        tree: Option<u64>,
+    },
+
+    /// One-click rescue: run dbs + verify every tree + blame every bad page,
+    /// producing a unified diagnosis report.
+    Rescue,
 }
 
 impl Command {
@@ -131,6 +149,8 @@ impl Command {
             Command::Header { .. } => "header",
             Command::Vpid { .. } => "vpid",
             Command::Verify { .. } => "verify",
+            Command::Blame { .. } => "blame",
+            Command::Rescue { .. } => "rescue",
         }
     }
 }
@@ -165,7 +185,10 @@ mod tests {
         .unwrap();
         assert_eq!(t.command.name(), "header");
         match t.command {
-            Command::Header { vpid } => assert_eq!(vpid, 5),
+            Command::Header { vpid, neighbors } => {
+                assert_eq!(vpid, 5);
+                assert!(!neighbors);
+            }
             _ => panic!("wrong command"),
         }
     }

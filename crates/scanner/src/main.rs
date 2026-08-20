@@ -46,9 +46,11 @@ fn main() -> ExitCode {
 
     let cmd_result: Result<u8> = match top.command {
         Command::Dbs => commands::dbs::run(globals, &mut out),
-        Command::Header { vpid } => commands::header::run(globals, vpid, &mut out),
+        Command::Header { vpid, neighbors } => commands::header::run(globals, vpid, neighbors, &mut out),
         Command::Vpid { vpid, raw } => commands::vpid::run(globals, vpid, raw, &mut out),
         Command::Verify { root } => commands::verify::run(globals, root, &mut out),
+        Command::Blame { vpid, tree } => commands::blame::run(globals, vpid, tree, &mut out),
+        Command::Rescue => commands::rescue::run(globals, &mut out),
     };
 
     match cmd_result {
