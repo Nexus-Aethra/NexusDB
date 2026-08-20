@@ -155,6 +155,39 @@ pub enum Command {
         #[arg(long, default_value_t = true)]
         skip_bad: bool,
     },
+
+    /// List WAL segment files in the data directory.
+    WalList,
+
+    /// Decode WAL segment files byte-by-byte.
+    WalDump {
+        /// Sequence number of the segment to dump.
+        #[arg(short, long, value_parser = clap::value_parser!(u64).range(0..))]
+        seq: u64,
+
+        /// Optional end sequence (inclusive).
+        #[arg(short = 't', long)]
+        to: Option<u64>,
+
+        /// Max frames to decode.
+        #[arg(short, long)]
+        limit: Option<u64>,
+    },
+
+    /// Full rescue pipeline: export tree with optional WAL replay.
+    Merge {
+        /// Root vpid of the btree to export.
+        #[arg(value_parser = clap::value_parser!(u64).range(0..))]
+        root: u64,
+
+        /// Output format: "kv" or "json".
+        #[arg(short, long, default_value = "kv")]
+        format: String,
+
+        /// Include WAL replay on top of the page-pool export.
+        #[arg(long)]
+        include_wal: bool,
+    },
 }
 
 impl Command {
@@ -167,6 +200,9 @@ impl Command {
             Command::Blame { .. } => "blame",
             Command::Rescue { .. } => "rescue",
             Command::Export { .. } => "export",
+            Command::WalList { .. } => "wal-list",
+            Command::WalDump { .. } => "wal-dump",
+            Command::Merge { .. } => "merge",
         }
     }
 }

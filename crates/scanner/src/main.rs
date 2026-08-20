@@ -27,6 +27,7 @@ mod page_decode;
 mod page_io;
 mod pid;
 mod tree;
+mod wal;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -55,6 +56,15 @@ fn main() -> ExitCode {
             let fmt = crate::commands::export::ExportFormat::from_str(&format)
                 .unwrap_or(crate::commands::export::ExportFormat::Kv);
             commands::export::run(globals, root, fmt, skip_bad, &mut out)
+        },
+        Command::WalList => commands::wal_list::run(globals, &mut out),
+        Command::WalDump { seq, to, limit } => {
+            commands::wal_dump::run(globals, seq, to, limit, &mut out)
+        },
+        Command::Merge { root, format, include_wal } => {
+            let fmt = crate::commands::merge::MergeFormat::from_str(&format)
+                .unwrap_or(crate::commands::merge::MergeFormat::Kv);
+            commands::merge::run(globals, root, fmt, include_wal, &mut out)
         },
     };
 
