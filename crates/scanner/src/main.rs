@@ -51,6 +51,11 @@ fn main() -> ExitCode {
         Command::Verify { root } => commands::verify::run(globals, root, &mut out),
         Command::Blame { vpid, tree } => commands::blame::run(globals, vpid, tree, &mut out),
         Command::Rescue => commands::rescue::run(globals, &mut out),
+        Command::Export { root, format, skip_bad } => {
+            let fmt = crate::commands::export::ExportFormat::from_str(&format)
+                .unwrap_or(crate::commands::export::ExportFormat::Kv);
+            commands::export::run(globals, root, fmt, skip_bad, &mut out)
+        },
     };
 
     match cmd_result {

@@ -8,6 +8,7 @@
 
 pub mod blame;
 pub mod dbs;
+pub mod export;
 pub mod header;
 pub mod rescue;
 pub mod verify;

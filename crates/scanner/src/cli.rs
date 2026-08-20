@@ -140,6 +140,21 @@ pub enum Command {
     /// One-click rescue: run dbs + verify every tree + blame every bad page,
     /// producing a unified diagnosis report.
     Rescue,
+
+    /// Export every reachable (key, value) pair from a btree as a stream.
+    Export {
+        /// Root vpid of the btree to export.
+        #[arg(value_parser = clap::value_parser!(u64).range(0..))]
+        root: u64,
+
+        /// Output format: "kv" (hex_key \t hex_value) or "json".
+        #[arg(short, long, default_value = "kv")]
+        format: String,
+
+        /// Skip bad pages (default: true).
+        #[arg(long, default_value_t = true)]
+        skip_bad: bool,
+    },
 }
 
 impl Command {
@@ -151,6 +166,7 @@ impl Command {
             Command::Verify { .. } => "verify",
             Command::Blame { .. } => "blame",
             Command::Rescue { .. } => "rescue",
+            Command::Export { .. } => "export",
         }
     }
 }

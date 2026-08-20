@@ -14,6 +14,10 @@
 //!   separator corruption and to pages whose `internal_child` decisions
 //!   would mislead a "travel to leaf" path.
 //!
+//! - [`walk_tree_in_order`] — a key-order (in-order) traversal that
+//!   visits every leaf page and yields (full_key, value) pairs in BTree
+//!   order. Used by `export` to produce a sorted dump.
+//!
 //! - [`bfs_travel_path`] — a path-targeted search that returns the
 //!   breadcrumb trail from the root down to the first page whose contents
 //!   match a predicate. Used by `blame` to point at a specific bad page.
@@ -139,6 +143,115 @@ where
 
     summary.max_depth = depth_seen.max(summary.max_depth);
     summary
+}
+
+/// Key-order (in-order) traversal of a btree rooted at `root_vpid`.
+///
+/// For each leaf page, enumerates every item (skipping the sentinel) and
+/// calls `on_entry` with `(full_key, value)`. Internal pages are descended
+/// recursively in separator order, so the output is in BTree key order.
+///
+/// Bad pages are skipped with a `[BAD-PAGE]` note recorded in the returned
+/// `WalkSummary` (the `bad` counter increases). The traversal continues
+/// past bad pages when possible (tolerant mode).
+pub fn walk_tree_in_order<F>(
+    shard: &ShardDir,
+    locate: &Locate,
+    root_vpid: u64,
+    mut on_entry: F,
+) -> WalkSummary
+where
+    F: FnMut(&[u8], &[u8]),
+{
+    let mut summary = WalkSummary::default();
+    do_in_order(shard, locate, root_vpid, &mut on_entry, &mut summary);
+    summary
+}
+
+fn do_in_order<F>(
+    shard: &ShardDir,
+    locate: &Locate,
+    vpid: u64,
+    on_entry: &mut F,
+    summary: &mut WalkSummary,
+) where
+    F: FnMut(&[u8], &[u8]),
+{
+    summary.visited += 1;
+    let coord = match locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic) {
+        Ok(c) => c,
+        Err(_) => {
+            summary.unread += 1;
+            return;
+        }
+    };
+    let buf = match page_io::read_page(shard, coord) {
+        page_io::PageRead::Ok(b) => b,
+        _ => {
+            summary.unread += 1;
+            return;
+        }
+    };
+    let page_bytes: &[u8] = &*buf;
+    let pt = page::page_type(page_bytes);
+    match pt {
+        PageType::Leaf => {
+            // Enumerate all items, skip sentinel (item 0), yield (key, value).
+            let free_off = page::page_free_off(page_bytes) as usize;
+            let mut off = page::PAGE_HEADER_SIZE;
+            let mut prev_key: Vec<u8> = Vec::new();
+            let mut count = 0u16;
+            while off < free_off {
+                match page::decode_item(page_bytes, off, page::ItemKind::Leaf) {
+                    Ok((item, n)) => {
+                        let full = item.full_key(&prev_key);
+                        if count > 0 && !full.is_empty() {
+                            on_entry(&full, item.value);
+                            summary.ok += 1;
+                        }
+                        prev_key = full;
+                        count += 1;
+                        off += n;
+                    }
+                    Err(_) => {
+                        summary.bad += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        PageType::Internal => {
+            // Enumerate all children in order, recurse.
+            let free_off = page::page_free_off(page_bytes) as usize;
+            let mut off = page::PAGE_HEADER_SIZE;
+            let mut prev_key: Vec<u8> = Vec::new();
+            while off < free_off {
+                match page::decode_item(page_bytes, off, page::ItemKind::Internal) {
+                    Ok((item, n)) => {
+                        let full = item.full_key(&prev_key);
+                        // The sentinel (item 0) has empty key, but its
+                        // child_vpid is the first child. Every other item
+                        // has a separator key and its child_vpid is the
+                        // child for keys >= that separator.
+                        if item.child_vpid != 0 && item.child_vpid != vpid {
+                            do_in_order(shard, locate, item.child_vpid, on_entry, summary);
+                        }
+                        prev_key = full;
+                        off += n;
+                    }
+                    Err(_) => {
+                        summary.bad += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        other => {
+            // Meta / Overflow / OverflowIndex: not a btree node, skip.
+            summary.bad += 1;
+            let _ = other;
+        }
+    }
 }
 
 /// Walk from `root_vpid` to the first page that satisfies `matches`,
@@ -477,9 +590,58 @@ mod tests {
         assert!(was_unread_or_bad, "corrupt page must be classified as bad or unread, got ok={}", summary2.ok);
     }
 
+    /// Test that in-order traversal returns keys in sorted order.
+    #[test]
+    fn walk_in_order_returns_sorted_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_dir = dir.path().join("shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Build a leaf page with multiple keys inserted.
+        let mut page = page::leaf_new();
+        page::page_set_vpid(&mut page, 0);
+        page::leaf_insert(&mut page, b"bravo", b"v2").unwrap();
+        page::leaf_insert(&mut page, b"alpha", b"v1").unwrap();
+        page::leaf_insert(&mut page, b"delta", b"v4").unwrap();
+        page::leaf_insert(&mut page, b"charlie", b"v3").unwrap();
+
+        let mut block = vec![0u8; PAGE_SIZE];
+        block[..PAGE_SIZE].copy_from_slice(&page);
+        std::fs::write(shard_dir.join("000000.block"), &block).unwrap();
+        std::fs::write(shard_dir.join("page.mate"), vec![0u8; 1024 * 1024]).unwrap();
+
+        let shard = ShardDir {
+            id: 0,
+            path: shard_dir.clone(),
+            block_files: vec![crate::dir::BlockFile {
+                file_id: 0,
+                path: shard_dir.join("000000.block"),
+                size_bytes: PAGE_SIZE as u64,
+            }],
+            page_mate: Some(shard_dir.join("page.mate")),
+            pid_state: None,
+            wal_segments: Vec::new(),
+        };
+        let locate = Locate::open(&shard).unwrap();
+
+        let mut keys = Vec::new();
+        let summary = walk_tree_in_order(&shard, &locate, 0, |key, _value| {
+            keys.push(key.to_vec());
+        });
+
+        // Keys should be in BTree order: alpha, bravo, charlie, delta
+        assert_eq!(keys.len(), 4, "expected 4 keys, got {}: {:?}", keys.len(), keys);
+        assert_eq!(&keys[0], b"alpha");
+        assert_eq!(&keys[1], b"bravo");
+        assert_eq!(&keys[2], b"charlie");
+        assert_eq!(&keys[3], b"delta");
+        assert_eq!(summary.ok, 4);
+        assert_eq!(summary.visited, 1);
+        assert_eq!(summary.bad, 0);
+    }
+
     // unused helper for manual item synthesis; referenced to satisfy
     // dead-code analysis and to verify leaf_insert remains reachable.
-    // (removed in PR2.2 cleanup; reserved for PR3 tests)
     fn _placeholder_keeps_page_use() {
         let _ = page::leaf_new();
     }

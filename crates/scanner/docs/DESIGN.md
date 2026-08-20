@@ -1,6 +1,6 @@
 # NexusDBScanner — Design
 
-> Status: **PR2 complete**. All PR1 commands (dbs/header/vpid) and PR2 commands (layout auto-discovery, verify, header --neighbors, blame, rescue) are committed. PR3 (export + merge) is next.
+> Status: **PR3 complete**. Export command (key-order tree traversal, kv/json output, bad-page skip) is committed. PR4 (WAL dump + merge --include-wal) is next.
 
 This document is the contract. Implementation PRs (PR1..PR5) are expected to
 honour every "must" clause below. Any deviation needs a written rationale
@@ -460,7 +460,7 @@ figuring out *why* the engine refused to open it.
 | PR2.4 | `commands/blame.rs` | 2026-08-21 | committed | bad page → tree path → impact range |
 | PR2.5 | `commands/rescue.rs` | 2026-08-21 | committed | one-shot diagnosis pipeline |
 | PR2.6 | Integration test | 2026-08-21 | committed | synthetic corrupt directory → walk detects bad page |
-| PR3 | `export` + `merge` + `verify` repair mode | deferred | data rescue pipeline |
+| PR3 | `export` (kv/json, key-order traversal, skip-bad) | 2026-08-21 | committed | data rescue pipeline |
 | PR4 | `wal list`/`dump` + `merge --include-wal` | deferred | WAL replay + export |
 | PR5 | `map` + `lookup` + `range` | deferred | fine-grained tree navigation |
 
