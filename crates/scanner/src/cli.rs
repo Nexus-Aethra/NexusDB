@@ -188,6 +188,39 @@ pub enum Command {
         #[arg(long)]
         include_wal: bool,
     },
+
+    /// Dump the vpid → (file_id, chunk_idx, page_idx) mapping.
+    Map {
+        /// Only use page.mate entries; skip arithmetic fallback.
+        #[arg(long)]
+        from_mate_only: bool,
+    },
+
+    /// Find a specific key inside a btree and report its value.
+    Lookup {
+        /// Root vpid of the btree to search.
+        #[arg(value_parser = clap::value_parser!(u64).range(0..))]
+        tree: u64,
+
+        /// Hex-encoded key to find.
+        #[arg(short, long)]
+        key: String,
+    },
+
+    /// Per-page range scan: list items whose keys fall within [start, end].
+    Range {
+        /// vpid of the page to scan.
+        #[arg(value_parser = clap::value_parser!(u64).range(0..))]
+        vpid: u64,
+
+        /// Inclusive start key (hex). Empty = page start.
+        #[arg(short, long)]
+        start: Option<String>,
+
+        /// Inclusive end key (hex). Empty = page end.
+        #[arg(short = 'e', long)]
+        end: Option<String>,
+    },
 }
 
 impl Command {
@@ -203,6 +236,9 @@ impl Command {
             Command::WalList { .. } => "wal-list",
             Command::WalDump { .. } => "wal-dump",
             Command::Merge { .. } => "merge",
+            Command::Map { .. } => "map",
+            Command::Lookup { .. } => "lookup",
+            Command::Range { .. } => "range",
         }
     }
 }

@@ -66,6 +66,9 @@ fn main() -> ExitCode {
                 .unwrap_or(crate::commands::merge::MergeFormat::Kv);
             commands::merge::run(globals, root, fmt, include_wal, &mut out)
         },
+        Command::Map { from_mate_only } => commands::map::run(globals, from_mate_only, &mut out),
+        Command::Lookup { tree, key } => commands::lookup::run(globals, tree, &key, &mut out),
+        Command::Range { vpid, start, end } => commands::range::run(globals, vpid, start, end, &mut out),
     };
 
     match cmd_result {

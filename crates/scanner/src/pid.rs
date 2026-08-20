@@ -147,6 +147,17 @@ impl Locate {
         self.usable_slots
     }
 
+    /// Access a single mate slot by vpid. Returns `None` if the vpid is beyond
+    /// the loaded mate region.
+    pub fn mate_slot(&self, vpid: u64) -> Option<PidLocation> {
+        let idx = vpid as usize;
+        if idx < self.mate.len() {
+            Some(self.mate[idx])
+        } else {
+            None
+        }
+    }
+
     /// How many slots were malformed and dropped during `page.mate` load.
     #[allow(dead_code)] // Consumed by `map` (PR2).
     pub fn bad_slot_count(&self) -> u32 {
