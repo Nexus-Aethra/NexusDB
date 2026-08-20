@@ -9,6 +9,7 @@ members = [
     "crates/network",
     "crates/config",
     "crates/logging",
+    "crates/scanner",
 ]
 
 [package]
