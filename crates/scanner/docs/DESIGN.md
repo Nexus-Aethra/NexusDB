@@ -1,6 +1,8 @@
 # NexusDBScanner — Design
 
-> Status: **PR3 complete**. Export command (key-order tree traversal, kv/json output, bad-page skip) is committed. PR4 (WAL dump + merge --include-wal) is next.
+> Status: **PR5 complete**. All 5 PRs are implemented. The scanner now supports
+> the full CLI surface: dbs, header, vpid, verify, blame, rescue, export,
+> wal-list, wal-dump, merge, map, lookup, range.
 
 This document is the contract. Implementation PRs (PR1..PR5) are expected to
 honour every "must" clause below. Any deviation needs a written rationale
@@ -188,7 +190,7 @@ If the page is bad (`magic` mismatch, `checksum` mismatch, `page_type` byte
 not in `{1..5}`, `vpid` mismatch, `free_off` out of bounds), it prints
 `[BAD-PAGE]` with diagnostic fields and exits tolerant mode handling.
 
-#### `range` [ ]
+#### `range` [x] (PR5)
 
 In-page ordered range scan over a single leaf or meta page.
 
@@ -223,7 +225,7 @@ attempt to descend (tolerant only — strict mode halts).
 
 This is the workhorse for "give me everything in this tree".
 
-#### `lookup` [ ] (formerly `keydetail` in the original draft)
+#### `lookup` [x] (PR5)
 
 Find a specific physical key inside a tree and report its full item.
 
@@ -252,7 +254,7 @@ Useful when the full `vpid` command fails deep in item parsing and you still
 want the 40-byte header + footer decoded. Identical output to the first block
 of `vpid` but guaranteed cheap.
 
-#### `map` [ ]
+#### `map` [x] (PR5)
 
 Dump the vpid → (file_id, chunk_idx, page_idx) map from `page.mate` /
 `pid.state`. If both files are missing, scans `.block` files for `LCBP`
@@ -310,7 +312,7 @@ code is 0 if any row was emitted, 1 if zero rows were emitted *and* the
 tree appeared non-empty (we cannot distinguish a legitimately empty tree from
 a wholly-corrupt tree; that ambiguity is logged).
 
-#### `wal list` [ ]
+#### `wal list` [x] (PR4)
 
 ```
 nexusdb-scanner --dir <PATH> wal list
@@ -319,7 +321,7 @@ nexusdb-scanner --dir <PATH> wal list
 Walks the directory, lists every `*.wal.<seq>` segment file with size and
 mtime as raw integers. No bytes are read yet.
 
-#### `wal dump` [ ]
+#### `wal dump` [x] (PR4)
 
 Decode one or a range of WAL segments byte-by-byte.
 
@@ -332,7 +334,7 @@ frame: prints `(op_type, encoded_key_len, encoded_key_hex,
 encoded_value_len, encoded_value_hex, checksum_ok, frame_crc_ok)`. There is
 no replay — frames are inspected, not applied.
 
-#### `merge`
+#### `merge` [x] (PR4)
 
 The full rescue pipeline. **Not implemented in the first three PRs.**
 
@@ -452,7 +454,7 @@ figuring out *why* the engine refused to open it.
 ## 8. Current progress
 
 | PR | Scope | Date | Status |
-|---|---|---|---|
+|---|---|---|---|---|
 | PR1 | Design docs + skeleton + `dbs`/`header`/`vpid` commands | 2026-08-21 | committed (`bc3018e`, `ba06683`) |
 | PR2.1 | dir module split + layout auto-discovery (L1/L2/L3/L4) | 2026-08-21 | committed (`77950b2`) |
 | PR2.2 | `tree.rs` (BFS traversal) + `verify` command | 2026-08-21 | committed (`4f1a7fd`) |
@@ -461,8 +463,8 @@ figuring out *why* the engine refused to open it.
 | PR2.5 | `commands/rescue.rs` | 2026-08-21 | committed | one-shot diagnosis pipeline |
 | PR2.6 | Integration test | 2026-08-21 | committed | synthetic corrupt directory → walk detects bad page |
 | PR3 | `export` (kv/json, key-order traversal, skip-bad) | 2026-08-21 | committed | data rescue pipeline |
-| PR4 | `wal list`/`dump` + `merge --include-wal` | deferred | WAL replay + export |
-| PR5 | `map` + `lookup` + `range` | deferred | fine-grained tree navigation |
+| PR4 | `wal list`/`dump` + `merge --include-wal` | 2026-08-21 | committed | WAL replay + export |
+| PR5 | `map` + `lookup` + `range` | 2026-08-21 | committed | fine-grained tree navigation |
 
 ## 9. Open questions deferred to a later PR
 

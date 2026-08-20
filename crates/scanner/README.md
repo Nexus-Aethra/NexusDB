@@ -71,6 +71,22 @@ nexusdb-scanner --dir /var/data/nexusdb verify -tree 192
 
 # 4. Export the data — this is the rescue path
 nexusdb-scanner --dir /var/data/nexusdb export -tree 192 -format json > rescue.ndjson
+
+# 5. Inspect WAL segments
+nexusdb-scanner --dir /var/data/nexusdb wal list
+nexusdb-scanner --dir /var/data/nexusdb wal dump -seq 1
+
+# 6. Full rescue with WAL replay
+nexusdb-scanner --dir /var/data/nexusdb merge -tree 192 -include-wal -format json > full_rescue.ndjson
+
+# 7. Inspect the vpid map
+nexusdb-scanner --dir /var/data/nexusdb map
+
+# 8. Find a specific key
+nexusdb-scanner --dir /var/data/nexusdb lookup -tree 192 -key 48656c6c6f
+
+# 9. Per-page range scan
+nexusdb-scanner --dir /var/data/nexusdb range -vpid 192 -start 00 -end ff
 ```
 
 ---
@@ -138,10 +154,20 @@ the same directory across multiple sessions.
 
 ## Status
 
-This is the **design + skeleton PR** (`tool/scanner`). The skeleton binary
-exists and `cargo check` succeeds; commands are not yet implemented. See
-[`docs/DESIGN.md`](docs/DESIGN.md) for the rollout plan across PR1..PR5.
+All PRs (PR1–PR5) are implemented. The scanner supports the full CLI surface:
 
-PR1 implements `dbs` and `header` (the minimum to confirm any directory is
-readable). Subsequent PRs add `vpid`, `walk`, `lookup`, `range`, `verify`,
-`export`, then WAL handling.
+- **dbs** — list tables
+- **header** — decode page header
+- **vpid** — full page decode
+- **verify** — walk and validate an entire btree
+- **blame** — locate a bad page's context within a tree
+- **rescue** — one-click diagnosis pipeline
+- **export** — key-order tree traversal (kv/json output)
+- **wal list** — enumerate WAL segments
+- **wal dump** — decode WAL segments byte-by-byte
+- **merge** — export with optional WAL replay
+- **map** — dump vpid → disk coordinate mapping
+- **lookup** — find a specific key in a tree
+- **range** — per-page key range scan
+
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture and CLI reference.
