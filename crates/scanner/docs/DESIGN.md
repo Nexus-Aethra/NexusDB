@@ -1,6 +1,6 @@
 # NexusDBScanner — Design
 
-> Status: **frozen direction**, pending first implementation PR.
+> Status: **PR2 in progress**. PR1 (dbs/header/vpid) and PR2.1-2.2 (layout auto-discovery, tree traversal, verify) are committed. PR2.3-2.6 (header --neighbors, blame, rescue, integration test) are pending.
 
 This document is the contract. Implementation PRs (PR1..PR5) are expected to
 honour every "must" clause below. Any deviation needs a written rationale
@@ -140,7 +140,9 @@ nexusdb-scanner [--dir <PATH>] [--tolerant|--strict] [--json] [--limit N]
 
 Each command is independent; a single invocation runs exactly one command.
 
-#### `dbs`
+Legend: `[x]` = implemented, `[ ]` = pending design doc, `[~]` = partially implemented.
+
+#### `dbs` [x] (PR1)
 
 Enumerate all tables in the directory's MetaPage. For each table, report the
 root_vpid. Reads `page.mate` if available, falls back to scanning `.block`
@@ -162,9 +164,9 @@ study      knowledge_points  256          Leaf         15
 
 JSON mode emits an array of records, one per table.
 
-#### `vpid`
+#### `vpid` [x] (PR1)
 
-Read a single page by vpid and print a full decode. Does **not** require a
+Read a single page by vpid, print a full decode. Does **not** require a
 tree handle. Designed for "look at vpid 5 and tell me what went wrong".
 
 ```
@@ -186,7 +188,7 @@ If the page is bad (`magic` mismatch, `checksum` mismatch, `page_type` byte
 not in `{1..5}`, `vpid` mismatch, `free_off` out of bounds), it prints
 `[BAD-PAGE]` with diagnostic fields and exits tolerant mode handling.
 
-#### `range`
+#### `range` [ ]
 
 In-page ordered range scan over a single leaf or meta page.
 
@@ -205,7 +207,7 @@ The reason `range` stays per-page: it is the canonical tool for diagnosing
 "is this key inside this page, and is the binary search correct?". Anything
 that crosses a page boundary inherently traverses the btree, which is `walk`.
 
-#### `walk`
+#### `walk` [~] (PR2.2 tree.rs provides the BFS traversal engine; CLI command not yet wired)
 
 Tree-wide ordered scan starting from a root vpid.
 
@@ -221,7 +223,7 @@ attempt to descend (tolerant only — strict mode halts).
 
 This is the workhorse for "give me everything in this tree".
 
-#### `lookup` (formerly `keydetail` in the original draft)
+#### `lookup` [ ] (formerly `keydetail` in the original draft)
 
 Find a specific physical key inside a tree and report its full item.
 
@@ -238,7 +240,7 @@ item. Output includes:
 - the page vpid and item index where it was found,
 - a `[BAD-PAGE]` marker if the lookup could not complete.
 
-#### `header`
+#### `header` [x] (PR1; `--neighbors` flag arrives in PR2.3)
 
 Lightweight diagnostic — read page header only, skip item decode.
 
@@ -250,7 +252,7 @@ Useful when the full `vpid` command fails deep in item parsing and you still
 want the 40-byte header + footer decoded. Identical output to the first block
 of `vpid` but guaranteed cheap.
 
-#### `map`
+#### `map` [ ]
 
 Dump the vpid → (file_id, chunk_idx, page_idx) map from `page.mate` /
 `pid.state`. If both files are missing, scans `.block` files for `LCBP`
@@ -264,7 +266,7 @@ This is the scanner's internal index for "given a vpid, where on disk does
 this page live". It is exposed as a command because the user often wants to
 spot-check the map against reality.
 
-#### `verify`
+#### `verify` [x] (PR2.2)
 
 Walk an entire btree, validating every page along the way.
 
@@ -285,7 +287,7 @@ For each page, checks:
 
 Outputs a per-page status table. Default mode is `--tolerant`.
 
-#### `export`
+#### `export` [~] (PR2.5 rescue command planned; export as standalone command deferred to PR3)
 
 Dump an entire tree to a stream on stdout. **This is the data-rescue path.**
 
@@ -308,7 +310,7 @@ code is 0 if any row was emitted, 1 if zero rows were emitted *and* the
 tree appeared non-empty (we cannot distinguish a legitimately empty tree from
 a wholly-corrupt tree; that ambiguity is logged).
 
-#### `wal list`
+#### `wal list` [ ]
 
 ```
 nexusdb-scanner --dir <PATH> wal list
@@ -317,7 +319,7 @@ nexusdb-scanner --dir <PATH> wal list
 Walks the directory, lists every `*.wal.<seq>` segment file with size and
 mtime as raw integers. No bytes are read yet.
 
-#### `wal dump`
+#### `wal dump` [ ]
 
 Decode one or a range of WAL segments byte-by-byte.
 
@@ -447,7 +449,22 @@ figuring out *why* the engine refused to open it.
 
 ---
 
-## 8. Open questions deferred to a later PR
+## 8. Current progress
+
+| PR | Scope | Date | Status |
+|---|---|---|---|
+| PR1 | Design docs + skeleton + `dbs`/`header`/`vpid` commands | 2026-08-21 | committed (`bc3018e`, `ba06683`) |
+| PR2.1 | dir module split + layout auto-discovery (L1/L2/L3/L4) | 2026-08-21 | committed (`77950b2`) |
+| PR2.2 | `tree.rs` (BFS traversal) + `verify` command | 2026-08-21 | committed (`4f1a7fd`) |
+| PR2.3 | `header --neighbors` | pending | reading same-chunk neighbour pages |
+| PR2.4 | `commands/blame.rs` | pending | bad page → tree path → impact range |
+| PR2.5 | `commands/rescue.rs` | pending | one-shot diagnosis pipeline |
+| PR2.6 | Integration test | pending | synthetic corrupt directory → rescue report |
+| PR3 | `export` + `merge` + `verify` repair mode | deferred | data rescue pipeline |
+| PR4 | `wal list`/`dump` + `merge --include-wal` | deferred | WAL replay + export |
+| PR5 | `map` + `lookup` + `range` | deferred | fine-grained tree navigation |
+
+## 9. Open questions deferred to a later PR
 
 - Should `verify` follow `internal_child` pointers or recompute them from
   a clean reload of `page.mate`? Currently intent: follow pointers, record
