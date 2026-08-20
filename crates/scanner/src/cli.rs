@@ -1,0 +1,203 @@
+//! CLI: clap-based argument parsing for `nexusdb-scanner`.
+//!
+//! Three layers of args:
+//! 1. **Global flags** that apply to *all* subcommands (e.g. `--dir`,
+//!    `--tolerant`, `--json`, `--hex-vpid`).
+//! 2. **Subcommand** name (required positional-like via clap derive).
+//! 3. **Per-subcommand** args.
+//!
+//! `clap` does all of this for us. We split into `Args` (globals) and
+//! `Command` (enum) so dispatch stays trivial in `main.rs`.
+// `is_strict`, `name`, and `parse` are scaffolding: `is_strict` will be
+// used by `--strict` failure paths in PR2+, `name` is reserved for
+// per-command help rendering, and `parse` is a future PR-friendly entry
+// point alongside the current `clap::Parser` derive.
+#[allow(dead_code)]
+
+use clap::{Args, Parser, Subcommand};
+
+use crate::output::OutputMode;
+
+/// Top-level CLI: `nexusdb-scanner [...globals] <COMMAND> [args]`.
+///
+/// We use the `command` attribute on Parser so subcommands appear in help.
+#[derive(Debug, Parser)]
+#[command(
+    name = "nexusdb-scanner",
+    version,
+    about = "Read-only offline scanner / data-rescue tool for NexusDB.",
+    long_about = "Reads NexusDB data directories without booting the engine.\n\
+                  Designed for the case where the engine refuses to open the directory\n\
+                  and the user still needs to inspect or rescue the data."
+)]
+pub struct Top {
+    #[command(flatten)]
+    pub globals: Globals,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Global flags shared by every subcommand.
+///
+/// `dir` is implemented as a non-`global` flatten member: clap forbids
+/// combining `global = true` with required (clap issue tracked in DEBUG
+/// asserts). flatten propagates the option to every subcommand anyway, so
+/// the user-visible behaviour is identical to "global + required".
+#[derive(Debug, Args, Clone)]
+pub struct Globals {
+    /// Data directory to scan.
+    #[arg(long)]
+    pub dir: std::path::PathBuf,
+
+    /// Tolerant mode (default): never exit non-zero on bad pages.
+    #[arg(long, global = true, default_value_t = true)]
+    pub tolerant: bool,
+
+    /// Strict mode: abort on the first bad page. CI use only.
+    #[arg(long, global = true, conflicts_with = "tolerant")]
+    pub strict: bool,
+
+    /// Emit machine-readable JSON.
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Parse and render vpid values as hex.
+    #[arg(long, global = true)]
+    pub hex_vpid: bool,
+
+    /// Cap output rows (0 = unlimited).
+    #[arg(long, global = true, default_value_t = 0u32)]
+    pub limit: u32,
+
+    /// Disable ANSI color (also auto-honoured when `NO_COLOR` is set).
+    #[arg(long, global = true)]
+    pub no_color: bool,
+}
+
+impl Globals {
+    pub fn output_mode(&self) -> OutputMode {
+        if self.json {
+            OutputMode::Json
+        } else {
+            OutputMode::Human
+        }
+    }
+
+    pub fn is_strict(&self) -> bool {
+        self.strict
+    }
+}
+
+/// Every subcommand the scanner supports in PR1.
+///
+/// Additional commands (`walk`, `lookup`, `range`, `verify`, `export`,
+/// `wal ...`, `merge`, `map`) arrive in PR2+.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// List tables (the `dbs` command from the design doc).
+    Dbs,
+
+    /// Decode the 40-byte header of a single page (the `header` command).
+    Header {
+        /// vpid to inspect.
+        #[arg(value_parser = clap::value_parser!(u64).range(0..))]
+        vpid: u64,
+    },
+
+    /// Full decode of a single page (the `vpid` command).
+    Vpid {
+        /// vpid to inspect.
+        #[arg(value_parser = clap::value_parser!(u64).range(0..))]
+        vpid: u64,
+
+        /// Skip item-area decoding; only print header + footer.
+        #[arg(long)]
+        raw: bool,
+    },
+}
+
+impl Command {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Dbs { .. } => "dbs",
+            Command::Header { .. } => "header",
+            Command::Vpid { .. } => "vpid",
+        }
+    }
+}
+
+/// Parse argv into a `Top`. Exits the process on parse error.
+pub fn parse() -> Top {
+    Top::parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_dbs_command() {
+        let t = Top::try_parse_from(["nexusdb-scanner", "--dir", "E:/study", "dbs"]).unwrap();
+        assert_eq!(t.globals.dir.to_string_lossy(), "E:/study");
+        assert!(t.globals.tolerant);
+        assert!(!t.globals.strict);
+        assert_eq!(t.command.name(), "dbs");
+    }
+
+    #[test]
+    fn parses_header_command_with_vpid() {
+        let t = Top::try_parse_from([
+            "nexusdb-scanner",
+            "--dir",
+            "E:/study",
+            "header",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(t.command.name(), "header");
+        match t.command {
+            Command::Header { vpid } => assert_eq!(vpid, 5),
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn parses_vpid_command_with_raw_flag() {
+        let t = Top::try_parse_from([
+            "nexusdb-scanner",
+            "--dir",
+            "E:/study",
+            "vpid",
+            "5",
+            "--raw",
+        ])
+        .unwrap();
+        match t.command {
+            Command::Vpid { vpid, raw } => {
+                assert_eq!(vpid, 5);
+                assert!(raw);
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn strict_and_tolerant_cannot_coexist() {
+        let r = Top::try_parse_from([
+            "nexusdb-scanner",
+            "--dir",
+            "E:/study",
+            "--strict",
+            "--tolerant",
+            "dbs",
+        ]);
+        assert!(r.is_err(), "--strict should conflict with --tolerant");
+    }
+
+    #[test]
+    fn json_flag_sets_output_mode() {
+        let t = Top::try_parse_from(["nexusdb-scanner", "--dir", "E:/study", "--json", "dbs"]).unwrap();
+        assert_eq!(t.globals.output_mode(), OutputMode::Json);
+    }
+}
