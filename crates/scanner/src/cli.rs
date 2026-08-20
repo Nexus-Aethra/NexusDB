@@ -89,10 +89,10 @@ impl Globals {
     }
 }
 
-/// Every subcommand the scanner supports in PR1.
+/// Every subcommand the scanner supports in PR1 + PR2.
 ///
-/// Additional commands (`walk`, `lookup`, `range`, `verify`, `export`,
-/// `wal ...`, `merge`, `map`) arrive in PR2+.
+/// Additional commands (`walk`, `lookup`, `range`, `export`,
+/// `wal ...`, `merge`, `map`, `blame`, `rescue`) arrive in later PRs.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// List tables (the `dbs` command from the design doc).
@@ -115,6 +115,13 @@ pub enum Command {
         #[arg(long)]
         raw: bool,
     },
+
+    /// Walk every page reachable from a btree root and report per-page status.
+    Verify {
+        /// Root vpid of the btree to walk.
+        #[arg(value_parser = clap::value_parser!(u64).range(0..))]
+        root: u64,
+    },
 }
 
 impl Command {
@@ -123,6 +130,7 @@ impl Command {
             Command::Dbs { .. } => "dbs",
             Command::Header { .. } => "header",
             Command::Vpid { .. } => "vpid",
+            Command::Verify { .. } => "verify",
         }
     }
 }

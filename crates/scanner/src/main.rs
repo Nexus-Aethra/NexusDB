@@ -26,6 +26,7 @@ mod output;
 mod page_decode;
 mod page_io;
 mod pid;
+mod tree;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -47,6 +48,7 @@ fn main() -> ExitCode {
         Command::Dbs => commands::dbs::run(globals, &mut out),
         Command::Header { vpid } => commands::header::run(globals, vpid, &mut out),
         Command::Vpid { vpid, raw } => commands::vpid::run(globals, vpid, raw, &mut out),
+        Command::Verify { root } => commands::verify::run(globals, root, &mut out),
     };
 
     match cmd_result {

@@ -80,6 +80,10 @@ pub enum BadKind {
     /// treat this as "no items" rather than corrupt, so it is *not* a `bad`
     /// by itself. Reserved here for future use.
     DumpEmpty,
+    /// Page could not be read at all (block file missing, IO error). Used
+    /// by callers that attach `BadPage` from `page_io::PageRead` rather
+    /// than from byte-level decoding.
+    Unreadable,
 }
 
 impl PageReport {

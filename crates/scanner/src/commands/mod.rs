@@ -8,4 +8,5 @@
 
 pub mod dbs;
 pub mod header;
+pub mod verify;
 pub mod vpid;
