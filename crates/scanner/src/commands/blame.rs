@@ -24,7 +24,7 @@ pub fn run<W: Write>(globals: &Globals, bad_vpid: u64, tree_root: Option<u64>, m
         .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
             path: globals.dir.clone(),
         })?;
-    let locate = Locate::open(shard)?;
+    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     if let Some(root) = tree_root {
         blame_in_tree(&mut out, globals, &shard, &locate, bad_vpid, root);

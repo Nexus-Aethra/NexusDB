@@ -70,6 +70,13 @@ pub struct Globals {
     #[arg(long, global = true, default_value_t = 0u32)]
     pub limit: u32,
 
+    /// Add N to every DiskCoord.file_id resolved by this scan.
+    /// Use when page.mate was written with file_id=X but actual .block
+    /// files on disk are numbered file_id=X+N (e.g. mate=0, disk=1).
+    /// Value of 0 disables remapping.
+    #[arg(long, global = true, default_value_t = 0u32, name = "N")]
+    pub block_file_id_override: u32,
+
     /// Disable ANSI color (also auto-honoured when `NO_COLOR` is set).
     #[arg(long, global = true)]
     pub no_color: bool,
@@ -221,6 +228,46 @@ pub enum Command {
         #[arg(short = 'e', long)]
         end: Option<String>,
     },
+
+/// Brute-force scan of every page in every block file, deduplicating KV
+        /// pairs by later-writes-wins and emitting in key order.
+        ExportForce {
+            /// Output format: "kv" or "json".
+            #[arg(short, long, default_value = "kv")]
+            format: String,
+        },
+
+        /// Repair specific slots in page.mate (the only scanner command that
+        /// writes to disk). Refuses to write without `--apply`.
+    FixMate {
+        /// vpid whose slot should be rewritten.
+        #[arg(short, long, value_parser = clap::value_parser!(u64).range(0..))]
+        vpid: Option<u64>,
+
+        /// New page_idx for that slot.
+        #[arg(short = 'p', long, value_parser = clap::value_parser!(u64).range(0..))]
+        page_idx: Option<u64>,
+
+        /// New file_id for that slot. Defaults to 1.
+        #[arg(short = 'f', long)]
+        file_id: Option<u32>,
+
+        /// Mark the slot as FREED (0x08) instead of ALIVE.
+        #[arg(long)]
+        freed: bool,
+
+        /// Scan every ALIVE slot and auto-repair: repoint to orphan copy if
+        /// exactly one match exists, mark FREED if no copy exists, fix
+        /// file_id=0 -> file_id=1 when the pointed page is alive. Mutually
+        /// exclusive with --vpid / --page-idx / --file-id / --freed.
+        #[arg(long, conflicts_with_all = ["vpid", "page_idx", "file_id", "freed"])]
+        auto: bool,
+
+        /// Actually write the changes. Without this flag, the command runs in
+        /// dry-run mode and only reports what it would do.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 impl Command {
@@ -239,6 +286,8 @@ impl Command {
             Command::Map { .. } => "map",
             Command::Lookup { .. } => "lookup",
             Command::Range { .. } => "range",
+            Command::ExportForce { .. } => "export-force",
+            Command::FixMate { .. } => "fix-mate",
         }
     }
 }

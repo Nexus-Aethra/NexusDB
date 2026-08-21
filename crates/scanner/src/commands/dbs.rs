@@ -33,7 +33,7 @@ pub fn run<W: Write>(globals: &Globals, mut out: W) -> Result<u8> {
         }
     };
 
-    let locate = Locate::open(shard)?;
+    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     // 1. Read MetaPage at vpid 0 -- yields (db_name -> table_dir_root_vpid).
     let meta_table_dir = match locate.resolve(0, crate::pid::Strategy::MateThenArithmetic) {

@@ -23,7 +23,7 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, key_hex: &str, mut out: 
         .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
             path: globals.dir.clone(),
         })?;
-    let locate = Locate::open(shard)?;
+    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let target_key = match hex::decode(key_hex) {
         Ok(k) => k,

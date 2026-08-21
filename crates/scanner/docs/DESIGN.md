@@ -1,8 +1,19 @@
 # NexusDBScanner — Design
 
-> Status: **PR5 complete**. All 5 PRs are implemented. The scanner now supports
-> the full CLI surface: dbs, header, vpid, verify, blame, rescue, export,
-> wal-list, wal-dump, merge, map, lookup, range.
+> Status: **PR5 complete**. The scanner now supports the full CLI surface:
+> dbs, header, vpid, verify, blame, rescue, export, wal-list, wal-dump,
+> merge, map, lookup, range, fix-mate, export-force.
+>
+> Post-PR5 additions (post-incident tooling):
+> - `--block-file-id-override N`: global flag; remaps DiskCoord.file_id += N
+>   (fixes the engine bug where page.mate stores file_id=0 but blocks live
+>   under file_id=1).
+> - `fix-mate`: rewrite page.mate slots in-place. Two modes: `--auto`
+>   (auto-repair via orphan copy scan) and `--vpid N --page-idx M` (explicit).
+>   Only scanner command that writes to disk.
+> - `export-force`: brute-force scan every page in every block, decode Leaf
+>   items, dedup by later-writes-wins, emit in key order. Does not rely on
+>   page.mate correctness — rescues data even when the engine cannot open.
 
 This document is the contract. Implementation PRs (PR1..PR5) are expected to
 honour every "must" clause below. Any deviation needs a written rationale

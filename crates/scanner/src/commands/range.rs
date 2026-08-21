@@ -32,7 +32,7 @@ pub fn run<W: Write>(
         .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
             path: globals.dir.clone(),
         })?;
-    let locate = Locate::open(shard)?;
+    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let start_key: Option<Vec<u8>> = match start_hex {
         Some(s) if s.is_empty() => None,

@@ -28,7 +28,7 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, format: ExportFormat, sk
         .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
             path: globals.dir.clone(),
         })?;
-    let locate = Locate::open(shard)?;
+    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let out_rc = RefCell::new(&mut out);
     let row_count = RefCell::new(0u64);

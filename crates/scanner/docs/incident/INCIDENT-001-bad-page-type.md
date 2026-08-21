@@ -3,6 +3,7 @@
 > **日期**: 2026-08-21
 > **报告人**: 扫描器工具链
 > **状态**: 根因已定位，引擎已修复（2026-08-02），待救援
+> **更新**: 2026-08-21 增补 §5.4「未覆盖场景：周期 flush 与 swap flush 乱序竞态」
 
 ---
 
@@ -224,6 +225,48 @@ chunk 0（page_idx 0~63）中，page_idx 0~12 有 LCBP 魔数，13~63 全零。�
 **问题**: 扫描器按 page.mate 的 file_id 查找 block 文件，但 mate 中 file_id=0 而实际文件是 `000001.block`（file_id=1）。导致扫描器无法读取任何页面。
 
 **建议**: 在 `Locate::resolve()` 中，当 mate 的 file_id 对应的 block 文件不存在时，尝试 file_id + 1。
+
+### 5.4 周期 flush 与 swap flush 的乱序竞态（未覆盖场景）
+
+**问题描述**：`maybe_periodic_flush`（256 次写 / 10 秒触发）与 `swap_full_chunk_to_write_queue`（chunk 写满置换触发）可能产生以下时序：
+
+```
+T1: chunk 驻留 4 页（page_idx 0..3）
+T2: 写计数达 256，周期 flush 触发
+    → 4 页快照 A 写入 WriteQueue（pending）
+T3: chunk 继续写入，填满 64 页
+    → swap 触发，64 页快照 A' 写入 WriteQueue（pending 中 A 被 dedup 覆盖为 A'）
+T4: A 在 IO 完成队列中先返回，in_flight 中 A 被移除
+    → complete_flush：pending 空（A' 已离开 pending）→ 插入 chunk_list（4 页版本）
+T5: take_meta_flush_batch() 检查 flush_backlog()
+    → 若 backlog 仅看 pending 而不看 in_flight：backlog=0 → 触发 meta 刷盘
+T6: meta 落盘，记录 4 页版本的 page_idx 范围
+T7: A' 完成 in_flight → 升级 chunk_list 为 64 页
+    → 但 meta 已记录 4 页，page_idx 4+ 永远查不到
+```
+
+**关键风险窗口**：`complete_flush` 那一刻 A' 还在 in_flight 里飞行，但 `take_meta_flush_batch()` 的 `flush_backlog() == 0` 闸门只检查 pending 队列，若 backlog 定义不含 in_flight，meta 会被允许提前刷盘。
+
+**修复建议**：
+
+1. **`flush_backlog()` 必须包含 `pending + in_flight`**：
+   ```rust
+   fn flush_backlog(&self) -> usize {
+       self.write_queue.pending_keys().len()
+           + self.in_flight.len()
+   }
+   ```
+
+2. **meta 刷盘前 snapshot 一个 data version vector**：
+   - 在 `take_meta_flush_batch()` 触发时，记录每个 ChunkKey 在 chunk_list 中的"有效页数"快照 V_old
+   - meta 落盘时，校验 chunk_list 中每个 key 的"有效页数" ≥ V_old
+   - 若任意 key 的版本回退，meta 写入失败并触发重试
+
+3. **周期 flush 与 swap flush 的合并**：
+   - 当 chunk 写满 64 页时，取消该 chunk 上挂起的周期 flush 任务
+   - 避免周期快照与 swap 快照的并发飞行，简化 race 分析
+
+**与 5.1 的关系**：5.1 提出的"meta+data 原子提交"在物理层最干净，但写放大严重。本节提议的 version vector 闸门是逻辑层等价方案——不强制物理绑定，但保证"meta 记录的版本不超过刷盘时的 data 版本"，实现简单且无写放大。
 
 ---
 

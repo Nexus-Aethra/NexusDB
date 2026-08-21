@@ -69,6 +69,19 @@ fn main() -> ExitCode {
         Command::Map { from_mate_only } => commands::map::run(globals, from_mate_only, &mut out),
         Command::Lookup { tree, key } => commands::lookup::run(globals, tree, &key, &mut out),
         Command::Range { vpid, start, end } => commands::range::run(globals, vpid, start, end, &mut out),
+        Command::ExportForce { format } => {
+            let fmt = crate::commands::export_force::ExportForceFormat::from_str(&format)
+                .unwrap_or(crate::commands::export_force::ExportForceFormat::Kv);
+            commands::export_force::run(globals, fmt, &mut out)
+        },
+        Command::FixMate {
+            vpid,
+            page_idx,
+            file_id,
+            freed,
+            auto,
+            apply,
+        } => commands::fix_mate::run(globals, vpid, page_idx, file_id, freed, auto, apply, &mut out),
     };
 
     match cmd_result {

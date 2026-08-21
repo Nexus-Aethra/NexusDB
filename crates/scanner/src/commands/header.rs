@@ -24,7 +24,7 @@ pub fn run<W: Write>(globals: &Globals, vpid: u64, neighbors: bool, mut out: W) 
         .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
             path: globals.dir.clone(),
         })?;
-    let locate = Locate::open(shard)?;
+    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let coord = locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic)?;
     let read = page_io::read_page(shard, coord);

@@ -36,7 +36,7 @@ pub fn run<W: Write>(
         .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
             path: globals.dir.clone(),
         })?;
-    let locate = Locate::open(shard)?;
+    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     // Phase 1: collect all key-value pairs from the page pool
     let merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();

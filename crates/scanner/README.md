@@ -147,6 +147,7 @@ the same directory across multiple sessions.
 | `--json` | machine-readable JSON output |
 | `--limit N` | cap emitted rows |
 | `--hex-vpid` | vpid values are hex in input and output |
+| `--block-file-id-override N` | add N to every resolved DiskCoord.file_id (fixes engine bug where page.mate stores file_id=0 but blocks live under file_id=1). All commands benefit. |
 | `--no-color` | disable ANSI escapes |
 | `-h`, `--help` | per-command help |
 
@@ -169,5 +170,19 @@ All PRs (PR1–PR5) are implemented. The scanner supports the full CLI surface:
 - **map** — dump vpid → disk coordinate mapping
 - **lookup** — find a specific key in a tree
 - **range** — per-page key range scan
+- **fix-mate** — repair page.mate slots in-place (`--auto` or `--vpid N --page-idx M` + `--apply`)
+- **export-force** — brute-force scan every page, decode Leaf items, dedup by later-writes-wins (kv/json output)
+
+### Global flags
+
+`--block-file-id-override N` remaps every `DiskCoord.file_id` by adding `N` before the block file is looked up. This fixes datasets where `page.mate` was written with `file_id=0` but the actual `.block` files on disk are numbered `file_id=1` (the engine bug INC-001). Apply it as a global flag alongside any command; no in-place file repair is needed.
+
+### Example: `export-force` without any repair
+
+```bash
+nexusdb-scanner --dir E:\study --block-file-id-override 1 export-force
+```
+
+This scans all 640 pages in the single `.block` file, decodes the 13 Leaf pages (117 items total), deduplicates by later-writes-wins, and emits 105 key-value rows in key order — **without modifying any file on disk**.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture and CLI reference.

@@ -95,6 +95,10 @@ pub struct Locate {
     pid_state_path: Option<PathBuf>,
     /// Number of malformed slots encountered while loading `page.mate`.
     bad_slot_count: u32,
+    /// Offset applied to `DiskCoord.file_id` after resolve.
+    /// Set via `with_file_id_offset`; useful when page.mate stores file_id=X
+    /// but actual .block files on disk are numbered file_id=X+N.
+    file_id_offset: u32,
 }
 
 impl Locate {
@@ -125,7 +129,17 @@ impl Locate {
             mate_path,
             pid_state_path,
             bad_slot_count,
+            file_id_offset: 0,
         })
+    }
+
+    /// Open a locator for the given shard directory, then apply a per-read
+    /// file_id offset (from `--block-file-id-override`). Use this entry point
+    /// from command dispatch to keep the override logic in one place.
+    pub fn open_with_override(shard: &ShardDir, file_id_offset: u32) -> Result<Self> {
+        let mut loc = Self::open(shard)?;
+        loc.file_id_offset = file_id_offset;
+        Ok(loc)
     }
 
     /// Source diagnostics used by the `map` command.
@@ -165,14 +179,39 @@ impl Locate {
     }
 
     /// Resolve a single vpid to a `DiskCoord` using the given strategy.
+    /// `DiskCoord.file_id` is automatically shifted by `file_id_offset` if set.
     pub fn resolve(&self, vpid: u64, strategy: Strategy) -> Result<DiskCoord> {
-        match strategy {
-            Strategy::MateOnly => self.lookup_mate(vpid),
-            Strategy::ArithmeticOnly => Ok(DiskCoord::from_vpid_arithmetic(vpid)),
+        let mut coord = match strategy {
+            Strategy::MateOnly => self.lookup_mate(vpid)?,
+            Strategy::ArithmeticOnly => DiskCoord::from_vpid_arithmetic(vpid),
             Strategy::MateThenArithmetic => self
                 .lookup_mate(vpid)
-                .or_else(|_| Ok(DiskCoord::from_vpid_arithmetic(vpid))),
+                .unwrap_or_else(|_| DiskCoord::from_vpid_arithmetic(vpid)),
+        };
+        if self.file_id_offset != 0 {
+            coord.file_id =
+                (coord.file_id as u64 + self.file_id_offset as u64) as u32;
         }
+        Ok(coord)
+    }
+
+    /// Return a copy of this locator with a per-read `file_id` offset.
+    /// Useful when page.mate was written with file_id=X but the actual .block
+    /// files on disk live under file_id=X+N (common after engine bug
+    /// INC-001 fixed the encoding).
+    pub fn with_file_id_offset(&self, offset: u32) -> Locate {
+        let mut new = Locate {
+            mate: self.mate.clone(),
+            usable_slots: self.usable_slots,
+            pid_state_hint: self.pid_state_hint,
+            block_file_id_range: self.block_file_id_range,
+            mate_path: self.mate_path.clone(),
+            pid_state_path: self.pid_state_path.clone(),
+            bad_slot_count: self.bad_slot_count,
+            file_id_offset: 0,
+        };
+        new.file_id_offset = offset;
+        new
     }
 
     fn lookup_mate(&self, vpid: u64) -> Result<DiskCoord> {
