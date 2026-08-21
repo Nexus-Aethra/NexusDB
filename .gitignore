@@ -30,3 +30,6 @@ embedded-data/
 
 data-test/
 logs-test/
+
+# ZCode session artifacts (plans, scratch state)
+.zcode/
