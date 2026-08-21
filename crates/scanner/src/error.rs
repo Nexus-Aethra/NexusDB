@@ -47,6 +47,16 @@ pub enum ScannerError {
         #[source]
         source: io::Error,
     },
+
+    /// Generic I/O error not tied to a specific read offset (e.g. file
+    /// create/write). Used by write-style commands like rescue-json and
+    /// fix-mate.
+    #[error("I/O error at {path}: {source}")]
+    IoError {
+        path: std::path::PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl From<io::Error> for ScannerError {

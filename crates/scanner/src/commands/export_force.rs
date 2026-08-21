@@ -38,34 +38,34 @@ const KIND_TYPE_META: u8 = b'#';
 const KIND_SCHEMA: u8 = b'$';
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum PageKind {
+pub enum PageKind {
     Leaf,
     Other,
     BadMagic,
 }
 
-struct ScanStats {
-    scanned: u64,
-    bad: u64,
-    leaf: u64,
-    decoded: u64,
+pub struct ScanStats {
+    pub scanned: u64,
+    pub bad: u64,
+    pub leaf: u64,
+    pub decoded: u64,
 }
 
 /// Decoded physical key: kind + logical_key_bytes + parsed table name (if
 /// logical_key contains a '/' separator).
 #[derive(Debug, Clone)]
-struct ParsedKey {
-    kind_byte: u8,
-    kind_name: String,
-    logical_key: Vec<u8>,
-    table_name: String, // empty if no '/' found
-    logical_key_after_table: Vec<u8>,
+pub struct ParsedKey {
+    pub kind_byte: u8,
+    pub kind_name: String,
+    pub logical_key: Vec<u8>,
+    pub table_name: String, // empty if no '/' found
+    pub logical_key_after_table: Vec<u8>,
 }
 
 impl ParsedKey {
     /// Decode a physical key: `[kind: 1B][varint(klen): 1-5B][logical_key_body]`.
     /// Then parse logical_key_body to extract table_name and within-table key.
-    fn from_physical(pkey: &[u8]) -> Option<Self> {
+    pub fn from_physical(pkey: &[u8]) -> Option<Self> {
         if pkey.is_empty() {
             return None;
         }
@@ -177,7 +177,7 @@ pub fn run<W: Write>(
     }
 }
 
-fn scan_all_blocks(shard: &dir::ShardDir) -> (BTreeMap<Vec<u8>, Vec<u8>>, ScanStats) {
+pub fn scan_all_blocks(shard: &dir::ShardDir) -> (BTreeMap<Vec<u8>, Vec<u8>>, ScanStats) {
     let mut map = BTreeMap::new();
     let mut stats = ScanStats {
         scanned: 0,

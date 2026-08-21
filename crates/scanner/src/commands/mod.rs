@@ -17,6 +17,7 @@ pub mod map;
 pub mod merge;
 pub mod range;
 pub mod rescue;
+pub mod rescue_json;
 pub mod verify;
 pub mod vpid;
 pub mod wal_dump;

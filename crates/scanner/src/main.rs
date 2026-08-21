@@ -82,6 +82,9 @@ fn main() -> ExitCode {
             auto,
             apply,
         } => commands::fix_mate::run(globals, vpid, page_idx, file_id, freed, auto, apply, &mut out),
+        Command::RescueJson { out_dir, ndjson } => {
+            commands::rescue_json::run(globals, &out_dir, ndjson)
+        }
     };
 
     match cmd_result {

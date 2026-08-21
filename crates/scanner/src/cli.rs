@@ -268,6 +268,20 @@ pub enum Command {
         #[arg(long)]
         apply: bool,
     },
+
+    /// Decode all KV pairs into their original JSON form and write one
+    /// `<table>.json` per table into `--out-dir`. Each row in a table file
+    /// is a JSON object (decoded from the keyspace-encoded value's inner
+    /// JSON, stripping the leading type byte).
+    RescueJson {
+        /// Directory to write `<table>.json` files into. Created if missing.
+        #[arg(long)]
+        out_dir: std::path::PathBuf,
+
+        /// Emit one JSON object per line (ndjson) instead of a JSON array.
+        #[arg(long)]
+        ndjson: bool,
+    },
 }
 
 impl Command {
@@ -288,6 +302,7 @@ impl Command {
             Command::Range { .. } => "range",
             Command::ExportForce { .. } => "export-force",
             Command::FixMate { .. } => "fix-mate",
+            Command::RescueJson { .. } => "rescue-json",
         }
     }
 }
