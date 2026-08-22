@@ -1251,6 +1251,46 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// 回归: list_prefix_async 对含 `\x00` 的 prefix 不会被截断.
+    ///
+    /// 场景: 4 个 user key 前 7 字节相同, 只差第 8 字节; 第 1~3 字节全为 0x00.
+    /// 误传 C 字符串语义时 prefix 会被截短, 命中全部 key. Rust `starts_with`
+    /// 是字节比较, 应只返回 1 条.
+    #[test]
+    fn list_prefix_async_with_nul_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = EmbeddedOptions::new(temp.path());
+        let db = NexusDb::open(options).unwrap();
+        let app = db.create_database("app").unwrap();
+        let table = app.create_table("kv").unwrap();
+
+        let common = [0x00u8, 0x00, 0x00, 0x12, 0xE8, 0x93, 0x70];
+        let ids: &[&[u8]] = &[b"\x01", b"\x02", b"\x03", b"\x04"];
+        for id in ids {
+            let mut k = common.to_vec();
+            k.extend_from_slice(id);
+            table.set(&k, b"v").unwrap();
+        }
+
+        // 单独查每个 subject: 必须恰好 1 条.
+        for id in ids {
+            let mut prefix = common.to_vec();
+            prefix.extend_from_slice(id);
+            let got = pollster::block_on(table.list_prefix_async(&prefix)).unwrap();
+            assert_eq!(
+                got.len(),
+                1,
+                "prefix {prefix:?} matched {} keys, expected 1",
+                got.len()
+            );
+            assert_eq!(got[0], prefix);
+        }
+
+        drop(table);
+        drop(app);
+        db.close().unwrap();
+    }
+
     /// ⭐ Async 跨 shard 正确性: 在 num_shards=2 下批量写, list_async 收齐
     /// (验证 fan-out + 归并不丢 key, 不重复).
     #[test]

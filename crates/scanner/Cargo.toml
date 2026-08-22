@@ -1,0 +1,44 @@
+[package]
+name = "nexusdb-scanner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+publish = false
+description = "Read-only offline scanner/repair tool for NexusDB page images, designed to run when the engine cannot open the data directory."
+
+[[bin]]
+name = "nexusdb-scanner"
+path = "src/main.rs"
+
+[features]
+# Reserved for future use; the scanner is intentionally lean and ships with no
+# default features so that `cargo build` works on any platform without extra
+# configuration.
+default = []
+color = []
+mmap = ["dep:memmap2"]
+
+[dependencies]
+# Workspace: pure-functional page parser, zero OS dependencies.
+page = { path = "../page" }
+
+# CLI. Pure Rust, no OS bindings.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+
+# Error type ergonomics. No OS dependencies.
+thiserror = "2"
+
+# Output formatting. Pure Rust.
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc", "std"] }
+
+# Hex encoding for binary key/value output. Pure Rust, no OS.
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# Optional fast path for reading large .block files via mmap. The crate itself
+# is platform-neutral (its own cfg dispatch); we only enable the dependency
+# when the user opts in via `--features mmap`.
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
