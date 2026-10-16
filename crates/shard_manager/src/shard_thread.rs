@@ -1366,19 +1366,28 @@ pub(crate) fn shard_thread_main(
                             results.push(r);
                         }
                         // ⭐ WAL (F60) strict: 回复前持久化屏障 (一个 Batch 多 op
-                        // 天然共享一次 fsync); reply 到达 ⇒ 已落盘
+                        // 天然共享一次 fsync); reply 到达 ⇒ 已落盘.
+                        // ⭐ 2026-10-17 (审计 P2): barrier 失败必须让客户端看到
+                        // 错误 — 旧实现只记日志后仍发成功回复, 客户端以为写已
+                        // 持久化, 违背 strict (crash 零丢失) 语义.
+                        let mut wal_err: Option<String> = None;
                         if e.wal_mode() == storage::wal::WalMode::Strict
                             && e.wal_needs_sync()
                             && let Err(err) = block_on_io(e.wal_barrier())
                         {
                             nlog::error!("shard", "WAL barrier failed: {err}");
+                            wal_err = Some(format!("WAL persist failed: {err}"));
                         }
-                        let _ = reply.send(Ok(ShardReply::BatchResults(results)));
+                        let reply_msg = match wal_err {
+                            Some(msg) => Err(crate::request::ShardErrorKind::StorageError(msg)),
+                            None => Ok(ShardReply::BatchResults(results)),
+                        };
+                        let _ = reply.send(reply_msg.clone());
                         // reply_bus 支持
                         if req_id > 0 {
                             let sink_opt = reply_sink.lock().expect("reply_sink lock").clone();
                             if let Some(sink) = sink_opt {
-                                sink.push_reply(req_id, shard_id as u32, Ok(ShardReply::PutOk));
+                                sink.push_reply(req_id, shard_id as u32, reply_msg);
                             }
                         }
                     } else {
@@ -1642,10 +1651,19 @@ pub(crate) fn shard_thread_main(
                     }
                 }
                 if !held.is_empty() {
-                    if let Err(err) = block_on_io(e.wal_barrier()) {
-                        nlog::error!("shard", "WAL group-commit barrier failed: {err}");
-                    }
-                    for (wid, tr) in held {
+                    // ⭐ 2026-10-17 (审计 P2): barrier 失败 → held 回复改发错误,
+                    // 不得把未持久化的写当成功回复 (strict 语义).
+                    let wal_err = match block_on_io(e.wal_barrier()) {
+                        Ok(()) => None,
+                        Err(err) => {
+                            nlog::error!("shard", "WAL group-commit barrier failed: {err}");
+                            Some(format!("WAL persist failed: {err}"))
+                        }
+                    };
+                    for (wid, mut tr) in held {
+                        if let Some(msg) = &wal_err {
+                            tr.result = crate::request::BatchResult::Error(msg.clone());
+                        }
                         reply_bus_set.get(wid).push(tr);
                     }
                 }
@@ -1793,14 +1811,21 @@ pub(crate) fn handle_request_blocking(
             ..
         } => {
             let r = block_on_io(e.table_put(&db, &table, &key, &val));
-            // ⭐ WAL (F60) strict: 同步慢路径也保证回复前持久化
-            if e.wal_mode() == storage::wal::WalMode::Strict && e.wal_needs_sync() {
-                let _ = block_on_io(e.wal_barrier());
+            // ⭐ WAL (F60) strict: 同步慢路径也保证回复前持久化;
+            // ⭐ 2026-10-17 (审计 P2): barrier 失败同样要回错误 (旧实现 `let _ =` 吞掉).
+            let mut wal_err: Option<String> = None;
+            if e.wal_mode() == storage::wal::WalMode::Strict
+                && e.wal_needs_sync()
+                && let Err(err) = block_on_io(e.wal_barrier())
+            {
+                nlog::error!("shard", "WAL barrier failed: {err}");
+                wal_err = Some(format!("WAL persist failed: {err}"));
             }
             send_reply(
-                match r {
-                    Ok(_) => Ok(ShardReply::PutOk),
-                    Err(err) => Err(ShardErrorKind::from_storage_display(&err)),
+                match (r, wal_err) {
+                    (_, Some(msg)) => Err(ShardErrorKind::StorageError(msg)),
+                    (Ok(_), None) => Ok(ShardReply::PutOk),
+                    (Err(err), None) => Err(ShardErrorKind::from_storage_display(&err)),
                 },
                 req_id,
             );
@@ -1829,13 +1854,20 @@ pub(crate) fn handle_request_blocking(
             ..
         } => {
             let r = block_on_io(e.table_delete(&db, &table, &key));
-            if e.wal_mode() == storage::wal::WalMode::Strict && e.wal_needs_sync() {
-                let _ = block_on_io(e.wal_barrier());
+            // ⭐ 2026-10-17 (审计 P2): barrier 失败回错误 (同 Put 路径).
+            let mut wal_err: Option<String> = None;
+            if e.wal_mode() == storage::wal::WalMode::Strict
+                && e.wal_needs_sync()
+                && let Err(err) = block_on_io(e.wal_barrier())
+            {
+                nlog::error!("shard", "WAL barrier failed: {err}");
+                wal_err = Some(format!("WAL persist failed: {err}"));
             }
             send_reply(
-                match r {
-                    Ok(b) => Ok(ShardReply::DeleteExisted(b)),
-                    Err(err) => Err(ShardErrorKind::from_storage_display(&err)),
+                match (r, wal_err) {
+                    (_, Some(msg)) => Err(ShardErrorKind::StorageError(msg)),
+                    (Ok(b), None) => Ok(ShardReply::DeleteExisted(b)),
+                    (Err(err), None) => Err(ShardErrorKind::from_storage_display(&err)),
                 },
                 req_id,
             );

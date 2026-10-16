@@ -107,3 +107,21 @@ ORDER BY 数值列也按字典序 ("10" < "2").
 **测试**: `avg_decimal_exact` (0.20 精确 8 位; 0.15 除不尽; SUM 不受影响;
 INT 列 AVG 维持 F64); 反向验证旧实现 0.20000000000000004;
 network 串行 227 passed / 0 failed; clippy 0; fmt 0.
+
+---
+
+## 附: WAL strict barrier 失败仍回成功 (P2) — 同批次修复
+
+**问题**: strict 模式 (crash 零丢失) 下, `wal_barrier()` 失败被三处 swallow:
+Batch 臂 (仅记日志后发 `Ok(BatchResults)`)、group-commit held 路径 (held
+回复照发成功)、同步慢路径 Put/Delete (`let _ =` 吞掉后发 Ok) —
+客户端以为写已持久化, 实际 fsync 失败, 违背 strict 语义.
+
+**修复**: 三处 barrier 失败均转为错误回复 —
+Batch 臂: `Err(ShardErrorKind::StorageError("WAL persist failed: ..."))`
+(同步 reply 与 reply_bus sink); group-commit: held 的 `TaskResult.result`
+改 `BatchResult::Error(...)`; 同步 Put/Delete: 匹配 `(r, wal_err)` 优先
+回 barrier 错误.
+
+**测试**: shard_manager 串行 65 passed / 0 failed; clippy 0; fmt 0.
+(barrier 失败需 IO 故障注入, 仓库无该设施, 按构造验证.)
