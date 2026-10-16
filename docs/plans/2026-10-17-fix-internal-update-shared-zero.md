@@ -222,3 +222,29 @@ IN 子查询折叠产物 (`fold_one_subq`) 与字面量 IN 列表同一 Cond 结
 | `mysql_in_type_mismatch_errors_not_silent_empty` | ✅ 同型 IN 子查询/可 coercion 文本仍正常; 跨型 IN 子查询、跨型字面量列表、DELETE 跨型 IN 均报 "IN types cannot be matched"; 报错后数据未被误删 |
 | network 全量串行 | ✅ 228 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: prepared 语句注册表无上限 (P2) — 同批次修复
+
+**问题**: `conn.mysql_stmts` (MySQL `COM_STMT_PREPARE`) 与 `conn.pg_stmts`
+(PG `Parse` 命名语句) 均**无上限** — 单连接可无限注册, 注册表无界增长 →
+worker OOM. worker 是单线程事件循环, 一个连接的内存泄漏会拖死同 worker
+上的**全部**连接 (等效拒绝服务).
+
+**修复**: `KvLimits` 新增 `max_prepared_stmts` (默认 1024; 对 ORM 通常个
+位数~数十条预备语句足够宽裕), 随 `WorkerConfig.limits` 穿到
+`process_sql_input` / `process_pg_input`:
+- MySQL: 超限回 ERR **1461** (MySQL max_prepared_stmt_count 同义错误码);
+- PG: 超限走 batch error → ErrorResponse;
+- `pg_pending_prepares` (等 schema 的挂起项) 一并计入, 堵住旁路;
+- CLOSE / Close 语句即时释放名额 (语义不变).
+
+**测试** (反向验证: 中和两处上限判断后, 第 5 条 prepare 返回 Ok 而非 1461 → 断言失败):
+
+| 用例 | 结果 |
+|---|---|
+| `mysql_prepared_stmt_registry_capped` | ✅ 上限内正常注册; 第 5 条 ERR 1461; CLOSE 后可继续 prepare 且能执行 |
+| `pg_named_statement_registry_capped` | ✅ 上限内 ParseComplete; 超限 ErrorResponse "too many prepared statements"; Close 后可继续 Parse+Execute |
+| network 全量串行 | ✅ 230 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

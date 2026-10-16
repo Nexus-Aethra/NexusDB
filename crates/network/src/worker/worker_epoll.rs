@@ -283,6 +283,7 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                                             &shard_inboxes,
                                             num_shards,
                                             &tls,
+                                            &lim,
                                         );
                                         should_remove = conn.resp_should_close();
                                     }
@@ -298,6 +299,7 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                                             &shard_inboxes,
                                             num_shards,
                                             &tls,
+                                            &lim,
                                         );
                                         should_remove = conn.resp_should_close();
                                     }

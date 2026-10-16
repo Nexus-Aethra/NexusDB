@@ -339,6 +339,7 @@ async fn conn_coro(
                                 &shard_inboxes,
                                 num_shards,
                                 &tls_config,
+                                &limits,
                             );
                             conn.resp_should_close()
                         }
@@ -353,6 +354,7 @@ async fn conn_coro(
                                 &shard_inboxes,
                                 num_shards,
                                 &tls_config,
+                                &limits,
                             );
                             conn.resp_should_close()
                         }

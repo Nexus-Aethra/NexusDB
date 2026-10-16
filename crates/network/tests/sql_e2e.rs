@@ -14,6 +14,13 @@ use shard_manager::{ShardManager, ShardManagerOptions};
 use storage::{IoBackend, IoBackendConfig};
 
 fn start_sql_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>) {
+    start_sql_server_with_limits(password, KvLimits::default())
+}
+
+fn start_sql_server_with_limits(
+    password: Option<&str>,
+    limits: KvLimits,
+) -> (NetworkServer, Arc<ShardManager>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let opts = ShardManagerOptions {
         num_shards: 3,
@@ -38,7 +45,7 @@ fn start_sql_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>
         default_table: "kv".to_string(),
         inbox_capacity: 64,
         protocol: ProtocolKind::Sql,
-        limits: KvLimits::default(),
+        limits,
         auth_password: password.map(|s| s.to_string()),
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
@@ -4219,6 +4226,57 @@ fn mysql_in_type_mismatch_errors_not_silent_empty() {
         c.ids("SELECT id FROM u ORDER BY id"),
         vec!["1", "2", "3"],
         "报错后数据不得被改动"
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P2 (2026-10-17): 单连接 prepared 语句注册表上限.
+///
+/// 旧实现 `conn.mysql_stmts` 无上限 — 单连接可无限 `COM_STMT_PREPARE`,
+/// 注册表无界增长 → worker OOM (worker 单线程, 一个连接的泄漏会拖死同
+/// worker 上的全部连接).
+#[test]
+fn mysql_prepared_stmt_registry_capped() {
+    let limits = KvLimits {
+        max_prepared_stmts: 4,
+        ..Default::default()
+    };
+    let (server, mgr) = start_sql_server_with_limits(None, limits);
+    let mut c = MyConn::handshake_login(&server, "");
+    assert_eq!(
+        c.query("CREATE TABLE ps (id INT PRIMARY KEY, v INT)"),
+        QueryResult::Ok { affected: 0 }
+    );
+    assert_eq!(
+        c.query("INSERT INTO ps VALUES (1, 10)"),
+        QueryResult::Ok { affected: 1 }
+    );
+
+    // 上限内正常注册
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let (id, _) = c.stmt_prepare("SELECT v FROM ps WHERE id = ?").unwrap();
+        ids.push(id);
+    }
+    // 超限 → ERR 1461 (旧实现无上限, 静默吃内存)
+    assert_eq!(
+        c.stmt_prepare("SELECT v FROM ps WHERE id = ?").unwrap_err(),
+        1461,
+        "超过注册表上限必须报错"
+    );
+
+    // CLOSE 释放名额后可继续 prepare, 且新语句可执行
+    c.stmt_close(ids[0]);
+    let (id, _) = c
+        .stmt_prepare("SELECT v FROM ps WHERE id = ?")
+        .expect("close 后名额释放");
+    assert_eq!(
+        c.stmt_execute(id, &[MyParam::I64(1)]),
+        QueryResult::Rows(vec![vec![Some("10".into())]]),
+        "注册表仍可用"
     );
 
     drop(c);

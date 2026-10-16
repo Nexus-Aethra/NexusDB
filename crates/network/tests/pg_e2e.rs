@@ -10,6 +10,13 @@ use std::sync::Arc;
 use storage::{IoBackend, IoBackendConfig};
 
 fn start_pg_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>) {
+    start_pg_server_with_limits(password, KvLimits::default())
+}
+
+fn start_pg_server_with_limits(
+    password: Option<&str>,
+    limits: KvLimits,
+) -> (NetworkServer, Arc<ShardManager>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let opts = ShardManagerOptions {
         num_shards: 3,
@@ -34,7 +41,7 @@ fn start_pg_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>)
         default_table: "kv".to_string(),
         inbox_capacity: 64,
         protocol: ProtocolKind::Pg,
-        limits: KvLimits::default(),
+        limits,
         auth_password: password.map(|s| s.to_string()),
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
@@ -794,6 +801,65 @@ fn pg_group_by_aggregates() {
             ]
         )
     );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P2 (2026-10-17): PG 命名语句注册表上限 (同 MySQL COM_STMT_PREPARE).
+///
+/// 旧实现 `conn.pg_stmts` 无上限 — 单连接可无限 Parse, 注册表无界增长 →
+/// worker OOM (worker 单线程, 一个连接的泄漏会拖死同 worker 全部连接).
+#[test]
+fn pg_named_statement_registry_capped() {
+    let limits = KvLimits {
+        max_prepared_stmts: 3,
+        ..Default::default()
+    };
+    let (server, mgr) = start_pg_server_with_limits(None, limits);
+    let mut c = PgConn::login(&server, None, false).unwrap();
+    assert_eq!(
+        c.query("CREATE TABLE ps (id BIGINT PRIMARY KEY, v INT)"),
+        PgResult::Complete("OK 0".into())
+    );
+    assert_eq!(
+        c.query("INSERT INTO ps VALUES (1, 10)"),
+        PgResult::Complete("OK 1".into())
+    );
+
+    // 上限内正常注册
+    for i in 0..3 {
+        c.send_parse(&format!("s{i}"), "SELECT v FROM ps WHERE id = $1", &[20]);
+        c.send_simple(b'S', &[]);
+        let (types, _, _, err) = c.drain_until_ready();
+        assert!(err.is_none(), "{err:?}");
+        assert!(types.contains(&b'1'), "ParseComplete");
+    }
+    // 超限 → ErrorResponse (旧实现无上限, 静默吃内存)
+    c.send_parse("s3", "SELECT v FROM ps WHERE id = $1", &[20]);
+    c.send_simple(b'S', &[]);
+    let (_, _, _, err) = c.drain_until_ready();
+    let (code, msg) = err.expect("超过注册表上限必须报错");
+    assert!(
+        msg.contains("too many prepared statements"),
+        "错误信息应说明超限: {msg}"
+    );
+    assert!(!code.is_empty(), "{code}");
+
+    // 关闭一条命名语句 → 名额释放, 可继续 Parse 且能执行
+    c.send_simple(b'C', b"Ss0\0");
+    c.send_simple(b'S', &[]);
+    let (types, _, _, err) = c.drain_until_ready();
+    assert!(err.is_none(), "{err:?}");
+    assert!(types.contains(&b'3'), "CloseComplete");
+    c.send_parse("s4", "SELECT v FROM ps WHERE id = $1", &[20]);
+    c.send_bind("s4", &[(1, Some(1i64.to_be_bytes().to_vec()))]);
+    c.send_simple(b'E', &[0, 0, 0, 0, 0]);
+    c.send_simple(b'S', &[]);
+    let (_, rows, _, err) = c.drain_until_ready();
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(rows, vec![vec![Some("10".into())]], "注册表仍可用");
+
     drop(c);
     server.shutdown().unwrap();
     drop(mgr);

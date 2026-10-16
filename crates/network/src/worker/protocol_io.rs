@@ -362,6 +362,7 @@ pub(crate) fn process_sql_input(
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
     tls_config: &Option<std::sync::Arc<rustls::ServerConfig>>,
+    limits: &KvLimits,
 ) {
     use crate::protocol::mysql as my;
     let mut cursor = 0usize;
@@ -578,6 +579,22 @@ pub(crate) fn process_sql_input(
                     conn.next_seq += 1;
                     match sql::parse_prepared(&payload[1..]) {
                         Ok((stmt, params)) => {
+                            // ⭐ 审计 P2 (2026-10-17): 注册表上限 — 旧实现无上限,
+                            // 单连接可无限 PREPARE → 无界增长 → worker OOM.
+                            if conn.mysql_stmts.len() >= limits.max_prepared_stmts {
+                                conn.resp_complete(
+                                    seq,
+                                    my::build_err(
+                                        pkt_seq.wrapping_add(1),
+                                        1461,
+                                        &format!(
+                                            "too many prepared statements (max {})",
+                                            limits.max_prepared_stmts
+                                        ),
+                                    ),
+                                );
+                                continue;
+                            }
                             let id = conn.next_stmt_id;
                             conn.next_stmt_id += 1;
                             conn.mysql_stmts.insert(
@@ -701,6 +718,7 @@ pub(crate) fn process_pg_input(
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
     tls_config: &Option<std::sync::Arc<rustls::ServerConfig>>,
+    limits: &KvLimits,
 ) {
     use crate::protocol::pg;
     let pwd = sql_password.as_deref().unwrap_or("");
@@ -980,11 +998,23 @@ pub(crate) fn process_pg_input(
                                         oids[i] = *o;
                                     }
                                 }
+                                // ⭐ 审计 P2 (2026-10-17): 命名语句注册表上限
+                                // (同 MySQL COM_STMT_PREPARE; 旧实现无上限 → 单连接
+                                // 可注册至 OOM). 等 schema 的 pending 项也计入.
+                                if conn.pg_stmts.len() + conn.pg_pending_prepares.len()
+                                    >= limits.max_prepared_stmts
+                                {
+                                    if conn.pg_batch.error.is_none() {
+                                        conn.pg_batch.error = Some(format!(
+                                            "too many prepared statements (max {})",
+                                            limits.max_prepared_stmts
+                                        ));
+                                    }
                                 // ⭐ portal: INSERT 目标表 schema 未入缓存 → 挂起 Parse,
                                 // 发 GetSchemaOp 拉 schema, 续跑时再推断 OID 回 ParseComplete.
                                 // 期间同批的 Describe/Sync 一并挂起 (statement 不在 pg_stmts,
                                 // Sync 检测 pg_waiting_schema 不 flush).
-                                if let Some(table) = needs_schema {
+                                } else if let Some(table) = needs_schema {
                                     let seq = conn.next_seq;
                                     conn.next_seq += 1;
                                     conn.pg_pending_prepares.insert(

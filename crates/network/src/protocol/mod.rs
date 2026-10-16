@@ -71,6 +71,11 @@ pub enum Response {
 pub struct KvLimits {
     pub max_key_bytes: usize,
     pub max_value_bytes: usize,
+    /// ⭐ 审计 P2 (2026-10-17): 单连接 prepared 语句注册表上限.
+    /// 旧实现无上限 — 单连接可无限 PREPARE, 注册表无限增长 → worker OOM
+    /// (worker 单线程, 一个连接的泄漏会拖死同 worker 上的全部连接).
+    /// MySQL `COM_STMT_PREPARE` 与 PG `Parse` (命名语句) 共用此上限.
+    pub max_prepared_stmts: usize,
 }
 
 impl Default for KvLimits {
@@ -78,6 +83,7 @@ impl Default for KvLimits {
         Self {
             max_key_bytes: 1024,
             max_value_bytes: 1024 * 1024,
+            max_prepared_stmts: 1024,
         }
     }
 }
