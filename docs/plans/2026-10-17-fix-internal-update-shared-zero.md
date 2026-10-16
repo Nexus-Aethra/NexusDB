@@ -174,3 +174,26 @@ unlink (仅 fd 存活 → 无共享路径、无残留、退出即回收).
 | `recover_mate_backend_is_db_local_not_shared_tmp` | ✅ 全新 shard 目录: flush 落库目录 page.mate 且重启读回; 固定共享 /tmp 文件内容不被写/不被截断; 匿名 mate unlink 无残留 |
 | storage 全量串行 | ✅ 510 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: leaf_get_with 1000 步假 miss (P2) — 同批次修复
+
+**问题**: `leaf_get_with` (`leaf.rs`) 段内线性扫描用**固定 1000 步上限**,
+`loop_count > 1000` 即 `return None` — 单段 item 数超 1000 (bulk split /
+索引重建可产出的大段) 时, 对**真实存在的 key** 也返回 None:
+静默丢数据 (点查 miss → 上层按"键不存在"处理).
+
+**修复**: 迭代次数改按段自身的 `item_count` 界定 (与 `leaf_scan_from` 同源
+语义, 哨兵占一个名额), 删掉魔法数 1000; 段内扫尽即返回 None, 不再跨段乱闯.
+`item_count` 本身不可信 (损坏页) 时由 `ptr.next()` 的解码失败/边界检查兜底
+终止, 不会死循环.
+
+**测试** (反向验证: stash 掉 leaf.rs 后 `k01000` 起断言失败, left=None):
+
+| 用例 | 结果 |
+|---|---|
+| `leaf_get_with_scans_segment_larger_than_1000_items` | ✅ 1200 key 合并成单段 (item_count=1201), k00000/k00999/k01000/k01001/k01199 全部命中, 不存在 key 仍 None, scan_from 覆盖 200 项 |
+| page 全量串行 | ✅ 152 passed / 0 failed |
+| storage 全量串行 (leaf_get_with 热路径消费方) | ✅ 510 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

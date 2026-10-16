@@ -2,9 +2,9 @@
 
 use page::{
     Checkpoint, CheckpointHeader, ItemKind, PAGE_HEADER_SIZE, PAGE_SIZE, PageIndex, PageType,
-    leaf_delete, leaf_get, leaf_insert, leaf_new, leaf_push_back, leaf_split, leaf_update_with,
-    page_free_off, page_free_space, page_key_count, page_set_free_off, page_set_key_count,
-    page_type, write_checkpoint, write_checkpoint_header,
+    leaf_delete, leaf_get, leaf_insert, leaf_new, leaf_push_back, leaf_scan_from, leaf_split,
+    leaf_update_with, page_free_off, page_free_space, page_key_count, page_set_free_off,
+    page_set_key_count, page_type, write_checkpoint, write_checkpoint_header,
 };
 use page::{LeafItemPtr, decode_item, encode_leaf_item};
 
@@ -555,4 +555,62 @@ fn update_segment_head_keeps_shared_zero() {
         let key = format!("memtier-{i:08}");
         assert!(leaf_get(&page, key.as_bytes()).is_some(), "key {i} lost");
     }
+}
+
+/// ⭐ 审计 P2 (2026-10-17): `leaf_get_with` 曾用固定 1000 步迭代上限 —
+/// 单段 item 数超 1000 时, 对**存在的 key** 也会返回 None (假 miss →
+/// 静默丢数据). bulk split / 索引重建可产出这样的大段.
+///
+/// 造法: 顺序插 1200 个 key (物理连续), 再把 cp 数组合并成单段
+/// (item_count = 1201, 含哨兵), 模拟大段页.
+#[test]
+fn leaf_get_with_scans_segment_larger_than_1000_items() {
+    const N: usize = 1200;
+    let mut page = leaf_new();
+    for i in 0..N {
+        let key = format!("k{i:05}");
+        leaf_insert(&mut page, key.as_bytes(), b"v").expect("insert");
+    }
+    assert_eq!(page_key_count(&page), N as u16);
+
+    // 合并成单段 (bulk split 大段形态): cp[0] 含哨兵 + 全部真实 item
+    let idx = PageIndex::load(&page, ItemKind::Leaf).unwrap();
+    let total: u16 = idx.segments.iter().map(|s| s.item_count).sum();
+    let merged = PageIndex {
+        key_count: idx.key_count,
+        segments: vec![page::Segment {
+            first_item_off: PAGE_HEADER_SIZE as u16,
+            item_count: total,
+            first_full_key: Vec::new(),
+        }],
+    };
+    merged.write_back(&mut page).unwrap();
+    // 合并后索引自洽 (单段, item_count 含哨兵)
+    let reloaded = PageIndex::load(&page, ItemKind::Leaf).unwrap();
+    assert_eq!(reloaded.segments.len(), 1);
+    assert_eq!(reloaded.segments[0].item_count, total);
+
+    // 跨过旧 1000 步上限的 key 必须命中 (旧实现从 k01000 起全部假 miss)
+    for i in [0usize, 1, 500, 999, 1000, 1001, N - 2, N - 1] {
+        let key = format!("k{i:05}");
+        assert_eq!(
+            leaf_get(&page, key.as_bytes()).as_deref(),
+            Some(b"v".as_slice()),
+            "key {key} 应命中 (单段 {total} item, 超过旧 1000 步上限)"
+        );
+    }
+    // 不存在的 key 仍返回 None (不会死循环 / 误命中后续段)
+    assert!(leaf_get(&page, b"zzzzz").is_none());
+    assert!(leaf_get(&page, b"").is_none(), "空 key 保留给哨兵");
+    // 段内 scan 同样覆盖全段
+    let mut scanned = 0usize;
+    let flow = leaf_scan_from(&page, b"k01000", &mut |_k, _v| {
+        scanned += 1;
+        core::ops::ControlFlow::<()>::Continue(())
+    });
+    assert!(
+        matches!(flow, core::ops::ControlFlow::Continue(())),
+        "扫描应自然扫尽本页"
+    );
+    assert_eq!(scanned, N - 1000, "scan_from 应覆盖 k01000..k01199");
 }

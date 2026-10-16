@@ -131,7 +131,12 @@ pub fn leaf_get_with<R>(page: &[u8], key: &[u8], f: impl FnOnce(&[u8]) -> R) -> 
         ptr.byte_offset(),
         std::str::from_utf8(ptr.key()).unwrap_or("?")
     );
-    // cp[0] 段首是哨兵, 跳过
+    // ⭐ 审计 P2 (2026-10-17): 段内迭代次数按 `item_count` 界定, 不再用固定
+    // 1000 步上限 — bulk split / 索引重建可产出单段 >1000 item 的大段, 旧
+    // 实现在命中前就撞上限返回 None (假 miss → 静默丢数据). item_count 本身
+    // 不可信 (损坏页) 时由 ptr.next() 的解码失败 / 边界检查兜底终止.
+    let mut remaining = seg.item_count as usize;
+    // cp[0] 段首是哨兵, 跳过 (哨兵占 item_count 的一个名额)
     if seg_idx == 0 && ptr.key().is_empty() {
         let next_ptr = ptr.next().ok()??;
         dprintln!(
@@ -141,19 +146,19 @@ pub fn leaf_get_with<R>(page: &[u8], key: &[u8], f: impl FnOnce(&[u8]) -> R) -> 
             std::str::from_utf8(next_ptr.key()).unwrap_or("?")
         );
         ptr = next_ptr;
+        remaining = remaining.saturating_sub(1);
     }
-    let mut loop_count = 0;
     loop {
-        loop_count += 1;
-        if loop_count > 1000 {
-            dprintln!(leaf, "[LEAF_GET] LOOP LIMIT EXCEEDED");
+        if remaining == 0 {
+            // 段内已扫尽仍未命中 (key 不在本段 / 不存在)
+            dprintln!(leaf, "[LEAF_GET] segment exhausted, return None");
             return None;
         }
+        remaining -= 1;
         let cur_key = ptr.key();
         dprintln!(
             leaf,
-            "[LEAF_GET] loop #{} off={} key={:?} (looking for {:?})",
-            loop_count,
+            "[LEAF_GET] off={} key={:?} (looking for {:?})",
             ptr.byte_offset(),
             std::str::from_utf8(cur_key).unwrap_or("?"),
             std::str::from_utf8(key).unwrap_or("?")
@@ -163,6 +168,11 @@ pub fn leaf_get_with<R>(page: &[u8], key: &[u8], f: impl FnOnce(&[u8]) -> R) -> 
         }
         if cur_key > key {
             dprintln!(leaf, "[LEAF_GET] cur_key > key, return None");
+            return None;
+        }
+        if remaining == 0 {
+            // 段内最后一项已比对过, 无需再推进
+            dprintln!(leaf, "[LEAF_GET] last item in segment, return None");
             return None;
         }
         match ptr.next().ok()? {
