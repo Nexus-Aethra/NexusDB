@@ -35,9 +35,9 @@ pub use park::{
     clear_all_parked, is_parked, park_current_coroutine, parked_count, register_parked,
     take_parked, unpark,
 };
-pub use scheduler::current_task_id;
-pub use pool::{Pool, POOL_SIZE};
+pub use pool::{POOL_SIZE, Pool};
 pub use ready::{ReadyQueueHandle, new_handle as new_ready_queue};
+pub use scheduler::current_task_id;
 pub use scheduler::{SchedHandle, Scheduler, with_current};
 pub use task::{JoinError, JoinHandle, spawn, spawn_on, spawn_on_low};
 pub use yield_now::yield_now;
@@ -47,5 +47,5 @@ pub mod test_support {
     pub use crate::task::test_support::*;
 }
 
+pub use await_predicate::{AwaitPredicate, await_predicate};
 pub use waker::make_waker_for_test;
-pub use await_predicate::{await_predicate, AwaitPredicate};

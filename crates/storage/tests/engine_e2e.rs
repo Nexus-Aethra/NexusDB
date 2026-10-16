@@ -15,8 +15,8 @@
 
 use std::path::Path;
 
-use storage::{IoBackend, IoBackendConfig};
 use storage::engine::OpenOptions;
+use storage::{IoBackend, IoBackendConfig};
 use storage::{PAGE_SIZE, StorageEngine};
 
 mod common;

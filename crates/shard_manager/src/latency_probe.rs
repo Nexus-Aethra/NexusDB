@@ -54,7 +54,10 @@ impl Histogram {
         if count == 0 {
             return format!("[{label}] (no samples)\n");
         }
-        let mut s = format!("[{label}] samples={count} avg_ns={}\n", self.sum_ns.load(Ordering::Relaxed) / count);
+        let mut s = format!(
+            "[{label}] samples={count} avg_ns={}\n",
+            self.sum_ns.load(Ordering::Relaxed) / count
+        );
         for (i, &b) in BUCKETS.iter().enumerate() {
             let c = self.buckets[i].load(Ordering::Relaxed);
             if c > 0 {
@@ -186,7 +189,11 @@ impl Probe {
         s.push_str(&self.drive_round_ns.dump("drive_async_flush_round_ns"));
         s.push_str(&self.poll_wait_ns.dump("poll_wait_ns"));
         s.push_str(&self.drive_until_idle_ns.dump("drive_until_idle_ns"));
-        s.push_str(&self.sync_write_coroutine_ns.dump("flush_coroutine_total_ns"));
+        s.push_str(
+            &self
+                .sync_write_coroutine_ns
+                .dump("flush_coroutine_total_ns"),
+        );
         s.push_str(&self.block_on_io_ns.dump("block_on_io_ns"));
         s.push_str(&self.task_exec_ns.dump("shard_task_exec_ns"));
         s.push_str(&self.put_run_exec_ns.dump("shard_put_run_exec_ns"));
@@ -215,7 +222,11 @@ impl Probe {
         s.push_str(&self.flush_harvest_ns.dump("flush_harvest_ns"));
         s.push_str(&self.flush_data_admission_ns.dump("flush_data_admission_ns"));
         s.push_str(&self.flush_meta_admission_ns.dump("flush_meta_admission_ns"));
-        s.push_str(&self.flush_compact_admission_ns.dump("flush_compact_admission_ns"));
+        s.push_str(
+            &self
+                .flush_compact_admission_ns
+                .dump("flush_compact_admission_ns"),
+        );
         s.push_str(&format!(
             "backpressure_fallbacks={}\nin_flight_peak={}\n",
             self.backpressure_fallbacks.load(Ordering::Relaxed),

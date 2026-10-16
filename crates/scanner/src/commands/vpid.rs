@@ -5,18 +5,19 @@ use std::io::Write;
 use crate::cli::Globals;
 use crate::dir;
 use crate::error::Result;
-use crate::output::{HumanRow, JsonObject, format_vpid, human_row, json_row};
+use crate::output::{format_vpid, human_row, json_row, HumanRow, JsonObject};
 use crate::page_io;
 use crate::pid::Locate;
 
 pub fn run<W: Write>(globals: &Globals, vpid: u64, raw: bool, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let coord = locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic)?;
@@ -92,7 +93,12 @@ fn emit_full<W: Write>(
     match globals.output_mode() {
         crate::output::OutputMode::Human => {
             if let Some(b) = &r.bad {
-                writeln!(out, "[BAD-PAGE] vpid={} kind={:?} detail={}", vpid_str, b.kind, b.detail).ok();
+                writeln!(
+                    out,
+                    "[BAD-PAGE] vpid={} kind={:?} detail={}",
+                    vpid_str, b.kind, b.detail
+                )
+                .ok();
             }
             writeln!(out, "=== vpid {} ===", vpid_str).ok();
             if let Some(d) = &r.dump {
@@ -102,18 +108,15 @@ fn emit_full<W: Write>(
         crate::output::OutputMode::Json => {
             let obj = JsonObject::new()
                 .field("vpid", vpid)
-                .field(
-                    "page_type",
-                    format!("{:?}", r.page_type),
-                )
+                .field("page_type", format!("{:?}", r.page_type))
                 .field(
                     "bad",
-                    r.bad.as_ref().map(|b| format!("{:?}", b.kind)).unwrap_or_else(|| "-".to_string()),
+                    r.bad
+                        .as_ref()
+                        .map(|b| format!("{:?}", b.kind))
+                        .unwrap_or_else(|| "-".to_string()),
                 )
-                .field(
-                    "dump",
-                    r.dump.clone().unwrap_or_default(),
-                );
+                .field("dump", r.dump.clone().unwrap_or_default());
             json_row(out, &obj).ok();
         }
     }
@@ -125,11 +128,7 @@ fn emit_bad<W: Write>(out: &mut W, globals: &Globals, vpid: u64, read: &page_io:
         page_io::PageRead::BlockFileMissing { file_id } => {
             format!("block file {file_id}.block missing")
         }
-        page_io::PageRead::BlockFileTruncated {
-            file_id,
-            size,
-            ..
-        } => {
+        page_io::PageRead::BlockFileTruncated { file_id, size, .. } => {
             format!("block {file_id} truncated (size={size})")
         }
         page_io::PageRead::IoError { source, .. } => format!("io error: {source}"),

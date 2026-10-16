@@ -188,16 +188,20 @@ pub async fn travel_to_leaf(
             other => {
                 // ⭐ DIAG: 坏页诊断 — dump 页头 + meta 映射 (NLOG_DIAG=1)
                 if std::env::var("NLOG_DIAG").is_ok_and(|v| v == "1") {
-                    let hdr_vpid = u64::from_le_bytes(
-                        page[0x18..0x20].try_into().unwrap_or_default(),
-                    );
-                    let pid_info = pager.meta_debug_iter()
+                    let hdr_vpid =
+                        u64::from_le_bytes(page[0x18..0x20].try_into().unwrap_or_default());
+                    let pid_info = pager
+                        .meta_debug_iter()
                         .into_iter()
                         .find(|(v, _)| *v == current_vpid)
-                        .map(|(_, p)| format!(
-                            "file={} chunk={} page_idx={}",
-                            p.file_id(), p.chunk_idx(), p.page_idx()
-                        ))
+                        .map(|(_, p)| {
+                            format!(
+                                "file={} chunk={} page_idx={}",
+                                p.file_id(),
+                                p.chunk_idx(),
+                                p.page_idx()
+                            )
+                        })
                         .unwrap_or_else(|| "UNMAPPED".into());
                     eprintln!(
                         "[DIAG-BADPAGE] vpid={current_vpid} root={root_vpid} depth={depth} \
@@ -354,16 +358,20 @@ pub async fn travel_to_leaf_guided(
             other => {
                 // ⭐ DIAG: 坏页诊断 (guided 版)
                 if std::env::var("NLOG_DIAG").is_ok_and(|v| v == "1") {
-                    let hdr_vpid = u64::from_le_bytes(
-                        page[0x18..0x20].try_into().unwrap_or_default(),
-                    );
-                    let pid_info = pager.meta_debug_iter()
+                    let hdr_vpid =
+                        u64::from_le_bytes(page[0x18..0x20].try_into().unwrap_or_default());
+                    let pid_info = pager
+                        .meta_debug_iter()
                         .into_iter()
                         .find(|(v, _)| *v == current_vpid)
-                        .map(|(_, p)| format!(
-                            "file={} chunk={} page_idx={}",
-                            p.file_id(), p.chunk_idx(), p.page_idx()
-                        ))
+                        .map(|(_, p)| {
+                            format!(
+                                "file={} chunk={} page_idx={}",
+                                p.file_id(),
+                                p.chunk_idx(),
+                                p.page_idx()
+                            )
+                        })
                         .unwrap_or_else(|| "UNMAPPED".into());
                     eprintln!(
                         "[DIAG-BADPAGE] vpid={current_vpid} root={root_vpid} depth={depth} \
@@ -520,7 +528,10 @@ pub async fn btree_insert(
 
     // 2. 读 leaf 字节, 尝试 insert
     let leaf_bytes = pager.read(leaf_vpid).await?;
-    btree_insert_from_leaf(pager, root_vpid, key, value, leaf_vpid, leaf_bytes, &mut path).await
+    btree_insert_from_leaf(
+        pager, root_vpid, key, value, leaf_vpid, leaf_bytes, &mut path,
+    )
+    .await
 }
 
 /// Insert a new key using a leaf and split path returned by
@@ -587,10 +598,9 @@ pub async fn btree_insert_from_leaf(
 
             // 4d. propagate split up: 处理 parent insert (split_key, right_vpid)
             //     old_root_vpid 用来 root split 时作为新 root 的 first_child
-            let new_root = propagate_split_up(
-                pager, path, root_vpid, &split_key, right_vpid, &mut batch,
-            )
-            .await?;
+            let new_root =
+                propagate_split_up(pager, path, root_vpid, &split_key, right_vpid, &mut batch)
+                    .await?;
             batch.submit(pager).await?;
             // ⭐ DIAG: split 后回查验证 — 确认 split_key 从根可达
             if crate::chunk_writer::diag_enabled() {
@@ -1040,8 +1050,10 @@ mod tests {
             assert_eq!(got, Some(expected.len()));
         }
         // 不存在的 key
-        let got = pollster::block_on(btree_lookup_with(&mut p, root, b"missing", |v: &[u8]| v.len()))
-            .unwrap();
+        let got = pollster::block_on(btree_lookup_with(&mut p, root, b"missing", |v: &[u8]| {
+            v.len()
+        }))
+        .unwrap();
         assert_eq!(got, None);
     }
 
@@ -1347,8 +1359,7 @@ mod tests {
         for i in 0..10u32 {
             let key = format!("k{:03}", i);
             let val = format!("v{:03}", i);
-            pollster::block_on(btree_insert(&mut p, root, key.as_bytes(), val.as_bytes()))
-                .unwrap();
+            pollster::block_on(btree_insert(&mut p, root, key.as_bytes(), val.as_bytes())).unwrap();
         }
         // lookup 填充 cache
         for i in 0..10u32 {

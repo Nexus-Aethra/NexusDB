@@ -102,8 +102,7 @@ impl Scheduler {
                 .build(IO_URING_ENTRIES)
                 .expect("io_uring setup with SQPOLL failed")
         } else {
-            io_uring::IoUring::new(IO_URING_ENTRIES)
-                .expect("io_uring setup failed")
+            io_uring::IoUring::new(IO_URING_ENTRIES).expect("io_uring setup failed")
         };
         Self::from_ring(ring)
     }
@@ -454,7 +453,11 @@ impl Scheduler {
     pub fn run_until<F: FnMut() -> bool>(&mut self, predicate: F, max_iters: usize) -> bool {
         let mut pred = predicate;
         let mut iters = 0;
-        while !self.stop_flag.load(Ordering::Acquire) && !pred() && iters < max_iters && self.has_work() {
+        while !self.stop_flag.load(Ordering::Acquire)
+            && !pred()
+            && iters < max_iters
+            && self.has_work()
+        {
             self.drive_once();
             iters += 1;
         }
@@ -519,14 +522,15 @@ pub(crate) fn clear_current_scheduler() {
 pub fn with_current<R>(f: impl FnOnce(&mut Scheduler) -> R) -> Option<R> {
     // TLS 析构阶段 drop future 仍可能尝试清理已提交 IO；此时 scheduler/ring 已在
     // 同一析构链中释放，不能因访问已销毁的 CURRENT 再次 panic/abort。
-    CURRENT.try_with(|c| {
-        let rc = c.borrow();
-        let cell = rc.as_ref()?;
-        let mut s = cell.try_borrow_mut().ok()?;
-        Some(f(&mut s))
-    })
-    .ok()
-    .flatten()
+    CURRENT
+        .try_with(|c| {
+            let rc = c.borrow();
+            let cell = rc.as_ref()?;
+            let mut s = cell.try_borrow_mut().ok()?;
+            Some(f(&mut s))
+        })
+        .ok()
+        .flatten()
 }
 
 // SAFETY: handle 只能以唯一所有权 move 到 driver 线程；运行时会在首次 drive 后绑定

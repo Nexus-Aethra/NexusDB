@@ -26,14 +26,14 @@ pub mod kv_to_shard;
 pub mod portable;
 pub mod protocol;
 pub mod reply_bus;
+#[cfg(target_os = "windows")]
+pub mod runtime_iocp;
 #[cfg(target_os = "linux")]
 pub mod server;
 pub mod tls;
 pub mod value_codec;
 #[cfg(target_os = "linux")]
 pub mod worker;
-#[cfg(target_os = "windows")]
-pub mod runtime_iocp;
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub use portable::{SqlSharedRoutes, new_sql_shared};
 #[cfg(target_os = "linux")]
@@ -106,9 +106,9 @@ pub use protocol::{
     RespCommand, Response, validate_request,
 };
 pub use reply_bus::{ReplyBusReceiver, ReplyBusSender, ReplyEnvelope};
-#[cfg(target_os = "linux")]
-pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 #[cfg(target_os = "windows")]
 pub use runtime_iocp::{NetworkServer, NetworkServerConfig, ProtocolKind};
+#[cfg(target_os = "linux")]
+pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 #[cfg(target_os = "linux")]
 pub use worker::{WorkerConfig, WorkerPool};

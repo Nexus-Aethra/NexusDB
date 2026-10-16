@@ -201,7 +201,10 @@ where
         inner.set_result(Ok(r));
     });
     // 通过 handle.0 直接 borrow_mut 提交.
-    handle.0.borrow().submit_with_priority(wrapper, low_priority);
+    handle
+        .0
+        .borrow()
+        .submit_with_priority(wrapper, low_priority);
     join
 }
 

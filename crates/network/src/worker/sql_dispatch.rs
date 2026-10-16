@@ -1128,7 +1128,7 @@ mod tests {
             col: "score".into(),
             op: CmpOp::In,
             val: SqlValue::Null,
-            set: (1..=100).map(|i| SqlValue::Int(i)).collect(),
+            set: (1..=100).map(SqlValue::Int).collect(),
         });
         let (np, _) = sql::normalize_pred_cond(&p);
         let plan = sql_plan_select(&schema, &np).unwrap();

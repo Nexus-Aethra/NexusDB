@@ -31,6 +31,50 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> i32 {
     1
 }
 
+/// ⚠️ 安全告警: 监听非回环地址 且 对应门面未配置口令 = 对外裸奔.
+/// 启动时显式打印, 避免"开箱即用即无认证"被静默忽略.
+#[cfg(target_os = "linux")]
+fn warn_if_insecure_defaults(cfg: &config::NexusConfig) {
+    let s = &cfg.server;
+    // 空 host 与通配地址同样监听所有网卡
+    let is_wildcard = |addr: &str| {
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+        host.is_empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
+    };
+
+    let mut open: Vec<&str> = Vec::new();
+    let no_resp_auth = s.redis_password.is_empty();
+    if !s.listen_addr.is_empty() && no_resp_auth && is_wildcard(&s.listen_addr) {
+        open.push("Binary(5433)");
+    }
+    if !s.redis_addr.is_empty() && no_resp_auth && is_wildcard(&s.redis_addr) {
+        open.push("RESP");
+    }
+    let sql_no_auth = s.sql_password.is_empty();
+    if !s.sql_addr.is_empty() && sql_no_auth && is_wildcard(&s.sql_addr) {
+        open.push("MySQL(5434)");
+    }
+    if !s.pg_addr.is_empty() && sql_no_auth && is_wildcard(&s.pg_addr) {
+        open.push("PostgreSQL(5435)");
+    }
+    let http_no_auth = s.http_token.is_empty() && s.tls_key.is_empty();
+    if !s.http_addr.is_empty() && http_no_auth && is_wildcard(&s.http_addr) {
+        open.push("HTTP/REST(6778)");
+    }
+    if open.is_empty() {
+        return;
+    }
+    nlog::warn!(
+        "main",
+        "SECURITY: {} 监听所有网卡且未配置口令 — 当前对外免鉴权",
+        open.join(", ")
+    );
+    nlog::warn!(
+        "main",
+        "SECURITY: 建议绑定 127.0.0.1, 或配置 redis_password / sql_password / http_token 与 TLS"
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn main() {
     // 默认查找: ./nexusdb.toml → 找不到则 ./config/nexusdb.toml (新结构)
@@ -109,6 +153,9 @@ fn main() {
         libc::signal(libc::SIGINT, handler as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
     }
+
+    // 3.5 安全告警: 非回环监听 + 空口令
+    warn_if_insecure_defaults(&cfg);
 
     // 4. 启动 ShardManager
     let io_backend = cfg.storage.io_backend().expect("validated backend");

@@ -32,7 +32,7 @@
 
 use std::collections::BTreeSet;
 
-use page::{PageType, decode_item};
+use page::{decode_item, PageType};
 
 use crate::dir::ShardDir;
 use crate::page_decode::BadKind;
@@ -321,10 +321,9 @@ pub struct BfsResult {
 /// Read one page and turn it into a [`TreeNode`]; structural integrity
 /// is reported via `node.bad` rather than as an error.
 fn read_node(shard: &ShardDir, locate: &Locate, vpid: u64) -> TreeNode {
-    let coord = match locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic) {
-        Ok(c) => Some(c),
-        Err(_) => None,
-    };
+    let coord = locate
+        .resolve(vpid, crate::pid::Strategy::MateThenArithmetic)
+        .ok();
     let coord_for_read = match coord {
         Some(c) => c,
         None => DiskCoord::from_vpid_arithmetic(vpid),
@@ -369,11 +368,9 @@ fn page_read_reason(r: &page_io::PageRead) -> String {
         page_io::PageRead::BlockFileMissing { file_id } => {
             format!("block file {file_id}.block missing")
         }
-        page_io::PageRead::BlockFileTruncated {
-            file_id,
-            size,
-            ..
-        } => format!("block {file_id} truncated (size={size})"),
+        page_io::PageRead::BlockFileTruncated { file_id, size, .. } => {
+            format!("block {file_id} truncated (size={size})")
+        }
         page_io::PageRead::IoError { source, .. } => format!("io error: {source}"),
         page_io::PageRead::Ok(_) => "ok".into(),
     }
@@ -587,7 +584,11 @@ mod tests {
         // At minimum, the page should be classified as visited and not
         // be "unread" (it was readable, just structurally bad).
         let was_unread_or_bad = summary2.bad > 0 || summary2.unread > 0;
-        assert!(was_unread_or_bad, "corrupt page must be classified as bad or unread, got ok={}", summary2.ok);
+        assert!(
+            was_unread_or_bad,
+            "corrupt page must be classified as bad or unread, got ok={}",
+            summary2.ok
+        );
     }
 
     /// Test that in-order traversal returns keys in sorted order.
@@ -630,7 +631,13 @@ mod tests {
         });
 
         // Keys should be in BTree order: alpha, bravo, charlie, delta
-        assert_eq!(keys.len(), 4, "expected 4 keys, got {}: {:?}", keys.len(), keys);
+        assert_eq!(
+            keys.len(),
+            4,
+            "expected 4 keys, got {}: {:?}",
+            keys.len(),
+            keys
+        );
         assert_eq!(&keys[0], b"alpha");
         assert_eq!(&keys[1], b"bravo");
         assert_eq!(&keys[2], b"charlie");

@@ -267,6 +267,7 @@ pub(crate) fn exec_row_put(
 /// - `with_values = true` 时按 user_key 逐个 `table_get_typed` 拉 stored value
 ///   (含 type tag; 未知 key 返回 `None`, 与 HSet/HGetAll 的 (None) 区分).
 /// - `limit > 0` 时在 callback 内 `Break` 早停.
+///
 /// ⭐ Phase Scan: 列出表内 String 类型 user keys (BTree 有序, 跨 leaf 游标).
 ///
 /// 行为契约:
@@ -284,6 +285,9 @@ pub(crate) fn exec_row_put(
 /// 不知道 user 提供的 `start` 对应的 varint klen 是什么, 物理 start 难拼; 用
 /// callback 过滤换来正确性. 几十到几百条规模下 cost 忽略; 大规模时可在
 /// `exec_scan_keys` 顶部按 `start` 长度构造物理 start, 跳到对应 leaf 起点.
+// 参数列表刻意与 ScanKeys 命令形状一一对应 (db/table/范围/前缀/limit/callback),
+// 打包成 struct 只会把同一组字段换个地方放, 不减理解成本.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_scan_keys(
     e: &mut StorageEngine,
     db: &str,

@@ -793,10 +793,17 @@ impl Pager {
     pub async fn flush(&mut self) -> io::Result<()> {
         // ⭐ 异步落盘契约: caller (shard 主循环/close) 必须先排空 in-flight
         // 再调 flush, 否则同 key 新旧快照可能并发写同一磁盘 offset.
-        debug_assert!(
-            self.in_flight.is_empty(),
-            "flush() requires in-flight chunks drained first"
-        );
+        // 用硬错误而非 `debug_assert`: 违反时是**并发写同一 offset**, release 下
+        // 不 panic 而是把磁盘写坏 —— 必须在 release 也显式失败.
+        if !self.in_flight.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "flush() requires in-flight chunks drained first (pending={} chunk(s))",
+                    self.in_flight.len()
+                ),
+            ));
+        }
         // ⭐ 纯 COW (2026-07-26): 驻留即待刷, take 即移出不回插.
         // flush 后这些 chunk 内 vpid 的后续更新走 COW alloc 新 pid.
         let resident: Vec<PageKey> = self.nowchunks.resident_keys();
@@ -858,7 +865,9 @@ impl Pager {
     /// 避免写时队列无限膨胀, 且无等待+收割死锁风险.
     pub async fn swap_full_chunk_to_write_queue(&mut self, key: PageKey) -> io::Result<()> {
         // ⭐ DIAG: swap 前校验 chunk(0,0) 各页数据
-        if crate::chunk_writer::diag_enabled() && key.file_id == 0 && key.chunk_idx == 0
+        if crate::chunk_writer::diag_enabled()
+            && key.file_id == 0
+            && key.chunk_idx == 0
             && let Some(chunk) = self.nowchunks.peek_chunk(key)
         {
             for pidx in [0usize, 1, 30, 60, 63] {

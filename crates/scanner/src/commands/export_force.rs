@@ -82,12 +82,13 @@ impl ParsedKey {
 
         // Try to extract table name: first '/' in logical_key separates
         // table_name from within-table key.
-        let (table_name, logical_key_after) = if let Some(slash) = logical_key.iter().position(|b| *b == b'/') {
-            let tbl = String::from_utf8_lossy(&logical_key[..slash]).to_string();
-            (tbl, logical_key[slash + 1..].to_vec())
-        } else {
-            (String::new(), logical_key.clone())
-        };
+        let (table_name, logical_key_after) =
+            if let Some(slash) = logical_key.iter().position(|b| *b == b'/') {
+                let tbl = String::from_utf8_lossy(&logical_key[..slash]).to_string();
+                (tbl, logical_key[slash + 1..].to_vec())
+            } else {
+                (String::new(), logical_key.clone())
+            };
 
         Some(ParsedKey {
             kind_byte: kind,
@@ -134,18 +135,15 @@ fn read_varint_u32(buf: &[u8]) -> Option<(u32, usize)> {
     }
 }
 
-pub fn run<W: Write>(
-    globals: &Globals,
-    format: ExportForceFormat,
-    mut out: W,
-) -> Result<u8> {
+pub fn run<W: Write>(globals: &Globals, format: ExportForceFormat, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
 
     let (merged, stats) = scan_all_blocks(shard);
     let row_count = merged.len() as u64;
@@ -170,7 +168,11 @@ pub fn run<W: Write>(
     }
 
     if emitted == 0 {
-        writeln!(out, "export-force: zero rows — all pages were bad or unreadable").ok();
+        writeln!(
+            out,
+            "export-force: zero rows — all pages were bad or unreadable"
+        )
+        .ok();
         Ok(1)
     } else {
         Ok(0)
@@ -305,50 +307,55 @@ fn emit_row<W: Write>(
 ) -> std::io::Result<()> {
     let pkey_hex = hex::encode(raw_key);
     match globals.output_mode() {
-        crate::output::OutputMode::Json | crate::output::OutputMode::Human => {
-            match format {
-                ExportForceFormat::Jsonl => {
-                    let obj = JsonObject::new()
-                        .field("kind", JsonValue::Str(match parsed {
+        crate::output::OutputMode::Json | crate::output::OutputMode::Human => match format {
+            ExportForceFormat::Jsonl => {
+                let obj = JsonObject::new()
+                    .field(
+                        "kind",
+                        JsonValue::Str(match parsed {
                             Some(p) => p.kind_name.clone(),
                             None => "?".to_string(),
-                        }))
-                        .field("table", JsonValue::Str(match parsed {
+                        }),
+                    )
+                    .field(
+                        "table",
+                        JsonValue::Str(match parsed {
                             Some(p) => p.table_name.clone(),
                             None => "".to_string(),
-                        }))
-                        .field("logical_key", JsonValue::Str(match parsed {
+                        }),
+                    )
+                    .field(
+                        "logical_key",
+                        JsonValue::Str(match parsed {
                             Some(p) => hex::encode(&p.logical_key),
                             None => hex::encode(raw_key),
-                        }))
-                        .field(
-                            "logical_key_after_table",
-                            JsonValue::Str(match parsed {
-                                Some(p) => hex::encode(&p.logical_key_after_table),
-                                None => "".to_string(),
-                            }),
-                        )
-                        .field("value", JsonValue::Str(hex::encode(value)))
-                        .field("pkey_hex", JsonValue::Str(pkey_hex));
-                    crate::output::json_row(out, &obj)
-                }
-                ExportForceFormat::Kv => {
-                    match parsed {
-                        Some(p) => {
-                            writeln!(
-                                out,
-                                "{}\t{}\t{}\t{}",
-                                p.kind_name,
-                                p.table_name,
-                                hex::encode(&p.logical_key_after_table),
-                                hex::encode(value),
-                            )
-                        }
-                        None => writeln!(out, "?\t\t{}\t{}", pkey_hex, hex::encode(value)),
-                    }
-                }
+                        }),
+                    )
+                    .field(
+                        "logical_key_after_table",
+                        JsonValue::Str(match parsed {
+                            Some(p) => hex::encode(&p.logical_key_after_table),
+                            None => "".to_string(),
+                        }),
+                    )
+                    .field("value", JsonValue::Str(hex::encode(value)))
+                    .field("pkey_hex", JsonValue::Str(pkey_hex));
+                crate::output::json_row(out, &obj)
             }
-        }
+            ExportForceFormat::Kv => match parsed {
+                Some(p) => {
+                    writeln!(
+                        out,
+                        "{}\t{}\t{}\t{}",
+                        p.kind_name,
+                        p.table_name,
+                        hex::encode(&p.logical_key_after_table),
+                        hex::encode(value),
+                    )
+                }
+                None => writeln!(out, "?\t\t{}\t{}", pkey_hex, hex::encode(value)),
+            },
+        },
     }
 }
 
@@ -382,7 +389,10 @@ mod tests {
     fn read_varint_u32_basic() {
         assert_eq!(read_varint_u32(&[0x07u8]), Some((7, 1)));
         assert_eq!(read_varint_u32(&[0x80u8, 0x01u8]), Some((128, 2)));
-        assert_eq!(read_varint_u32(&[0xFFu8, 0xFFu8, 0x7Fu8]), Some((2097151, 3)));
+        assert_eq!(
+            read_varint_u32(&[0xFFu8, 0xFFu8, 0x7Fu8]),
+            Some((2097151, 3))
+        );
     }
 
     #[test]

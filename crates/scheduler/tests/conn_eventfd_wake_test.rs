@@ -17,8 +17,7 @@ fn conn_eventfd_poll_wakes() {
         sched.set_current();
 
         // 同 server.rs 的 conn_eventfd 创建
-        let conn_eventfd =
-            unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let conn_eventfd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(conn_eventfd >= 0);
 
         let woke: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
@@ -36,11 +35,7 @@ fn conn_eventfd_poll_wakes() {
             std::thread::sleep(Duration::from_millis(200));
             let val: u64 = 1;
             unsafe {
-                let n = libc::write(
-                    conn_eventfd,
-                    &val as *const u64 as *const libc::c_void,
-                    8,
-                );
+                let n = libc::write(conn_eventfd, &val as *const u64 as *const libc::c_void, 8);
                 eprintln!("[exp4] wrote conn_eventfd: n={n}");
             }
         });

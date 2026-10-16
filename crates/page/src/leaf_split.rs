@@ -75,7 +75,8 @@ fn force_split_segment_at_mid(
             let (k1_item, k1_old_n) = decode_item(page, k1_off, kind)?;
             let k1_full_key = k1_item.full_key(&mid_full_key);
             let mut k1_buf = [0u8; 4096];
-            let k1_new_n = encode_leaf_item(&mut k1_buf, &mid_full_key, &k1_full_key, k1_item.value)?;
+            let k1_new_n =
+                encode_leaf_item(&mut k1_buf, &mid_full_key, &k1_full_key, k1_item.value)?;
             let k1_delta = k1_new_n as isize - k1_old_n as isize;
             if k1_delta != 0 {
                 let cur_free = page_free_off(page) as usize;
@@ -108,10 +109,7 @@ fn force_split_segment_at_mid(
 ///
 /// 返回 Some(split_key) 表示成功, None 表示条件不满足 (回退到原始逻辑).
 /// 安全性: 任何内部错误都返回 None (不 panic, 不破坏 page).
-fn try_bulk_leaf_split(
-    left: &mut [u8; PAGE_SIZE],
-    right: &mut [u8; PAGE_SIZE],
-) -> Option<Vec<u8>> {
+fn try_bulk_leaf_split(left: &mut [u8; PAGE_SIZE], right: &mut [u8; PAGE_SIZE]) -> Option<Vec<u8>> {
     let mut idx = PageIndex::load(left, ItemKind::Leaf).ok()?;
 
     // 如果只有 1 个段, 强制在段内创建段边界
@@ -181,8 +179,11 @@ fn try_bulk_leaf_split(
             for (si, seg) in idx.segments.iter().enumerate() {
                 eprintln!(
                     "  seg[{si}] item_count={} first_off={} first_key={:?}",
-                    seg.item_count, seg.first_item_off,
-                    String::from_utf8_lossy(&seg.first_full_key[..seg.first_full_key.len().min(20)])
+                    seg.item_count,
+                    seg.first_item_off,
+                    String::from_utf8_lossy(
+                        &seg.first_full_key[..seg.first_full_key.len().min(20)]
+                    )
                 );
             }
         }
@@ -382,8 +383,21 @@ fn leaf_split_minimal(
     // right cp
     page_set_free_off(right, write_off as u16);
     page_set_key_count(right, new_key_count);
-    write_checkpoint_header(right, CheckpointHeader { checkpoint_count: 1, ..Default::default() });
-    write_checkpoint(right, 0, Checkpoint { item_count: 1 + new_key_count, first_item_off: PAGE_HEADER_SIZE as u16 });
+    write_checkpoint_header(
+        right,
+        CheckpointHeader {
+            checkpoint_count: 1,
+            ..Default::default()
+        },
+    );
+    write_checkpoint(
+        right,
+        0,
+        Checkpoint {
+            item_count: 1 + new_key_count,
+            first_item_off: PAGE_HEADER_SIZE as u16,
+        },
+    );
     let ri = PageIndex::load(right, ItemKind::Leaf)?;
     ri.write_back(right)?;
     crate::header::page_set_vpid(right, 0);
@@ -395,8 +409,21 @@ fn leaf_split_minimal(
     write_checkpoint_header(left, CheckpointHeader::default());
     let li = PageIndex::load(left, ItemKind::Leaf)?;
     if li.segments.is_empty() && mid > 0 {
-        write_checkpoint(left, 0, Checkpoint { item_count: mid as u16 + 1, first_item_off: PAGE_HEADER_SIZE as u16 });
-        write_checkpoint_header(left, CheckpointHeader { checkpoint_count: 1, ..Default::default() });
+        write_checkpoint(
+            left,
+            0,
+            Checkpoint {
+                item_count: mid as u16 + 1,
+                first_item_off: PAGE_HEADER_SIZE as u16,
+            },
+        );
+        write_checkpoint_header(
+            left,
+            CheckpointHeader {
+                checkpoint_count: 1,
+                ..Default::default()
+            },
+        );
     } else {
         li.write_back(left)?;
     }

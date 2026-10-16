@@ -10,6 +10,12 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// 子任务回传通道: None = 尚未完成, Ok = 读到的字节, Err = 失败原因.
+type IoSlot = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
+
+/// 同上, 但成功值额外带回读到的长度.
+type IoSlot2 = Arc<Mutex<Option<Result<(Vec<u8>, usize), String>>>>;
+
 fn run_with_timeout(ms: u64, f: impl FnOnce() + Send + 'static) {
     let handle = std::thread::spawn(f);
     let start = Instant::now();
@@ -52,8 +58,7 @@ fn socket_read_write_roundtrip() {
         let payload = b"hello io_uring socket";
         let expected_len = payload.len();
         let expected = payload.to_vec();
-        let result: Arc<Mutex<Option<Result<(Vec<u8>, usize), String>>>> =
-            Arc::new(Mutex::new(None));
+        let result: IoSlot2 = Arc::new(Mutex::new(None));
         let result2 = result.clone();
 
         // 协程: 写 fd_a → 关写侧 → 读 fd_b.
@@ -96,7 +101,11 @@ fn socket_read_write_roundtrip() {
             .expect("task never completed")
             .expect("socket io_uring failed");
         assert_eq!(got, expected_len);
-        assert_eq!(buf, b"hello io_uring socket".to_vec(), "socket io_uring roundtrip data mismatch");
+        assert_eq!(
+            buf,
+            b"hello io_uring socket".to_vec(),
+            "socket io_uring roundtrip data mismatch"
+        );
     });
 }
 
@@ -105,7 +114,7 @@ fn socket_read_write_roundtrip() {
 #[test]
 fn io_uring_read_eventfd() {
     run_with_timeout(20000, || {
-        let sched = setup();
+        let _sched = setup();
         let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(efd >= 0, "eventfd failed");
 
@@ -239,7 +248,7 @@ fn scheduler_drop_with_inflight_poll() {
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
         b.set_nonblocking(true).unwrap();
         let fd_b = b.as_raw_fd();
-        let (a2, b2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (_a2, b2) = std::os::unix::net::UnixStream::pair().unwrap();
         b2.set_nonblocking(true).unwrap();
         let fd_b2 = b2.as_raw_fd();
 
@@ -257,7 +266,10 @@ fn scheduler_drop_with_inflight_poll() {
         drop(sched);
         let elapsed = t.elapsed();
         eprintln!("[sched-drop] scheduler dropped in {:?}", elapsed);
-        assert!(elapsed < Duration::from_secs(5), "scheduler drop too slow: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "scheduler drop too slow: {elapsed:?}"
+        );
         drop(a);
     });
 }
@@ -267,7 +279,7 @@ fn scheduler_drop_with_inflight_poll() {
 fn socket_concurrent_tasks() {
     run_with_timeout(30000, || {
         let sched = setup();
-        let mut results: Vec<Arc<Mutex<Option<Result<Vec<u8>, String>>>>> = Vec::new();
+        let mut results: Vec<IoSlot> = Vec::new();
         for i in 0..8u8 {
             let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
             a.set_nonblocking(true).unwrap();
@@ -276,17 +288,15 @@ fn socket_concurrent_tasks() {
             let fd_b = b.as_raw_fd();
             let payload = format!("conn-{i}-payload").into_bytes();
             let expect = payload.clone();
-            let result: Arc<Mutex<Option<Result<Vec<u8>, String>>>> =
-                Arc::new(Mutex::new(None));
+            let result: IoSlot = Arc::new(Mutex::new(None));
             let result2 = result.clone();
             scheduler::spawn_on(&sched, async move {
                 let r = async {
                     let mut written = 0;
                     while written < payload.len() {
-                        let n =
-                            scheduler::io_ops::write(fd_a, &payload[written..], u64::MAX)
-                                .await
-                                .map_err(|e| e.to_string())?;
+                        let n = scheduler::io_ops::write(fd_a, &payload[written..], u64::MAX)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         assert!(n > 0);
                         written += n;
                     }

@@ -10,8 +10,8 @@
 
 use std::os::unix::fs::FileExt;
 
-use storage::{IoBackend, IoBackendConfig};
 use storage::meta_page::{META_PID, META_VPID, MetaError, MetaPage};
+use storage::{IoBackend, IoBackendConfig};
 use storage::{OpenOptions, PAGE_SIZE, StorageEngine};
 
 mod common;
@@ -38,7 +38,7 @@ fn meta_page_flush_then_load_via_storage_engine() {
             io_config: IoBackendConfig::default(),
             wal_mode: Default::default(),
         };
-        
+
         // 第一次: open, put data, flush, close
         let (v_user, _meta_pid_pos) = {
             let mut e = StorageEngine::open(opts.clone()).await.expect("open ok");
@@ -79,7 +79,7 @@ fn meta_page_persists_in_disk_after_recovery() {
             io_config: IoBackendConfig::default(),
             wal_mode: Default::default(),
         };
-        
+
         {
             let mut e = StorageEngine::open(opts.clone()).await.expect("open ok");
             e.flush().await.expect("flush ok");
@@ -206,7 +206,7 @@ fn meta_page_empty_dbs_after_recovery() {
             io_config: IoBackendConfig::default(),
             wal_mode: Default::default(),
         };
-        
+
         {
             let e = StorageEngine::open(opts.clone()).await.expect("open ok");
             e.close().await.expect("close ok");
@@ -276,7 +276,7 @@ fn meta_page_pager_integration_with_simulated_catalog() {
             io_config: IoBackendConfig::default(),
             wal_mode: Default::default(),
         };
-        
+
         // 1. 构造 MetaPage (3 个 db)
         let mut meta = MetaPage::new_empty();
         meta.add_db("users", 100).unwrap();

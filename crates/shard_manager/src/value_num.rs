@@ -34,7 +34,10 @@ pub const TAG_F32: u8 = 0x06;
 
 /// 首字节是否为已知 type tag.
 pub fn is_known_tag(tag: u8) -> bool {
-    matches!(tag, TAG_RAW | TAG_I64 | TAG_F64 | TAG_STR | TAG_DOC | TAG_F32)
+    matches!(
+        tag,
+        TAG_RAW | TAG_I64 | TAG_F64 | TAG_STR | TAG_DOC | TAG_F32
+    )
 }
 
 /// 解析后的数值 (RMW 运算用).
@@ -105,9 +108,9 @@ pub fn parse_num(stored: &[u8]) -> Option<NumValue> {
 /// Redis INCR 语义: 对 float 值报 "not an integer".
 pub fn parse_num_int_only(stored: &[u8]) -> Option<i64> {
     match stored.first() {
-        Some(&TAG_I64) if stored.len() == 9 => Some(i64::from_le_bytes(
-            stored[1..9].try_into().expect("8B"),
-        )),
+        Some(&TAG_I64) if stored.len() == 9 => {
+            Some(i64::from_le_bytes(stored[1..9].try_into().expect("8B")))
+        }
         Some(&TAG_F64) | Some(&TAG_F32) => None,
         _ => {
             let payload = match stored.first() {

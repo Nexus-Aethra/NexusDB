@@ -34,11 +34,11 @@ impl<'a> ItemPtr<'a> {
         // 不知道 prev_key (调用方需要), 所以 cur_key 只能用 key_unshared.
         // 但通常我们是从 cp 段首 (shared=0) 或从 next() 来的, 都有 prev_key.
         // 这里 new() 直接从 key_unshared 推 full key — **仅适用于 shared=0 的 item**.
-        debug_assert_eq!(
-            item.shared_prefix_len, 0,
-            "ItemPtr::new called on item with shared_prefix_len={}, must be shared=0 (cp segment head or sentinel)",
-            item.shared_prefix_len
-        );
+        // 违反时 cur_key 缺失与 prev_key 的公共前缀, 后续所有比较都是错的, 而
+        // 且**无声**。故用硬错误挡住, 不只在 debug 下 panic (release 会静默错读).
+        if item.shared_prefix_len != 0 {
+            return Err(PageError::NotSegmentHead(item.shared_prefix_len));
+        }
         Ok(Self {
             page,
             off,
@@ -99,11 +99,10 @@ impl<'a> LeafItemPtr<'a> {
     /// 从指定字节偏移构造 ptr. decode 后缓存 value 指针.
     pub fn new(page: &'a [u8], off: usize) -> Result<Self, PageError> {
         let (item, n) = decode_item(page, off, ItemKind::Leaf)?;
-        debug_assert_eq!(
-            item.shared_prefix_len, 0,
-            "LeafItemPtr::new called on item with shared_prefix_len={}, must be shared=0",
-            item.shared_prefix_len
-        );
+        // 同 ItemPtr::new: 段首/哨兵之外的偏移会让 cur_key 缺前缀, 且无声出错.
+        if item.shared_prefix_len != 0 {
+            return Err(PageError::NotSegmentHead(item.shared_prefix_len));
+        }
         let value_ptr = item.value.as_ptr();
         Ok(Self {
             value_len: item.value_len,

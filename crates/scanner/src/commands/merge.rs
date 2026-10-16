@@ -30,12 +30,13 @@ pub fn run<W: Write>(
     mut out: W,
 ) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     // Phase 1: collect all key-value pairs from the page pool
@@ -87,12 +88,7 @@ pub fn run<W: Write>(
                 }
                 Err(e) => {
                     if matches!(globals.output_mode(), OutputMode::Human) {
-                        writeln!(
-                            &mut out,
-                            "[WAL-READ-ERROR] {}: {e}",
-                            seg.path.display()
-                        )
-                        .ok();
+                        writeln!(&mut out, "[WAL-READ-ERROR] {}: {e}", seg.path.display()).ok();
                     }
                     wal_bad += 1;
                 }
@@ -112,12 +108,7 @@ pub fn run<W: Write>(
             MergeFormat::Json => {
                 let k_hex = hex::encode(key);
                 let v_hex = hex::encode(value);
-                writeln!(
-                    &mut out,
-                    r#"{{"key":"{}","value":"{}"}}"#,
-                    k_hex, v_hex
-                )
-                .ok();
+                writeln!(&mut out, r#"{{"key":"{}","value":"{}"}}"#, k_hex, v_hex).ok();
             }
         }
         row_count += 1;
@@ -134,7 +125,11 @@ pub fn run<W: Write>(
     }
 
     if row_count == 0 && page_pool_bad > 0 {
-        writeln!(&mut out, "merge: zero rows emitted (all pages were bad or unreadable)").ok();
+        writeln!(
+            &mut out,
+            "merge: zero rows emitted (all pages were bad or unreadable)"
+        )
+        .ok();
         Ok(1)
     } else {
         Ok(0)

@@ -431,11 +431,9 @@ impl Future for PollFd {
 
         let slot_id = with_current_slot(|id| id).unwrap_or(0);
         // IORING_OP_POLL_ADD: 注册对 fd 的事件监听, 返回触发的事件 mask.
-        let entry = io_uring::opcode::PollAdd::new(
-            io_uring::types::Fd(this.fd),
-            this.events as u32,
-        )
-        .build();
+        let entry =
+            io_uring::opcode::PollAdd::new(io_uring::types::Fd(this.fd), this.events as u32)
+                .build();
         let ud = submit_sqe!(entry, slot_id, cx);
         this.user_data.set(Some(ud));
         Poll::Pending
@@ -515,8 +513,16 @@ pub struct SelectRead {
 impl SelectRead {
     pub(crate) fn new(fd1: RawFd, fd2: RawFd) -> Self {
         Self {
-            f1: Box::pin(PollFd { fd: fd1, events: libc::POLLIN, user_data: Cell::new(None) }),
-            f2: Box::pin(PollFd { fd: fd2, events: libc::POLLIN, user_data: Cell::new(None) }),
+            f1: Box::pin(PollFd {
+                fd: fd1,
+                events: libc::POLLIN,
+                user_data: Cell::new(None),
+            }),
+            f2: Box::pin(PollFd {
+                fd: fd2,
+                events: libc::POLLIN,
+                user_data: Cell::new(None),
+            }),
             done1: false,
             done2: false,
         }

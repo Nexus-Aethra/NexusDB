@@ -71,15 +71,22 @@ fn put_get_roundtrip() {
     let addr = server.local_addr();
 
     let mut stream = TcpStream::connect(addr).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream.set_nodelay(true).expect("nodelay");
 
     // PUT
-    let req = encode_request(42, &Request::Put {
-        key: b"hello".to_vec(),
-        value: b"world".to_vec(),
-    });
+    let req = encode_request(
+        42,
+        &Request::Put {
+            key: b"hello".to_vec(),
+            value: b"world".to_vec(),
+        },
+    );
     stream.write_all(&req).expect("write put");
     stream.flush().expect("flush put");
 
@@ -90,9 +97,12 @@ fn put_get_roundtrip() {
     assert!(matches!(resp, network::Response::PutOk));
 
     // GET
-    let req = encode_request(43, &Request::Get {
-        key: b"hello".to_vec(),
-    });
+    let req = encode_request(
+        43,
+        &Request::Get {
+            key: b"hello".to_vec(),
+        },
+    );
     stream.write_all(&req).expect("write get");
     stream.flush().expect("flush get");
     let n = stream.read(&mut buf).expect("read get reply");
@@ -104,9 +114,12 @@ fn put_get_roundtrip() {
     }
 
     // GET miss
-    let req = encode_request(44, &Request::Get {
-        key: b"missing".to_vec(),
-    });
+    let req = encode_request(
+        44,
+        &Request::Get {
+            key: b"missing".to_vec(),
+        },
+    );
     stream.write_all(&req).expect("write get miss");
     stream.flush().expect("flush get miss");
     let n = stream.read(&mut buf).expect("read miss reply");
@@ -114,9 +127,12 @@ fn put_get_roundtrip() {
     assert!(matches!(resp, network::Response::Get(None)));
 
     // DELETE
-    let req = encode_request(45, &Request::Delete {
-        key: b"hello".to_vec(),
-    });
+    let req = encode_request(
+        45,
+        &Request::Delete {
+            key: b"hello".to_vec(),
+        },
+    );
     stream.write_all(&req).expect("write del");
     stream.flush().expect("flush del");
     let n = stream.read(&mut buf).expect("read del reply");
@@ -170,8 +186,12 @@ fn multi_request_single_connection() {
     let addr = server.local_addr();
 
     let mut stream = TcpStream::connect(addr).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     let mut buf = [0u8; 4096];
     // 3 个 Put 在一条连接上, server 应该按 frame 解析分别回 3 个 reply.

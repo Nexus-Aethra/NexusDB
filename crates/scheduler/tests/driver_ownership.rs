@@ -9,9 +9,7 @@ fn a_second_driver_thread_is_rejected() {
     let second = sched.clone();
     let result = std::thread::spawn(move || {
         second.set_current();
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            second.drive_until_idle(0)
-        }))
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| second.drive_until_idle(0)))
     })
     .join()
     .expect("second thread itself must not abort");

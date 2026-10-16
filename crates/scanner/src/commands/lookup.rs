@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use page::{ItemKind, decode_item, page_free_off, page_type};
+use page::{decode_item, page_free_off, page_type, ItemKind};
 
 use crate::cli::Globals;
 use crate::dir;
@@ -17,12 +17,13 @@ use crate::pid::{Locate, Strategy};
 
 pub fn run<W: Write>(globals: &Globals, tree_root: u64, key_hex: &str, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let target_key = match hex::decode(key_hex) {
@@ -34,7 +35,7 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, key_hex: &str, mut out: 
     };
 
     // Navigate from root to the leaf that should contain the key
-    match lookup_key(&shard, &locate, tree_root, &target_key, &mut out, globals) {
+    match lookup_key(shard, &locate, tree_root, &target_key, &mut out, globals) {
         Ok(_) => Ok(0),
         Err(msg) => {
             writeln!(&mut out, "{msg}").ok();

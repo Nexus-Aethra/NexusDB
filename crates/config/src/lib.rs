@@ -20,12 +20,12 @@ pub struct NexusConfig {
 
 /// ⭐ S4: pg_addr 缺省 (旧配置文件无此字段时兼容).
 fn default_pg_addr() -> String {
-    "0.0.0.0:5435".to_string()
+    "127.0.0.1:5435".to_string()
 }
 
 /// ⭐ H1: http_addr 缺省 (用户拍板 6778, 避开 8080).
 fn default_http_addr() -> String {
-    "0.0.0.0:6778".to_string()
+    "127.0.0.1:6778".to_string()
 }
 
 /// ⭐ ORM-B3: SQL 门面 worker 数缺省.
@@ -83,12 +83,14 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        // ⚠️ 安全默认: 缺省只绑回环地址. 暴露到外网必须显式写 "0.0.0.0:PORT",
+        // 且自行配置 redis_password / sql_password / http_token (缺省为空 = 免鉴权).
         Self {
-            listen_addr: "0.0.0.0:5433".to_string(),
+            listen_addr: "127.0.0.1:5433".to_string(),
             worker_count: 2,
-            redis_addr: "0.0.0.0:6379".to_string(),
+            redis_addr: "127.0.0.1:6379".to_string(),
             redis_password: String::new(),
-            sql_addr: "0.0.0.0:5434".to_string(),
+            sql_addr: "127.0.0.1:5434".to_string(),
             pg_addr: default_pg_addr(),
             sql_password: String::new(),
             sql_worker_count: 1,
@@ -187,8 +189,12 @@ impl NexusConfig {
             return Ok((Self::default(), false));
         }
         let text = std::fs::read_to_string(path)?;
-        let cfg: NexusConfig = toml::from_str(&text)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse {}: {e}", path.display())))?;
+        let cfg: NexusConfig = toml::from_str(&text).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parse {}: {e}", path.display()),
+            )
+        })?;
         cfg.validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok((cfg, true))
@@ -199,10 +205,20 @@ impl NexusConfig {
         self.storage.io_backend()?;
         match self.log.level.to_ascii_lowercase().as_str() {
             "error" | "warn" | "info" | "debug" | "trace" => {}
-            other => return Err(format!("log.level invalid: {other:?} (expect error|warn|info|debug|trace)")),
+            other => {
+                return Err(format!(
+                    "log.level invalid: {other:?} (expect error|warn|info|debug|trace)"
+                ));
+            }
         }
-        if !matches!(self.storage.wal_mode.to_ascii_lowercase().as_str(), "off" | "periodic" | "strict" | "") {
-            return Err(format!("storage.wal_mode invalid: {} (off|periodic|strict)", self.storage.wal_mode));
+        if !matches!(
+            self.storage.wal_mode.to_ascii_lowercase().as_str(),
+            "off" | "periodic" | "strict" | ""
+        ) {
+            return Err(format!(
+                "storage.wal_mode invalid: {} (off|periodic|strict)",
+                self.storage.wal_mode
+            ));
         }
         if self.storage.num_shards == 0 {
             return Err("storage.num_shards must be >= 1".to_string());
@@ -243,7 +259,9 @@ impl NexusConfig {
         }
         // key 参与 page item 比较/分裂/internal 路由, 维持 inline 上限
         if self.server.max_key_bytes > 1024 {
-            return Err("server.max_key_bytes must be <= 1024 (page item routing limit)".to_string());
+            return Err(
+                "server.max_key_bytes must be <= 1024 (page item routing limit)".to_string(),
+            );
         }
         // ⭐ 大 value: 超 inline 阈值走溢出页 (单层间接), 上限 1MB
         if self.server.max_value_bytes > 1024 * 1024 {
@@ -268,7 +286,9 @@ impl StorageConfig {
                 "storage.io_backend=io_uring is unsupported on {:?}; use stdfs or select that target's native backend",
                 platform::CURRENT.target
             )),
-            other => Err(format!("storage.io_backend invalid: {other:?} (expect stdfs|io_uring)")),
+            other => Err(format!(
+                "storage.io_backend invalid: {other:?} (expect stdfs|io_uring)"
+            )),
         }
     }
 }
@@ -305,7 +325,10 @@ stderr = false
         assert_eq!(cfg.server.listen_addr, "127.0.0.1:9999");
         assert_eq!(cfg.server.worker_count, 4);
         assert_eq!(cfg.storage.num_shards, 8);
-        assert!(matches!(cfg.storage.io_backend().unwrap(), storage::IoBackend::StdFs));
+        assert!(matches!(
+            cfg.storage.io_backend().unwrap(),
+            storage::IoBackend::StdFs
+        ));
         assert!(!cfg.storage.create_if_missing);
         assert_eq!(cfg.log.level, "debug");
         assert_eq!(cfg.log.buffer_kb, 128);
@@ -321,8 +344,8 @@ num_shards = 2
         let cfg: NexusConfig = toml::from_str(text).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.storage.num_shards, 2);
-        // 其余字段用默认值
-        assert_eq!(cfg.server.listen_addr, "0.0.0.0:5433");
+        // 其余字段用默认值 —— 监听地址缺省绑回环 (安全默认, 见 ServerConfig::default)
+        assert_eq!(cfg.server.listen_addr, "127.0.0.1:5433");
         assert_eq!(cfg.storage.io_backend, "io_uring");
         assert_eq!(cfg.log.level, "info");
     }

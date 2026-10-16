@@ -106,7 +106,10 @@ impl LeafDir {
     }
 
     fn total_keys(&self) -> usize {
-        self.leaves.iter().map(|p| page_key_count(&p[..]) as usize).sum()
+        self.leaves
+            .iter()
+            .map(|p| page_key_count(&p[..]) as usize)
+            .sum()
     }
 }
 

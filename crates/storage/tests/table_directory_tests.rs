@@ -15,8 +15,8 @@
 //!
 //! 详见 `docs/superpowers/plans/2026-07-18-storage-crate.md` §Task 10.
 
-use storage::{IoBackend, IoBackendConfig};
 use storage::table_directory::TableDirError;
+use storage::{IoBackend, IoBackendConfig};
 use storage::{OpenOptions, StorageEngine};
 
 mod common;

@@ -36,7 +36,10 @@ fn zset_dual_index_and_score_update() {
         ];
         assert_eq!(e.zset_add("db1", "t1", b"z", &pairs).await.unwrap(), 3);
         assert_eq!(e.zset_card("db1", "t1", b"z").await.unwrap(), 3);
-        assert_eq!(e.zset_score("db1", "t1", b"z", b"b").await.unwrap(), Some(2.0));
+        assert_eq!(
+            e.zset_score("db1", "t1", b"z", b"b").await.unwrap(),
+            Some(2.0)
+        );
 
         // 按 score 升序
         let r = e.zset_range("db1", "t1", b"z", 0, -1, false).await.unwrap();
@@ -44,25 +47,47 @@ fn zset_dual_index_and_score_update() {
         assert_eq!(members, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
 
         // 更新 a 的 score → 10, 双索引一致: a 移到末尾, card 不变
-        assert_eq!(e.zset_add("db1", "t1", b"z", &[(10.0, b"a".to_vec())]).await.unwrap(), 0);
+        assert_eq!(
+            e.zset_add("db1", "t1", b"z", &[(10.0, b"a".to_vec())])
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(e.zset_card("db1", "t1", b"z").await.unwrap(), 3);
         let r = e.zset_range("db1", "t1", b"z", 0, -1, false).await.unwrap();
         let members: Vec<Vec<u8>> = r.iter().map(|(m, _)| m.clone()).collect();
         assert_eq!(members, vec![b"b".to_vec(), b"c".to_vec(), b"a".to_vec()]);
-        assert_eq!(e.zset_score("db1", "t1", b"z", b"a").await.unwrap(), Some(10.0));
+        assert_eq!(
+            e.zset_score("db1", "t1", b"z", b"a").await.unwrap(),
+            Some(10.0)
+        );
 
         // ZRANGEBYSCORE
-        let r = e.zset_range_by_score("db1", "t1", b"z", 2.0, 3.0).await.unwrap();
+        let r = e
+            .zset_range_by_score("db1", "t1", b"z", 2.0, 3.0)
+            .await
+            .unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].0, b"b");
         assert_eq!(r[1].0, b"c");
 
         // ZRANK
-        assert_eq!(e.zset_rank("db1", "t1", b"z", b"b", false).await.unwrap(), Some(0));
-        assert_eq!(e.zset_rank("db1", "t1", b"z", b"a", false).await.unwrap(), Some(2));
+        assert_eq!(
+            e.zset_rank("db1", "t1", b"z", b"b", false).await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            e.zset_rank("db1", "t1", b"z", b"a", false).await.unwrap(),
+            Some(2)
+        );
 
         // ZREM: 删 b, 旧 score 索引行也应被清 (再 range 不含 b)
-        assert_eq!(e.zset_rem("db1", "t1", b"z", &[b"b".to_vec()]).await.unwrap(), 1);
+        assert_eq!(
+            e.zset_rem("db1", "t1", b"z", &[b"b".to_vec()])
+                .await
+                .unwrap(),
+            1
+        );
         let r = e.zset_range("db1", "t1", b"z", 0, -1, false).await.unwrap();
         let members: Vec<Vec<u8>> = r.iter().map(|(m, _)| m.clone()).collect();
         assert_eq!(members, vec![b"c".to_vec(), b"a".to_vec()]);
@@ -100,7 +125,10 @@ fn zset_large_cross_leaf_and_reopen() {
         }
         let mut e = StorageEngine::open(opts_for(&tmp)).await.unwrap();
         assert_eq!(e.zset_card("db1", "t1", b"big").await.unwrap(), 1000);
-        let all = e.zset_range("db1", "t1", b"big", 0, -1, false).await.unwrap();
+        let all = e
+            .zset_range("db1", "t1", b"big", 0, -1, false)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 1000, "跨 leaf score 扫描收齐");
         // 有序: score 递增
         for w in all.windows(2) {
@@ -108,6 +136,9 @@ fn zset_large_cross_leaf_and_reopen() {
         }
         assert_eq!(all[0].0, b"m00000");
         assert_eq!(all[999].0, b"m00999");
-        assert_eq!(e.zset_score("db1", "t1", b"big", b"m00500").await.unwrap(), Some(500.0));
+        assert_eq!(
+            e.zset_score("db1", "t1", b"big", b"m00500").await.unwrap(),
+            Some(500.0)
+        );
     });
 }

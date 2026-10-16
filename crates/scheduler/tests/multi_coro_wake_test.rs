@@ -20,10 +20,8 @@ fn multi_coro_conn_wake() {
         sched.set_current();
 
         // 同 server.rs 的 eventfd
-        let reply_eventfd =
-            unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        let conn_eventfd =
-            unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let reply_eventfd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let conn_eventfd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         let stop_efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
 
         let conn_woke: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
@@ -64,7 +62,10 @@ fn multi_coro_conn_wake() {
             *conn_woke.lock().unwrap(),
             t0.elapsed()
         );
-        assert!(*conn_woke.lock().unwrap(), "new_conn_loop 应被 conn_eventfd 唤醒");
+        assert!(
+            *conn_woke.lock().unwrap(),
+            "new_conn_loop 应被 conn_eventfd 唤醒"
+        );
         unsafe {
             libc::close(reply_eventfd);
             libc::close(conn_eventfd);

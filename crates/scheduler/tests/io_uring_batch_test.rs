@@ -25,12 +25,20 @@ fn batch_push_one_submit_all_complete() {
         let mut buf1 = [0u8; 16];
         let mut buf2 = [0u8; 16];
 
-        let e1 = opcode::Read::new(types::Fd(b1.as_raw_fd()), buf1.as_mut_ptr(), buf1.len() as _)
-            .build()
-            .user_data(1);
-        let e2 = opcode::Read::new(types::Fd(b2.as_raw_fd()), buf2.as_mut_ptr(), buf2.len() as _)
-            .build()
-            .user_data(2);
+        let e1 = opcode::Read::new(
+            types::Fd(b1.as_raw_fd()),
+            buf1.as_mut_ptr(),
+            buf1.len() as _,
+        )
+        .build()
+        .user_data(1);
+        let e2 = opcode::Read::new(
+            types::Fd(b2.as_raw_fd()),
+            buf2.as_mut_ptr(),
+            buf2.len() as _,
+        )
+        .build()
+        .user_data(2);
         // 分离 sq/cq (split 返回 (Submitter, SubmissionQueue, CompletionQueue))
         let (sub, mut sq, mut cq) = ring.split();
         // ---- push 2 个 SQE (不 submit) ----
@@ -107,7 +115,9 @@ fn poll_not_ready_waits_for_data() {
         let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
         let fd = b.as_raw_fd();
 
-        let e = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32).build().user_data(3);
+        let e = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32)
+            .build()
+            .user_data(3);
         let (sub, mut sq, mut cq) = ring.split();
         unsafe { sq.push(&e).expect("push") };
         drop(sq);
@@ -144,12 +154,20 @@ fn batch_push_submit_and_wait_all() {
         a1.write_all(b"11111111").unwrap();
         a2.write_all(b"22222222").unwrap();
 
-        let e1 = opcode::Read::new(types::Fd(b1.as_raw_fd()), buf1.as_mut_ptr(), buf1.len() as _)
-            .build()
-            .user_data(1);
-        let e2 = opcode::Read::new(types::Fd(b2.as_raw_fd()), buf2.as_mut_ptr(), buf2.len() as _)
-            .build()
-            .user_data(2);
+        let e1 = opcode::Read::new(
+            types::Fd(b1.as_raw_fd()),
+            buf1.as_mut_ptr(),
+            buf1.len() as _,
+        )
+        .build()
+        .user_data(1);
+        let e2 = opcode::Read::new(
+            types::Fd(b2.as_raw_fd()),
+            buf2.as_mut_ptr(),
+            buf2.len() as _,
+        )
+        .build()
+        .user_data(2);
         let (sub, mut sq, mut cq) = ring.split();
         unsafe {
             sq.push(&e1).expect("push1");

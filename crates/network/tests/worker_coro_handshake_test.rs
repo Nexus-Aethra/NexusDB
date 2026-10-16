@@ -18,13 +18,6 @@ use network::protocol::mysql as my;
 
 // ===== 与 sql_e2e 相同的最小 MySQL 客户端 (测试辅助) =====
 
-#[derive(Debug, PartialEq)]
-enum QueryResult {
-    Ok { affected: u64 },
-    Err { code: u16, msg: String },
-    Rows(Vec<Vec<Option<String>>>),
-}
-
 struct MyConn {
     stream: TcpStream,
     buf: Vec<u8>,
@@ -32,9 +25,14 @@ struct MyConn {
 impl MyConn {
     fn connect(addr: std::net::SocketAddr) -> Self {
         let stream = TcpStream::connect(addr).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         stream.set_nodelay(true).unwrap();
-        Self { stream, buf: Vec::new() }
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
     }
     fn read_frame(&mut self) -> (u8, Vec<u8>) {
         loop {
@@ -53,7 +51,9 @@ impl MyConn {
         assert_eq!(seq, 0);
         assert_eq!(p[0], 10, "protocol version");
         let mut pos = 1;
-        while p[pos] != 0 { pos += 1; }
+        while p[pos] != 0 {
+            pos += 1;
+        }
         pos += 1 + 4;
         let mut salt = [0u8; 20];
         salt[..8].copy_from_slice(&p[pos..pos + 8]);
@@ -86,10 +86,7 @@ fn coro_worker_handshake(fd: i32) {
     let sched = scheduler::SchedHandle::new(scheduler::Scheduler::new());
     sched.set_current();
 
-    let salt: [u8; 20] = [
-        b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'a', b'b', b'c', b'd', b'e',
-        b'f', b'g', b'h', b'i', b'j',
-    ];
+    let salt: [u8; 20] = *b"0123456789abcdefghij";
     let done: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let done2 = done.clone();
 
@@ -98,7 +95,9 @@ fn coro_worker_handshake(fd: i32) {
         let greeting = my::build_handshake_v10_caps(&salt, 1, false);
         let mut w = 0usize;
         while w < greeting.len() {
-            w += scheduler::io_ops::write(fd, &greeting[w..], u64::MAX).await.unwrap();
+            w += scheduler::io_ops::write(fd, &greeting[w..], u64::MAX)
+                .await
+                .unwrap();
         }
 
         // 2. 收 HandshakeResponse41
@@ -107,8 +106,12 @@ fn coro_worker_handshake(fd: i32) {
         // 循环读直到拿到完整包 (长度在包头 3 字节).
         let mut total = 0usize;
         loop {
-            let n = scheduler::io_ops::read(fd, &mut buf[total..], u64::MAX).await.unwrap();
-            if n == 0 { break; }
+            let n = scheduler::io_ops::read(fd, &mut buf[total..], u64::MAX)
+                .await
+                .unwrap();
+            if n == 0 {
+                break;
+            }
             total += n;
             if let Some((_, _n, payload)) = my::read_packet(&buf[..total]) {
                 // 校验 auth: 空密码 + native_password
@@ -118,7 +121,9 @@ fn coro_worker_handshake(fd: i32) {
                         let okpkt = my::build_ok(2, 0);
                         let mut wo = 0usize;
                         while wo < okpkt.len() {
-                            wo += scheduler::io_ops::write(fd, &okpkt[wo..], u64::MAX).await.unwrap();
+                            wo += scheduler::io_ops::write(fd, &okpkt[wo..], u64::MAX)
+                                .await
+                                .unwrap();
                         }
                         got = 1;
                     }

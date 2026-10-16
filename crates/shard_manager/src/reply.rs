@@ -19,8 +19,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::thread::Thread;
 
@@ -85,15 +85,21 @@ impl Drop for ReplySlot {
     fn drop(&mut self) {
         let ptr = *self.ptr.get_mut();
         if !ptr.is_null() {
-            unsafe { drop(Box::from_raw(ptr)); }
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
         }
         let w = *self.waiter.get_mut();
         if !w.is_null() {
-            unsafe { drop(Box::from_raw(w)); }
+            unsafe {
+                drop(Box::from_raw(w));
+            }
         }
         let tw = *self.task_waker.get_mut();
         if !tw.is_null() {
-            unsafe { drop(Box::from_raw(tw)); }
+            unsafe {
+                drop(Box::from_raw(tw));
+            }
         }
     }
 }
@@ -132,7 +138,9 @@ impl Future for ReplyFuture {
         let boxed = Box::into_raw(Box::new(cx.waker().clone()));
         let old = self.slot.task_waker.swap(boxed, Ordering::AcqRel);
         if !old.is_null() {
-            unsafe { drop(Box::from_raw(old)); }
+            unsafe {
+                drop(Box::from_raw(old));
+            }
         }
         // double-check: send 可能发生在上面 try_take 与注册之间.
         // (waker 残留在槽里无害: 下次 store 会取走 wake, 顶多多 poll 一次)
@@ -225,7 +233,10 @@ mod tests {
         drop(tx);
         tx2.send(Err(crate::request::ShardErrorKind::ChannelClosed));
         let resp = block_on_v2(fut);
-        assert!(matches!(resp, Err(crate::request::ShardErrorKind::ChannelClosed)));
+        assert!(matches!(
+            resp,
+            Err(crate::request::ShardErrorKind::ChannelClosed)
+        ));
     }
 
     #[test]
@@ -238,7 +249,10 @@ mod tests {
         assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
         // send 后 poll, ready
         tx.send(Ok(ShardReply::PutOk));
-        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Ready(Ok(ShardReply::PutOk))));
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Ready(Ok(ShardReply::PutOk))
+        ));
     }
 
     #[test]

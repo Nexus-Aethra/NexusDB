@@ -123,7 +123,10 @@ impl PageIndex {
                             dprintln!(
                                 index,
                                 "[PAGE_INDEX_LOAD] cp[{}].item[{}] decode FAILED at off={}: {}",
-                                i, j, off, e
+                                i,
+                                j,
+                                off,
+                                e
                             );
                             return Err(e);
                         }
@@ -425,10 +428,26 @@ mod tests {
     fn find_segment_by_offset_is_upper_bound_binary_search() {
         let idx = PageIndex {
             segments: vec![
-                Segment { first_item_off: 32, item_count: 1, first_full_key: vec![] },
-                Segment { first_item_off: 96, item_count: 1, first_full_key: b"a".to_vec() },
-                Segment { first_item_off: 192, item_count: 1, first_full_key: b"b".to_vec() },
-                Segment { first_item_off: 384, item_count: 1, first_full_key: b"c".to_vec() },
+                Segment {
+                    first_item_off: 32,
+                    item_count: 1,
+                    first_full_key: vec![],
+                },
+                Segment {
+                    first_item_off: 96,
+                    item_count: 1,
+                    first_full_key: b"a".to_vec(),
+                },
+                Segment {
+                    first_item_off: 192,
+                    item_count: 1,
+                    first_full_key: b"b".to_vec(),
+                },
+                Segment {
+                    first_item_off: 384,
+                    item_count: 1,
+                    first_full_key: b"c".to_vec(),
+                },
             ],
             key_count: 4,
         };

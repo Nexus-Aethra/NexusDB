@@ -378,7 +378,6 @@ pub fn apply_pre_merge_steal(
     Ok(true)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -47,6 +47,9 @@ pub struct ShardManagerOptions {
     pub wal_mode: storage::wal::WalMode,
 }
 
+/// 扫描结果: (物理 key, value) 对的列表 —— 各 shard 归并后的全局结果.
+pub type ScanEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
 impl ShardManagerOptions {
     /// 构造默认配置.
     pub fn new(num_shards: usize, block_root: std::path::PathBuf) -> Self {
@@ -573,7 +576,7 @@ impl ShardManager {
         end: &[u8],
         prefix: &[u8],
         limit: u32,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+    ) -> Result<ScanEntries, String> {
         // 每 shard 单独一份 ScanKeys (各自 limit 下推, 归并后全局截断).
         let mut futures = Vec::with_capacity(self.num_shards);
         for shard in &self.shards {
@@ -946,7 +949,7 @@ impl ShardManager {
             match fut.await {
                 Ok(ShardReply::BatchResults(rs)) => {
                     // rs 顺序与 push 时的 ops 顺序一致, 也就是 group 顺序.
-                    for (slot, result) in orig_indices.iter().zip(rs.into_iter()) {
+                    for (slot, result) in orig_indices.iter().zip(rs) {
                         results[*slot] = result;
                     }
                 }

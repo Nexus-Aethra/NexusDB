@@ -96,9 +96,12 @@ fn blank_page(page_type: PageType) -> Box<[u8; PAGE_SIZE]> {
 ///
 /// 顺序: 数据页先落 (逐页 `pager.create`, 每页一个 batch — 1MB 数据本就
 /// 分页写, 无跨页原子性需求), index 页最后; leaf item 由 caller 随后提交.
-/// crash 半途 → 孤儿页 (leaf 未引用), 见 plan 取舍记录.
+///
+/// ⚠️ 中途失败 (磁盘满 / IO 错误) 会留下**孤儿页**: 已分配但永远不会被 leaf 引用,
+/// 白占空间且让 liveness 计数偏高. 故这里做失败回滚 —— 每成功一页就记下 vpid,
+/// 任一步出错先把已建页全部释放再返回错误.
+/// (进程级 crash 的孤儿页由 GC 的死页回收兜底, 见 plan 取舍记录.)
 pub async fn write_overflow(pager: &mut Pager, value: &[u8]) -> io::Result<[u8; DESCRIPTOR_LEN]> {
-    debug_assert!(value.len() <= MAX_OVERFLOW_VALUE, "caller 应先校验上限");
     if value.len() > MAX_OVERFLOW_VALUE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -107,14 +110,38 @@ pub async fn write_overflow(pager: &mut Pager, value: &[u8]) -> io::Result<[u8; 
     }
 
     // 1. 数据页
-    let mut data_vpids: Vec<u64> = Vec::with_capacity(value.len().div_ceil(OVERFLOW_PAYLOAD_PER_PAGE));
+    let mut data_vpids: Vec<u64> =
+        Vec::with_capacity(value.len().div_ceil(OVERFLOW_PAYLOAD_PER_PAGE));
     for slice in value.chunks(OVERFLOW_PAYLOAD_PER_PAGE) {
         let mut p = blank_page(PageType::Overflow);
         p[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + slice.len()].copy_from_slice(slice);
-        data_vpids.push(pager.create(p).await?);
+        match pager.create(p).await {
+            Ok(v) => data_vpids.push(v),
+            Err(e) => {
+                // 回滚: 已建的数据页此刻还没有任何引用, 释放是安全的.
+                for v in &data_vpids {
+                    pager.free_overflow_vpid(*v);
+                }
+                return Err(e);
+            }
+        }
     }
 
     // 2. index 页: count + vpid 数组
+    // MAX_OVERFLOW_VALUE 把 count 限在 ~65; 这里再硬校验一次, 防止将来调大上限
+    // 常量后无声越界写页 (段长超页容量 → index 页自身损坏).
+    if data_vpids.len() > MAX_INDEX_ENTRIES {
+        for v in &data_vpids {
+            pager.free_overflow_vpid(*v);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "overflow chain too long: {} pages > index capacity {MAX_INDEX_ENTRIES}",
+                data_vpids.len()
+            ),
+        ));
+    }
     let mut idx_page = blank_page(PageType::OverflowIndex);
     idx_page[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 2]
         .copy_from_slice(&(data_vpids.len() as u16).to_le_bytes());
@@ -122,10 +149,21 @@ pub async fn write_overflow(pager: &mut Pager, value: &[u8]) -> io::Result<[u8; 
         let off = PAGE_HEADER_SIZE + 2 + i * 8;
         idx_page[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
-    let head_vpid = pager.create(idx_page).await?;
+    let head_vpid = match pager.create(idx_page).await {
+        Ok(v) => v,
+        Err(e) => {
+            for v in &data_vpids {
+                pager.free_overflow_vpid(*v);
+            }
+            return Err(e);
+        }
+    };
 
     Ok(encode_descriptor(head_vpid, value.len() as u32))
 }
+
+/// index 页内可容纳的最大 vpid 条数: count 字段 2B + 每项 8B, 页尾无保留区.
+pub const MAX_INDEX_ENTRIES: usize = (PAGE_SIZE - PAGE_HEADER_SIZE - 2) / 8;
 
 /// 解析 index 页里的数据页 vpid 列表.
 fn parse_index_page(idx_page: &[u8; PAGE_SIZE]) -> io::Result<Vec<u64>> {
@@ -140,12 +178,31 @@ fn parse_index_page(idx_page: &[u8; PAGE_SIZE]) -> io::Result<Vec<u64>> {
             .try_into()
             .expect("2B"),
     ) as usize;
+    // ⚠️ 磁盘数据不可信: 损坏页的 count 可能是任意 u16 (最大 65535), 而页只能装
+    // 2042 项。旧实现直接按 count 切片取 8 字节 → 越界 panic (slice index out of
+    // range), 把"数据损坏"变成"进程崩溃". 必须先验容量再返回 InvalidData.
+    if count > MAX_INDEX_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "overflow index page corrupt: count={count} exceeds capacity {MAX_INDEX_ENTRIES}"
+            ),
+        ));
+    }
     let mut vpids = Vec::with_capacity(count);
     for i in 0..count {
         let off = PAGE_HEADER_SIZE + 2 + i * 8;
-        vpids.push(u64::from_le_bytes(
-            idx_page[off..off + 8].try_into().expect("8B"),
-        ));
+        // 再逐项 checked 一次: 即使 count 合法也不假设布局永不变.
+        let bytes: [u8; 8] = idx_page
+            .get(off..off + 8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("overflow index page truncated at entry {i}"),
+                )
+            })?;
+        vpids.push(u64::from_le_bytes(bytes));
     }
     Ok(vpids)
 }
@@ -158,6 +215,16 @@ pub async fn read_overflow(pager: &mut Pager, stored: &[u8]) -> io::Result<Vec<u
             "not an overflow descriptor",
         ));
     };
+    // ⚠️ total_len 同样来自磁盘描述符 (u32, 上限 4GiB). 不校验就 with_capacity
+    // 会按损坏值预分配巨量内存 (可致 OOM abort, 连错误都来不及返回).
+    if total_len as usize > MAX_OVERFLOW_VALUE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "overflow descriptor corrupt: total_len={total_len} exceeds max {MAX_OVERFLOW_VALUE}"
+            ),
+        ));
+    }
     let idx_page = pager.read(head_vpid).await?;
     let data_vpids = parse_index_page(&idx_page)?;
 
@@ -207,6 +274,43 @@ mod tests {
         let d = encode_descriptor(0xDEAD_BEEF_1234, 1 << 20);
         assert!(is_indirect(&d));
         assert_eq!(decode_descriptor(&d), Some((0xDEAD_BEEF_1234, 1 << 20)));
+    }
+
+    #[test]
+    fn corrupt_index_count_is_invalid_data_not_panic() {
+        // count 字段写满 u16 —— 远超页容量. 修复前这里会按 count 切片取 8B,
+        // 直接 panic (slice index out of range): 数据损坏升级成进程崩溃.
+        let mut page = blank_page(PageType::OverflowIndex);
+        page[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        let err = parse_index_page(&page).expect_err("corrupt count 应返回 Err");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds capacity"));
+    }
+
+    #[test]
+    fn boundary_index_count_accepted() {
+        // 恰好装满页容量: 合法, 不应被误拒.
+        let mut page = blank_page(PageType::OverflowIndex);
+        page[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 2]
+            .copy_from_slice(&(MAX_INDEX_ENTRIES as u16).to_le_bytes());
+        let v = parse_index_page(&page).expect("边界 count 应被接受");
+        assert_eq!(v.len(), MAX_INDEX_ENTRIES);
+        // 再多一个就应拒绝
+        page[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 2]
+            .copy_from_slice(&((MAX_INDEX_ENTRIES + 1) as u16).to_le_bytes());
+        assert_eq!(
+            parse_index_page(&page).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn wrong_page_type_rejected() {
+        let page = blank_page(PageType::Overflow);
+        assert_eq!(
+            parse_index_page(&page).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

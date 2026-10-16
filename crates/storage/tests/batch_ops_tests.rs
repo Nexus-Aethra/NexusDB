@@ -42,7 +42,10 @@ fn get_many_orders_and_reuses_leaf() {
         for i in 0..500u32 {
             let k = format!("key{:05}", i);
             let v = format!("val{i}");
-            engine.table_put("db1", "t1", k.as_bytes(), v.as_bytes()).await.unwrap();
+            engine
+                .table_put("db1", "t1", k.as_bytes(), v.as_bytes())
+                .await
+                .unwrap();
         }
 
         // 乱序请求 (含 miss key), 断言原顺序返回
@@ -91,19 +94,31 @@ fn put_many_insert_update_and_duplicate_key() {
         // 预置一半 key (update 路径), 另一半留给 insert 路径
         for i in (0..200u32).step_by(2) {
             let k = format!("pm{:04}", i);
-            engine.table_put("db1", "t1", k.as_bytes(), b"old").await.unwrap();
+            engine
+                .table_put("db1", "t1", k.as_bytes(), b"old")
+                .await
+                .unwrap();
         }
 
         // 批量写 200 个 (交错 insert/update) + 末尾同 key 重复 (后者覆盖)
         let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..200u32)
-            .map(|i| (format!("pm{:04}", i).into_bytes(), format!("new{i}").into_bytes()))
+            .map(|i| {
+                (
+                    format!("pm{:04}", i).into_bytes(),
+                    format!("new{i}").into_bytes(),
+                )
+            })
             .collect();
         pairs.push((b"pm0000".to_vec(), b"final".to_vec())); // 重复: 覆盖 new0
         engine.table_put_many("db1", "t1", &pairs).await.unwrap();
 
         for i in 0..200u32 {
             let k = format!("pm{:04}", i);
-            let got = engine.table_get("db1", "t1", k.as_bytes()).await.unwrap().unwrap();
+            let got = engine
+                .table_get("db1", "t1", k.as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
             let expect = if i == 0 {
                 b"final".to_vec()
             } else {
@@ -137,7 +152,11 @@ fn put_many_split_fallback_and_reopen() {
 
             for i in (0..2000u32).step_by(97) {
                 let k = format!("big{:05}", i);
-                let got = engine.table_get("db1", "t1", k.as_bytes()).await.unwrap().unwrap();
+                let got = engine
+                    .table_get("db1", "t1", k.as_bytes())
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(got, vec![(i % 251) as u8 + 1; 800], "key {k}");
             }
             engine.close().await.unwrap();
@@ -146,7 +165,11 @@ fn put_many_split_fallback_and_reopen() {
         let mut engine = StorageEngine::open(opts).await.unwrap();
         for i in (0..2000u32).step_by(211) {
             let k = format!("big{:05}", i);
-            let got = engine.table_get("db1", "t1", k.as_bytes()).await.unwrap().unwrap();
+            let got = engine
+                .table_get("db1", "t1", k.as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(got, vec![(i % 251) as u8 + 1; 800], "reopen key {k}");
         }
     });
@@ -170,11 +193,19 @@ fn put_many_with_overflow_values_no_leak() {
         ];
         engine.table_put_many("db1", "t1", &pairs).await.unwrap();
         assert_eq!(
-            engine.table_get("db1", "t1", b"huge01").await.unwrap().unwrap(),
+            engine
+                .table_get("db1", "t1", b"huge01")
+                .await
+                .unwrap()
+                .unwrap(),
             big1
         );
         assert_eq!(
-            engine.table_get("db1", "t1", b"huge02").await.unwrap().unwrap(),
+            engine
+                .table_get("db1", "t1", b"huge02")
+                .await
+                .unwrap()
+                .unwrap(),
             big2
         );
 
@@ -196,7 +227,11 @@ fn put_many_with_overflow_values_no_leak() {
             assert_eq!(alive(&mut engine), baseline, "第 {round} 轮覆盖写泄漏");
         }
         assert_eq!(
-            engine.table_get("db1", "t1", b"huge01").await.unwrap().unwrap(),
+            engine
+                .table_get("db1", "t1", b"huge01")
+                .await
+                .unwrap()
+                .unwrap(),
             vec![2u8; 100 * 1024]
         );
     });

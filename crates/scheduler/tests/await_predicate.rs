@@ -26,8 +26,8 @@ fn await_predicate_immediate_returns_ready() {
 
 #[test]
 fn await_predicate_unpark_resumes() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let sched = fresh();
     sched.set_current();
@@ -43,7 +43,11 @@ fn await_predicate_unpark_resumes() {
 
     // 2. drive → 协程 park (predicate false)
     drive(&sched);
-    assert!(parked_count() >= 1, "expected parked > 0, got {}", parked_count());
+    assert!(
+        parked_count() >= 1,
+        "expected parked > 0, got {}",
+        parked_count()
+    );
 
     // 3. flip flag → 让 predicate 变 true
     ready.store(true, Ordering::Release);

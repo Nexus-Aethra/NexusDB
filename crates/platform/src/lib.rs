@@ -73,6 +73,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    // 这些字段是编译期常量, 断言的正是"常量被声明成预期的值"—— 改动 CURRENT 定义时
+    // 让测试失败, 正是本用例的用途, 故显式豁免 assertions_on_constants.
+    #[allow(clippy::assertions_on_constants)]
     fn linux_declares_its_native_capabilities() {
         assert_eq!(CURRENT.target, TargetPlatform::Linux);
         assert!(CURRENT.supports_io_uring);

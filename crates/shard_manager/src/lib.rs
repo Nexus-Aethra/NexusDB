@@ -60,13 +60,15 @@ pub use latency_probe::PROBE;
 
 pub use coordinator::TwoPhaseCoordinator;
 pub use error::{ShardError, ShardResult};
-pub use inbox::{SharedInbox, ShardInbox};
+pub use inbox::{ShardInbox, SharedInbox};
 pub use manager::{DbDirView, ReplySink, ShardManager, ShardManagerOptions};
 pub use reply::{PendingReply, ReplyFuture, ReplySender};
-pub use request::{BatchOp, BatchResult, ShardId, ShardReply, ShardRequest, ShardResponse, ShardTask, TaskResult};
-pub use request::{PredOp, ScanPred};
 pub use request::IndexHint;
 pub use request::KeySetHint;
+pub use request::{
+    BatchOp, BatchResult, ShardId, ShardReply, ShardRequest, ShardResponse, ShardTask, TaskResult,
+};
+pub use request::{PredOp, ScanPred};
 pub use router::{HashRouter, Router};
 pub use task_inbox::{SharedTaskInbox, TaskInbox};
 pub use task_reply_bus::{ReplyBusSet, SharedTaskReplyBus, TaskReplyBus};

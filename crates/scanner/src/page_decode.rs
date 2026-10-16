@@ -13,11 +13,10 @@
 // `prefix_overlap`, `dbs`, `DumpEmpty`, `header_line`, and `try_decode_item`
 // are scaffolding for richer decoders (OverflowIndex, MetaPage details) and
 // the `range`/`lookup` commands arriving in PR3+.
-#[allow(dead_code)]
-
-use page::PageType;
 use page::dump;
-use page::{Item, ItemKind, decode_item};
+#[allow(dead_code)]
+use page::PageType;
+use page::{decode_item, Item, ItemKind};
 
 use crate::page_io::PAGE_SIZE;
 
@@ -119,19 +118,12 @@ impl PageReport {
         let bad = if !magic_ok {
             Some(BadPage {
                 kind: BadKind::BadMagic,
-                detail: format!(
-                    "expected {:?}, got {:02X?}",
-                    page::PAGE_MAGIC,
-                    &bytes[0..4]
-                ),
+                detail: format!("expected {:?}, got {:02X?}", page::PAGE_MAGIC, &bytes[0..4]),
             })
         } else if !vpid_matches {
             Some(BadPage {
                 kind: BadKind::VpidMismatch,
-                detail: format!(
-                    "expected vpid {}, header says {}",
-                    expected_vpid, vpid
-                ),
+                detail: format!("expected vpid {}, header says {}", expected_vpid, vpid),
             })
         } else if !free_off_in_range {
             Some(BadPage {
@@ -221,7 +213,13 @@ mod tests {
         let buf = [0u8; PAGE_SIZE];
         let r = PageReport::decode(&buf, 0);
         assert!(!r.magic_ok);
-        assert!(matches!(r.bad, Some(BadPage { kind: BadKind::BadMagic, .. })));
+        assert!(matches!(
+            r.bad,
+            Some(BadPage {
+                kind: BadKind::BadMagic,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -244,7 +242,10 @@ mod tests {
         assert!(!r.vpid_matches);
         assert!(matches!(
             r.bad,
-            Some(BadPage { kind: BadKind::VpidMismatch, .. })
+            Some(BadPage {
+                kind: BadKind::VpidMismatch,
+                ..
+            })
         ));
     }
 }

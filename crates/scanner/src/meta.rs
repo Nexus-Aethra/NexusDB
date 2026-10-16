@@ -17,9 +17,7 @@ pub fn decode_meta_page(page: &[u8; PAGE_SIZE]) -> Result<Vec<(String, u64)>, Me
 
 /// Open a single leaf page as a table directory and list every (table_name,
 /// root_vpid) it contains.
-pub fn list_table_dir_leaf(
-    page: &[u8; PAGE_SIZE],
-) -> Result<Vec<(String, u64)>, TableDirError> {
+pub fn list_table_dir_leaf(page: &[u8; PAGE_SIZE]) -> Result<Vec<(String, u64)>, TableDirError> {
     walk_meta_items(page).map_err(|e| TableDirError { reason: e })
 }
 

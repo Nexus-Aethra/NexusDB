@@ -49,8 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[bob, dave): {:?}", range);
 
     // 6. 类型感知范围扫描 (async)
-    let typed_range =
-        pollster::block_on(users.list_typed_range_async(b"alice", b"dave", 0))?;
+    let typed_range = pollster::block_on(users.list_typed_range_async(b"alice", b"dave", 0))?;
     for (k, v) in &typed_range {
         println!("range {k:?} -> {v:?}");
     }

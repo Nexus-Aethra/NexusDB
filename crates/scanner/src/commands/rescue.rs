@@ -11,19 +11,20 @@ use std::io::Write;
 use crate::cli::Globals;
 use crate::dir;
 use crate::error::Result;
-use crate::output::{JsonObject, format_vpid, json_row};
+use crate::output::{format_vpid, json_row, JsonObject};
 use crate::page_io;
 use crate::pid::Locate;
 use crate::tree::{self, WalkSummary};
 
 pub fn run<W: Write>(globals: &Globals, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     match globals.output_mode() {
@@ -57,7 +58,14 @@ fn run_human<W: Write>(
     }
     writeln!(out, "  found {} table(s)", tables.len()).ok();
     for (db, table, root_vpid) in &tables {
-        writeln!(out, "    db={} table={} root_vpid={}", db, table, format_vpid(*root_vpid, globals.hex_vpid)).ok();
+        writeln!(
+            out,
+            "    db={} table={} root_vpid={}",
+            db,
+            table,
+            format_vpid(*root_vpid, globals.hex_vpid)
+        )
+        .ok();
     }
     writeln!(out).ok();
 
@@ -76,9 +84,16 @@ fn run_human<W: Write>(
         writeln!(
             out,
             "  tree db={} table={} root_vpid={}: visited={} ok={} bad={} unread={} depth={}",
-            db, table, format_vpid(*root_vpid, globals.hex_vpid),
-            summary.visited, summary.ok, summary.bad, summary.unread, summary.max_depth
-        ).ok();
+            db,
+            table,
+            format_vpid(*root_vpid, globals.hex_vpid),
+            summary.visited,
+            summary.ok,
+            summary.bad,
+            summary.unread,
+            summary.max_depth
+        )
+        .ok();
         if summary.bad > 0 || summary.unread > 0 {
             bad_tree_roots.push((db.clone(), table.clone(), *root_vpid, summary));
         }
@@ -88,7 +103,8 @@ fn run_human<W: Write>(
         out,
         "  total: {} pages visited, {} bad, {} unreadable",
         total_visited, total_bad, total_unread
-    ).ok();
+    )
+    .ok();
     writeln!(out).ok();
 
     // Phase 3: blame each bad page
@@ -100,9 +116,13 @@ fn run_human<W: Write>(
             writeln!(
                 out,
                 "  tree db={} table={} root_vpid={} has {} bad pages, {} unreadable",
-                db, table, format_vpid(*root_vpid, globals.hex_vpid),
-                summary.bad, summary.unread
-            ).ok();
+                db,
+                table,
+                format_vpid(*root_vpid, globals.hex_vpid),
+                summary.bad,
+                summary.unread
+            )
+            .ok();
         }
     }
     writeln!(out).ok();
@@ -110,16 +130,31 @@ fn run_human<W: Write>(
     // Recovery advice
     writeln!(out, "--- Recovery advice ---").ok();
     if bad_tree_roots.is_empty() {
-        writeln!(out, "  All trees appear healthy. The engine may have failed for a reason").ok();
-        writeln!(out, "  other than page corruption (e.g. WAL replay, meta count mismatch).").ok();
-        writeln!(out, "  Try: cargo run -- -dir <PATH> export -tree <root_vpid> -format json").ok();
+        writeln!(
+            out,
+            "  All trees appear healthy. The engine may have failed for a reason"
+        )
+        .ok();
+        writeln!(
+            out,
+            "  other than page corruption (e.g. WAL replay, meta count mismatch)."
+        )
+        .ok();
+        writeln!(
+            out,
+            "  Try: cargo run -- -dir <PATH> export -tree <root_vpid> -format json"
+        )
+        .ok();
     } else {
         for (db, table, root_vpid, _summary) in &bad_tree_roots {
             writeln!(
                 out,
                 "  Tree db={} table={} (root_vpid={}) has issues.",
-                db, table, format_vpid(*root_vpid, globals.hex_vpid)
-            ).ok();
+                db,
+                table,
+                format_vpid(*root_vpid, globals.hex_vpid)
+            )
+            .ok();
             writeln!(
                 out,
                 "    To export reachable data: nexusdb-scanner --dir {} export -tree {} -format json > {}_{}.ndjson",
@@ -129,7 +164,8 @@ fn run_human<W: Write>(
                 out,
                 "    To examine bad pages:  nexusdb-scanner --dir {} header -vpid <N> --neighbors",
                 globals.dir.display()
-            ).ok();
+            )
+            .ok();
         }
     }
     writeln!(out, "  (export command is available in PR3)").ok();
@@ -193,10 +229,11 @@ fn discover_tables(shard: &dir::ShardDir, locate: &Locate) -> Vec<(String, Strin
         Err(_) => return out,
     };
     for (db, table_dir_vpid) in &dbs {
-        let td_coord = match locate.resolve(*table_dir_vpid, crate::pid::Strategy::MateThenArithmetic) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let td_coord =
+            match locate.resolve(*table_dir_vpid, crate::pid::Strategy::MateThenArithmetic) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
         let td_buf = match page_io::read_page(shard, td_coord) {
             page_io::PageRead::Ok(b) => b,
             _ => continue,

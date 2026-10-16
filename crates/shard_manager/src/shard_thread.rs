@@ -28,56 +28,6 @@ struct PutReply {
     group: u32,
 }
 
-#[cfg(test)]
-mod adaptive_window_tests {
-    use super::AdaptiveTaskWindow;
-
-    fn window(current: usize) -> AdaptiveTaskWindow {
-        AdaptiveTaskWindow {
-            current,
-            calm_rounds: 0,
-            target_round_ns: AdaptiveTaskWindow::TARGET_FOREGROUND_ROUND_NS,
-            enabled: true,
-        }
-    }
-
-    #[test]
-    fn full_round_with_backlog_multiplicatively_reduces_window() {
-        let mut w = window(128);
-        assert!(w.observe(128, true, 1));
-        assert_eq!(w.limit(), 96);
-        assert_eq!(w.busy_drive_budget(), 24);
-    }
-
-    #[test]
-    fn calm_rounds_additively_recover_window() {
-        let mut w = window(64);
-        for _ in 0..7 {
-            assert!(!w.observe(8, false, 1));
-        }
-        assert!(w.observe(8, false, 1));
-        assert_eq!(w.limit(), 80);
-    }
-
-    #[test]
-    fn window_obeys_bounds_and_disable_switch() {
-        let mut w = window(AdaptiveTaskWindow::MIN);
-        assert!(!w.observe(AdaptiveTaskWindow::MIN, true, 1));
-        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
-
-        w.enabled = false;
-        assert!(!w.observe(usize::MAX, true, 1));
-        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
-    }
-
-    #[test]
-    fn slow_round_reduces_window_without_residual_backlog() {
-        let mut w = window(128);
-        assert!(w.observe(8, false, w.target_round_ns));
-        assert_eq!(w.limit(), 96);
-    }
-}
-
 /// Per-shard adaptive foreground quantum.  This is deliberately an AIMD
 /// controller rather than a global queue: a hot shard should yield sooner
 /// without reducing service capacity of unrelated shards.
@@ -721,9 +671,16 @@ pub(crate) fn shard_thread_main(
                                     prefix,
                                     limit,
                                     with_values,
-                                } => {
-                                    exec_scan_keys(e, &db, &table, &start, &end, &prefix, limit, with_values)
-                                }
+                                } => exec_scan_keys(
+                                    e,
+                                    &db,
+                                    &table,
+                                    &start,
+                                    &end,
+                                    &prefix,
+                                    limit,
+                                    with_values,
+                                ),
                                 // ⭐ F65: 占坑 op (管理面兼容; 热路径走 ShardTask → exec_task_op)
                                 op @ (BatchOp::ReserveUnique { .. }
                                 | BatchOp::StealUnique { .. }
@@ -1953,5 +1910,55 @@ pub(crate) fn handle_request_blocking(
                 "batch should be handled in main loop".into(),
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod adaptive_window_tests {
+    use super::AdaptiveTaskWindow;
+
+    fn window(current: usize) -> AdaptiveTaskWindow {
+        AdaptiveTaskWindow {
+            current,
+            calm_rounds: 0,
+            target_round_ns: AdaptiveTaskWindow::TARGET_FOREGROUND_ROUND_NS,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn full_round_with_backlog_multiplicatively_reduces_window() {
+        let mut w = window(128);
+        assert!(w.observe(128, true, 1));
+        assert_eq!(w.limit(), 96);
+        assert_eq!(w.busy_drive_budget(), 24);
+    }
+
+    #[test]
+    fn calm_rounds_additively_recover_window() {
+        let mut w = window(64);
+        for _ in 0..7 {
+            assert!(!w.observe(8, false, 1));
+        }
+        assert!(w.observe(8, false, 1));
+        assert_eq!(w.limit(), 80);
+    }
+
+    #[test]
+    fn window_obeys_bounds_and_disable_switch() {
+        let mut w = window(AdaptiveTaskWindow::MIN);
+        assert!(!w.observe(AdaptiveTaskWindow::MIN, true, 1));
+        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
+
+        w.enabled = false;
+        assert!(!w.observe(usize::MAX, true, 1));
+        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
+    }
+
+    #[test]
+    fn slow_round_reduces_window_without_residual_backlog() {
+        let mut w = window(128);
+        assert!(w.observe(8, false, w.target_round_ns));
+        assert_eq!(w.limit(), 96);
     }
 }

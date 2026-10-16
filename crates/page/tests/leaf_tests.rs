@@ -2,9 +2,9 @@
 
 use page::{
     Checkpoint, CheckpointHeader, ItemKind, PAGE_HEADER_SIZE, PAGE_SIZE, PageIndex, PageType,
-    leaf_delete, leaf_get, leaf_insert, leaf_new, leaf_push_back, leaf_split, page_free_off,
-    page_free_space, page_key_count, page_set_free_off, page_set_key_count, page_type, leaf_update_with,
-    write_checkpoint, write_checkpoint_header,
+    leaf_delete, leaf_get, leaf_insert, leaf_new, leaf_push_back, leaf_split, leaf_update_with,
+    page_free_off, page_free_space, page_key_count, page_set_free_off, page_set_key_count,
+    page_type, write_checkpoint, write_checkpoint_header,
 };
 use page::{LeafItemPtr, decode_item, encode_leaf_item};
 
@@ -55,10 +55,26 @@ fn page_index_locates_last_eligible_segment_with_binary_search() {
     let index = PageIndex {
         key_count: 0,
         segments: vec![
-            page::Segment { first_item_off: 0, item_count: 1, first_full_key: vec![] },
-            page::Segment { first_item_off: 1, item_count: 1, first_full_key: b"cat".to_vec() },
-            page::Segment { first_item_off: 2, item_count: 1, first_full_key: b"mango".to_vec() },
-            page::Segment { first_item_off: 3, item_count: 1, first_full_key: b"zoo".to_vec() },
+            page::Segment {
+                first_item_off: 0,
+                item_count: 1,
+                first_full_key: vec![],
+            },
+            page::Segment {
+                first_item_off: 1,
+                item_count: 1,
+                first_full_key: b"cat".to_vec(),
+            },
+            page::Segment {
+                first_item_off: 2,
+                item_count: 1,
+                first_full_key: b"mango".to_vec(),
+            },
+            page::Segment {
+                first_item_off: 3,
+                item_count: 1,
+                first_full_key: b"zoo".to_vec(),
+            },
         ],
     };
     assert_eq!(index.locate_segment(b"ant"), 0);
@@ -494,10 +510,19 @@ fn update_segment_head_keeps_shared_zero() {
     // 长公共前缀 key (模拟 memtier-XXXXXXXX), 插入 60 个触发 pre_split 出多段
     for i in 0..60 {
         let key = format!("memtier-{i:08}");
-        leaf_insert(&mut page, key.as_bytes(), b"v_initial_00000000000000000000000").unwrap();
+        leaf_insert(
+            &mut page,
+            key.as_bytes(),
+            b"v_initial_00000000000000000000000",
+        )
+        .unwrap();
     }
     let idx = PageIndex::load(&page, ItemKind::Leaf).unwrap();
-    assert!(idx.segments.len() >= 2, "need multiple segments, got {}", idx.segments.len());
+    assert!(
+        idx.segments.len() >= 2,
+        "need multiple segments, got {}",
+        idx.segments.len()
+    );
 
     // 逐个更新每个段的段首 key (不同长度 value 覆盖快/慢两条路径)
     let heads: Vec<Vec<u8>> = idx.segments[1..]

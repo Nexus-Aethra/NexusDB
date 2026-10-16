@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 
 use network::protocol::Response;
-use network::reply_bus::{reply_bus, ReplyEnvelope};
+use network::reply_bus::{ReplyEnvelope, reply_bus};
 
 #[test]
 fn mpmc_roundtrip_1000_msgs() {
@@ -54,7 +54,10 @@ fn mpmc_roundtrip_1000_msgs() {
         h.join().unwrap();
     }
 
-    assert_eq!(received.load(std::sync::atomic::Ordering::Relaxed), total_msgs);
+    assert_eq!(
+        received.load(std::sync::atomic::Ordering::Relaxed),
+        total_msgs
+    );
 }
 
 #[test]

@@ -13,7 +13,6 @@
 // per-command help rendering, and `parse` is a future PR-friendly entry
 // point alongside the current `clap::Parser` derive.
 #[allow(dead_code)]
-
 use clap::{Args, Parser, Subcommand};
 
 use crate::output::OutputMode;
@@ -229,16 +228,16 @@ pub enum Command {
         end: Option<String>,
     },
 
-/// Brute-force scan of every page in every block file, deduplicating KV
-        /// pairs by later-writes-wins and emitting in key order.
-        ExportForce {
-            /// Output format: "kv" or "json".
-            #[arg(short, long, default_value = "kv")]
-            format: String,
-        },
+    /// Brute-force scan of every page in every block file, deduplicating KV
+    /// pairs by later-writes-wins and emitting in key order.
+    ExportForce {
+        /// Output format: "kv" or "json".
+        #[arg(short, long, default_value = "kv")]
+        format: String,
+    },
 
-        /// Repair specific slots in page.mate (the only scanner command that
-        /// writes to disk). Refuses to write without `--apply`.
+    /// Repair specific slots in page.mate (the only scanner command that
+    /// writes to disk). Refuses to write without `--apply`.
     FixMate {
         /// vpid whose slot should be rewritten.
         #[arg(short, long, value_parser = clap::value_parser!(u64).range(0..))]
@@ -287,14 +286,14 @@ pub enum Command {
 impl Command {
     pub fn name(&self) -> &'static str {
         match self {
-            Command::Dbs { .. } => "dbs",
+            Command::Dbs => "dbs",
             Command::Header { .. } => "header",
             Command::Vpid { .. } => "vpid",
             Command::Verify { .. } => "verify",
             Command::Blame { .. } => "blame",
-            Command::Rescue { .. } => "rescue",
+            Command::Rescue => "rescue",
             Command::Export { .. } => "export",
-            Command::WalList { .. } => "wal-list",
+            Command::WalList => "wal-list",
             Command::WalDump { .. } => "wal-dump",
             Command::Merge { .. } => "merge",
             Command::Map { .. } => "map",
@@ -327,14 +326,8 @@ mod tests {
 
     #[test]
     fn parses_header_command_with_vpid() {
-        let t = Top::try_parse_from([
-            "nexusdb-scanner",
-            "--dir",
-            "E:/study",
-            "header",
-            "5",
-        ])
-        .unwrap();
+        let t =
+            Top::try_parse_from(["nexusdb-scanner", "--dir", "E:/study", "header", "5"]).unwrap();
         assert_eq!(t.command.name(), "header");
         match t.command {
             Command::Header { vpid, neighbors } => {
@@ -347,15 +340,8 @@ mod tests {
 
     #[test]
     fn parses_vpid_command_with_raw_flag() {
-        let t = Top::try_parse_from([
-            "nexusdb-scanner",
-            "--dir",
-            "E:/study",
-            "vpid",
-            "5",
-            "--raw",
-        ])
-        .unwrap();
+        let t = Top::try_parse_from(["nexusdb-scanner", "--dir", "E:/study", "vpid", "5", "--raw"])
+            .unwrap();
         match t.command {
             Command::Vpid { vpid, raw } => {
                 assert_eq!(vpid, 5);
@@ -380,7 +366,8 @@ mod tests {
 
     #[test]
     fn json_flag_sets_output_mode() {
-        let t = Top::try_parse_from(["nexusdb-scanner", "--dir", "E:/study", "--json", "dbs"]).unwrap();
+        let t =
+            Top::try_parse_from(["nexusdb-scanner", "--dir", "E:/study", "--json", "dbs"]).unwrap();
         assert_eq!(t.globals.output_mode(), OutputMode::Json);
     }
 }

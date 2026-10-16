@@ -279,7 +279,11 @@ pub fn leaf_insert(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), Page
         // 估算新 item 大小: key + value + 编码开销 (shared/varint/头)
         let est_item = key.len() + value.len() + 20;
         // pre_split 会多一个段 = 多一个 checkpoint entry (4B)
-        let cp_growth = if need_pre_split { crate::checkpoint::CHECKPOINT_SIZE } else { 0 };
+        let cp_growth = if need_pre_split {
+            crate::checkpoint::CHECKPOINT_SIZE
+        } else {
+            0
+        };
         let cp_size = crate::checkpoint::checkpoint_area_size(idx.segments.len()) + cp_growth;
         let free_off = page_free_off(page) as usize;
         if free_off + est_item + cp_size + PAGE_FOOTER_SIZE > PAGE_SIZE {

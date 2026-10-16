@@ -363,7 +363,9 @@ pub(crate) fn process_sql_input(
 ) {
     use crate::protocol::mysql as my;
     let mut cursor = 0usize;
-    while let Some((pkt_seq, n, payload)) = my::read_packet(&conn.read_buf[cursor..]) {
+    // read_packet_full: 长度字段满 0xFFFFFF 时会继续拼接续包, 否则大请求
+    // (如 >16MB 的 COM_QUERY) 只会看到第一段.
+    while let Some((pkt_seq, n, payload)) = my::read_packet_full(&conn.read_buf[cursor..]) {
         cursor += n;
         if conn.close_after_flush {
             break;
@@ -667,83 +669,100 @@ pub(crate) fn process_pg_input(
         match conn.pg_phase {
             // ---- 等 StartupMessage (无 type 帧) ----
             0 => {
-                let Some((n, payload)) = pg::read_startup_frame(&conn.read_buf[cursor..]) else {
-                    break;
-                };
-                cursor += n;
-                if payload.len() == 4 {
-                    let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                    match code {
-                        // ⭐ F83: SSLRequest — 配置了 TLS → 回 'S' 并升级; 否则回 'N' 明文回落
-                        pg::SSL_REQUEST_CODE => {
-                            if let Some(cfg) = tls_config {
-                                conn.send_bytes(b"S"); // 明文 'S' (升级前最后一个明文字节)
-                                if !conn.start_tls(cfg.clone()) {
-                                    conn.close_after_flush = true;
-                                }
-                                // 后续 StartupMessage 走 TLS, 回到 epoll 等 ClientHello
-                                break;
-                            }
-                            conn.send_bytes(b"N");
-                            continue;
-                        }
-                        pg::GSSENC_REQUEST_CODE => {
-                            conn.send_bytes(b"N");
-                            continue;
-                        }
-                        pg::CANCEL_REQUEST_CODE => {
-                            conn.close_after_flush = true;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                match pg::parse_startup(payload) {
-                    Ok((_user, database)) => {
-                        // database 参数 → 切库 (不存在直接拒绝断连)
-                        // ⭐ PG 兼容: "postgres" admin 库别名 → 映射 default 库 (migrator 探测用)
-                        if let Some(dbn) = database
-                            && !dbn.is_empty()
-                            && dbn != default_db.as_ref()
-                        {
-                            let resolved = if dbn == "postgres" {
-                                default_db.clone()
-                            } else {
-                                std::sync::Arc::from(dbn.as_str())
-                            };
-                            if &*resolved == default_db.as_ref()
-                                || db_view.id_of(&resolved).is_some()
-                            {
-                                conn.current_db = resolved;
-                            } else {
-                                conn.send_bytes(&pg::build_error(
-                                    "3D000",
-                                    &format!("database \"{dbn}\" does not exist"),
-                                ));
-                                conn.close_after_flush = true;
-                                break;
-                            }
-                        }
-                        if pwd.is_empty() {
-                            conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
-                            conn.pg_phase = 2;
-                        } else {
-                            // ⭐ F82: 宣告 SCRAM-SHA-256 (取代明文口令), 进 SASL 交换
-                            conn.send_bytes(&pg::build_auth_sasl());
-                            conn.pg_scram = None;
-                            conn.pg_phase = 1;
-                        }
-                    }
-                    Err(e) => {
-                        conn.send_bytes(&pg::build_error("08P01", &e));
+                match pg::read_startup_frame(&conn.read_buf[cursor..]) {
+                    pg::FrameParse::NeedMore => break,
+                    pg::FrameParse::Invalid(why) => {
+                        // 长度字段非法: 回错误并断开. 绝不能退化成"继续等字节" ——
+                        // 字节永远凑不齐, 连接会静默挂起.
+                        conn.send_bytes(&pg::build_error("08P01", why));
                         conn.close_after_flush = true;
+                        break;
+                    }
+                    pg::FrameParse::Frame((n, payload)) => {
+                        cursor += n;
+                        if payload.len() == 4 {
+                            let code = u32::from_be_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]);
+                            match code {
+                                // ⭐ F83: SSLRequest — 配置了 TLS → 回 'S' 并升级; 否则回 'N' 明文回落
+                                pg::SSL_REQUEST_CODE => {
+                                    if let Some(cfg) = tls_config {
+                                        conn.send_bytes(b"S"); // 明文 'S' (升级前最后一个明文字节)
+                                        if !conn.start_tls(cfg.clone()) {
+                                            conn.close_after_flush = true;
+                                        }
+                                        // 后续 StartupMessage 走 TLS, 回到 epoll 等 ClientHello
+                                        break;
+                                    }
+                                    conn.send_bytes(b"N");
+                                    continue;
+                                }
+                                pg::GSSENC_REQUEST_CODE => {
+                                    conn.send_bytes(b"N");
+                                    continue;
+                                }
+                                pg::CANCEL_REQUEST_CODE => {
+                                    conn.close_after_flush = true;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        match pg::parse_startup(payload) {
+                            Ok((_user, database)) => {
+                                // database 参数 → 切库 (不存在直接拒绝断连)
+                                // ⭐ PG 兼容: "postgres" admin 库别名 → 映射 default 库 (migrator 探测用)
+                                if let Some(dbn) = database
+                                    && !dbn.is_empty()
+                                    && dbn != default_db.as_ref()
+                                {
+                                    let resolved = if dbn == "postgres" {
+                                        default_db.clone()
+                                    } else {
+                                        std::sync::Arc::from(dbn.as_str())
+                                    };
+                                    if &*resolved == default_db.as_ref()
+                                        || db_view.id_of(&resolved).is_some()
+                                    {
+                                        conn.current_db = resolved;
+                                    } else {
+                                        conn.send_bytes(&pg::build_error(
+                                            "3D000",
+                                            &format!("database \"{dbn}\" does not exist"),
+                                        ));
+                                        conn.close_after_flush = true;
+                                        break;
+                                    }
+                                }
+                                if pwd.is_empty() {
+                                    conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
+                                    conn.pg_phase = 2;
+                                } else {
+                                    // ⭐ F82: 宣告 SCRAM-SHA-256 (取代明文口令), 进 SASL 交换
+                                    conn.send_bytes(&pg::build_auth_sasl());
+                                    conn.pg_scram = None;
+                                    conn.pg_phase = 1;
+                                }
+                            }
+                            Err(e) => {
+                                conn.send_bytes(&pg::build_error("08P01", &e));
+                                conn.close_after_flush = true;
+                            }
+                        }
                     }
                 }
             }
             // ---- SASL 交换 (SCRAM-SHA-256): 首条 SASLInitialResponse, 次条 SASLResponse ----
             1 => {
-                let Some((n, ty, payload)) = pg::read_frame(&conn.read_buf[cursor..]) else {
-                    break;
+                let (n, ty, payload) = match pg::read_frame(&conn.read_buf[cursor..]) {
+                    pg::FrameParse::NeedMore => break,
+                    pg::FrameParse::Invalid(why) => {
+                        conn.send_bytes(&pg::build_error("08P01", why));
+                        conn.close_after_flush = true;
+                        break;
+                    }
+                    pg::FrameParse::Frame(f) => f,
                 };
                 cursor += n;
                 if ty != b'p' {
@@ -800,8 +819,14 @@ pub(crate) fn process_pg_input(
             }
             // ---- 已认证: simple Query ----
             _ => {
-                let Some((n, ty, payload)) = pg::read_frame(&conn.read_buf[cursor..]) else {
-                    break;
+                let (n, ty, payload) = match pg::read_frame(&conn.read_buf[cursor..]) {
+                    pg::FrameParse::NeedMore => break,
+                    pg::FrameParse::Invalid(why) => {
+                        conn.send_bytes(&pg::build_error("08P01", why));
+                        conn.close_after_flush = true;
+                        break;
+                    }
+                    pg::FrameParse::Frame(f) => f,
                 };
                 cursor += n;
                 match ty {

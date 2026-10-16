@@ -10,16 +10,17 @@ use crate::cli::Globals;
 use crate::dir;
 use crate::error::Result;
 use crate::output::{self, HumanRow, JsonObject, JsonValue};
-use crate::pid::{DiskCoord, Locate, MATE_CAPACITY, PAGES_PER_BLOCK, Strategy};
+use crate::pid::{DiskCoord, Locate, Strategy, MATE_CAPACITY, PAGES_PER_BLOCK};
 
 pub fn run<W: Write>(globals: &Globals, from_mate_only: bool, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
     let provenance = locate.provenance();
 
@@ -35,9 +36,9 @@ pub fn run<W: Write>(globals: &Globals, from_mate_only: bool, mut out: W) -> Res
     } else {
         // Show up to mate capacity, or the arithmetic-sensible range
         let mate_max = MATE_CAPACITY;
-        let block_max = provenance.block_file_id_range.map_or(0, |(_, max_id)| {
-            (max_id as u64 + 1) * PAGES_PER_BLOCK
-        });
+        let block_max = provenance
+            .block_file_id_range
+            .map_or(0, |(_, max_id)| (max_id as u64 + 1) * PAGES_PER_BLOCK);
         mate_max.max(block_max)
     };
 

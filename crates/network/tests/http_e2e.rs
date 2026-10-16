@@ -70,7 +70,10 @@ impl Resp {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with(&name.to_ascii_lowercase()))
+            .find(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with(&name.to_ascii_lowercase())
+            })
             .and_then(|l| l.split_once(':'))
             .map(|(_, v)| v.trim())
     }
@@ -83,7 +86,10 @@ impl HttpConn {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
-        Self { stream, buf: Vec::new() }
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
     }
 
     fn request(&mut self, method: &str, path: &str, body: Option<&str>, extra: &str) -> Resp {
@@ -112,7 +118,11 @@ impl HttpConn {
                         .unwrap();
                     let body = self.buf[head_end + 4..head_end + 4 + cl].to_vec();
                     self.buf.drain(..head_end + 4 + cl);
-                    return Resp { status, headers, body };
+                    return Resp {
+                        status,
+                        headers,
+                        body,
+                    };
                 }
             }
             let mut tmp = [0u8; 65536];
@@ -137,7 +147,11 @@ fn http_full_flow() {
     // ---- KV ----
     let r = c.request("PUT", "/v1/kv/user/alice", Some(r#"{"value":"hello"}"#), "");
     assert_eq!(r.status, 200);
-    assert_eq!(r.header("Access-Control-Allow-Origin"), Some("*"), "CORS 头");
+    assert_eq!(
+        r.header("Access-Control-Allow-Origin"),
+        Some("*"),
+        "CORS 头"
+    );
     let r = c.request("GET", "/v1/kv/user/alice", None, "");
     assert_eq!((r.status, r.json()["value"].as_str()), (200, Some("hello")));
     // 数值 value → 数值 tag → JSON number 回读
@@ -165,14 +179,22 @@ fn http_full_flow() {
         Some(false)
     );
     // 错误面
-    assert_eq!(c.request("PUT", "/v1/kv/user/x", Some("not-json"), "").status, 400);
+    assert_eq!(
+        c.request("PUT", "/v1/kv/user/x", Some("not-json"), "")
+            .status,
+        400
+    );
     assert_eq!(c.request("PATCH", "/v1/kv/user/x", None, "").status, 405);
     assert_eq!(c.request("GET", "/v1/nope", None, "").status, 404);
-    assert_eq!(c.request("GET", "/v1/kv/user/k?db=nodb", None, "").status, 400);
+    assert_eq!(
+        c.request("GET", "/v1/kv/user/k?db=nodb", None, "").status,
+        400
+    );
 
     // ---- SQL ----
     assert_eq!(
-        c.sql("CREATE TABLE ht (id INT PRIMARY KEY, name TEXT NOT NULL, INDEX(name))").status,
+        c.sql("CREATE TABLE ht (id INT PRIMARY KEY, name TEXT NOT NULL, INDEX(name))")
+            .status,
         200
     );
     let r = c.sql("INSERT INTO ht VALUES (1,'a'), (2,'b'), (3,'a')");
@@ -187,7 +209,11 @@ fn http_full_flow() {
     // 错误映射: 语法 400 / 未知列 400 / duplicate 409
     assert_eq!(c.sql("SELEKT 1").status, 400);
     assert_eq!(c.sql("SELECT nope FROM ht WHERE id = 1").status, 400);
-    assert_eq!(c.request("POST", "/v1/sql", Some(r#"{"q":"x"}"#), "").status, 400);
+    assert_eq!(
+        c.request("POST", "/v1/sql", Some(r#"{"q":"x"}"#), "")
+            .status,
+        400
+    );
 
     // ---- 观测 ----
     let r = c.request("GET", "/v1/status", None, "");
@@ -209,7 +235,11 @@ fn http_full_flow() {
     let r = c.request("OPTIONS", "/v1/sql", None, "Origin: http://app.example\r\n");
     assert_eq!(r.status, 204);
     assert_eq!(r.header("Access-Control-Allow-Origin"), Some("*"));
-    assert!(r.header("Access-Control-Allow-Methods").unwrap().contains("DELETE"));
+    assert!(
+        r.header("Access-Control-Allow-Methods")
+            .unwrap()
+            .contains("DELETE")
+    );
 
     drop(c);
     server.shutdown().unwrap();
@@ -224,11 +254,18 @@ fn http_bearer_auth() {
 
     assert_eq!(c.request("GET", "/v1/kv/t/k", None, "").status, 401);
     assert_eq!(
-        c.request("GET", "/v1/kv/t/k", None, "Authorization: Bearer wrong\r\n").status,
+        c.request("GET", "/v1/kv/t/k", None, "Authorization: Bearer wrong\r\n")
+            .status,
         401
     );
     assert_eq!(
-        c.request("GET", "/v1/kv/t/k", None, "Authorization: Bearer tok123\r\n").status,
+        c.request(
+            "GET",
+            "/v1/kv/t/k",
+            None,
+            "Authorization: Bearer tok123\r\n"
+        )
+        .status,
         404,
         "鉴权过 → 正常 404 (key 不存在)"
     );
@@ -236,7 +273,10 @@ fn http_bearer_auth() {
     assert_eq!(c.request("GET", "/metrics", None, "").status, 200);
     assert_eq!(c.request("GET", "/v1/status", None, "").status, 200);
     // debug 端点需要鉴权
-    assert_eq!(c.request("GET", "/v1/debug/sql-cache", None, "").status, 401);
+    assert_eq!(
+        c.request("GET", "/v1/debug/sql-cache", None, "").status,
+        401
+    );
 
     drop(c);
     server.shutdown().unwrap();

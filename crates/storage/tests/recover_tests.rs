@@ -439,11 +439,7 @@ fn pid_state_fast_path_roundtrip() {
             e.flush().await.unwrap();
         }
         // pid.state 应已写入 (default db 的 shard 目录; app db 各自独立)
-        let ps = tmp
-            .path()
-            .join("default")
-            .join("shard_0")
-            .join("pid.state");
+        let ps = tmp.path().join("default").join("shard_0").join("pid.state");
         assert!(ps.exists(), "pid.state must be persisted on flush: {ps:?}");
         assert_eq!(std::fs::metadata(&ps).unwrap().len(), 8, "8B PidLocation");
 
@@ -454,12 +450,21 @@ fn pid_state_fast_path_roundtrip() {
         for i in 0..50u32 {
             let k = format!("k{i:04}");
             let got = e2.table_get("app", "kv", k.as_bytes()).await.unwrap();
-            assert_eq!(got.as_deref(), Some(b"v".as_slice()), "key {k} after reopen");
+            assert_eq!(
+                got.as_deref(),
+                Some(b"v".as_slice()),
+                "key {k} after reopen"
+            );
         }
         // 新写入不得覆盖旧数据 (pid 水位正确前进)
-        e2.table_put("app", "kv", b"new_key", b"new_v").await.unwrap();
+        e2.table_put("app", "kv", b"new_key", b"new_v")
+            .await
+            .unwrap();
         assert_eq!(
-            e2.table_get("app", "kv", b"k0000").await.unwrap().as_deref(),
+            e2.table_get("app", "kv", b"k0000")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(b"v".as_slice())
         );
     });

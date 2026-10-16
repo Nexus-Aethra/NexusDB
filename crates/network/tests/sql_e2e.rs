@@ -59,8 +59,13 @@ struct MyConn {
 /// 查询结果.
 #[derive(Debug, PartialEq)]
 enum QueryResult {
-    Ok { affected: u64 },
-    Err { code: u16, msg: String },
+    Ok {
+        affected: u64,
+    },
+    Err {
+        code: u16,
+        msg: String,
+    },
     /// 文本结果集: 每行每列 Option<String> (None = NULL).
     Rows(Vec<Vec<Option<String>>>),
 }
@@ -73,9 +78,14 @@ impl MyConn {
     /// ⭐ Phase A: addr 版构造 (bench 多线程用).
     fn connect_addr(addr: std::net::SocketAddr) -> Self {
         let stream = TcpStream::connect(addr).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         stream.set_nodelay(true).unwrap();
-        Self { stream, buf: Vec::new() }
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
     }
 
     /// ⭐ Phase A: 已连接后登录 (免 &NetworkServer).
@@ -149,7 +159,9 @@ impl MyConn {
         self.stream.write_all(&my::write_packet(0, &p)).unwrap();
         let (_, first) = self.read_frame();
         match first[0] {
-            0x00 => QueryResult::Ok { affected: first[1] as u64 }, // affected < 251
+            0x00 => QueryResult::Ok {
+                affected: first[1] as u64,
+            }, // affected < 251
             0xFF => QueryResult::Err {
                 code: u16::from_le_bytes([first[1], first[2]]),
                 msg: String::from_utf8_lossy(&first[9..]).into_owned(),
@@ -191,9 +203,10 @@ impl MyConn {
 
     fn ids(&mut self, stmt: &str) -> Vec<String> {
         match self.query(stmt) {
-            QueryResult::Rows(rows) => {
-                rows.iter().map(|r| r[0].clone().expect("id 非 NULL")).collect()
-            }
+            QueryResult::Rows(rows) => rows
+                .iter()
+                .map(|r| r[0].clone().expect("id 非 NULL"))
+                .collect(),
             other => panic!("expect rows, got {other:?}"),
         }
     }
@@ -207,7 +220,11 @@ fn mysql_auth_password_and_failures() {
 
     // 正确密码
     let mut c = MyConn::handshake_login(&server, "s3cret");
-    assert_eq!(c.query("SELECT 1").err_code(), Some(1064), "SELECT 1 非法语法 (需 FROM)");
+    assert_eq!(
+        c.query("SELECT 1").err_code(),
+        Some(1064),
+        "SELECT 1 非法语法 (需 FROM)"
+    );
 
     // 密码错 → 1045
     let mut bad = MyConn::connect(&server);
@@ -294,7 +311,10 @@ fn mysql_sql_full_flow() {
             None,
         ]])
     );
-    assert_eq!(c.query("SELECT * FROM users WHERE id = 999"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c.query("SELECT * FROM users WHERE id = 999"),
+        QueryResult::Rows(vec![])
+    );
 
     // 索引等值 (广播聚合全局有序)
     assert_eq!(
@@ -302,13 +322,30 @@ fn mysql_sql_full_flow() {
         vec!["2", "5", "8", "11", "14", "17"]
     );
     // 范围/开区间/AND 残余/LIMIT
-    assert_eq!(c.ids("SELECT * FROM users WHERE score >= 5 AND score <= 8").len(), 4);
-    assert_eq!(c.ids("SELECT * FROM users WHERE score > 5 AND score < 8"), vec!["6", "7"]);
-    assert_eq!(c.ids("SELECT * FROM users WHERE name = 'u2' AND score > 10").len(), 3);
-    assert_eq!(c.ids("SELECT * FROM users WHERE name = 'u0' LIMIT 2"), vec!["0", "3"]);
+    assert_eq!(
+        c.ids("SELECT * FROM users WHERE score >= 5 AND score <= 8")
+            .len(),
+        4
+    );
+    assert_eq!(
+        c.ids("SELECT * FROM users WHERE score > 5 AND score < 8"),
+        vec!["6", "7"]
+    );
+    assert_eq!(
+        c.ids("SELECT * FROM users WHERE name = 'u2' AND score > 10")
+            .len(),
+        3
+    );
+    assert_eq!(
+        c.ids("SELECT * FROM users WHERE name = 'u0' LIMIT 2"),
+        vec!["0", "3"]
+    );
 
     // ⭐ Y1: bloom 拒绝未插入值
-    assert_eq!(c.query("SELECT * FROM users WHERE name = 'ghost'"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c.query("SELECT * FROM users WHERE name = 'ghost'"),
+        QueryResult::Rows(vec![])
+    );
 
     // ⭐ O1: 投影列 (顺序 = 投影序, 与 schema 序无关)
     assert_eq!(
@@ -317,28 +354,46 @@ fn mysql_sql_full_flow() {
     );
     // ⭐ O1: 覆盖索引 — 投影/条件全在 (name, id) → 免回表, 值从索引条目重建
     let r = c.query("SELECT name, id FROM users WHERE name = 'u2'");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(rows.len(), 6);
     assert!(rows.iter().all(|x| x[0].as_deref() == Some("u2")));
     assert_eq!(
-        rows.iter().map(|x| x[1].clone().unwrap()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|x| x[1].clone().unwrap())
+            .collect::<Vec<_>>(),
         vec!["2", "5", "8", "11", "14", "17"],
         "覆盖路径 pk 重建 + 全局有序"
     );
     // 覆盖 + 数值索引 (F64 保序解码重建)
     let r = c.query("SELECT score FROM users WHERE score >= 5 AND score <= 7");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(
-        rows.iter().map(|x| x[0].clone().unwrap()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|x| x[0].clone().unwrap())
+            .collect::<Vec<_>>(),
         vec!["5", "6", "7"],
         "F64 覆盖重建"
     );
     // 非覆盖投影 (投影列不在索引) — 回表后投影
     let r = c.query("SELECT score FROM users WHERE name = 'u2' LIMIT 2");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
-    assert_eq!(rows.iter().map(|x| x[0].clone().unwrap()).collect::<Vec<_>>(), vec!["2", "5"]);
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|x| x[0].clone().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["2", "5"]
+    );
     // 投影未知列
-    assert_eq!(c.query("SELECT nope FROM users WHERE id = 1").err_code(), Some(1054));
+    assert_eq!(
+        c.query("SELECT nope FROM users WHERE id = 1").err_code(),
+        Some(1054)
+    );
 
     // UPDATE 覆盖换索引
     assert_eq!(
@@ -350,25 +405,44 @@ fn mysql_sql_full_flow() {
 
     // 错误面 (MySQL 错误码)
     assert_eq!(c.query("SELECT * FORM users").err_code(), Some(1064));
-    assert_eq!(c.query("SELECT * FROM users WHERE nope = 1").err_code(), Some(1054));
+    assert_eq!(
+        c.query("SELECT * FROM users WHERE nope = 1").err_code(),
+        Some(1054)
+    );
     // ⭐ S2: 无 WHERE 从报错变为全表扫 (行为升级; 0..20 + 上方 INSERT id=100)
     assert_eq!(c.ids("SELECT * FROM users").len(), 21);
-    assert_eq!(c.query("SELECT * FROM plainkv WHERE id = 1").err_code(), Some(1146));
-    assert_eq!(c.query("INSERT INTO users (id, name) VALUES ('x', 'y')").err_code(), Some(1105));
+    assert_eq!(
+        c.query("SELECT * FROM plainkv WHERE id = 1").err_code(),
+        Some(1146)
+    );
+    assert_eq!(
+        c.query("INSERT INTO users (id, name) VALUES ('x', 'y')")
+            .err_code(),
+        Some(1105)
+    );
 
     // schema miss 续跑 (新连接)
     let mut c2 = MyConn::handshake_login(&server, "");
     assert_eq!(
         c2.query("SELECT * FROM users WHERE id = 3"),
-        QueryResult::Rows(vec![vec![Some("3".into()), Some("u0".into()), Some("3".into())]])
+        QueryResult::Rows(vec![vec![
+            Some("3".into()),
+            Some("u0".into()),
+            Some("3".into())
+        ]])
     );
     // ⭐ W3: 跨连接等值查询 — INSERT 全在 conn A, conn B 经 worker 级共享
     // 路由缓存候选分派, 结果必须完整 (共享 cache 可见性 + 无假阴性)
     assert_eq!(c2.ids("SELECT * FROM users WHERE name = 'u1'").len(), 7);
-    assert_eq!(c2.query("SELECT * FROM users WHERE name = 'ghost2'"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c2.query("SELECT * FROM users WHERE name = 'ghost2'"),
+        QueryResult::Rows(vec![])
+    );
 
     // COM_PING
-    c2.stream.write_all(&my::write_packet(0, &[my::COM_PING])).unwrap();
+    c2.stream
+        .write_all(&my::write_packet(0, &[my::COM_PING]))
+        .unwrap();
     let (_, pong) = c2.read_frame();
     assert_eq!(pong[0], 0x00);
 
@@ -460,7 +534,9 @@ fn mysql_unique_index() {
     }
     // 普通索引不受影响
     let r = c.query("SELECT * FROM accts WHERE name = 'n1'");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(rows.len(), 4);
 
     drop(c);
@@ -480,7 +556,9 @@ fn mysql_dml_full() {
     );
     // 多行 INSERT: affected = 行数
     assert_eq!(
-        c.query("INSERT INTO items VALUES (1,'a',10), (2,'b',20), (3,'a',30), (4,'c',40), (5,'a',50)"),
+        c.query(
+            "INSERT INTO items VALUES (1,'a',10), (2,'b',20), (3,'a',30), (4,'c',40), (5,'a',50)"
+        ),
         QueryResult::Ok { affected: 5 }
     );
     // UPDATE pk 等值 (单 shard 原子)
@@ -503,30 +581,56 @@ fn mysql_dml_full() {
         QueryResult::Ok { affected: 3 }
     );
     let r = c.query("SELECT qty, id FROM items WHERE cat = 'a'");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
-    assert!(rows.iter().all(|x| x[0].as_deref() == Some("7")), "{rows:?}");
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
+    assert!(
+        rows.iter().all(|x| x[0].as_deref() == Some("7")),
+        "{rows:?}"
+    );
     // UPDATE 改索引列: 索引行跟随 (b → a)
     assert_eq!(
         c.query("UPDATE items SET cat = 'a' WHERE id = 2"),
         QueryResult::Ok { affected: 1 }
     );
     assert_eq!(c.ids("SELECT * FROM items WHERE cat = 'a'").len(), 4);
-    assert_eq!(c.query("SELECT * FROM items WHERE cat = 'b'"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c.query("SELECT * FROM items WHERE cat = 'b'"),
+        QueryResult::Rows(vec![])
+    );
     // UPDATE 禁改 pk / 未知列
-    assert_eq!(c.query("UPDATE items SET id = 9 WHERE id = 1").err_code(), Some(1105));
-    assert_eq!(c.query("UPDATE items SET nope = 9 WHERE id = 1").err_code(), Some(1054));
+    assert_eq!(
+        c.query("UPDATE items SET id = 9 WHERE id = 1").err_code(),
+        Some(1105)
+    );
+    assert_eq!(
+        c.query("UPDATE items SET nope = 9 WHERE id = 1").err_code(),
+        Some(1054)
+    );
 
     // DELETE pk 等值
-    assert_eq!(c.query("DELETE FROM items WHERE id = 4"), QueryResult::Ok { affected: 1 });
-    assert_eq!(c.query("DELETE FROM items WHERE id = 4"), QueryResult::Ok { affected: 0 });
+    assert_eq!(
+        c.query("DELETE FROM items WHERE id = 4"),
+        QueryResult::Ok { affected: 1 }
+    );
+    assert_eq!(
+        c.query("DELETE FROM items WHERE id = 4"),
+        QueryResult::Ok { affected: 0 }
+    );
     // DELETE 索引条件 (两阶段): cat='a' 剩 4 行全删
     assert_eq!(
         c.query("DELETE FROM items WHERE cat = 'a'"),
         QueryResult::Ok { affected: 4 }
     );
-    assert_eq!(c.query("SELECT * FROM items WHERE cat = 'a'"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c.query("SELECT * FROM items WHERE cat = 'a'"),
+        QueryResult::Rows(vec![])
+    );
     // 剩 id=5? 不 — 5 是 cat 'a' 已删; 全表剩 0 行 (1,2,3,5 删 + 4 删)
-    assert_eq!(c.query("SELECT * FROM items WHERE id = 5"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c.query("SELECT * FROM items WHERE id = 5"),
+        QueryResult::Rows(vec![])
+    );
 
     // DROP TABLE: 后续查询报 no schema; 重建同名表干净
     assert_eq!(
@@ -534,7 +638,10 @@ fn mysql_dml_full() {
         QueryResult::Ok { affected: 1 }
     );
     assert_eq!(c.query("DROP TABLE items"), QueryResult::Ok { affected: 0 });
-    assert_eq!(c.query("SELECT * FROM items WHERE id = 7").err_code(), Some(1146));
+    assert_eq!(
+        c.query("SELECT * FROM items WHERE id = 7").err_code(),
+        Some(1146)
+    );
     assert_eq!(
         c.query("CREATE TABLE items (id INT PRIMARY KEY, cat TEXT NOT NULL, INDEX(cat))"),
         QueryResult::Ok { affected: 0 }
@@ -653,15 +760,29 @@ fn mysql_select_extended() {
         "g0 组内 val 降序"
     );
     // IN (索引列, [min,max] 界 + 残余精确)
-    assert_eq!(c.ids("SELECT id FROM nums WHERE grp IN ('g1', 'g3')").len(), 10);
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE grp IN ('g1', 'g3')").len(),
+        10
+    );
     // BETWEEN (desugar 成闭界)
-    assert_eq!(c.ids("SELECT id FROM nums WHERE val BETWEEN 5 AND 8").len(), 4);
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE val BETWEEN 5 AND 8").len(),
+        4
+    );
     // != (残余)
-    assert_eq!(c.ids("SELECT id FROM nums WHERE grp = 'g1' AND val != 5").len(), 4);
+    assert_eq!(
+        c.ids("SELECT id FROM nums WHERE grp = 'g1' AND val != 5")
+            .len(),
+        4
+    );
     // LIKE 前缀 (索引列 → 范围; 无索引列 → 全表扫)
     assert_eq!(c.ids("SELECT id FROM nums WHERE grp LIKE 'g%'").len(), 20);
     assert_eq!(c.ids("SELECT id FROM nums WHERE note LIKE 'n1%'").len(), 4);
-    assert_eq!(c.query("SELECT * FROM nums WHERE note LIKE '%x'").err_code(), Some(1105));
+    assert_eq!(
+        c.query("SELECT * FROM nums WHERE note LIKE '%x'")
+            .err_code(),
+        Some(1105)
+    );
 
     // ⭐ S1+S2 组合: 无 WHERE 的 UPDATE/DELETE (全表扫 phase1)
     assert_eq!(
@@ -672,7 +793,10 @@ fn mysql_select_extended() {
         c.query("SELECT COUNT(*) FROM nums WHERE note = 'flat'"),
         QueryResult::Rows(vec![vec![Some("5".into())]])
     );
-    assert_eq!(c.query("DELETE FROM nums"), QueryResult::Ok { affected: 20 });
+    assert_eq!(
+        c.query("DELETE FROM nums"),
+        QueryResult::Ok { affected: 20 }
+    );
     assert_eq!(
         c.query("SELECT COUNT(*) FROM nums"),
         QueryResult::Rows(vec![vec![Some("0".into())]])
@@ -700,18 +824,29 @@ fn mysql_dialect_and_tools() {
     );
     // DESCRIBE: Field/Type/Null/Key
     let r = c.query("DESCRIBE dlg");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(rows.len(), 5);
     assert_eq!(rows[0][0].as_deref(), Some("id"));
     assert_eq!(rows[0][3].as_deref(), Some("PRI"));
     assert_eq!(rows[1][3].as_deref(), Some("UNI"));
     assert_eq!(rows[1][2].as_deref(), Some("NO"), "UNIQUE 隐含 NOT NULL");
-    assert_eq!(rows[3][1].as_deref(), Some("boolean"), "⭐ F80: BOOLEAN 独立类型");
+    assert_eq!(
+        rows[3][1].as_deref(),
+        Some("boolean"),
+        "⭐ F80: BOOLEAN 独立类型"
+    );
 
     // SET / SELECT version() stub
-    assert_eq!(c.query("SET NAMES utf8mb4"), QueryResult::Ok { affected: 0 });
+    assert_eq!(
+        c.query("SET NAMES utf8mb4"),
+        QueryResult::Ok { affected: 0 }
+    );
     let r = c.query("SELECT version()");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert!(rows[0][0].as_deref().unwrap().contains("NexusDB"));
 
     // USE: 未知库报 1049; 默认库 (app) 可切
@@ -806,7 +941,9 @@ impl MyConn {
         // 响应: OK / ERR / 二进制结果集
         let (_, f) = self.read_frame();
         match f[0] {
-            0x00 => QueryResult::Ok { affected: f[1] as u64 }, // lenenc 1B 快路径
+            0x00 => QueryResult::Ok {
+                affected: f[1] as u64,
+            }, // lenenc 1B 快路径
             0xFF => QueryResult::Err {
                 code: u16::from_le_bytes([f[1], f[2]]),
                 msg: String::from_utf8_lossy(&f[9..]).into_owned(),
@@ -881,7 +1018,9 @@ fn mysql_prepared_statements() {
     let mut c = MyConn::handshake_login(&server, "");
 
     assert_eq!(
-        c.query("CREATE TABLE ps (id INT PRIMARY KEY, name TEXT NOT NULL, score DOUBLE, INDEX(name))"),
+        c.query(
+            "CREATE TABLE ps (id INT PRIMARY KEY, name TEXT NOT NULL, score DOUBLE, INDEX(name))"
+        ),
         QueryResult::Ok { affected: 0 }
     );
     // prepare INSERT (3 参数)
@@ -894,16 +1033,24 @@ fn mysql_prepared_statements() {
             &[
                 MyParam::I64(i),
                 MyParam::Str(format!("n{}", i % 3).into_bytes()),
-                if i == 5 { MyParam::Null } else { MyParam::F64(i as f64 + 0.5) },
+                if i == 5 {
+                    MyParam::Null
+                } else {
+                    MyParam::F64(i as f64 + 0.5)
+                },
             ],
         );
         assert_eq!(r, QueryResult::Ok { affected: 1 }, "insert {i}");
     }
     // prepare SELECT (索引等值参数)
-    let (sel, n) = c.stmt_prepare("SELECT id, name, score FROM ps WHERE name = ? ORDER BY id").unwrap();
+    let (sel, n) = c
+        .stmt_prepare("SELECT id, name, score FROM ps WHERE name = ? ORDER BY id")
+        .unwrap();
     assert_eq!(n, 1);
     let r = c.stmt_execute(sel, &[MyParam::Str(b"n1".to_vec())]);
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(rows.len(), 3, "n1 → id 1,4,7");
     assert_eq!(rows[0][0].as_deref(), Some("1"));
     // pk 点查 + NULL 二进制渲染
@@ -913,7 +1060,9 @@ fn mysql_prepared_statements() {
     let r = c.stmt_execute(pk, &[MyParam::I64(3)]);
     assert_eq!(r, QueryResult::Rows(vec![vec![Some("3.5".into())]]));
     // prepared UPDATE / DELETE (affected)
-    let (upd, _) = c.stmt_prepare("UPDATE ps SET score = ? WHERE name = ?").unwrap();
+    let (upd, _) = c
+        .stmt_prepare("UPDATE ps SET score = ? WHERE name = ?")
+        .unwrap();
     let r = c.stmt_execute(upd, &[MyParam::F64(9.0), MyParam::Str(b"n2".to_vec())]);
     assert_eq!(r, QueryResult::Ok { affected: 3 });
     // 文本协议交叉验证 (同连接混用 COM_QUERY)
@@ -1097,14 +1246,22 @@ fn multi_worker_route_cache_consistency() {
         assert_eq!(c2.ids(&q).len(), 6, "worker1 tag {tag}");
     }
     // miss 零任务短路两侧生效
-    assert_eq!(c1.query("SELECT * FROM mw WHERE tag = 'ghost'"), QueryResult::Rows(vec![]));
-    assert_eq!(c2.query("SELECT * FROM mw WHERE tag = 'ghost'"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c1.query("SELECT * FROM mw WHERE tag = 'ghost'"),
+        QueryResult::Rows(vec![])
+    );
+    assert_eq!(
+        c2.query("SELECT * FROM mw WHERE tag = 'ghost'"),
+        QueryResult::Rows(vec![])
+    );
 
     // DROP(经 c2/worker1) + 重建换 schema → c1(worker0) 的陈旧 schema 被
     // epoch 失效, 用新 schema 正确解码
     assert_eq!(c2.query("DROP TABLE mw"), QueryResult::Ok { affected: 0 });
     assert_eq!(
-        c2.query("CREATE TABLE mw (id INT PRIMARY KEY, tag TEXT NOT NULL, extra DOUBLE, INDEX(tag))"),
+        c2.query(
+            "CREATE TABLE mw (id INT PRIMARY KEY, tag TEXT NOT NULL, extra DOUBLE, INDEX(tag))"
+        ),
         QueryResult::Ok { affected: 0 }
     );
     assert_eq!(
@@ -1144,7 +1301,10 @@ fn mysql_transactions() {
         );
     }
     // 另一连接: 不可见
-    assert_eq!(c2.query("SELECT * FROM tx WHERE id = 3"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c2.query("SELECT * FROM tx WHERE id = 3"),
+        QueryResult::Rows(vec![])
+    );
     // RYOW: 本连接 pk 点查见未提交行
     assert_eq!(c1.ids("SELECT id FROM tx WHERE id = 3"), vec!["3"]);
     // DDL 在事务中拒绝
@@ -1163,7 +1323,10 @@ fn mysql_transactions() {
     c1.query("UPDATE tx SET name = 'changed' WHERE id = 0");
     c1.query("DELETE FROM tx WHERE id = 1");
     assert_eq!(c1.query("ROLLBACK"), QueryResult::Ok { affected: 0 });
-    assert_eq!(c2.query("SELECT * FROM tx WHERE id = 100"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c2.query("SELECT * FROM tx WHERE id = 100"),
+        QueryResult::Rows(vec![])
+    );
     assert_eq!(
         c2.query("SELECT name FROM tx WHERE id = 0"),
         QueryResult::Rows(vec![vec![Some("n0".into())]])
@@ -1179,7 +1342,10 @@ fn mysql_transactions() {
         c2.query("SELECT name FROM tx WHERE id = 2"),
         QueryResult::Rows(vec![vec![Some("upd".into())]])
     );
-    assert_eq!(c2.query("SELECT * FROM tx WHERE id = 4"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c2.query("SELECT * FROM tx WHERE id = 4"),
+        QueryResult::Rows(vec![])
+    );
 
     // --- unique 冲突: 同 shard 时 commit 报错且零部分应用; 不同 shard 时
     // 漏检 (O3 既有跨 shard 唯一性 gap, 非事务引入 — 稳定验证见
@@ -1189,7 +1355,10 @@ fn mysql_transactions() {
     c1.query("INSERT INTO tx VALUES (201, 'b', 'm0@x')"); // 与 id=0 的 mail 冲突
     if let QueryResult::Err { ref msg, .. } = c1.query("COMMIT") {
         assert!(msg.contains("duplicate"), "{msg}");
-        assert_eq!(c2.query("SELECT * FROM tx WHERE id = 201"), QueryResult::Rows(vec![]));
+        assert_eq!(
+            c2.query("SELECT * FROM tx WHERE id = 201"),
+            QueryResult::Rows(vec![])
+        );
     }
 
     // --- 批内自冲突 (两行同 unique 值) ---
@@ -1199,7 +1368,10 @@ fn mysql_transactions() {
     let r = c1.query("COMMIT");
     // 同 shard 时预检拒; 跨 shard 时盘上探测各自过 (v1 gap) — 至少不 panic
     if matches!(r, QueryResult::Err { .. }) {
-        assert_eq!(c2.query("SELECT * FROM tx WHERE id = 300"), QueryResult::Rows(vec![]));
+        assert_eq!(
+            c2.query("SELECT * FROM tx WHERE id = 300"),
+            QueryResult::Rows(vec![])
+        );
     }
 
     // --- 重复 BEGIN 忽略 + 空事务 COMMIT ---
@@ -1212,7 +1384,10 @@ fn mysql_transactions() {
     c1.query("INSERT INTO tx VALUES (400, 'drop', 'd@x')");
     drop(c1);
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(c2.query("SELECT * FROM tx WHERE id = 400"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c2.query("SELECT * FROM tx WHERE id = 400"),
+        QueryResult::Rows(vec![])
+    );
 
     drop(c2);
     server.shutdown().unwrap();
@@ -1255,16 +1430,29 @@ fn mysql_txn_unique_single_shard() {
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
     c.query("CREATE TABLE u1 (id INT PRIMARY KEY, mail TEXT UNIQUE)");
-    assert_eq!(c.query("INSERT INTO u1 VALUES (1, 'a@x')"), QueryResult::Ok { affected: 1 });
+    assert_eq!(
+        c.query("INSERT INTO u1 VALUES (1, 'a@x')"),
+        QueryResult::Ok { affected: 1 }
+    );
 
     // 盘上冲突: 预检拒 + 零部分应用 (2 号行也不落)
     c.query("BEGIN");
     c.query("INSERT INTO u1 VALUES (2, 'clean@x')");
     c.query("INSERT INTO u1 VALUES (3, 'a@x')"); // 与 id=1 冲突
     let r = c.query("COMMIT");
-    assert!(matches!(r, QueryResult::Err { ref msg, .. } if msg.contains("duplicate")), "{r:?}");
-    assert_eq!(c.query("SELECT * FROM u1 WHERE id = 2"), QueryResult::Rows(vec![]), "零部分应用");
-    assert_eq!(c.query("SELECT * FROM u1 WHERE id = 3"), QueryResult::Rows(vec![]));
+    assert!(
+        matches!(r, QueryResult::Err { ref msg, .. } if msg.contains("duplicate")),
+        "{r:?}"
+    );
+    assert_eq!(
+        c.query("SELECT * FROM u1 WHERE id = 2"),
+        QueryResult::Rows(vec![]),
+        "零部分应用"
+    );
+    assert_eq!(
+        c.query("SELECT * FROM u1 WHERE id = 3"),
+        QueryResult::Rows(vec![])
+    );
 
     // 批内自冲突: 预检拒
     c.query("BEGIN");
@@ -1275,7 +1463,10 @@ fn mysql_txn_unique_single_shard() {
         matches!(r, QueryResult::Err { ref msg, .. } if msg.contains("within transaction")),
         "{r:?}"
     );
-    assert_eq!(c.query("SELECT * FROM u1 WHERE id = 4"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c.query("SELECT * FROM u1 WHERE id = 4"),
+        QueryResult::Rows(vec![])
+    );
 
     drop(c);
     server.shutdown().unwrap();
@@ -1340,7 +1531,11 @@ fn mysql_isolation_levels() {
     c1.query("SELECT v FROM iso WHERE id = 2");
     c2.query("UPDATE iso SET v = 200 WHERE id = 2");
     c1.query("UPDATE iso SET v = 21 WHERE id = 2");
-    assert_eq!(c1.query("COMMIT"), QueryResult::Ok { affected: 1 }, "RC 无读集验证");
+    assert_eq!(
+        c1.query("COMMIT"),
+        QueryResult::Ok { affected: 1 },
+        "RC 无读集验证"
+    );
 
     // --- SER 读到的行未变 → commit 成功 (无假阳性) ---
     c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
@@ -1387,15 +1582,24 @@ fn mysql_savepoints() {
     c.query("INSERT INTO sp VALUES (2, 'drop-me')");
     c.query("INSERT INTO sp VALUES (3, 'drop-me-too')");
     // 回滚到 s1: 2/3 丢弃, 1 保留
-    assert_eq!(c.query("ROLLBACK TO SAVEPOINT s1"), QueryResult::Ok { affected: 0 });
+    assert_eq!(
+        c.query("ROLLBACK TO SAVEPOINT s1"),
+        QueryResult::Ok { affected: 0 }
+    );
     // RYOW 验证: 2 不可见, 1 可见
-    assert_eq!(c.query("SELECT * FROM sp WHERE id = 2"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c.query("SELECT * FROM sp WHERE id = 2"),
+        QueryResult::Rows(vec![])
+    );
     assert_eq!(c.ids("SELECT id FROM sp WHERE id = 1"), vec!["1"]);
     // 继续写 + 再次回滚到同一 savepoint (PG 允许)
     c.query("INSERT INTO sp VALUES (4, 'also-drop')");
     c.query("ROLLBACK TO s1");
     // RELEASE 后名字失效
-    assert_eq!(c.query("RELEASE SAVEPOINT s1"), QueryResult::Ok { affected: 0 });
+    assert_eq!(
+        c.query("RELEASE SAVEPOINT s1"),
+        QueryResult::Ok { affected: 0 }
+    );
     assert!(matches!(c.query("ROLLBACK TO s1"), QueryResult::Err { .. }));
     c.query("INSERT INTO sp VALUES (5, 'final')");
     assert_eq!(c.query("COMMIT"), QueryResult::Ok { affected: 2 }); // 1 + 5
@@ -1474,7 +1678,9 @@ fn mysql_group_by_aggregates() {
     );
     // ORDER BY 聚合列 DESC + LIMIT
     assert_eq!(
-        c.query("SELECT region, SUM(amt) FROM sales GROUP BY region ORDER BY SUM(amt) DESC LIMIT 2"),
+        c.query(
+            "SELECT region, SUM(amt) FROM sales GROUP BY region ORDER BY SUM(amt) DESC LIMIT 2"
+        ),
         QueryResult::Rows(vec![
             vec![Some("east".into()), Some("60".into())],
             vec![Some("north".into()), Some("7.5".into())],
@@ -1496,7 +1702,10 @@ fn mysql_group_by_aggregates() {
         QueryResult::Err { .. }
     ));
     // SUM 非数值列
-    assert!(matches!(c.query("SELECT SUM(region) FROM sales"), QueryResult::Err { .. }));
+    assert!(matches!(
+        c.query("SELECT SUM(region) FROM sales"),
+        QueryResult::Err { .. }
+    ));
     // 旧 COUNT(*) 路径不回归
     assert_eq!(
         c.query("SELECT COUNT(*) FROM sales WHERE region = 'east'"),
@@ -1552,7 +1761,11 @@ fn mysql_txn_ryow_update() {
     // UPDATE 后 DELETE → 见空
     c.query("UPDATE ry SET bal = 999 WHERE id = 2");
     c.query("DELETE FROM ry WHERE id = 2");
-    assert_eq!(c.query("SELECT bal FROM ry WHERE id = 2"), QueryResult::Rows(vec![]), "RYOW: 删后见空");
+    assert_eq!(
+        c.query("SELECT bal FROM ry WHERE id = 2"),
+        QueryResult::Rows(vec![]),
+        "RYOW: 删后见空"
+    );
 
     c.query("COMMIT");
     // 提交后另一连接见最终态
@@ -1560,7 +1773,10 @@ fn mysql_txn_ryow_update() {
         c2.query("SELECT bal, note FROM ry WHERE id = 1"),
         QueryResult::Rows(vec![vec![Some("800".into()), Some("changed".into())]])
     );
-    assert_eq!(c2.query("SELECT bal FROM ry WHERE id = 2"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c2.query("SELECT bal FROM ry WHERE id = 2"),
+        QueryResult::Rows(vec![])
+    );
     assert_eq!(
         c2.query("SELECT bal FROM ry WHERE id = 3"),
         QueryResult::Rows(vec![vec![Some("50".into())]])
@@ -1596,7 +1812,10 @@ fn mysql_global_unique() {
     // 遍历多个 pk, 全部拒 (确保不是碰巧同 shard)
     for id in 3..12 {
         let r = c.query(&format!("INSERT INTO gu VALUES ({id}, 'a@x', 'x')"));
-        assert!(matches!(r, QueryResult::Err { code: 1062, .. }), "id={id}: {r:?}");
+        assert!(
+            matches!(r, QueryResult::Err { code: 1062, .. }),
+            "id={id}: {r:?}"
+        );
     }
     // 不同 email 各自成功
     for id in 20..30 {
@@ -1615,7 +1834,10 @@ fn mysql_global_unique() {
     );
 
     // 删后重插同 email (懒校对: 旧 COMMITTED 坑回查行已删 → 抢占)
-    assert_eq!(c.query("DELETE FROM gu WHERE id = 1"), QueryResult::Ok { affected: 1 });
+    assert_eq!(
+        c.query("DELETE FROM gu WHERE id = 1"),
+        QueryResult::Ok { affected: 1 }
+    );
     assert_eq!(
         c.query("INSERT INTO gu VALUES (99, 'a@x', 'new-owner')"),
         QueryResult::Ok { affected: 1 },
@@ -1628,11 +1850,17 @@ fn mysql_global_unique() {
     // v1 边界: 事务内写全局唯一表 → 拒
     c.query("BEGIN");
     let r = c.query("INSERT INTO gu VALUES (200, 'txn@x', 't')");
-    assert!(matches!(r, QueryResult::Err { .. }), "事务内全局唯一写应拒: {r:?}");
+    assert!(
+        matches!(r, QueryResult::Err { .. }),
+        "事务内全局唯一写应拒: {r:?}"
+    );
     c.query("ROLLBACK");
     // v1 边界: UPDATE 全局唯一列 → 拒
     let r = c.query("UPDATE gu SET email = 'moved@x' WHERE id = 99");
-    assert!(matches!(r, QueryResult::Err { .. }), "UPDATE 全局唯一列应拒: {r:?}");
+    assert!(
+        matches!(r, QueryResult::Err { .. }),
+        "UPDATE 全局唯一列应拒: {r:?}"
+    );
     // 但 UPDATE 非全局唯一列 OK
     assert_eq!(
         c.query("UPDATE gu SET name = 'renamed' WHERE id = 99"),
@@ -1682,7 +1910,10 @@ fn mysql_plain_unique_unchanged() {
     c.query("CREATE TABLE p (id INT PRIMARY KEY, email TEXT UNIQUE)");
     c.query("INSERT INTO p VALUES (1, 'a@x')");
     let r = c.query("INSERT INTO p VALUES (2, 'a@x')");
-    assert!(matches!(r, QueryResult::Err { code: 1062, .. }), "普通 UNIQUE 单 shard 拒: {r:?}");
+    assert!(
+        matches!(r, QueryResult::Err { code: 1062, .. }),
+        "普通 UNIQUE 单 shard 拒: {r:?}"
+    );
     drop(c);
     server.shutdown().unwrap();
     drop(mgr);
@@ -1728,7 +1959,10 @@ fn mysql_composite_unique() {
     c.query("INSERT INTO uq VALUES (1, 1)");
     c.query("INSERT INTO uq VALUES (1, 2)"); // 同 a 不同 b: 允许
     let r = c.query("INSERT INTO uq VALUES (1, 1)"); // 整组重复: 拒
-    assert!(matches!(r, QueryResult::Err { code: 1062, .. }), "复合 UNIQUE 整组重复必拒: {r:?}");
+    assert!(
+        matches!(r, QueryResult::Err { code: 1062, .. }),
+        "复合 UNIQUE 整组重复必拒: {r:?}"
+    );
     assert_eq!(
         c.query("SELECT COUNT(*) FROM uq"),
         QueryResult::Rows(vec![vec![Some("2".into())]]),
@@ -1839,7 +2073,9 @@ fn mysql_update_set_expr() {
     };
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
-    c.query("CREATE TABLE ctr (id INT PRIMARY KEY, version INT DEFAULT 0, enabled BOOL DEFAULT true)");
+    c.query(
+        "CREATE TABLE ctr (id INT PRIMARY KEY, version INT DEFAULT 0, enabled BOOL DEFAULT true)",
+    );
     c.query("INSERT INTO ctr (id) VALUES (1), (2), (3)");
     // 乐观锁: version = version + 1 (id=1, 期望 0→1)
     c.query("UPDATE ctr SET version = version + 1 WHERE id = 1 AND version = 0");
@@ -1904,23 +2140,31 @@ fn mysql_foreign_key_referential_integrity() {
     let server = NetworkServer::start(cfg).expect("start server");
     let mut c = MyConn::handshake_login(&server, "");
     c.query("CREATE TABLE fk_p (id INT PRIMARY KEY)");
-    c.query("CREATE TABLE fk_c (id INT PRIMARY KEY, pid INT REFERENCES fk_p(id) ON DELETE CASCADE)");
+    c.query(
+        "CREATE TABLE fk_c (id INT PRIMARY KEY, pid INT REFERENCES fk_p(id) ON DELETE CASCADE)",
+    );
     // 先插父行 (预热父表 schema)
     c.query("INSERT INTO fk_p VALUES (1), (2)");
     // 引用存在的父 → 成功
     c.query("INSERT INTO fk_c VALUES (10, 1), (11, 2)");
     // 引用不存在的父 → 拒
-    assert!(matches!(
-        c.query("INSERT INTO fk_c VALUES (12, 999)"),
-        QueryResult::Err { code: 1062, .. } | QueryResult::Err { code: _, .. }
-    ), "悬空外键引用必拒");
+    assert!(
+        matches!(
+            c.query("INSERT INTO fk_c VALUES (12, 999)"),
+            QueryResult::Err { code: 1062, .. } | QueryResult::Err { .. }
+        ),
+        "悬空外键引用必拒"
+    );
     // NULL 外键 → 允许
     c.query("INSERT INTO fk_c VALUES (13, NULL)");
     // 多行混合 (1 有效 1 无效) → 整体拒, 无部分写入
-    assert!(matches!(
-        c.query("INSERT INTO fk_c VALUES (14, 1), (15, 888)"),
-        QueryResult::Err { .. }
-    ), "多行含无效外键整体拒");
+    assert!(
+        matches!(
+            c.query("INSERT INTO fk_c VALUES (14, 1), (15, 888)"),
+            QueryResult::Err { .. }
+        ),
+        "多行含无效外键整体拒"
+    );
     assert_eq!(
         c.query("SELECT COUNT(*) FROM fk_c"),
         QueryResult::Rows(vec![vec![Some("3".into())]]),
@@ -1971,7 +2215,10 @@ fn mysql_pk_range_scan() {
     // 批量插 5000 行
     c.query(&format!(
         "INSERT INTO rng VALUES {}",
-        (0..5000).map(|i| format!("({i},{i})")).collect::<Vec<_>>().join(",")
+        (0..5000)
+            .map(|i| format!("({i},{i})"))
+            .collect::<Vec<_>>()
+            .join(",")
     ));
     // BETWEEN 范围 (走主键索引)
     assert_eq!(
@@ -2044,7 +2291,10 @@ fn mysql_huge_insert_no_deadlock() {
     let n = 10000;
     let sql = format!(
         "INSERT INTO big VALUES {}",
-        (0..n).map(|i| format!("({i},{i})")).collect::<Vec<_>>().join(",")
+        (0..n)
+            .map(|i| format!("({i},{i})"))
+            .collect::<Vec<_>>()
+            .join(",")
     );
     c.query(&sql);
     // 数据完整 (COUNT = n)
@@ -2077,7 +2327,10 @@ fn mysql_information_schema() {
     // information_schema.tables (default 库名是 app? start_sql_server 用 "app")
     // 用 mysql_sql_full_flow 同款: 默认库名从 server 配置; 这里不带 table_schema 过滤取全部
     let ids = c.ids("SELECT table_name FROM information_schema.tables ORDER BY table_name");
-    assert!(ids.contains(&"orders".to_string()) && ids.contains(&"users".to_string()), "{ids:?}");
+    assert!(
+        ids.contains(&"orders".to_string()) && ids.contains(&"users".to_string()),
+        "{ids:?}"
+    );
 
     // columns: 列名 + 类型 + nullable (UNIQUE 隐含 NOT NULL)
     let r = c.query("SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = 'users' ORDER BY ordinal_position");
@@ -2087,7 +2340,11 @@ fn mysql_information_schema() {
             vec![Some("id".into()), Some("bigint".into()), Some("NO".into())],
             vec![Some("email".into()), Some("text".into()), Some("NO".into())],
             vec![Some("name".into()), Some("text".into()), Some("YES".into())],
-            vec![Some("age".into()), Some("bigint".into()), Some("YES".into())],
+            vec![
+                Some("age".into()),
+                Some("bigint".into()),
+                Some("YES".into())
+            ],
         ]),
         "columns 元数据"
     );
@@ -2116,7 +2373,10 @@ fn mysql_information_schema() {
     assert_eq!(r, QueryResult::Rows(vec![vec![Some("orders".into())]]));
 
     // 未知系统表 → 空结果 (不报错)
-    assert_eq!(c.query("SELECT * FROM information_schema.routines"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c.query("SELECT * FROM information_schema.routines"),
+        QueryResult::Rows(vec![])
+    );
 
     // 普通表查询不受影响
     c.query("INSERT INTO orders VALUES (1, 9.9)");
@@ -2144,7 +2404,10 @@ fn mysql_show_commands() {
     let r = c.query("SHOW FULL TABLES FROM `default`");
     if let QueryResult::Rows(rows) = &r {
         assert_eq!(rows.len(), 2, "两表");
-        assert!(rows.iter().all(|row| row[1] == Some("BASE TABLE".into())), "{rows:?}");
+        assert!(
+            rows.iter().all(|row| row[1] == Some("BASE TABLE".into())),
+            "{rows:?}"
+        );
     } else {
         panic!("expected rows: {r:?}");
     }
@@ -2154,9 +2417,30 @@ fn mysql_show_commands() {
     assert_eq!(
         r,
         QueryResult::Rows(vec![
-            vec![Some("id".into()), Some("bigint".into()), Some("NO".into()), Some("PRI".into()), None, Some("".into())],
-            vec![Some("sku".into()), Some("text".into()), Some("NO".into()), Some("UNI".into()), None, Some("".into())],
-            vec![Some("price".into()), Some("double".into()), Some("YES".into()), Some("".into()), None, Some("".into())],
+            vec![
+                Some("id".into()),
+                Some("bigint".into()),
+                Some("NO".into()),
+                Some("PRI".into()),
+                None,
+                Some("".into())
+            ],
+            vec![
+                Some("sku".into()),
+                Some("text".into()),
+                Some("NO".into()),
+                Some("UNI".into()),
+                None,
+                Some("".into())
+            ],
+            vec![
+                Some("price".into()),
+                Some("double".into()),
+                Some("YES".into()),
+                Some("".into()),
+                None,
+                Some("".into())
+            ],
         ]),
         "SHOW COLUMNS"
     );
@@ -2184,7 +2468,10 @@ fn mysql_show_commands() {
 
     // SELECT @@var 系统变量 stub
     let r = c.query("SELECT @@transaction_isolation");
-    assert_eq!(r, QueryResult::Rows(vec![vec![Some("READ-COMMITTED".into())]]));
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![vec![Some("READ-COMMITTED".into())]])
+    );
 
     drop(c);
     server.shutdown().unwrap();
@@ -2201,14 +2488,18 @@ fn mysql_join_two_tables() {
     c.query("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)");
     c.query("CREATE TABLE orders (id INT PRIMARY KEY, uid INT, amt DOUBLE)");
     for i in 1..=4 {
-        c.query(&format!("INSERT INTO users VALUES ({i}, 'u{i}', {})", 20 + i));
+        c.query(&format!(
+            "INSERT INTO users VALUES ({i}, 'u{i}', {})",
+            20 + i
+        ));
     }
     c.query("INSERT INTO orders VALUES (1, 1, 9.9)");
     c.query("INSERT INTO orders VALUES (2, 1, 5.0)");
     c.query("INSERT INTO orders VALUES (3, 3, 7.7)");
 
     // INNER: 正确配对, ORDER BY 右表列
-    let r = c.query("SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid ORDER BY o.amt");
+    let r =
+        c.query("SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid ORDER BY o.amt");
     assert_eq!(
         r,
         QueryResult::Rows(vec![
@@ -2220,7 +2511,9 @@ fn mysql_join_two_tables() {
     );
 
     // LEFT: 无订单用户补 NULL 右列 (完整 ORDER BY 保确定顺序: u1 有两单)
-    let r = c.query("SELECT u.name, o.amt FROM users u LEFT JOIN orders o ON u.id = o.uid ORDER BY u.id, o.amt");
+    let r = c.query(
+        "SELECT u.name, o.amt FROM users u LEFT JOIN orders o ON u.id = o.uid ORDER BY u.id, o.amt",
+    );
     assert_eq!(
         r,
         QueryResult::Rows(vec![
@@ -2234,27 +2527,46 @@ fn mysql_join_two_tables() {
     );
 
     // 谓词下推 (u.age > 22 → 仅 u3/u4; 有订单的只有 u3)
-    let r = c.query("SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid WHERE u.age > 22");
-    assert_eq!(r, QueryResult::Rows(vec![vec![Some("u3".into()), Some("7.7".into())]]), "WHERE 下推");
+    let r =
+        c.query("SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid WHERE u.age > 22");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![vec![Some("u3".into()), Some("7.7".into())]]),
+        "WHERE 下推"
+    );
 
     // 右表谓词 (INNER 下推)
     let r = c.query("SELECT u.name FROM users u JOIN orders o ON u.id = o.uid WHERE o.amt > 8.0");
-    assert_eq!(r, QueryResult::Rows(vec![vec![Some("u1".into())]]), "右表 WHERE");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![vec![Some("u1".into())]]),
+        "右表 WHERE"
+    );
 
     // SELECT * → 限定列头展开左右全列
     let r = c.query("SELECT * FROM users u JOIN orders o ON u.id = o.uid ORDER BY o.id LIMIT 1");
     assert_eq!(
         r,
         QueryResult::Rows(vec![vec![
-            Some("1".into()), Some("u1".into()), Some("21".into()),
-            Some("1".into()), Some("1".into()), Some("9.9".into()),
+            Some("1".into()),
+            Some("u1".into()),
+            Some("21".into()),
+            Some("1".into()),
+            Some("1".into()),
+            Some("9.9".into()),
         ]]),
         "SELECT * 展开"
     );
 
     // 反向 ON (o.uid = u.id) 等价
-    let r = c.query("SELECT u.name, o.amt FROM users u JOIN orders o ON o.uid = u.id ORDER BY o.amt LIMIT 1");
-    assert_eq!(r, QueryResult::Rows(vec![vec![Some("u1".into()), Some("5".into())]]), "反向 ON");
+    let r = c.query(
+        "SELECT u.name, o.amt FROM users u JOIN orders o ON o.uid = u.id ORDER BY o.amt LIMIT 1",
+    );
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![vec![Some("u1".into()), Some("5".into())]]),
+        "反向 ON"
+    );
 
     // 单表 SELECT 零回归
     assert_eq!(c.ids("SELECT id FROM users WHERE id = 2"), vec!["2"]);
@@ -2338,8 +2650,13 @@ fn mysql_join_family() {
     );
 
     // 索引驱动 gather (age > 21): 结果正确 (u3 有订单 o3)
-    let r = c.query("SELECT u.id, o.amt FROM u JOIN o ON u.id = o.uid WHERE u.age > 21 ORDER BY o.amt");
-    assert_eq!(r, QueryResult::Rows(vec![vec![Some("3".into()), Some("7.7".into())]]), "index-driven gather");
+    let r =
+        c.query("SELECT u.id, o.amt FROM u JOIN o ON u.id = o.uid WHERE u.age > 21 ORDER BY o.amt");
+    assert_eq!(
+        r,
+        QueryResult::Rows(vec![vec![Some("3".into()), Some("7.7".into())]]),
+        "index-driven gather"
+    );
 
     // USING (id): 合成等值连接
     c.query("CREATE TABLE a (id INT PRIMARY KEY, x INT)");
@@ -2372,13 +2689,25 @@ fn mysql_or_predicates() {
 
     // ⭐ M2: 索引列 a 上的 OR → IndexUnion (分别 IndexScan + 合并去重)
     // 数据 (id,a,b)=(1,1,10)(2,2,20)(3,3,30)(4,1,99) → a∈{1,2} 命中 id=1,2,4
-    assert_eq!(c.ids("SELECT id FROM t WHERE a = 1 OR a = 2 ORDER BY id"), vec!["1", "2", "4"]);
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE a = 1 OR a = 2 ORDER BY id"),
+        vec!["1", "2", "4"]
+    );
     // OR (跨列 a=1 OR b=30 → 全表扫回退, 结果正确)
-    assert_eq!(c.ids("SELECT id FROM t WHERE a = 1 OR b = 30 ORDER BY id"), vec!["1", "3", "4"]);
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE a = 1 OR b = 30 ORDER BY id"),
+        vec!["1", "3", "4"]
+    );
     // 混合 (a=1 OR a=2) AND b>15
-    assert_eq!(c.ids("SELECT id FROM t WHERE (a = 1 OR a = 2) AND b > 15 ORDER BY id"), vec!["2", "4"]);
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE (a = 1 OR a = 2) AND b > 15 ORDER BY id"),
+        vec!["2", "4"]
+    );
     // NOT (括号)
-    assert_eq!(c.ids("SELECT id FROM t WHERE NOT (a = 1) ORDER BY id"), vec!["2", "3"]);
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE NOT (a = 1) ORDER BY id"),
+        vec!["2", "3"]
+    );
     // 纯 AND 仍走索引 (零回归)
     assert_eq!(c.ids("SELECT id FROM t WHERE a = 2"), vec!["2"]);
     // 嵌套括号
@@ -2394,15 +2723,16 @@ fn mysql_or_predicates() {
     // UPDATE 带 OR
     c.query("INSERT INTO t VALUES (5, 5, 5)");
     c.query("UPDATE t SET b = 100 WHERE a = 2 OR a = 5");
-    assert_eq!(c.ids("SELECT id FROM t WHERE b = 100 ORDER BY id"), vec!["2", "5"]);
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE b = 100 ORDER BY id"),
+        vec!["2", "5"]
+    );
 
     drop(c);
     server.shutdown().unwrap();
     drop(mgr);
 }
 
-/// JOIN WHERE 带 OR (下推回退, worker 残余递归) + HAVING 带 OR.
-#[test]
 /// ⭐ M3-2 (连接顺序): 双表 Inner join 驱动交换 — 右表 (候选驱动) 远小于左表时,
 /// EstimateRows 收集行数 → 选小表驱动 (先 Gather 右表, 左表 key_set 点查);
 /// 结果与不交换一致, SELECT * 列序保持.
@@ -2536,7 +2866,9 @@ fn mysql_join_est_threshold() {
     }
     c.query(&sql);
     assert_eq!(
-        c.query("SELECT u.name, big.id FROM u JOIN big ON u.id = big.id WHERE big.a = 0 AND big.b = 0"),
+        c.query(
+            "SELECT u.name, big.id FROM u JOIN big ON u.id = big.id WHERE big.a = 0 AND big.b = 0"
+        ),
         QueryResult::Rows(vec![vec![Some("zero".into()), Some("0".into())]]),
         "大表 JOIN 走统计后结果仍正确"
     );
@@ -2568,6 +2900,8 @@ fn mysql_join_est_threshold() {
     drop(mgr);
 }
 
+/// JOIN WHERE 带 OR (下推回退, worker 残余递归) + HAVING 带 OR.
+#[test]
 fn mysql_or_join_having() {
     let (server, mgr) = start_sql_server(None);
     let mut c = MyConn::handshake_login(&server, "");
@@ -2638,7 +2972,10 @@ fn mysql_where_subqueries() {
         vec!["2", "4", "5"]
     );
     // 标量子查询 = MAX(age)=25 → id5
-    assert_eq!(c.ids("SELECT id FROM u WHERE age = (SELECT MAX(age) FROM u)"), vec!["5"]);
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE age = (SELECT MAX(age) FROM u)"),
+        vec!["5"]
+    );
     // 标量比较 > MIN(age)=21
     assert_eq!(
         c.ids("SELECT id FROM u WHERE age > (SELECT MIN(age) FROM u) ORDER BY id"),
@@ -2712,7 +3049,9 @@ fn mysql_derived_join() {
     );
     // 派生表 LEFT JOIN: 全 u 左驱动, 无匹配补 NULL → 5 行 (id1,3,3 匹配; 2,4,5 无)
     assert_eq!(
-        c.ids("SELECT t.id FROM (SELECT id FROM u) t LEFT JOIN o ON t.id = o.uid ORDER BY t.id, o.id"),
+        c.ids(
+            "SELECT t.id FROM (SELECT id FROM u) t LEFT JOIN o ON t.id = o.uid ORDER BY t.id, o.id"
+        ),
         vec!["1", "2", "3", "3", "4", "5"]
     );
     // 派生表列 + 真表列混合投影 + WHERE 限定列 (t.id∈{3,4,5}; 仅 o3 uid=3 amt=70 匹配且 >60)
@@ -2753,11 +3092,16 @@ fn mysql_orm_shapes() {
     assert_eq!(c.query("DESCRIBE default.orm_t").err_code(), Some(1146));
     c.query("CREATE TABLE orm_t (id INT PRIMARY KEY, name TEXT, age INT, INDEX(age))");
     for i in 1..=5 {
-        c.query(&format!("INSERT INTO orm_t VALUES ({i}, 'u{i}', {})", 20 + i));
+        c.query(&format!(
+            "INSERT INTO orm_t VALUES ({i}, 'u{i}', {})",
+            20 + i
+        ));
     }
     // 列别名 AS (输出列名 = 别名)
     let r = c.query("SELECT id AS x FROM orm_t WHERE id = 1");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(rows, &vec![vec![Some("1".into())]]);
     // 单表限定列 表.列 (投影 + WHERE + ORDER)
     assert_eq!(
@@ -2766,18 +3110,34 @@ fn mysql_orm_shapes() {
     );
     // 限定列 + AS
     let r = c.query("SELECT orm_t.id AS uid FROM orm_t WHERE id = 2");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(rows, &vec![vec![Some("2".into())]]);
     // db.table 限定 (裸 + 反引号)
-    assert_eq!(c.ids("SELECT id FROM default.orm_t WHERE id = 3"), vec!["3"]);
-    assert_eq!(c.ids("SELECT id FROM `default`.`orm_t` WHERE id = 3"), vec!["3"]);
+    assert_eq!(
+        c.ids("SELECT id FROM default.orm_t WHERE id = 3"),
+        vec!["3"]
+    );
+    assert_eq!(
+        c.ids("SELECT id FROM `default`.`orm_t` WHERE id = 3"),
+        vec!["3"]
+    );
     // DESCRIBE 现存在表 → 成功
-    assert!(matches!(c.query("DESCRIBE default.orm_t"), QueryResult::Rows(_)));
+    assert!(matches!(
+        c.query("DESCRIBE default.orm_t"),
+        QueryResult::Rows(_)
+    ));
     // LIMIT offset,count 逗号形态 → 第 2 行起 1 行 = id2
-    assert_eq!(c.ids("SELECT id FROM orm_t ORDER BY id LIMIT 1, 1"), vec!["2"]);
+    assert_eq!(
+        c.ids("SELECT id FROM orm_t ORDER BY id LIMIT 1, 1"),
+        vec!["2"]
+    );
     // 聚合列 AS
     let r = c.query("SELECT COUNT(*) AS cnt FROM orm_t");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(rows, &vec![vec![Some("5".into())]]);
     // 零回归: 无限定无别名常规查询
     assert_eq!(c.ids("SELECT id FROM orm_t WHERE age = 22"), vec!["2"]);
@@ -2801,9 +3161,15 @@ fn mysql_distinct() {
     c.query("INSERT INTO s VALUES (5, 3, 30)");
 
     // SELECT DISTINCT 单列 → {1,2,3}
-    assert_eq!(c.ids("SELECT DISTINCT g FROM s ORDER BY g"), vec!["1", "2", "3"]);
+    assert_eq!(
+        c.ids("SELECT DISTINCT g FROM s ORDER BY g"),
+        vec!["1", "2", "3"]
+    );
     // DISTINCT + LIMIT
-    assert_eq!(c.ids("SELECT DISTINCT g FROM s ORDER BY g LIMIT 2"), vec!["1", "2"]);
+    assert_eq!(
+        c.ids("SELECT DISTINCT g FROM s ORDER BY g LIMIT 2"),
+        vec!["1", "2"]
+    );
     // DISTINCT 多列组合去重: (g,v) 不同组合 = {(1,10),(2,20),(2,30),(3,30)} = 4 行
     let r = c.query("SELECT DISTINCT g, v FROM s ORDER BY g, v");
     assert_eq!(
@@ -2836,10 +3202,22 @@ fn mysql_distinct() {
     assert_eq!(r, QueryResult::Rows(vec![vec![Some("5".into())]]));
 
     // 报错面
-    assert!(matches!(c.query("SELECT DISTINCT * FROM s"), QueryResult::Err { .. }));
-    assert!(matches!(c.query("SELECT DISTINCT COUNT(*) FROM s"), QueryResult::Err { .. }));
-    assert!(matches!(c.query("SELECT SUM(DISTINCT v) FROM s"), QueryResult::Err { .. }));
-    assert!(matches!(c.query("SELECT COUNT(DISTINCT *) FROM s"), QueryResult::Err { .. }));
+    assert!(matches!(
+        c.query("SELECT DISTINCT * FROM s"),
+        QueryResult::Err { .. }
+    ));
+    assert!(matches!(
+        c.query("SELECT DISTINCT COUNT(*) FROM s"),
+        QueryResult::Err { .. }
+    ));
+    assert!(matches!(
+        c.query("SELECT SUM(DISTINCT v) FROM s"),
+        QueryResult::Err { .. }
+    ));
+    assert!(matches!(
+        c.query("SELECT COUNT(DISTINCT *) FROM s"),
+        QueryResult::Err { .. }
+    ));
 
     drop(c);
     server.shutdown().unwrap();
@@ -2870,7 +3248,9 @@ fn mysql_expr_agg() {
     assert_eq!(r, QueryResult::Rows(vec![vec![Some("3".into())]]));
     // AVG(v / 2) = (5+10+15)/3 = 10.0
     let r = c.query("SELECT AVG(v / 2) FROM s");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(rows.len(), 1);
     assert!(rows[0][0].as_deref().unwrap().starts_with("10"));
     // GROUP BY 内表达式聚合: g=1→SUM(v+1)=32, g=2→SUM(v+1)=31
@@ -2906,7 +3286,10 @@ fn mysql_alter_table() {
     c.query("INSERT INTO t VALUES (1, 'a')");
     c.query("INSERT INTO t VALUES (2, 'b')");
     // ALTER ADD COLUMN
-    assert_eq!(c.query("ALTER TABLE t ADD COLUMN age INT"), QueryResult::Ok { affected: 0 });
+    assert_eq!(
+        c.query("ALTER TABLE t ADD COLUMN age INT"),
+        QueryResult::Ok { affected: 0 }
+    );
     // 旧行新列读 NULL
     let r = c.query("SELECT id, age FROM t ORDER BY id");
     assert_eq!(
@@ -2921,23 +3304,45 @@ fn mysql_alter_table() {
     assert_eq!(c.ids("SELECT id FROM t WHERE age = 30"), vec!["3"]);
     // ALTER 后 DESCRIBE 见新列
     let r = c.query("DESCRIBE t");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert!(rows.iter().any(|row| row[0].as_deref() == Some("age")));
     // 再 ADD 一列 (COLUMN 可省) + 旧行仍读 NULL
-    assert_eq!(c.query("ALTER TABLE t ADD email TEXT"), QueryResult::Ok { affected: 0 });
+    assert_eq!(
+        c.query("ALTER TABLE t ADD email TEXT"),
+        QueryResult::Ok { affected: 0 }
+    );
     let r = c.query("SELECT id, email FROM t WHERE id = 1");
     assert_eq!(r, QueryResult::Rows(vec![vec![Some("1".into()), None]]));
     // 重复列名 → 报错
-    assert!(matches!(c.query("ALTER TABLE t ADD COLUMN name TEXT"), QueryResult::Err { .. }));
+    assert!(matches!(
+        c.query("ALTER TABLE t ADD COLUMN name TEXT"),
+        QueryResult::Err { .. }
+    ));
     // NOT NULL → 报错 (v1)
-    assert!(matches!(c.query("ALTER TABLE t ADD COLUMN x INT NOT NULL"), QueryResult::Err { .. }));
+    assert!(matches!(
+        c.query("ALTER TABLE t ADD COLUMN x INT NOT NULL"),
+        QueryResult::Err { .. }
+    ));
     // ⭐ compat: DROP COLUMN — 标记删除 (SELECT * 隐藏, 显式引用报错, 存量行不受影响)
-    assert_eq!(c.query("ALTER TABLE t DROP COLUMN name"), QueryResult::Ok { affected: 0 });
-    assert!(matches!(c.query("SELECT name FROM t"), QueryResult::Err { .. }));
+    assert_eq!(
+        c.query("ALTER TABLE t DROP COLUMN name"),
+        QueryResult::Ok { affected: 0 }
+    );
+    assert!(matches!(
+        c.query("SELECT name FROM t"),
+        QueryResult::Err { .. }
+    ));
     let r = c.query("SELECT * FROM t ORDER BY id");
-    let QueryResult::Rows(rows) = &r else { panic!("{r:?}") };
+    let QueryResult::Rows(rows) = &r else {
+        panic!("{r:?}")
+    };
     assert_eq!(rows[0].len(), 3, "{rows:?}"); // id, age, email (name 已隐藏)
-    assert_eq!(c.query("SELECT id FROM t WHERE age = 30"), QueryResult::Rows(vec![vec![Some("3".into())]]));
+    assert_eq!(
+        c.query("SELECT id FROM t WHERE age = 30"),
+        QueryResult::Rows(vec![vec![Some("3".into())]])
+    );
 
     drop(c);
     server.shutdown().unwrap();
@@ -2979,11 +3384,20 @@ fn mysql_types() {
     assert_eq!(c.ids("SELECT id FROM t WHERE active = TRUE"), vec!["1"]);
     assert_eq!(c.ids("SELECT id FROM t WHERE active = FALSE"), vec!["2"]);
     // WHERE date 比较 (字面量按列类型强转微秒)
-    assert_eq!(c.ids("SELECT id FROM t WHERE created > DATE '2024-01-01'"), vec!["1"]);
-    assert_eq!(c.ids("SELECT id FROM t WHERE created < DATE '2024-01-01'"), vec!["2"]);
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE created > DATE '2024-01-01'"),
+        vec!["1"]
+    );
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE created < DATE '2024-01-01'"),
+        vec!["2"]
+    );
     // ORDER BY date (按微秒排序): 2023 先于 2024
     assert_eq!(c.ids("SELECT id FROM t ORDER BY created"), vec!["2", "1"]);
-    assert_eq!(c.ids("SELECT id FROM t ORDER BY created DESC"), vec!["1", "2"]);
+    assert_eq!(
+        c.ids("SELECT id FROM t ORDER BY created DESC"),
+        vec!["1", "2"]
+    );
     // WHERE timestamp
     assert_eq!(
         c.ids("SELECT id FROM t WHERE ts >= TIMESTAMP '2024-01-01 00:00:00'"),
@@ -3029,7 +3443,10 @@ fn mysql_projection_pushdown() {
         other => panic!("expected rows, got {other:?}"),
     }
     // 有排序 → 不走投影下推路径, 结果仍一致
-    assert_eq!(c.ids("SELECT id FROM t ORDER BY score"), vec!["2", "1", "3"]);
+    assert_eq!(
+        c.ids("SELECT id FROM t ORDER BY score"),
+        vec!["2", "1", "3"]
+    );
 
     drop(c);
     server.shutdown().unwrap();
@@ -3055,7 +3472,10 @@ fn mysql_const_fold_and_is_null() {
     assert_eq!(c.ids("SELECT id FROM t WHERE score > 2*3"), vec!["1", "3"]);
     // IS NULL / IS NOT NULL (desugar → 全扫过滤; NULL 不入索引走不了索引扫描)
     assert_eq!(c.ids("SELECT id FROM t WHERE name IS NULL"), vec!["3"]);
-    assert_eq!(c.ids("SELECT id FROM t WHERE name IS NOT NULL"), vec!["1", "2"]);
+    assert_eq!(
+        c.ids("SELECT id FROM t WHERE name IS NOT NULL"),
+        vec!["1", "2"]
+    );
 
     drop(c);
     server.shutdown().unwrap();
@@ -3089,8 +3509,14 @@ fn mysql_decimal() {
     assert_eq!(c.ids("SELECT id FROM acct WHERE bal > 100"), vec!["1"]);
     assert_eq!(c.ids("SELECT id FROM acct WHERE bal < '50.00'"), vec!["3"]);
     // ORDER BY decimal (按定标整数): 12.34 < 99.99 < 100.50
-    assert_eq!(c.ids("SELECT id FROM acct ORDER BY bal"), vec!["3", "2", "1"]);
-    assert_eq!(c.ids("SELECT id FROM acct ORDER BY bal DESC"), vec!["1", "2", "3"]);
+    assert_eq!(
+        c.ids("SELECT id FROM acct ORDER BY bal"),
+        vec!["3", "2", "1"]
+    );
+    assert_eq!(
+        c.ids("SELECT id FROM acct ORDER BY bal DESC"),
+        vec!["1", "2", "3"]
+    );
     // MIN/MAX 保持 Decimal 渲染
     assert_eq!(
         c.query("SELECT MIN(bal), MAX(bal) FROM acct"),
@@ -3117,14 +3543,29 @@ fn mysql_large_in_subquery() {
         c.query(&format!("INSERT INTO o VALUES ({i}, {i})"));
     }
     // 旧版报错语句 → 现出正确结果 (2000 行)
-    let n = c.ids("SELECT id FROM u WHERE id IN (SELECT uid FROM o)").len();
+    let n = c
+        .ids("SELECT id FROM u WHERE id IN (SELECT uid FROM o)")
+        .len();
     assert_eq!(n, 2000);
     // 边界抽查: 1500 ∈, 2500 ∉
-    assert_eq!(c.ids("SELECT id FROM u WHERE id IN (SELECT uid FROM o) ORDER BY id LIMIT 1"), vec!["1"]);
-    assert_eq!(c.ids("SELECT id FROM u WHERE id = 1500 AND id IN (SELECT uid FROM o)"), vec!["1500"]);
-    assert_eq!(c.query("SELECT id FROM u WHERE id = 2500 AND id IN (SELECT uid FROM o)"), QueryResult::Rows(vec![]));
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE id IN (SELECT uid FROM o) ORDER BY id LIMIT 1"),
+        vec!["1"]
+    );
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE id = 1500 AND id IN (SELECT uid FROM o)"),
+        vec!["1500"]
+    );
+    assert_eq!(
+        c.query("SELECT id FROM u WHERE id = 2500 AND id IN (SELECT uid FROM o)"),
+        QueryResult::Rows(vec![])
+    );
     // NOT IN 补集大小 = 3000 - 2000 = 1000
-    assert_eq!(c.ids("SELECT id FROM u WHERE id NOT IN (SELECT uid FROM o)").len(), 1000);
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE id NOT IN (SELECT uid FROM o)")
+            .len(),
+        1000
+    );
 
     drop(c);
     server.shutdown().unwrap();
@@ -3173,7 +3614,9 @@ fn mysql_correlated_exists() {
     );
     // 不可去相关: 多重相关 → 报错
     assert!(matches!(
-        c.query("SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND o.amt = u.age)"),
+        c.query(
+            "SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND o.amt = u.age)"
+        ),
         QueryResult::Err { .. }
     ));
     // 不可去相关: 非等值相关 → 报错

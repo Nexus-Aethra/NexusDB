@@ -515,15 +515,26 @@ mod tests {
         let ev = encode_index_bytes(b"a\x00b");
         let e = encode_index_entry(9, &ev, b"p\x00k");
         let (iid, val, pk) = split_index_entry(&e).unwrap();
-        assert_eq!((iid, val.as_slice(), pk), (9, &b"a\x00b"[..], &b"p\x00k"[..]));
+        assert_eq!(
+            (iid, val.as_slice(), pk),
+            (9, &b"a\x00b"[..], &b"p\x00k"[..])
+        );
     }
 
     #[test]
     fn index_bytes_memcmp_order_matches_value_order() {
         // 编码后 memcmp 序 == 原值字典序 (含 0x00 边界情形)
         let vals: Vec<&[u8]> = vec![
-            b"", b"\x00", b"\x00\x00", b"\x00\x01", b"a", b"a\x00", b"a\x00x", b"a\x01",
-            b"ab", b"b",
+            b"",
+            b"\x00",
+            b"\x00\x00",
+            b"\x00\x01",
+            b"a",
+            b"a\x00",
+            b"a\x00x",
+            b"a\x01",
+            b"ab",
+            b"b",
         ];
         for w in vals.windows(2) {
             let (lo, hi) = (encode_index_bytes(w[0]), encode_index_bytes(w[1]));
@@ -550,7 +561,15 @@ mod tests {
         let k = encode_schema_row();
         assert_eq!(k, vec![SCHEMA_ROW]);
         // 与其它 kind 首字节全不冲突
-        for b in [KIND_STRING, KIND_HASH, KIND_LIST, KIND_SET, KIND_ZSET, TYPE_META, KIND_INDEX] {
+        for b in [
+            KIND_STRING,
+            KIND_HASH,
+            KIND_LIST,
+            KIND_SET,
+            KIND_ZSET,
+            TYPE_META,
+            KIND_INDEX,
+        ] {
             assert_ne!(k[0], b);
         }
     }

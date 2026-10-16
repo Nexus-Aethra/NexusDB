@@ -16,14 +16,31 @@ use common::run_async;
 fn demo_schema() -> TableSchema {
     TableSchema::new(
         vec![
-            Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
-            Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
-            Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
+            Column {
+                name: "id".into(),
+                ty: ColType::I64,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "name".into(),
+                ty: ColType::Str,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "score".into(),
+                ty: ColType::F64,
+                nullable: true,
+                default: None,
+            },
         ],
         0,
         &[1], // iid 0 = name
         &[],
-        &[], &[], &[],
+        &[],
+        &[],
+        &[],
     )
     .unwrap()
 }
@@ -120,7 +137,9 @@ fn distinct_counts_via_index_write() {
         let mut e = StorageEngine::open(opts).await.expect("open ok");
         e.create_db("db1").await.expect("create db");
         e.create_table("db1", "t1").await.expect("create table");
-        e.set_schema("db1", "t1", &demo_schema()).await.expect("set schema");
+        e.set_schema("db1", "t1", &demo_schema())
+            .await
+            .expect("set schema");
 
         // 无记录 → None (未知)
         assert_eq!(e.estimate_distinct("db1", "t1", 0), None);
@@ -132,7 +151,9 @@ fn distinct_counts_via_index_write() {
                 ColValue::Bytes(format!("u{}", i % 3).into_bytes()),
                 ColValue::Null,
             ];
-            e.row_put("db1", "t1", &i.to_be_bytes(), &row).await.unwrap();
+            e.row_put("db1", "t1", &i.to_be_bytes(), &row)
+                .await
+                .unwrap();
         }
         assert_eq!(e.estimate_distinct("db1", "t1", 0), Some(3));
 
@@ -142,7 +163,9 @@ fn distinct_counts_via_index_write() {
             ColValue::Bytes(b"u0".to_vec()),
             ColValue::Null,
         ];
-        e.row_put("db1", "t1", &0i64.to_be_bytes(), &row).await.unwrap();
+        e.row_put("db1", "t1", &0i64.to_be_bytes(), &row)
+            .await
+            .unwrap();
         assert_eq!(e.estimate_distinct("db1", "t1", 0), Some(3));
 
         // 新值 → 4
@@ -151,7 +174,9 @@ fn distinct_counts_via_index_write() {
             ColValue::Bytes(b"u9".to_vec()),
             ColValue::Null,
         ];
-        e.row_put("db1", "t1", &6i64.to_be_bytes(), &row).await.unwrap();
+        e.row_put("db1", "t1", &6i64.to_be_bytes(), &row)
+            .await
+            .unwrap();
         assert_eq!(e.estimate_distinct("db1", "t1", 0), Some(4));
 
         // ⭐ M3-5: 索引列 min/max (有序字节, lo < hi)
@@ -180,7 +205,9 @@ fn stats_persist_across_reopen() {
             let mut e = StorageEngine::open(opts.clone()).await.expect("open ok");
             e.create_db("app").await.expect("create db");
             e.create_table("app", "t").await.expect("create table");
-            e.set_schema("app", "t", &demo_schema()).await.expect("set schema");
+            e.set_schema("app", "t", &demo_schema())
+                .await
+                .expect("set schema");
             for i in 0..3i64 {
                 let row = vec![
                     ColValue::I64(i),
@@ -196,9 +223,13 @@ fn stats_persist_across_reopen() {
             e.close().await.expect("close ok");
         }
         // 重新 open 同路径 → 统计保留
-        let mut e2 = StorageEngine::open(opts).await.expect("reopen ok");
+        let e2 = StorageEngine::open(opts).await.expect("reopen ok");
         assert_eq!(e2.estimate_row_count("app", "t"), Some(3), "行数持久化");
-        assert_eq!(e2.estimate_distinct("app", "t", 0), Some(2), "distinct 持久化");
+        assert_eq!(
+            e2.estimate_distinct("app", "t", 0),
+            Some(2),
+            "distinct 持久化"
+        );
         let (lo, hi) = e2.estimate_range("app", "t", 0).expect("range 持久化");
         assert!(lo.as_slice() < hi.as_slice());
     });

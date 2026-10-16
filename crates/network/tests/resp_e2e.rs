@@ -292,8 +292,8 @@ fn resp_contiguous_set_pipeline_is_ordered_and_visible() {
     s.write_all(&batch).unwrap();
 
     let replies = read_replies(&mut s, 96);
-    for i in 0..48 {
-        assert_eq!(replies[i], b"+OK\r\n", "SET reply {i}");
+    for (i, reply) in replies.iter().take(48).enumerate() {
+        assert_eq!(reply, b"+OK\r\n", "SET reply {i}");
     }
     for i in 0..48 {
         let value = format!("batch-value-{i:02}");

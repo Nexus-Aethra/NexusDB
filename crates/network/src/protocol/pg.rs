@@ -38,31 +38,52 @@ pub const OID_NUMERIC: u32 = 1700;
 /// 1970-01-01 → 微秒偏移 = 10957 天 (30 年含 7 闰). PG 值 + offset = NexusDB 值.
 pub(crate) const PG_EPOCH_OFFSET_MICROS: i64 = 10_957 * 86_400_000_000;
 
+/// 帧解析结果.
+///
+/// ⚠️ 必须区分"字节没收全"与"长度字段非法"：若两者都折叠成 `None`，调用方在
+/// 畸形长度上会无限等待 —— 字节永远凑不齐，连接既不报错也不关闭（静默挂起）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameParse<T> {
+    /// 缓冲区已含完整一帧。
+    Frame(T),
+    /// 长度字段合法，但字节尚未收全 —— 继续读 socket。
+    NeedMore,
+    /// 长度字段越界 —— 协议非法，调用方应回错误帧并断开。
+    Invalid(&'static str),
+}
+
 /// startup 阶段帧: `[len u32 BE 含自身][payload]` (无 type 字节).
 /// 返回 (消耗字节, payload).
-pub fn read_startup_frame(buf: &[u8]) -> Option<(usize, &[u8])> {
+pub fn read_startup_frame(buf: &[u8]) -> FrameParse<(usize, &[u8])> {
     if buf.len() < 4 {
-        return None;
+        return FrameParse::NeedMore;
     }
     let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if !(4..=1 << 20).contains(&len) || buf.len() < len {
-        return None;
+    // 先判长度合法性, 再判字节是否收全 —— 顺序反了会把"非法"误报成"没收全".
+    if !(4..=1 << 20).contains(&len) {
+        return FrameParse::Invalid("startup frame length out of range");
     }
-    Some((len, &buf[4..len]))
+    if buf.len() < len {
+        return FrameParse::NeedMore;
+    }
+    FrameParse::Frame((len, &buf[4..len]))
 }
 
 /// 命令阶段帧: `[type u8][len u32 BE 含 len 不含 type][payload]`.
 /// 返回 (消耗字节, type, payload).
-pub fn read_frame(buf: &[u8]) -> Option<(usize, u8, &[u8])> {
+pub fn read_frame(buf: &[u8]) -> FrameParse<(usize, u8, &[u8])> {
     if buf.len() < 5 {
-        return None;
+        return FrameParse::NeedMore;
     }
     let ty = buf[0];
     let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-    if !(4..=1 << 26).contains(&len) || buf.len() < 1 + len {
-        return None;
+    if !(4..=1 << 26).contains(&len) {
+        return FrameParse::Invalid("command frame length out of range");
     }
-    Some((1 + len, ty, &buf[5..1 + len]))
+    if buf.len() < 1 + len {
+        return FrameParse::NeedMore;
+    }
+    FrameParse::Frame((1 + len, ty, &buf[5..1 + len]))
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -579,13 +600,58 @@ pub fn decode_param(
 mod tests {
     use super::*;
 
+    /// 取帧; 非 Frame 变体直接 panic (测试里表示"本该解析出一帧").
+    fn expect_frame<T>(p: FrameParse<T>) -> T {
+        match p {
+            FrameParse::Frame(t) => t,
+            FrameParse::NeedMore => panic!("应当是完整帧, 却判定为 NeedMore"),
+            FrameParse::Invalid(w) => panic!("应当是完整帧, 却判定为 Invalid: {w}"),
+        }
+    }
+
     #[test]
     fn frame_roundtrip() {
         let f = frame(b'Q', b"SELECT 1\0");
-        let (n, ty, payload) = read_frame(&f).unwrap();
+        let (n, ty, payload) = expect_frame(read_frame(&f));
         assert_eq!((n, ty), (f.len(), b'Q'));
         assert_eq!(payload, b"SELECT 1\0");
-        assert!(read_frame(&f[..4]).is_none(), "不完整帧");
+        assert_eq!(
+            read_frame(&f[..4]),
+            FrameParse::NeedMore,
+            "字节没收全 → NeedMore"
+        );
+    }
+
+    #[test]
+    fn out_of_range_length_is_invalid_not_needmore() {
+        // 长度字段 0 —— 非法. 若折叠成 NeedMore, 调用方会永远等一个永远凑不齐的帧.
+        assert!(matches!(
+            read_frame(&[b'Q', 0, 0, 0, 0]),
+            FrameParse::Invalid(_)
+        ));
+        // 超上限 (1<<26) —— 同样非法
+        let huge = 1u32 << 27;
+        let mut buf = vec![b'Q'];
+        buf.extend_from_slice(&huge.to_be_bytes());
+        assert!(matches!(read_frame(&buf), FrameParse::Invalid(_)));
+
+        // startup 侧同理
+        let mut s = Vec::new();
+        s.extend_from_slice(&3u32.to_be_bytes()); // len=3 < 4 最小值
+        assert!(matches!(read_startup_frame(&s), FrameParse::Invalid(_)));
+        let mut s = Vec::new();
+        s.extend_from_slice(&(1u32 << 21).to_be_bytes()); // 超 1MiB 上限
+        assert!(matches!(read_startup_frame(&s), FrameParse::Invalid(_)));
+    }
+
+    #[test]
+    fn startup_frame_roundtrip() {
+        let mut p = 8u32.to_be_bytes().to_vec();
+        p.extend_from_slice(&[1, 2, 3, 4]);
+        let (n, payload) = expect_frame(read_startup_frame(&p));
+        assert_eq!(n, 8);
+        assert_eq!(payload, &[1, 2, 3, 4]);
+        assert_eq!(read_startup_frame(&p[..6]), FrameParse::NeedMore);
     }
 
     #[test]
@@ -615,15 +681,15 @@ mod tests {
             ],
         );
         // T / D / D / C 四帧
-        let (n1, t1, _) = read_frame(&out).unwrap();
+        let (n1, t1, _) = expect_frame(read_frame(&out));
         assert_eq!(t1, b'T');
-        let (n2, t2, _) = read_frame(&out[n1..]).unwrap();
+        let (n2, t2, _) = expect_frame(read_frame(&out[n1..]));
         assert_eq!(t2, b'D');
-        let (n3, t3, d2) = read_frame(&out[n1 + n2..]).unwrap();
+        let (n3, t3, d2) = expect_frame(read_frame(&out[n1 + n2..]));
         assert_eq!(t3, b'D');
         // NULL 单元 = -1 长度
         assert_eq!(&d2[d2.len() - 4..], (-1i32).to_be_bytes().as_slice());
-        let (_, t4, c) = read_frame(&out[n1 + n2 + n3..]).unwrap();
+        let (_, t4, c) = expect_frame(read_frame(&out[n1 + n2 + n3..]));
         assert_eq!(t4, b'C');
         assert!(c.starts_with(b"SELECT 2"));
     }
@@ -631,11 +697,11 @@ mod tests {
     #[test]
     fn error_and_ready() {
         let e = build_error("42601", "syntax error");
-        let (_, ty, p) = read_frame(&e).unwrap();
+        let (_, ty, p) = expect_frame(read_frame(&e));
         assert_eq!(ty, b'E');
         assert!(p.windows(6).any(|w| w == b"C42601"));
         let ready = build_ready();
-        let (_, ty, p) = read_frame(&ready).unwrap();
+        let (_, ty, p) = expect_frame(read_frame(&ready));
         assert_eq!((ty, p), (b'Z', b"I".as_slice()));
     }
 }

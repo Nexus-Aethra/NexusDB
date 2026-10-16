@@ -1,13 +1,15 @@
 # NexusDB 服务配置 (所有字段可省略, 缺省用默认值)
 
 [server]
-listen_addr = "0.0.0.0:5433"
+# ⚠️ 安全默认: 缺省只绑回环地址. 要对外暴露必须显式改 "0.0.0.0:PORT",
+#    并同时配置 redis_password / sql_password / http_token (下面三项缺省为空 = 免鉴权).
+listen_addr = "127.0.0.1:5433"
 worker_count = 2
-redis_addr = "0.0.0.0:6379"     # RESP (Redis 兼容) 监听地址, 空 = 禁用
-sql_addr = "0.0.0.0:5434"       # SQL 门面 (MySQL wire) 监听地址, 空 = 禁用
+redis_addr = "127.0.0.1:6379"   # RESP (Redis 兼容) 监听地址, 空 = 禁用
+sql_addr = "127.0.0.1:5434"     # SQL 门面 (MySQL wire) 监听地址, 空 = 禁用
 sql_worker_count = 1            # ⭐ 共享 worker 池下作参考 (实际线程数 = worker_count); 预留, 便于未来 per-protocol 池
-pg_addr = "0.0.0.0:5435"        # SQL 门面 (PostgreSQL wire) 监听地址, 空 = 禁用
-http_addr = "0.0.0.0:6778"      # REST 门面 (HTTP/1.1 JSON) 监听地址, 空 = 禁用
+pg_addr = "127.0.0.1:5435"      # SQL 门面 (PostgreSQL wire) 监听地址, 空 = 禁用
+http_addr = "127.0.0.1:6778"    # REST 门面 (HTTP/1.1 JSON) 监听地址, 空 = 禁用
 http_cors_origin = ""           # CORS Allow-Origin ("*" 或具体 origin, 空 = 不发 CORS 头)
 http_token = ""                 # REST Bearer token (空 = 免鉴权; /metrics /v1/status 恒免)
 sql_password = ""               # SQL 登录密码 (两门面共用), 空 = 免密

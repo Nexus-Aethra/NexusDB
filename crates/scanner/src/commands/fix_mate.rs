@@ -50,6 +50,8 @@ enum Mode {
     Auto,
 }
 
+// flag 组合参数 (vpid/page_idx/--fix/--dry-run...) 与业务无关, 收成 struct 反而多一层映射.
+#[allow(clippy::too_many_arguments)]
 pub fn run<W: Write>(
     globals: &Globals,
     vpid: Option<u64>,
@@ -64,7 +66,8 @@ pub fn run<W: Write>(
     let mode = if auto {
         if vpid.is_some() || page_idx.is_some() || file_id.is_some() || freed {
             return Err(ScannerError::InvalidFlags(
-                "--auto is mutually exclusive with --vpid / --page-idx / --file-id / --freed".into(),
+                "--auto is mutually exclusive with --vpid / --page-idx / --file-id / --freed"
+                    .into(),
             ));
         }
         Mode::Auto
@@ -152,7 +155,12 @@ pub fn run<W: Write>(
     };
 
     let planned: Vec<Edit> = match &mode {
-        Mode::Single { vpid, page_idx, file_id, freed } => {
+        Mode::Single {
+            vpid,
+            page_idx,
+            file_id,
+            freed,
+        } => {
             let slot = read_slot(&data, *vpid)?;
             let flags = if *freed { 0x08 } else { slot.flags() };
             vec![Edit {
@@ -164,7 +172,10 @@ pub fn run<W: Write>(
                     page_idx: *page_idx as u16,
                     flags,
                 },
-                reason: format!("explicit --vpid {} --page-idx {} --file-id {}", vpid, page_idx, file_id),
+                reason: format!(
+                    "explicit --vpid {} --page-idx {} --file-id {}",
+                    vpid, page_idx, file_id
+                ),
             }]
         }
         Mode::Auto => plan_auto(&data, block_bytes.as_deref().unwrap(), &mut out)?,
@@ -295,11 +306,7 @@ fn write_slot(data: &mut [u8], vpid: u64, slot: PidLocation) {
     data[off..off + 8].copy_from_slice(&bytes);
 }
 
-fn plan_auto<W: Write>(
-    data: &[u8],
-    block: &[u8],
-    out: &mut W,
-) -> Result<Vec<Edit>> {
+fn plan_auto<W: Write>(data: &[u8], block: &[u8], out: &mut W) -> Result<Vec<Edit>> {
     let mut edits = Vec::new();
     let slots = data.len() / 8;
     for vpid in 0..slots as u64 {

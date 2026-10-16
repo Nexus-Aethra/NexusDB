@@ -12,7 +12,6 @@ use thiserror::Error;
 // `InvalidFlags` is reserved for the strict-vs-tolerant validator and
 // `walk` flag checks; arrive with PR2+.
 #[allow(dead_code)]
-
 /// All errors that can be returned from scanner internals.
 #[derive(Debug, Error)]
 pub enum ScannerError {

@@ -339,9 +339,10 @@ impl StorageEngine {
         key: &[u8],
         kind: u8,
     ) -> Result<(), RegistryError> {
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let mut prefixes = vec![ks::data_prefix(kind, key)];
         if kind == ks::KIND_ZSET {
             prefixes.push(ks::zscore_prefix(key)); // score 索引行
@@ -357,7 +358,8 @@ impl StorageEngine {
         for pk in &pkeys {
             self.delete_physical(db, table, pk).await?;
         }
-        self.delete_physical(db, table, &ks::encode_type_meta(key)).await?;
+        self.delete_physical(db, table, &ks::encode_type_meta(key))
+            .await?;
         Ok(())
     }
 
@@ -499,9 +501,10 @@ impl StorageEngine {
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, RegistryError> {
         self.ensure_kind(db, table, key, ks::KIND_SET).await?;
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let prefix = ks::data_prefix(ks::KIND_SET, key);
         let mut found: Option<Vec<u8>> = None;
         crate::registry::table_scan_prefix(self.pager_mut(), root, &prefix, &mut |k, _v| {
@@ -522,9 +525,10 @@ impl StorageEngine {
         key: &[u8],
     ) -> Result<Vec<Vec<u8>>, RegistryError> {
         self.ensure_kind(db, table, key, ks::KIND_SET).await?;
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let prefix = ks::data_prefix(ks::KIND_SET, key);
         let mut members: Vec<Vec<u8>> = Vec::new();
         crate::registry::table_scan_prefix(self.pager_mut(), root, &prefix, &mut |k, _v| {
@@ -568,7 +572,10 @@ impl StorageEngine {
         Ok(self
             .get_physical(db, table, &ks::encode_data(ks::KIND_ZSET, key, member))
             .await?
-            .and_then(|v| v.get(..8).map(|b| f64::from_le_bytes(b.try_into().expect("8B")))))
+            .and_then(|v| {
+                v.get(..8)
+                    .map(|b| f64::from_le_bytes(b.try_into().expect("8B")))
+            }))
     }
 
     /// ZADD: 返回**新增**成员数 (已存在只更新 score). 双索引一致维护.
@@ -591,9 +598,7 @@ impl StorageEngine {
             .collect();
         let refs: Vec<&[u8]> = idx1s.iter().map(|k| k.as_slice()).collect();
         let olds = self.get_physical_many(db, table, &refs).await?;
-        let dec_score = |v: &[u8]| -> Option<f64> {
-            v.try_into().ok().map(f64::from_le_bytes)
-        };
+        let dec_score = |v: &[u8]| -> Option<f64> { v.try_into().ok().map(f64::from_le_bytes) };
         // member → 本批内最新已处理 score (覆盖旧盘上值)
         let mut last: std::collections::HashMap<&[u8], f64> = std::collections::HashMap::new();
         let mut score_bytes: Vec<[u8; 8]> = Vec::with_capacity(pairs.len());
@@ -667,9 +672,13 @@ impl StorageEngine {
         delta: f64,
         member: &[u8],
     ) -> Result<f64, RegistryError> {
-        let cur = self.zset_score(db, table, key, member).await?.unwrap_or(0.0);
+        let cur = self
+            .zset_score(db, table, key, member)
+            .await?
+            .unwrap_or(0.0);
         let new = cur + delta;
-        self.zset_add(db, table, key, &[(new, member.to_vec())]).await?;
+        self.zset_add(db, table, key, &[(new, member.to_vec())])
+            .await?;
         Ok(new)
     }
 
@@ -728,9 +737,10 @@ impl StorageEngine {
         table: &str,
         key: &[u8],
     ) -> Result<Vec<(Vec<u8>, f64)>, RegistryError> {
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let prefix = ks::zscore_prefix(key);
         let mut out: Vec<(Vec<u8>, f64)> = Vec::new();
         crate::registry::table_scan_prefix(self.pager_mut(), root, &prefix, &mut |k, _v| {
@@ -787,7 +797,10 @@ impl StorageEngine {
     ) -> Result<Vec<(Vec<u8>, f64)>, RegistryError> {
         self.ensure_kind(db, table, key, ks::KIND_ZSET).await?;
         let all = self.zset_ordered(db, table, key).await?;
-        Ok(all.into_iter().filter(|(_, sc)| *sc >= min && *sc <= max).collect())
+        Ok(all
+            .into_iter()
+            .filter(|(_, sc)| *sc >= min && *sc <= max)
+            .collect())
     }
 
     /// ZRANK / ZREVRANK: member 的排名 (0-based), None = 不存在.
@@ -881,9 +894,10 @@ impl StorageEngine {
         count: usize,
     ) -> Result<Vec<Vec<u8>>, RegistryError> {
         self.ensure_kind(db, table, key, ks::KIND_SET).await?;
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let prefix = ks::data_prefix(ks::KIND_SET, key);
         let mut out: Vec<Vec<u8>> = Vec::new();
         crate::registry::table_scan_prefix(self.pager_mut(), root, &prefix, &mut |k, _v| {

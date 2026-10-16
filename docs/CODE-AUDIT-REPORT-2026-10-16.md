@@ -1,0 +1,287 @@
+# NexusDB 全模块深度审计报告
+
+> 审查对象：`/home/wpp/nexus/NexusDB` @ `c4f9eaf`（main）+ 工作区未提交修复（约 +3865/−1570 行，含 2026-10-14 P0/C1-C6 修复）
+> 审查日期：2026-10-16　　审查方式：7 名分析员并行模块审计 + 交叉核对 [`CODE-AUDIT-REPORT.md`](./CODE-AUDIT-REPORT.md)（2026-10-13 版）条目现状 + 独立探针程序 release 模式实证
+> 本文档为审查产物，可随时移走或删除。**全程只读，未修改任何代码。**
+
+---
+
+## 摘要
+
+- **基线**：page crate 140 测试全绿；全库 clippy 0 警告；workspace 1074 个 `#[test]`。
+- **核实旧条目 24 项**：已修复 8（全部在工作区**未提交**）/ 部分修复 2 / 未修复 12 / 误报或过时 3。
+- **新发现：P0×4、P1×20、P2×40、P3×20**，其中 3 项经独立探针在 release 模式实证（标记【实证】）。
+- **最大风险类别是"静默降级"**：近半 P0/P1 不是崩溃而是"不报错但行为错误"——数据错了用户不知道。
+- **建议修复顺序**：P0 四项 → main.rs 退出路径丢数据 + UPDATE 置 NULL → 调度器死锁 → DoS hardening 批次 → 其余 P2。
+
+---
+
+## 一、既有审计条目现状核实
+
+### 1.1 ✅ 已修复（均为工作区未提交，存在丢失风险，建议尽快提交）
+
+| 条目 | 内容 | 证据 |
+|---|---|---|
+| C1 | PG 帧长度越界返回 None → 连接挂起 | 已改三态 `FrameParse`，带回归测试 |
+| C2 | `page_free_space` 用 `key_count/16` 差近 2 倍 | `header.rs` 统一为 `max(hdr.checkpoint_count, needed_checkpoint_count)`，探针验证有效 |
+| C4 | （详见原报告） | 已修复 |
+| C5 | 协议边界问题 | 已修复，带回归测试 |
+| C6 | （详见原报告） | 已修复 |
+| P2-11 | （详见原报告） | 已修复 |
+| P2-2 | "常量折叠全库无实现" | **审计报告自身过时**：`parser_where.rs:154-178`（常量比较短路）、`:382-455`（`fold_cond_arith`/`eval_const_bin`/`const_cmp`）已完整实现，e2e 测试 `tests/sql_e2e.rs:3456-3479` 覆盖 |
+
+### 1.2 ⚠️ 部分修复
+
+| 条目 | 已修部分 | 残留缺口 |
+|---|---|---|
+| C3 | `ItemPtr::new`（ptr.rs:39-41）、`LeafItemPtr::new`（ptr.rs:103-105）已改硬错误（新增 `PageError::NotSegmentHead`） | **`InternalItemPtr::new`（ptr.rs:171-175）仍为 debug_assert**——同一修复只做了 2/3，release 下 internal 段首校验失效 |
+| P0-4 | config 缺省改 127.0.0.1 + `warn_if_insecure_defaults()` 启动告警 | ① 空密码 + 回环地址 = 免鉴权可达；② 绑定具体外网 IP（非 0.0.0.0）不触发告警；③ Binary 协议 `auth_password: None` 硬编码绕过配置 |
+
+### 1.3 ❌ 未修复（仍存在）
+
+| 条目 | 现状证据 |
+|---|---|
+| P1-2 路由无 affinity | `manager.rs` DefaultHasher + 0 处 `sched_setaffinity`，DESIGN.md 宣称失准 |
+| P1-3 CHECK 约束静默丢弃 | `parser_ddl.rs:266-278`（表级）/ `:335-347`（列级）：`try_kw("CHECK")` 后括号深度计数直接吞掉表达式，注释 "v1 吞 (不强制约束)"，无警告无 AST |
+| P1-4 FK 父表缓存 miss 静默跳过 | `sql_fk.rs:53-56` 缓存 miss → `return false`（无日志）；`:61` 类型不匹配 → `return false`。**比原描述更严重**：FK 检查仅覆盖 INSERT，DELETE/UPDATE 完全无 RESTRICT 检查（`sql_dml.rs:181-198`） |
+| P1-6 `block_on_io` 自旋 | `manager.rs:1439-1455` 仍是 `Waker::noop` + spin（行号自 1436 漂移） |
+| P2-1 复合索引退化全表 | `sql_dispatch.rs:958-961`：`if idx.cols.len() != 1 { continue; }`——parser 把复合 UNIQUE 建成多列索引，执行层永远用不上 |
+| P2-4 协程 worker TLS | 半修：epoll 写缓冲已做；协程 worker TLS 两处残缺（见 2.2 节 P1-5/P1-6） |
+| P2-5 SchedHandle | **比原描述更严重**：`Clone + pub Rc` 破坏唯一所有权前提，clone 跨线程是真正 UB（非仅 API 误用） |
+| P2-6 | 未修复 |
+| P2-12 | `chunk_lock`/`travel_trees` 仍是死代码 |
+| P3-13 / P3-14 | 未修 |
+| P3-2/3/5/6/8/9/10/11 | 未修 |
+
+### 1.4 🚫 误报 / 描述需修正
+
+| 条目 | 结论 |
+|---|---|
+| P1-7 | **误报**（存储分析员逐条证伪） |
+| P2-2 | 审计报告自身过时（见 1.1，实现已存在） |
+| P3-15 空闲自旋 | 描述不准：shard 侧空闲实为 1024 轮自旋 + 10ms poll（非 100µs）；调度器 100µs 轮询仅存在于 `run()` 路径，生产用 `drive_until_idle` 无此问题 |
+
+---
+
+## 二、新发现问题
+
+严重度定义：P0 = 静默丢数据/数据错配；P1 = 服务崩溃/功能失效/数据破坏；P2 = 性能/一致性/健壮性缺陷；P3 = 低危或文档化建议。
+标记【实证】= 已由独立探针程序（/tmp，未触碰仓库）在 release 模式复现。
+
+### 2.1 🔴 P0 —— 静默丢数据 / 数据错配（4 项）
+
+#### [P0-1]【实证】internal_insert 缺空间预检，pre_split 静默写穿页结构，页永久损坏
+
+- **位置**：`crates/page/src/internal.rs:145-149`（无预检直接 pre_split）+ `crates/page/src/index.rs:327`（pre_split 的 `copy_within`）
+- **证据**：探针构造 600B 前缀 key 逐个插入 internal 页：第 319 个 key 后 `free_off=16373` **侵入 footer 区 [16368,16384)**，cp header 被覆盖成垃圾值 607，`PageIndex::load` 直接 `Err`——插入返回 `PageFull` 但页字节已损坏且不回滚。对照组（前缀 500/700/750B）则表现为 `copy_within` 越界 panic。
+- **根因**：`leaf_insert` 在 pre_split 前有 est 空间预检（`leaf.rs:274-292`，且 est 用整 key 长度恰好覆盖展开量），**internal_insert 完全没有对应预检**。这正是 `docs/bug-cold-start-data-loss.md` 记录的历史事故同一根因——leaf 修了、internal 没修。
+- **影响**：internal 页是 B 树父节点，损坏 = 整个子树不可访问；且静默发生（不 panic 的窗口），是最严重的静默丢数据路径。
+- **建议**：internal_insert 增加 est 预检（对齐 leaf.rs 模式）；更彻底的修法是 pre_split 只在内存 idx 层面预演、成功后再落字节，或失败时恢复页快照。
+
+#### [P0-2]【实证】leaf_update_with 慢路径缺空间检查，合法输入 panic
+
+- **位置**：`crates/page/src/leaf.rs:962-988`（974 行 `copy_within` 无空间检查）
+- **证据**：探针以 152 个 key 填满页后执行 `leaf_update(value: 100B → 4000B)`：4006B（key+value）≤ KvLimits 4060 上限，**完全合法**，release 下 panic `dest is out of bounds`。
+- **影响**：`btree_update` / registry `table_put` 覆盖写均走此路径——生产中一次大 value 覆盖写即崩溃服务。另存在窄窗口（约 cp_size+16 字节）静默覆盖 checkpoint 区而非 panic。
+- **建议**：慢路径 shift 前检查 `free_off + delta ≤ cp_start`，不足返回 `PageFull` 由上层走页分裂。
+
+#### [P0-3] strip_db_qual 静默改写跨库表名，数据串读
+
+- **位置**：`crates/network/src/protocol/sql/ast.rs:52-56` + `parser.rs:404`
+- **证据**：`db.tbl` 形式限定名被直接丢弃库名部分，取 `tbl` 在当前库解析，无报错无日志。
+- **影响**：`SELECT * FROM otherdb.users` 会静默查成**当前库的** `users` 表——若同名表存在，返回错误库的数据，客户端无法察觉；同时构成越权访问面。
+- **建议**：限定名与当前 db 不一致时显式报错（或按 db 路由）；至少打 WARN 日志。P0 定级理由：静默返回错误数据比报错危害更大。
+
+#### [P0-4] FK 级联 Decimal 编码不对称，级联删除静默失效
+
+- **位置**：`crates/network/src/worker/sql_cascade.rs:258-265` vs `sql_eval.rs:491-497`
+- **证据**：级联侧 `Decimal(x,_) => SqlValue::Str(format!("{x}"))` 产裸整数**无小数点**；匹配侧 `parse_decimal` 要求字符串含小数点。
+- **影响**：Decimal 主键/外键的 `ON DELETE CASCADE` 生成的 IN 条件永不匹配任何行——级联静默不生效，残留孤儿行，破坏引用完整性且无告警。
+- **建议**：编码侧统一走与 `sql_eval` 对称的可逆格式（固定 scale 字符串），补 Decimal 级联 e2e 测试。
+
+### 2.2 🟠 P1 —— 服务崩溃 / 功能失效 / 数据破坏（20 项）
+
+#### 存储层（storage）
+
+| # | 问题 | 位置 | 说明 |
+|---|---|---|---|
+| P1-1 | 驻留兜底吞 IO 错误用全零 chunk 覆盖 | `pager_write.rs:157` | `Err(_) => vec![0u8; CHUNK_SIZE]` —— IO 错误被吞后**全零页落盘覆盖历史数据**，静默丢数据 |
+| P1-2 | WAL replay 吞全部错误 | `engine.rs:458-461` | `Err(_) => skipped += 1`——段被 purge 后数据静默丢失，无日志 |
+| P1-3 | init_meta_page 以 truncate(true) 打开数据文件 | `engine.rs:299` | `000001.block` 以截断模式打开，特定条件（如 meta 判定失误）可清空全部数据 |
+
+#### 网络协议层（network 协议）
+
+| # | 问题 | 位置 | 说明 |
+|---|---|---|---|
+| P1-4 | 协程 worker TLS 完全不可用但可触发升级 | `worker_conn.rs:267-285` | PG SSLRequest 可触发 TLS 升级，但协程分支无 TLS 处理——密文被当明文解析，握手挂死 |
+| P1-5 | TLS 写路径 WouldBlock 自旋 | `tls.rs` | 单个慢客户端可拖死同 worker 全部连接 |
+| P1-6 | MySQL 续包累积无总长上限 | `mysql.rs:198-218` | `read_packet_full` 续包可无限累积 → 远程 OOM |
+
+#### SQL 引擎（network sql/worker）
+
+| # | 问题 | 位置 | 说明 |
+|---|---|---|---|
+| P1-7 | UPDATE SET 未知函数静默置 NULL | `parser_where.rs:528-545` | `UPDATE t SET c = SOMEFN(x)` 把整列刷成 NULL——**不可逆数据破坏**且用户以为执行了函数 |
+| P1-8 | UPDATE 算术无运算符优先级 | `parser_where.rs:568-586` | `SET a = a + 2 * 3` 按左结合算成 `(a+2)*3`——任何混合运算 UPDATE 都写坏数据；WHERE 侧 `fold_cond_arith`（:382-455）优先级正确，两处应统一 |
+| P1-9 | JOIN finish 大量 `.unwrap()` | `sql_join.rs:256/273-274/323-324/348-349/459` | worker 单线程事件循环，一处 panic 中断**所有连接**（等效全服 DoS） |
+| P1-10 | 深嵌套括号 parser 栈溢出 | `parser.rs:49` + `parse_or_expr→…→parse_primary` 递归链 | tokenize 与递归下降均无深度计数，数万个 `(` 即打满 8MB 栈——一条 SQL 远程 DoS |
+
+#### 分片层（shard_manager）
+
+| # | 问题 | 位置 | 说明 |
+|---|---|---|---|
+| P1-11 | shard 线程死亡后请求永久 park | `manager.rs` | 无超时、无断连感知——一个 shard 线程 panic 后对应数据面永久挂起 |
+| P1-12 | reply bus 满时 shard 线程自旋停摆 | `task_reply_bus.rs` | 消费端阻塞时生产端自旋，全 shard 吞吐归零 |
+| P1-13 | 2PC 无超时 + Commit 失败静默 Ok | `coordinator.rs`（`check_timeouts` 是死代码） | Prepare 挂起即永久挂起；Commit 阶段失败仍向客户端回成功 |
+| P1-14 | drain_async_flush 持续 IO 失败无限循环 | `manager.rs` | IO 故障下 flush 重试无上限无退避 |
+
+#### 调度层（scheduler + logging）
+
+| # | 问题 | 位置 | 说明 |
+|---|---|---|---|
+| P1-15 | poll_cqe! 消费他人 CQE 但不唤醒 | `io_ops.rs:43-53` vs `scheduler.rs:359-377` | `run()` 路径下 A 的 CQE 被 B 消费且 B 不唤醒 A → 调度线程永久死锁 |
+| P1-16 | Read/Write future drop 后 DMA 竞争 | `io_ops.rs` | future 取消后内核 DMA 仍在写 buffer，buffer 复用即数据竞争（**潜在 UB**） |
+| P1-17 | nlog 初始化失败 panic → 全局日志死锁连锁 | `logging/src/lib.rs` | 日志线程 panic 后 Error/Warn 满队自旋，拖死所有调用方 |
+
+#### 工具链（src/ scanner）
+
+| # | 问题 | 位置 | 说明 |
+|---|---|---|---|
+| P1-18 | 退出路径 shard final flush 永不执行 | `src/main.rs:479` | `Arc::try_unwrap(mgr)` 必失败（`sql_shared.cluster_ctl` 持有 mgr Arc）→ `close()` 被跳过 → shard 线程硬杀，nowchunks dirty data 丢失——**每次关机都丢**最近写入窗口的数据 |
+| P1-19 | scanner 三处遍历漏 internal 页 first_child | `scanner/src/tree.rs:233-235` 等 | internal 页 first_child 存于页头 vpid 字段（`page/src/internal.rs:49`，哨兵 child_vpid=0 应忽略），walk_tree/do_in_order/lookup 全部漏扫 → export 数据不完整；`walk_tree_in_order` 递归无环检测可栈溢出 |
+| P1-20 | fix-mate --auto 硬编码破坏 slot | `scanner/src/commands/fix_mate.rs` | 硬编码 `chunk_idx=0 / file_id=1`，非默认布局下修复工具本身写坏元数据 |
+
+### 2.3 🟡 P2 —— 性能 / 一致性 / 健壮性（40 项，择要按模块）
+
+#### page crate（10 项）
+
+| 问题 | 位置 | 说明 |
+|---|---|---|
+|【实证】PageIndex::load 前 4 段全量 decode | `index.rs:116-147` | debug 打印循环的 decode/full_key 计算在 release 也执行（有 Err 语义不可 DCE）——实测 **1.29µs/次**，热路径每次读页都付 |
+| checksum 从未实现 | `header.rs` 字段 vs 全 crate | 文档/lib.rs 宣称 `page_validate_checksum`，实际只有字段定义，`PageError::ChecksumMismatch` 无人返回 |
+| internal_split 无哨兵分支 item_count 多算 1 | `internal.rs`（无哨兵分支） | cp[0].item_count = left_kc + 1 假设哨兵存在，无哨兵页多算 1 |
+| bulk split 单段可超 32 | `leaf_split.rs:240-247` | right/left 重建为单段，item_count 可远超 MAX_PER_CHECKPOINT，违反"段 ≤ 32"不变量（性能退化 + free_space 估算失真）；split 重建的 `else { write_back }` 分支为死代码 |
+| read_checkpoint 损坏 count 下溢 panic | `checkpoint.rs:68/90` + `index.rs:48` | checkpoint_count ≥ 4093 的损坏页 → `hdr_off-(i+1)*4` usize 下溢 panic（release 也 panic） |
+| full_key shared 越界静默截断 | `item.rs:53` | `shared.min(prev_key.len())` 截断而非报错——损坏页静默错 key |
+| leaf_get_with 1000 步上限假 miss | `leaf.rs` | bulk split 大段连锁：段内超 1000 item 时错误返回 None |
+| internal_update 段首 target 破坏 shared=0 | `internal.rs:821-836` | leaf 同型 bug 已修（leaf.rs:922-931），internal 未修；当前无调用点故列 P2，一旦启用即触发 |
+| leaf_delete 冗余 O(N) 全页扫描 ×2 | `leaf.rs:458-462` | `target_prev_key` 计算后仅 debug 打印使用——每次删除白做一次全页扫描 |
+| ptr next 双重 decode | `ptr.rs:145-158/207-219` | `LeafItemPtr::next`/`InternalItemPtr::next` 每次 next 解码两次 |
+
+#### SQL 引擎（10 项）
+
+| 问题 | 位置 | 说明 |
+|---|---|---|
+| 事务读集仅覆盖 pk 点查 | `sql_dml.rs:683-750` | 范围扫描/全表 SELECT 不入 read_set → SERIALIZABLE OCC 失效，幻读/丢失更新 |
+| SELECT 结果集无内存护栏 | `sql_agg.rs:822-891` | ORDER BY 全量物化排序，对比 JOIN 有 JOIN_MAX_ROWS=262144——大表排序可 OOM |
+| UUID 列 IN >64 元素恒空集 | `sql_eval.rs`（eval_cond_leaf 二分分支） | 大集合二分路径不做 UUID 文本→16B 转换（线性路径做），同查询 64 元素正确、70 元素返回空——语义不一致 |
+| IndexUnion IN 界对 Decimal 无防护 | `sql_dispatch.rs:874-893` | 对比 `conds_to_scan_preds:753-756` 显式跳过 Decimal——混合 IN 界计算可得出错误区间 |
+| IN 子查询跨类型折叠恒 false | `sql_util.rs:268-293` + `sql_eval.rs:501` | 内外类型不一致时 `sql_cmp` 返回 None 按 false——静默空集 |
+| 恒假谓词短路返回错误列定义 | `sql_dml.rs:556-565` | `SELECT a,b FROM t WHERE 1=0` 返回单列空名 I64 结果集，列数与真实投影不符 |
+| 系统表全 Str schema + `__` 前缀恒真 | `sql_sysquery.rs:57-75` + `sql_eval.rs:412-419` | 数值比较退化为字符串比较；`__` 恒真规则混入通用 eval 路径 |
+| AVG(DECIMAL) 精度回退 f64 | `sql_agg.rs:554-558` | 金额均值出现浮点误差 |
+| 事务中 DDL 静默回 OK | `sql_dispatch.rs:234-252` | CREATE INDEX/DdlStub 落 stub 分支不执行不报错——客户端以为成功 |
+| JOIN cross 中间积无逐行检查 | `sql_join.rs:380-384` | JOIN_MAX_ROWS 检查在构建后，笛卡尔积中间过程可 OOM |
+
+#### 网络协议层（4 项）
+
+| 问题 | 位置 | 说明 |
+|---|---|---|
+| 无连接数上限 / idle 超时 | acceptor/worker | 连接可无限堆积 |
+| 认证无失败限速 | auth 路径 | 可暴力破解 |
+| prepared 语句注册表无上限 | worker sql state | 单连接可注册至 OOM |
+| SqlSharedRoutes 锁 expect 中毒即 panic | `sql_routes.rs` | RwLock 中毒直接 panic |
+
+#### 分片层（4 项）
+
+| 问题 | 位置 | 说明 |
+|---|---|---|
+| 双 inbox 无全序 | `task_inbox.rs`/`inbox.rs` | 同源消息跨 inbox 无顺序保证 |
+| WAL strict barrier 失败仍回成功 | `manager.rs` | 持久化失败不影响回复——违背 strict 语义 |
+| 无 Drop RAII | `manager.rs` | main.rs close 不执行的 crate 侧根因 |
+| DefaultHasher 三份拷贝 | `router.rs:40`/`manager.rs:1382-1389`/`resp_dispatch.rs:62-69` | 无跨版本稳定性契约 + 逻辑三处复制，漂移风险 |
+
+#### 调度层（3 项）
+
+| 问题 | 位置 | 说明 |
+|---|---|---|
+| SchedHandle Clone+pub Rc | `task.rs` | 破坏唯一所有权前提，clone 跨线程是真 UB（原审计 P2-5 升级确认） |
+| flush_uring 忙轮询 | `logging/src/lib.rs` | 烧 CPU |
+| 协程 panic 无隔离 | `scheduler.rs` | panic 穿透调度线程拖死同线程全部协程 |
+
+#### 存储层（3 项）
+
+| 问题 | 位置 | 说明 |
+|---|---|---|
+| meta_cache flush_dirty in-flight 前置仅 debug_assert | `meta_cache.rs` | release 下并发写同磁盘 offset 风险 |
+| pid.page_idx() u16→u8 截断 panic | `types.rs` | 页索引超 255 截断 |
+| recover 固定共享临时文件 | `recover.rs:130` | `/tmp/nexus_recover_empty.mate` 固定路径，多实例互踩 |
+
+#### 工具链（2 项）
+
+| 问题 | 位置 | 说明 |
+|---|---|---|
+| scanner 只处理第一个 shard | `scanner/src/` 全部命令 | 默认 6 shard 只救 1/6 数据 |
+| --strict/--tolerant 均为无效 flag | `scanner/src/` | 解析后从不读取 |
+
+#### 其他（4 项，原综合汇报 P2 清单剩余项归入各模块上述表格）
+
+### 2.4 ⚪ P3 —— 低危 / 文档化建议（20 项，简列）
+
+- logging 违反"不引入 crossbeam"契约（AGENTS.md 明令，实际依赖 crossbeam-queue 0.3）
+- varint 第 5 字节非规范编码静默截断（`varint.rs`）
+- lib.rs `#![allow(dead_code)]` 全 crate 豁免，掩盖 `pre_merge_segment`（逻辑版）等死代码
+- LIKE `_` 通配符被当字面量处理，中缀模式静默空集而非报错（`parser_where.rs:253-297`）
+- RETURNING / CREATE INDEX（非事务路径）吞掉回 OK（`parser_where.rs:487-491` / `sql_dispatch.rs:246`）
+- `eval_col_default` 非 UUID 列 uuid_generate_v4() 注释"保守报错"实际静默产 16B Bytes
+- CURRENT_DATE/CURRENT_TIME 统一返回 now 微秒 Timestamp，列名 "now"——语义偏差
+- SysVarStub transaction_isolation 固定返回 "READ-COMMITTED"，信息失真
+- `SELECT 1` 顶层字面量投影不支持（`parser_select.rs:492-494`，仅 `!top` 上下文放行——存活探针常用语句）
+- 空字符串不能作主键（`sql_pk_bytes` 非空校验）
+- 顶层 `SELECT <literal>`、UNION、窗口函数、GROUP_CONCAT、列列比较、WHERE 函数调用等缺口（多为文档化设计取舍，建议集中标注）
+- scanner dump 切片可越界（free_off > page.len 时）
+- 16KB 栈缓冲多处（`try_bulk_leaf_split` 等），深 async 链栈压（已有 RUST_MIN_STACK 缓解惯例）
+- `encode_leaf_item` buf 边界依赖调用方 KvLimits 约束，crate 级无保护、文档未写明
+- dump/调试工具若干小问题（略）
+
+---
+
+## 三、正面确认（澄清审计盲区）
+
+1. **参数绑定无 SQL 注入面**：`bind_params`（`parser.rs:832-880`）是结构化 `SqlValue::Param(i) → params[i]` 替换，发生在 tokenize 之后，**不是文本拼接**——注入面已杜绝。
+2. **常量折叠已实现**：见 1.1 节 P2-2，审计报告该条目过时。
+3. **C3 段首硬校验有效**：探针构造损坏页（段首 shared=1）被 `PageError::NotSegmentHead` 正确拦截——修复本身工作正常（仅 InternalItemPtr 遗漏，见 1.2）。
+4. **资源护栏意识良好**：JOIN_MAX_ROWS=262144 / SUBQ_IN_MAX=65536 / TXN_MAX_OPS=8192 / AGG_MAX_GROUPS=64K / IN_INDEX_MAX_SET=32——大部分路径有界，缺口集中在 SELECT 物化与协议入口（见 P2 表）。
+
+---
+
+## 四、系统性模式与修复路线建议
+
+### 4.1 三个跨模块共性模式
+
+1. **静默降级是最大风险类别**（近半 P0/P1）：CHECK 吞掉、FK 跳过、跨库表名改写、未知函数置 NULL、Decimal 级联永不匹配、PageFull 后页损坏……共同点是"不报错但行为错误"，在数据库里比 panic 危害更大——数据错了用户不知道。
+   **建议确立统一原则：凡未实现的语法/约束/失败路径，一律显式报错，禁止静默吞。**
+2. **修复不对称**：同一根因修了一半——leaf 有预检/internal 没有（P0-1）、epoll TLS 修了/协程没修（P1-4）、ItemPtr 修了/InternalItemPtr 没修（C3 残留）、storage 有 flush/main.rs 退出路径没有（P1-18）。
+   **建议按根因（而非表象）建立修复清单，每修一处全库 grep 同型。**
+3. **单线程 worker 无 panic 隔离 + 多个无上限资源**：parser 深递归（P1-10）、MySQL 续包（P1-6）、prepared 注册表、SELECT 物化——共同构成远程 DoS 面。
+   **建议合并为一个 hardening 批次：递归深度上限 + 各类资源上限 + 每查询 catch_unwind。**
+
+### 4.2 建议修复顺序
+
+| 批次 | 内容 | 理由 |
+|---|---|---|
+| 0 | **提交当前工作区** | 已验证的 C1-C6/P0-4 修复未提交，任何误操作即丢失 |
+| 1 | P0-1 / P0-2（page 层两项，已实证）+ P0-3 / P0-4（SQL 静默错数据） | 静默丢数据/错数据最高危 |
+| 2 | P1-18（每次关机丢数据）+ P1-7/P1-8（UPDATE 数据破坏） | 高频路径数据破坏 |
+| 3 | P1-15/P1-16/P1-17（调度死锁/UB）+ P1-11/P1-13（分片挂起） | 稳定性 |
+| 4 | DoS hardening 批次（P1-4/5/6/9/10 + 各资源上限） | 一次性收敛远程 DoS 面 |
+| 5 | 其余 P2 按模块分批 | 性能与一致性打磨 |
+
+---
+
+## 附：审计方法与团队
+
+- 7 名分析员并行：存储 / 网络协议 / SQL 引擎 / 分片管理 / page 页层 / 调度器 / 工具链，各自产出模块报告并逐项核实旧条目。
+- page 层分析员额外编写独立探针程序（位于 /tmp，依赖工作区版本 page crate，未修改仓库），在 debug + release 双模式实证 P0-1、P0-2、PageIndex::load 性能损耗及 C3 修复有效性。
+- 本报告由团队 leader 综合各模块报告交叉核对后产出；模块级完整报告存于分析员会话记录。
+- 全程只读：本次审计未修改任何源码文件。

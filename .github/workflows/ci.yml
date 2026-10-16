@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # e2e 测试写临时库, 且链接器需要可写的临时目录 (见 AGENTS.md "跑测试必加 TMPDIR").
+  # 仓库内路径比 /tmp 更可预测, 避免受限沙箱下 /tmp 写入失败导致假失败.
+  TMPDIR: ${{ github.workspace }}/target/nxtmp
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 准备 TMPDIR
+        run: mkdir -p "$TMPDIR"
+      # 禁止"仅 lib"式绿灯: 必须覆盖测试代码 (--all-targets),
+      # 否则 src/lib.rs 里的单测代码不会被 lint 到 (P0-1 即由此漏网).
+      # 用 -D warnings 把警告也当错误: 基线已清零 (0 warning / 0 error).
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    # 全量串行回归约 5-8 分钟; 留足余量, 超时按失败处理 (宁可红也不挂死).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 部分 e2e (socket / io_uring / shard 多线程) 需要 linux 原生能力.
+      - name: 准备 TMPDIR
+        run: mkdir -p "$TMPDIR"
+      - name: 探测 io_uring 可用性
+        run: |
+          if [ -e /proc/sys/kernel/io_uring_disabled ] && [ "$(cat /proc/sys/kernel/io_uring_disabled)" = "2" ]; then
+            echo "::warning::io_uring 被内核禁用, 相关用例将走 stdfs 回退"
+          fi
+      # --test-threads=1: e2e 各自拉起多 shard StorageEngine, 并行时引擎初始化
+      # 会耗尽有界资源并导致 2PC 协调器 hang (AGENTS.md 会话十六记录).
+      # 串行是当前唯一已验证可跑通的组合.
+      - name: cargo test (串行)
+        run: cargo test --workspace --no-fail-fast -- --test-threads=1

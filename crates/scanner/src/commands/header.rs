@@ -11,19 +11,20 @@ use crate::cli::Globals;
 use crate::dir;
 use crate::error::Result;
 use crate::output::{
-    ColumnName, HumanRow, JsonObject, format_vpid, human_header, human_row, json_row,
+    format_vpid, human_header, human_row, json_row, ColumnName, HumanRow, JsonObject,
 };
 use crate::page_io;
 use crate::pid::Locate;
 
 pub fn run<W: Write>(globals: &Globals, vpid: u64, neighbors: bool, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let coord = locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic)?;
@@ -191,11 +192,7 @@ fn emit_bad<W: Write>(out: &mut W, globals: &Globals, vpid: u64, read: &page_io:
         page_io::PageRead::BlockFileMissing { file_id } => {
             format!("block file {file_id}.block missing")
         }
-        page_io::PageRead::BlockFileTruncated {
-            file_id,
-            size,
-            ..
-        } => {
+        page_io::PageRead::BlockFileTruncated { file_id, size, .. } => {
             format!("block {file_id} truncated (size={size})")
         }
         page_io::PageRead::IoError { source, .. } => format!("io error: {source}"),

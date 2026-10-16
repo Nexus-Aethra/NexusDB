@@ -174,7 +174,10 @@ pub fn encode_row(schema: &TableSchema, values: &[ColValue]) -> Result<Vec<u8>, 
             }
             (ColType::I64, ColValue::I64(_)) | (ColType::F64, ColValue::F64(_)) => {}
             // ⭐ F80: Bool/Date/Time/Timestamp 以 i64 承载 (定长 8B)
-            (ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp, ColValue::I64(_)) => {}
+            (
+                ColType::Bool | ColType::Date | ColType::Time | ColType::Timestamp,
+                ColValue::I64(_),
+            ) => {}
             (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b)) => {
                 var_total += b.len()
             }
@@ -325,7 +328,9 @@ pub fn read_col(schema: &TableSchema, bytes: &[u8], col: u16) -> Result<ColValue
     } else {
         bytes.len() - data_at
     };
-    let slice = bytes.get(data_at + start..data_at + end).ok_or(RowError::Corrupt)?;
+    let slice = bytes
+        .get(data_at + start..data_at + end)
+        .ok_or(RowError::Corrupt)?;
     // ⭐ F81: Decimal 变长承载 16B i128; scale 由 schema 列恢复 (自描述值)
     if let ColType::Decimal { scale, .. } = ty {
         let raw: [u8; 16] = slice.try_into().map_err(|_| RowError::Corrupt)?;
@@ -342,15 +347,44 @@ mod tests {
     fn schema() -> TableSchema {
         TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
-                Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
-                Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
-                Column { name: "blob".into(), ty: ColType::Bytes, nullable: true, default: None },
-                Column { name: "note".into(), ty: ColType::Str, nullable: true, default: None },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "name".into(),
+                    ty: ColType::Str,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "score".into(),
+                    ty: ColType::F64,
+                    nullable: true,
+                    default: None,
+                },
+                Column {
+                    name: "blob".into(),
+                    ty: ColType::Bytes,
+                    nullable: true,
+                    default: None,
+                },
+                Column {
+                    name: "note".into(),
+                    ty: ColType::Str,
+                    nullable: true,
+                    default: None,
+                },
             ],
             0,
             &[1, 2],
-            &[], &[], &[], &[])
+            &[],
+            &[],
+            &[],
+            &[],
+        )
         .unwrap()
     }
 
@@ -369,7 +403,10 @@ mod tests {
         assert_eq!(decode_row(&s, &bytes).unwrap(), vals);
         // 单列读
         assert_eq!(read_col(&s, &bytes, 0).unwrap(), ColValue::I64(42));
-        assert_eq!(read_col(&s, &bytes, 3).unwrap(), ColValue::Bytes(b"\x00\x01\xFF".to_vec()));
+        assert_eq!(
+            read_col(&s, &bytes, 3).unwrap(),
+            ColValue::Bytes(b"\x00\x01\xFF".to_vec())
+        );
         assert_eq!(read_col(&s, &bytes, 4).unwrap(), ColValue::Bytes(vec![]));
     }
 
@@ -387,7 +424,10 @@ mod tests {
         assert_eq!(decode_row(&s, &bytes).unwrap(), vals);
         assert_eq!(read_col(&s, &bytes, 2).unwrap(), ColValue::Null);
         assert_eq!(read_col(&s, &bytes, 3).unwrap(), ColValue::Null);
-        assert_eq!(read_col(&s, &bytes, 4).unwrap(), ColValue::Bytes(b"x".to_vec()));
+        assert_eq!(
+            read_col(&s, &bytes, 4).unwrap(),
+            ColValue::Bytes(b"x".to_vec())
+        );
         // NULL 省空间: 比全填版本短
         let full = encode_row(
             &s,
@@ -407,7 +447,10 @@ mod tests {
     fn validation_errors() {
         let s = schema();
         // 列数不符
-        assert_eq!(encode_row(&s, &[ColValue::I64(1)]), Err(RowError::ArityMismatch));
+        assert_eq!(
+            encode_row(&s, &[ColValue::I64(1)]),
+            Err(RowError::ArityMismatch)
+        );
         // NOT NULL 违约
         let e = encode_row(
             &s,
@@ -464,20 +507,49 @@ mod tests {
         // 旧 schema: 3 列 (id I64 pk, name Str, age I64)
         let old = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
-                Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
-                Column { name: "age".into(), ty: ColType::I64, nullable: true, default: None },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "name".into(),
+                    ty: ColType::Str,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "age".into(),
+                    ty: ColType::I64,
+                    nullable: true,
+                    default: None,
+                },
             ],
-            0, &[], &[], &[], &[], &[],
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(old.version, 1);
-        let old_vals = vec![ColValue::I64(7), ColValue::Bytes(b"bob".to_vec()), ColValue::I64(30)];
+        let old_vals = vec![
+            ColValue::I64(7),
+            ColValue::Bytes(b"bob".to_vec()),
+            ColValue::I64(30),
+        ];
         let old_bytes = encode_row(&old, &old_vals).unwrap();
 
         // ADD COLUMN email Str (nullable) → version 2, 4 列
         let new = old
-            .with_added_column(Column { name: "email".into(), ty: ColType::Str, nullable: true, default: None })
+            .with_added_column(Column {
+                name: "email".into(),
+                ty: ColType::Str,
+                nullable: true,
+                default: None,
+            })
             .unwrap();
         assert_eq!(new.version, 2);
         assert_eq!(new.version_ncols, vec![3, 4]);
@@ -494,7 +566,10 @@ mod tests {
             ]
         );
         assert_eq!(read_col(&new, &old_bytes, 3).unwrap(), ColValue::Null);
-        assert_eq!(read_col(&new, &old_bytes, 1).unwrap(), ColValue::Bytes(b"bob".to_vec()));
+        assert_eq!(
+            read_col(&new, &old_bytes, 1).unwrap(),
+            ColValue::Bytes(b"bob".to_vec())
+        );
 
         // 新行 (version 2, 带 email) 编解码完整
         let new_vals = vec![
@@ -518,25 +593,62 @@ mod tests {
     fn f80_new_types_roundtrip() {
         let s = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
-                Column { name: "active".into(), ty: ColType::Bool, nullable: false, default: None },
-                Column { name: "d".into(), ty: ColType::Date, nullable: true, default: None },
-                Column { name: "t".into(), ty: ColType::Time, nullable: true, default: None },
-                Column { name: "ts".into(), ty: ColType::Timestamp, nullable: true, default: None },
-                Column { name: "meta".into(), ty: ColType::Json, nullable: true, default: None },
-                Column { name: "uid".into(), ty: ColType::Uuid, nullable: true, default: None },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "active".into(),
+                    ty: ColType::Bool,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "d".into(),
+                    ty: ColType::Date,
+                    nullable: true,
+                    default: None,
+                },
+                Column {
+                    name: "t".into(),
+                    ty: ColType::Time,
+                    nullable: true,
+                    default: None,
+                },
+                Column {
+                    name: "ts".into(),
+                    ty: ColType::Timestamp,
+                    nullable: true,
+                    default: None,
+                },
+                Column {
+                    name: "meta".into(),
+                    ty: ColType::Json,
+                    nullable: true,
+                    default: None,
+                },
+                Column {
+                    name: "uid".into(),
+                    ty: ColType::Uuid,
+                    nullable: true,
+                    default: None,
+                },
             ],
             0,
             &[],
             &[],
-            &[], &[], &[],
+            &[],
+            &[],
+            &[],
         )
         .unwrap();
         let vals = vec![
             ColValue::I64(1),
-            ColValue::I64(1),                                // bool true
-            ColValue::I64(19_737 * 86_400_000_000),          // 某天 (micros)
-            ColValue::I64(37_800_000_000),                   // 10:30:00
+            ColValue::I64(1),                       // bool true
+            ColValue::I64(19_737 * 86_400_000_000), // 某天 (micros)
+            ColValue::I64(37_800_000_000),          // 10:30:00
             ColValue::I64(19_737 * 86_400_000_000 + 37_800_000_000),
             ColValue::Bytes(br#"{"a":1}"#.to_vec()),
             ColValue::Bytes(vec![0u8; 16]),
@@ -545,10 +657,19 @@ mod tests {
         assert_eq!(decode_row(&s, &bytes).unwrap(), vals);
         // 定长承载列单读
         assert_eq!(read_col(&s, &bytes, 1).unwrap(), ColValue::I64(1));
-        assert_eq!(read_col(&s, &bytes, 3).unwrap(), ColValue::I64(37_800_000_000));
+        assert_eq!(
+            read_col(&s, &bytes, 3).unwrap(),
+            ColValue::I64(37_800_000_000)
+        );
         // 变长承载列单读
-        assert_eq!(read_col(&s, &bytes, 5).unwrap(), ColValue::Bytes(br#"{"a":1}"#.to_vec()));
-        assert_eq!(read_col(&s, &bytes, 6).unwrap(), ColValue::Bytes(vec![0u8; 16]));
+        assert_eq!(
+            read_col(&s, &bytes, 5).unwrap(),
+            ColValue::Bytes(br#"{"a":1}"#.to_vec())
+        );
+        assert_eq!(
+            read_col(&s, &bytes, 6).unwrap(),
+            ColValue::Bytes(vec![0u8; 16])
+        );
         // NULL 时间列
         let vals2 = vec![
             ColValue::I64(2),
@@ -568,10 +689,18 @@ mod tests {
     fn f81_decimal_roundtrip() {
         let s = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
                 Column {
                     name: "amt".into(),
-                    ty: ColType::Decimal { precision: 18, scale: 2 },
+                    ty: ColType::Decimal {
+                        precision: 18,
+                        scale: 2,
+                    },
                     nullable: false,
                     default: None,
                 },
@@ -583,7 +712,10 @@ mod tests {
                 },
                 Column {
                     name: "big".into(),
-                    ty: ColType::Decimal { precision: 38, scale: 4 },
+                    ty: ColType::Decimal {
+                        precision: 38,
+                        scale: 4,
+                    },
                     nullable: true,
                     default: None,
                 },
@@ -591,19 +723,27 @@ mod tests {
             0,
             &[],
             &[],
-            &[], &[], &[],
+            &[],
+            &[],
+            &[],
         )
         .unwrap();
         let vals = vec![
             ColValue::I64(1),
-            ColValue::Decimal(12345, 2),                    // 123.45
+            ColValue::Decimal(12345, 2), // 123.45
             ColValue::Bytes(b"x".to_vec()),
-            ColValue::Decimal(-98765432100000i128, 4),      // 负大数
+            ColValue::Decimal(-98765432100000i128, 4), // 负大数
         ];
         let bytes = encode_row(&s, &vals).unwrap();
         assert_eq!(decode_row(&s, &bytes).unwrap(), vals);
-        assert_eq!(read_col(&s, &bytes, 1).unwrap(), ColValue::Decimal(12345, 2));
-        assert_eq!(read_col(&s, &bytes, 3).unwrap(), ColValue::Decimal(-98765432100000i128, 4));
+        assert_eq!(
+            read_col(&s, &bytes, 1).unwrap(),
+            ColValue::Decimal(12345, 2)
+        );
+        assert_eq!(
+            read_col(&s, &bytes, 3).unwrap(),
+            ColValue::Decimal(-98765432100000i128, 4)
+        );
         // NULL decimal
         let vals2 = vec![
             ColValue::I64(2),
@@ -616,7 +756,19 @@ mod tests {
         // FMT_VER4: schema 编解码保 precision/scale
         let re = TableSchema::decode(&s.encode()).unwrap();
         assert_eq!(re, s);
-        assert_eq!(re.columns[1].ty, ColType::Decimal { precision: 18, scale: 2 });
-        assert_eq!(re.columns[3].ty, ColType::Decimal { precision: 38, scale: 4 });
+        assert_eq!(
+            re.columns[1].ty,
+            ColType::Decimal {
+                precision: 18,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            re.columns[3].ty,
+            ColType::Decimal {
+                precision: 38,
+                scale: 4
+            }
+        );
     }
 }

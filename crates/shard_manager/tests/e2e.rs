@@ -29,7 +29,8 @@ fn shard_manager_put_get_delete() {
     // put
     mgr.put("default", "users", b"alice", b"v1", 0)
         .expect("put alice");
-    mgr.put("default", "users", b"bob", b"v2", 0).expect("put bob");
+    mgr.put("default", "users", b"bob", b"v2", 0)
+        .expect("put bob");
 
     // get
     let v = mgr.get("default", "users", b"alice", 0).expect("get alice");

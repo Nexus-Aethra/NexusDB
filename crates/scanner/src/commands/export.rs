@@ -16,18 +16,25 @@ use std::io::Write;
 use crate::cli::Globals;
 use crate::dir;
 use crate::error::Result;
-use crate::output::{HumanRow, human_row};
+use crate::output::{human_row, HumanRow};
 use crate::pid::Locate;
 use crate::tree;
 
-pub fn run<W: Write>(globals: &Globals, tree_root: u64, format: ExportFormat, skip_bad: bool, mut out: W) -> Result<u8> {
+pub fn run<W: Write>(
+    globals: &Globals,
+    tree_root: u64,
+    format: ExportFormat,
+    skip_bad: bool,
+    mut out: W,
+) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let out_rc = RefCell::new(&mut out);
@@ -57,13 +64,19 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, format: ExportFormat, sk
     let skipped = (summary.bad + summary.unread) as u64;
 
     if skipped > 0 {
-        let row = HumanRow::new()
-            .field(format!("[BAD-PAGE-SKIPPED] {} bad pages, {} unreadable", summary.bad, summary.unread));
+        let row = HumanRow::new().field(format!(
+            "[BAD-PAGE-SKIPPED] {} bad pages, {} unreadable",
+            summary.bad, summary.unread
+        ));
         human_row(&mut out, &row).ok();
     }
 
     if rc == 0 && skipped > 0 {
-        writeln!(&mut out, "export: zero rows emitted (all pages were bad or unreadable)").ok();
+        writeln!(
+            &mut out,
+            "export: zero rows emitted (all pages were bad or unreadable)"
+        )
+        .ok();
         Ok(1)
     } else {
         Ok(0)

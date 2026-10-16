@@ -38,7 +38,9 @@ use crate::pager_io::PagerIo;
 use crate::recover::{recover, recover_for_shard, shard_dir_path};
 use crate::registry::{DbHandle, DbRegistry, RegistryError};
 use crate::table_directory::TableDirectory;
-use crate::types::{DEFAULT_DB_ID, DEFAULT_DB_NAME, DEFAULT_SHARD_ID, DbId, IoBackend, IoBackendConfig, PAGE_SIZE};
+use crate::types::{
+    DEFAULT_DB_ID, DEFAULT_DB_NAME, DEFAULT_SHARD_ID, DbId, IoBackend, IoBackendConfig, PAGE_SIZE,
+};
 
 // =====================================================================
 // OpenOptions
@@ -144,7 +146,8 @@ pub struct StorageEngine {
     /// 只增不减 — 用于纯 String 表跳过热路径类型探测 (SET purge / GET-miss
     /// WRONGTYPE); false positive 无害 (仅多一次点查), 开库时由
     /// `rebuild_composite_counts` 从 `[#]` meta 行重建.
-    pub(crate) composite_tables: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    pub(crate) composite_tables:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// ⭐ Q1 (SQL 索引): table schema 常驻镜像 ((db, table) → schema).
     /// write-through: set_schema 先落 `[$]` 行再更新; lazy load (首次 get miss
     /// 时读 `[$]` 行); 无 schema 行 = 纯 KV 表 (缓存 None 免重复探盘).
@@ -152,7 +155,8 @@ pub struct StorageEngine {
     /// ⭐ Y1 (布隆剪枝): 每 (db, table, iid) 一个本地索引 bloom.
     /// 等值 IndexScan 快速拒绝; set_schema 建空 bloom, row_put 喂值,
     /// 开库随 rebuild_composite_counts 扫 [I] 前缀重建 (永不假阴性).
-    pub(crate) index_blooms: std::collections::HashMap<(String, String, u32), crate::index_bloom::IndexBloom>,
+    pub(crate) index_blooms:
+        std::collections::HashMap<(String, String, u32), crate::index_bloom::IndexBloom>,
     /// ⭐ Y1: 剪枝命中计数 (等值扫被 bloom 短路的次数; 测试/观测用).
     pub bloom_skip_count: u64,
     /// ⭐ WAL (F60): per-shard 预写日志 (None = Off 档 / 重放期间).
@@ -196,9 +200,10 @@ impl StorageEngine {
 
     /// ⭐ Q1: schema 镜像写 (write-through 的内存侧; caller 先保证 `[$]` 行已落).
     pub(crate) fn schema_cache_put(&mut self, db: &str, table: &str, slot: SchemaSlot) {
-        self.schemas.insert((db.to_string(), table.to_string()), slot);
+        self.schemas
+            .insert((db.to_string(), table.to_string()), slot);
     }
-    
+
     /// ⭐ Y1: 确保 (db, table, iid) 的 bloom 存在并返回可变引用.
     pub(crate) fn bloom_entry(
         &mut self,
@@ -210,7 +215,7 @@ impl StorageEngine {
             .entry((db.to_string(), table.to_string(), iid))
             .or_default()
     }
-    
+
     /// ⭐ Y1: 等值剪枝判定 — Some(false) = bloom 断言不存在 (可短路);
     /// 无条目 → true (不剪枝, 正常扫).
     pub(crate) fn bloom_may_contain(&self, db: &str, table: &str, iid: u32, val: &[u8]) -> bool {
@@ -387,13 +392,18 @@ impl StorageEngine {
         engine.load_stats();
         // ⭐ U3: 从 data 行重建复合结构计数 (修复 crash 中 meta count 漂移).
         engine.rebuild_composite_counts().await.map_err(|e| {
-            StorageError::Io(std::io::Error::other(format!("rebuild_composite_counts: {e}")))
+            StorageError::Io(std::io::Error::other(format!(
+                "rebuild_composite_counts: {e}"
+            )))
         })?;
         // ⭐ WAL (F60): 重放现存段 (填补上次 crash 的刷盘窗口), 完成后删段并
         // 启用新 WalWriter. 段目录: compat 模式用 block_dir, 否则 block_root 根.
         if opts.wal_mode != crate::wal::WalMode::Off {
-            let wal_dir =
-                if let Some(bd) = &opts.block_dir { bd.clone() } else { block_root.clone() };
+            let wal_dir = if let Some(bd) = &opts.block_dir {
+                bd.clone()
+            } else {
+                block_root.clone()
+            };
             let segs = crate::wal::WalWriter::existing_segments(&wal_dir, shard_id);
             if !segs.is_empty() {
                 engine.replay_wal_segments(&segs).await;
@@ -424,7 +434,9 @@ impl StorageEngine {
         let mut applied = 0u64;
         let mut skipped = 0u64;
         for seg in segs {
-            let Ok(data) = std::fs::read(seg) else { continue };
+            let Ok(data) = std::fs::read(seg) else {
+                continue;
+            };
             for rec in crate::wal::decode_records(&data) {
                 let r = match &rec.value {
                     Some(v) => {
@@ -434,7 +446,9 @@ impl StorageEngine {
                             skipped += 1;
                             continue;
                         }
-                        self.put_physical(&rec.db, &rec.table, &rec.pkey, v).await.map(|_| ())
+                        self.put_physical(&rec.db, &rec.table, &rec.pkey, v)
+                            .await
+                            .map(|_| ())
                     }
                     None => self
                         .delete_physical(&rec.db, &rec.table, &rec.pkey)
@@ -448,7 +462,9 @@ impl StorageEngine {
             }
         }
         if applied + skipped > 0 {
-            eprintln!("[storage] WAL replay: {applied} applied, {skipped} skipped (stale db/table)");
+            eprintln!(
+                "[storage] WAL replay: {applied} applied, {skipped} skipped (stale db/table)"
+            );
         }
     }
 
@@ -498,7 +514,9 @@ impl StorageEngine {
 
     /// 当前 WAL 档位 (Off = 未启用).
     pub fn wal_mode(&self) -> crate::wal::WalMode {
-        self.wal.as_ref().map_or(crate::wal::WalMode::Off, |w| w.mode())
+        self.wal
+            .as_ref()
+            .map_or(crate::wal::WalMode::Off, |w| w.mode())
     }
 
     /// 有未持久化的 WAL 内容 (strict 档回复前判断是否需 barrier).
@@ -519,8 +537,7 @@ impl StorageEngine {
         const WAL_SYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
         match self.wal.as_mut() {
             Some(w)
-                if w.mode() == crate::wal::WalMode::Periodic
-                    && w.periodic_due(WAL_SYNC_PERIOD) =>
+                if w.mode() == crate::wal::WalMode::Periodic && w.periodic_due(WAL_SYNC_PERIOD) =>
             {
                 w.flush_and_sync().await
             }

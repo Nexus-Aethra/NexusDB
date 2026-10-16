@@ -10,18 +10,21 @@ use std::io::Write;
 use crate::cli::Globals;
 use crate::dir;
 use crate::error::Result;
-use crate::output::{ColumnName, HumanRow, JsonObject, format_vpid, human_header, human_row, json_row};
+use crate::output::{
+    format_vpid, human_header, human_row, json_row, ColumnName, HumanRow, JsonObject,
+};
 use crate::pid::Locate;
-use crate::tree::{self, TreeNode, WalkSummary, bad_kind_name};
+use crate::tree::{self, bad_kind_name, TreeNode, WalkSummary};
 
 pub fn run<W: Write>(globals: &Globals, tree_root: u64, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     match globals.output_mode() {
@@ -106,12 +109,7 @@ fn emit_summary_human<W: Write>(out: &mut W, summary: &WalkSummary) {
     let _ = writeln!(
         out,
         "verify summary: visited={} ok={} bad={} unread={} max_depth={} cycle={}",
-        summary.visited,
-        summary.ok,
-        summary.bad,
-        summary.unread,
-        summary.max_depth,
-        summary.cycle,
+        summary.visited, summary.ok, summary.bad, summary.unread, summary.max_depth, summary.cycle,
     );
 }
 

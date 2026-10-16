@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use network::protocol::mysql as my;
-use network::{
-    KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool,
-};
+use network::{KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 use shard_manager::{ShardManager, ShardManagerOptions};
 use storage::{IoBackend, IoBackendConfig};
 
@@ -83,7 +81,11 @@ fn resp_set_get(addr: SocketAddr, auth: Option<&str>) {
         // 无 AUTH 先操作应被拒
         s.write_all(&resp_cmd(&[b"SET", b"k0", b"x"])).unwrap();
         let n = s.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"-NOAUTH Authentication required.\r\n", "未认证应拒");
+        assert_eq!(
+            &buf[..n],
+            b"-NOAUTH Authentication required.\r\n",
+            "未认证应拒"
+        );
         // AUTH
         s.write_all(&resp_cmd(&[b"AUTH", pw.as_bytes()])).unwrap();
         let n = s.read(&mut buf).unwrap();
@@ -118,7 +120,9 @@ fn sql_ping(addr: SocketAddr) {
     // 发握手响应 (空密码, root)
     let p = &buf[..got];
     let mut pos = 1;
-    while p[pos] != 0 { pos += 1; }
+    while p[pos] != 0 {
+        pos += 1;
+    }
     pos += 1 + 4;
     let mut salt = [0u8; 20];
     salt[..8].copy_from_slice(&p[pos..pos + 8]);
@@ -145,7 +149,12 @@ fn sql_ping(addr: SocketAddr) {
             if got >= plen + 4 {
                 let seq = buf[3];
                 assert_eq!(seq, 2, "login resp seq should be 2, got {seq}");
-                assert_eq!(buf[4], 0x00, "login should succeed, payload={:?}", &buf[4..4 + plen]);
+                assert_eq!(
+                    buf[4],
+                    0x00,
+                    "login should succeed, payload={:?}",
+                    &buf[4..4 + plen]
+                );
                 return;
             }
         }
@@ -266,7 +275,10 @@ fn shared_worker_pool_mixed_load() {
                 assert_eq!(&buf[..n], b"+OK\r\n");
                 s.write_all(&resp_cmd(&[b"GET", key.as_bytes()])).unwrap();
                 let n = s.read(&mut buf).unwrap();
-                assert_eq!(&buf[..n], format!("${}\r\n{}\r\n", val.len(), val).as_bytes());
+                assert_eq!(
+                    &buf[..n],
+                    format!("${}\r\n{}\r\n", val.len(), val).as_bytes()
+                );
             }
         }));
         handles.push(std::thread::spawn(move || {

@@ -8,11 +8,11 @@ use std::io;
 use std::rc::Rc;
 
 use crate::pager::{
-    count_valid_pages, gc_debug, next_bump_chunk, parse_page_vpid, CompactReadJob,
-    CompactWriteJob, FlushBatch, MetaFlushBatch, Pager, BLOCK_DRAIN_ACTIVE_THRESHOLD,
-    COMPACT_LIVE_THRESHOLD, COMPACT_MIN_INTERVAL_MS,
+    BLOCK_DRAIN_ACTIVE_THRESHOLD, COMPACT_LIVE_THRESHOLD, COMPACT_MIN_INTERVAL_MS, CompactReadJob,
+    CompactWriteJob, FlushBatch, MetaFlushBatch, Pager, count_valid_pages, gc_debug,
+    next_bump_chunk, parse_page_vpid,
 };
-use crate::types::{CHUNK_SIZE, PAGES_PER_CHUNK, PAGE_SIZE, PidLocation, PageKey};
+use crate::types::{CHUNK_SIZE, PAGE_SIZE, PAGES_PER_CHUNK, PageKey, PidLocation};
 
 impl Pager {
     pub fn take_flush_batches(&mut self) -> Vec<FlushBatch> {
@@ -223,7 +223,10 @@ impl Pager {
                     self.liveness.forget_block(file_id);
                 }
                 Err(e) => {
-                    eprintln!("[pager] drop block {} failed (retry next round): {e}", path.display());
+                    eprintln!(
+                        "[pager] drop block {} failed (retry next round): {e}",
+                        path.display()
+                    );
                 }
             }
         }
@@ -252,16 +255,22 @@ impl Pager {
             self.write_queue.pending_keys().into_iter().collect();
         excluded.extend(self.in_flight.keys().copied());
         excluded.extend(self.nowchunks.resident_keys());
-        excluded.insert(PageKey { file_id: cur_file, chunk_idx: cur_chunk });
-        excluded.insert(PageKey { file_id: 0, chunk_idx: 0 }); // META 固定位置
+        excluded.insert(PageKey {
+            file_id: cur_file,
+            chunk_idx: cur_chunk,
+        });
+        excluded.insert(PageKey {
+            file_id: 0,
+            chunk_idx: 0,
+        }); // META 固定位置
 
         // ⭐ G4: 顺带收割自然死光的 chunk (COW 减到全死不经 compact 的).
         // 排除未分配区: tuple >= bump 水位的 chunk 从未分配过 (live 数组懒
         // 扩容的 0 项), 误收割会与未来 bump 分配重叠.
         let bump = self.pid_bump_next;
-        let dead: Vec<PageKey> = self.liveness.collect_dead_chunks(&|k| {
-            excluded.contains(&k) || (k.file_id, k.chunk_idx) >= bump
-        });
+        let dead: Vec<PageKey> = self
+            .liveness
+            .collect_dead_chunks(&|k| excluded.contains(&k) || (k.file_id, k.chunk_idx) >= bump);
         if !dead.is_empty() {
             for key in dead {
                 self.chunk_list.invalidate(&key.into());
@@ -284,14 +293,21 @@ impl Pager {
                 let need = self.liveness.live_pages(src) as usize;
                 // dst: 优先全局死槽宿主 (排除目标 block 自身); 无宿主兑底
                 // 开 bump 新 chunk (fresh: 磁盘无内容, 64 槽全可用)
-                let (dst, dst_fresh) = match self.liveness.pick_dst_for(need, &|k| {
-                    excluded.contains(&k) || k.file_id == f
-                }) {
+                let (dst, dst_fresh) = match self
+                    .liveness
+                    .pick_dst_for(need, &|k| excluded.contains(&k) || k.file_id == f)
+                {
                     Some(d) => (d, false),
                     None => {
                         let t = self.pid_bump_next;
                         self.pid_bump_next = next_bump_chunk(t.0, t.1);
-                        (PageKey { file_id: t.0, chunk_idx: t.1 }, true)
+                        (
+                            PageKey {
+                                file_id: t.0,
+                                chunk_idx: t.1,
+                            },
+                            true,
+                        )
                     }
                 };
                 self.compact_inflight = true;
@@ -374,12 +390,15 @@ impl Pager {
         // 差异槽即旧逻辑会误判/误伤的页 (典型: Internal 页)
         if gc_debug() {
             for (vpid, _, slot) in &src_live {
-                let header_says_alive = parse_page_vpid(&src_bytes, *slot)
-                    .is_some_and(|hv| hv == *vpid);
+                let header_says_alive =
+                    parse_page_vpid(&src_bytes, *slot).is_some_and(|hv| hv == *vpid);
                 if !header_says_alive {
                     eprintln!(
                         "[GC_DEBUG] src {:?} slot {} vpid {} alive-in-meta but header disagrees (page_type={}) — old logic would DROP it",
-                        src, slot, vpid, src_bytes[slot * PAGE_SIZE + 4]
+                        src,
+                        slot,
+                        vpid,
+                        src_bytes[slot * PAGE_SIZE + 4]
                     );
                 }
             }
@@ -470,10 +489,11 @@ impl Pager {
         if self.drain_block_target.is_none() {
             let (cur_file, _, _) = self.pid_alloc.current();
             let bump_file = self.pid_bump_next.0;
-            self.drain_block_target = self.liveness.pick_block_drain_candidate(
-                BLOCK_DRAIN_ACTIVE_THRESHOLD,
-                &|file| file == cur_file || file == bump_file || file == 0,
-            );
+            self.drain_block_target = self
+                .liveness
+                .pick_block_drain_candidate(BLOCK_DRAIN_ACTIVE_THRESHOLD, &|file| {
+                    file == cur_file || file == bump_file || file == 0
+                });
         }
     }
 
@@ -514,7 +534,9 @@ impl Pager {
         for key in &pending_keys {
             if let Some(chunk_bytes) = self.write_queue.peek_chunk_pending(*key) {
                 let bytes = chunk_bytes.to_vec();
-                self.io.write_page_chunk(&self.block_dir, *key, bytes).await?;
+                self.io
+                    .write_page_chunk(&self.block_dir, *key, bytes)
+                    .await?;
             }
             self.write_queue.mark_completed(*key);
         }
@@ -522,7 +544,8 @@ impl Pager {
         // drain completed 入 chunk_list
         let completed = self.write_queue.drain_completed();
         for handle in completed {
-            self.chunk_list.insert_from_write_queue(handle.key, handle.chunk);
+            self.chunk_list
+                .insert_from_write_queue(handle.key, handle.chunk);
         }
 
         // ⭐ 全部 chunk data 确认落盘后, 再 flush meta
@@ -559,5 +582,4 @@ impl Pager {
         self.last_flush_time = std::time::Instant::now();
         Ok(true)
     }
-
 }

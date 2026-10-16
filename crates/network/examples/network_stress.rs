@@ -12,13 +12,13 @@ use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use network::{NetworkServer, NetworkServerConfig};
 use network::protocol::{BinaryProtocol, DecodeOutcome, Protocol, Request, Response};
+use network::{NetworkServer, NetworkServerConfig};
 use shard_manager::{ShardManager, ShardManagerOptions};
 use storage::{IoBackend, IoBackendConfig};
 
@@ -27,7 +27,10 @@ const VALUE_LEN: usize = 32;
 const DEFAULT_OPS_PHASE2: usize = 5000;
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn encode_request(req_id: u64, req: &Request) -> Vec<u8> {
@@ -59,19 +62,14 @@ fn main() {
         .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(NUM_SHARDS);
-    let num_workers: usize = args
-        .get(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+    let num_workers: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(2);
     // pipeline 深度: 每个连接同时 in-flight 的请求数 (1 = ping-pong)
-    let pipeline: usize = args
-        .get(5)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+    let pipeline: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
     let _ = env_or::<u64>("RUST_LOG", 0);
 
-    println!("=== NexusDB 网络层 stress: 1 acceptor + {num_workers} workers + {num_shards} shards ===");
+    println!(
+        "=== NexusDB 网络层 stress: 1 acceptor + {num_workers} workers + {num_shards} shards ==="
+    );
     println!("topology: acceptor=1, workers={num_workers}, shards={num_shards}");
     println!("clients (TCP conn): {num_clients}, pipeline depth: {pipeline}");
     println!("ops/phase-2: {ops_phase2}");
@@ -97,7 +95,10 @@ fn main() {
     let mgr = Arc::new(ShardManager::open(opts).expect("open"));
     mgr.create_db("bench").expect("create db");
     mgr.create_table("bench", "kv").expect("create table");
-    println!("[setup] ShardManager in {:.3}s", setup_start.elapsed().as_secs_f64());
+    println!(
+        "[setup] ShardManager in {:.3}s",
+        setup_start.elapsed().as_secs_f64()
+    );
 
     // 启动 NetworkServer (1 acceptor + num_workers workers)
     println!("[setup] starting NetworkServer with {num_workers} workers...");
@@ -119,7 +120,10 @@ fn main() {
     })
     .expect("NetworkServer::start");
     let addr = server.local_addr();
-    println!("[setup] NetworkServer in {:.3}s listening on {addr}", net_start.elapsed().as_secs_f64());
+    println!(
+        "[setup] NetworkServer in {:.3}s listening on {addr}",
+        net_start.elapsed().as_secs_f64()
+    );
     println!();
 
     // ========== Phase 1: warmup ==========
@@ -143,10 +147,13 @@ fn main() {
                         for i in 0..200u64 {
                             let key = format!("warmup_t{tid}_{i:06}");
                             let v = vec![(i & 0xFF) as u8; VALUE_LEN];
-                            let req = encode_request(0, &Request::Put {
-                                key: key.into_bytes(),
-                                value: v,
-                            });
+                            let req = encode_request(
+                                0,
+                                &Request::Put {
+                                    key: key.into_bytes(),
+                                    value: v,
+                                },
+                            );
                             stream.write_all(&req).ok();
                             stream.flush().ok();
                             let n = stream.read(&mut buf).ok().unwrap_or(0);
@@ -181,7 +188,9 @@ fn main() {
     let total_delete = Arc::new(AtomicU64::new(0));
     let total_errors = Arc::new(AtomicU64::new(0));
     let phase_start = Arc::new(Mutex::new(Instant::now()));
-    let agg_lats = Arc::new(Mutex::new(Vec::<(u8, f64)>::with_capacity(ops_phase2 * num_clients)));
+    let agg_lats = Arc::new(Mutex::new(Vec::<(u8, f64)>::with_capacity(
+        ops_phase2 * num_clients,
+    )));
     let handles: Vec<_> = (0..num_clients)
         .map(|tid| {
             let barrier = barrier.clone();
@@ -222,16 +231,30 @@ fn main() {
                         for _ in 0..batch_n {
                             let i = sent_total;
                             let r = (next() >> 32) % 100;
-                            let op = if r < 60 { 0 } else if r < 85 { 1 } else { 2 };
+                            let op = if r < 60 {
+                                0
+                            } else if r < 85 {
+                                1
+                            } else {
+                                2
+                            };
                             let key = format!("t{tid}_{i:08}");
                             let kb = key.as_bytes();
                             let req = match op {
                                 0 => {
                                     let v = vec![((next() >> 32) & 0xFF) as u8; VALUE_LEN];
-                                    encode_request(i as u64, &Request::Put { key: kb.to_vec(), value: v })
+                                    encode_request(
+                                        i as u64,
+                                        &Request::Put {
+                                            key: kb.to_vec(),
+                                            value: v,
+                                        },
+                                    )
                                 }
                                 1 => encode_request(i as u64, &Request::Get { key: kb.to_vec() }),
-                                _ => encode_request(i as u64, &Request::Delete { key: kb.to_vec() }),
+                                _ => {
+                                    encode_request(i as u64, &Request::Delete { key: kb.to_vec() })
+                                }
                             };
                             out.extend_from_slice(&req);
                             op_types.push(op as u8);
@@ -253,15 +276,27 @@ fn main() {
                             while got < batch_n && progressed {
                                 progressed = false;
                                 if recv_buf.len() >= 4 {
-                                    let total_len = u32::from_be_bytes(recv_buf[0..4].try_into().unwrap()) as usize;
+                                    let total_len =
+                                        u32::from_be_bytes(recv_buf[0..4].try_into().unwrap())
+                                            as usize;
                                     if total_len >= 4 && recv_buf.len() >= total_len {
                                         match decode_response(&recv_buf[..total_len]) {
                                             Ok((_rid, resp)) => {
                                                 match resp {
-                                                    Response::PutOk => { total_put.fetch_add(1, Ordering::Relaxed); }
-                                                    Response::Get(_) => { total_get.fetch_add(1, Ordering::Relaxed); }
-                                                    Response::DeleteOk => { total_delete.fetch_add(1, Ordering::Relaxed); }
-                                                    Response::Error(_) => { total_errors.fetch_add(1, Ordering::Relaxed); }
+                                                    Response::PutOk => {
+                                                        total_put.fetch_add(1, Ordering::Relaxed);
+                                                    }
+                                                    Response::Get(_) => {
+                                                        total_get.fetch_add(1, Ordering::Relaxed);
+                                                    }
+                                                    Response::DeleteOk => {
+                                                        total_delete
+                                                            .fetch_add(1, Ordering::Relaxed);
+                                                    }
+                                                    Response::Error(_) => {
+                                                        total_errors
+                                                            .fetch_add(1, Ordering::Relaxed);
+                                                    }
                                                 }
                                                 got += 1;
                                                 progressed = true;
@@ -276,13 +311,23 @@ fn main() {
                                     }
                                 }
                             }
-                            if got >= batch_n { break; }
+                            if got >= batch_n {
+                                break;
+                            }
                             // 需要更多字节
                             match stream.read(&mut tmp) {
-                                Ok(0) => { failed = true; break; }
+                                Ok(0) => {
+                                    failed = true;
+                                    break;
+                                }
                                 Ok(n) => recv_buf.extend_from_slice(&tmp[..n]),
-                                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                                Err(_) => { failed = true; break; }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                                    continue;
+                                }
+                                Err(_) => {
+                                    failed = true;
+                                    break;
+                                }
                             }
                         }
                         if failed {
@@ -337,10 +382,13 @@ fn main() {
                         for i in 0..100 {
                             let key = format!("v{tid}_{i:06}");
                             let v = vec![((tid * 100 + i) & 0xFF) as u8; VALUE_LEN];
-                            let req = encode_request(0, &Request::Put {
-                                key: key.clone().into_bytes(),
-                                value: v,
-                            });
+                            let req = encode_request(
+                                0,
+                                &Request::Put {
+                                    key: key.clone().into_bytes(),
+                                    value: v,
+                                },
+                            );
                             stream.write_all(&req).ok();
                             stream.flush().ok();
                             let n = stream.read(&mut buf).unwrap_or(0);
@@ -406,7 +454,10 @@ fn main() {
                             Err(e) => {
                                 verify_errors.fetch_add(1, Ordering::Relaxed);
                                 if verify_errors.load(Ordering::Relaxed) <= 3 {
-                                    eprintln!("[verify] conn-tid {tid} err on {:?}: {e}", String::from_utf8_lossy(key));
+                                    eprintln!(
+                                        "[verify] conn-tid {tid} err on {:?}: {e}",
+                                        String::from_utf8_lossy(key)
+                                    );
                                 }
                             }
                         }
@@ -427,28 +478,56 @@ fn main() {
     println!();
 
     println!("=== Benchmark ===");
-    println!("topology: acceptor=1, workers={num_workers}, shards={num_shards}, conns={num_clients}");
+    println!(
+        "topology: acceptor=1, workers={num_workers}, shards={num_shards}, conns={num_clients}"
+    );
     println!("phase 2 ops/sec: {:.0}", ops_per_sec);
     println!("phase 2 errors: {errs}");
 
     // 延迟百分位统计
     {
         let lats = agg_lats.lock().unwrap();
-        let mut put_lats: Vec<f64> = lats.iter().filter(|(op, _)| *op == 0).map(|(_, d)| *d).collect();
-        let mut get_lats: Vec<f64> = lats.iter().filter(|(op, _)| *op == 1).map(|(_, d)| *d).collect();
-        let mut del_lats: Vec<f64> = lats.iter().filter(|(op, _)| *op == 2).map(|(_, d)| *d).collect();
+        let mut put_lats: Vec<f64> = lats
+            .iter()
+            .filter(|(op, _)| *op == 0)
+            .map(|(_, d)| *d)
+            .collect();
+        let mut get_lats: Vec<f64> = lats
+            .iter()
+            .filter(|(op, _)| *op == 1)
+            .map(|(_, d)| *d)
+            .collect();
+        let mut del_lats: Vec<f64> = lats
+            .iter()
+            .filter(|(op, _)| *op == 2)
+            .map(|(_, d)| *d)
+            .collect();
         let pct = |v: &mut Vec<f64>, p: f64| -> f64 {
-            if v.is_empty() { return 0.0; }
+            if v.is_empty() {
+                return 0.0;
+            }
             v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let idx = ((v.len() as f64) * (p / 100.0)) as usize;
             v[idx.min(v.len() - 1)]
         };
-        println!("put latency:    p50={:.3}ms p99={:.3}ms p999={:.3}ms",
-            pct(&mut put_lats, 50.0) * 1000.0, pct(&mut put_lats, 99.0) * 1000.0, pct(&mut put_lats, 99.9) * 1000.0);
-        println!("get latency:    p50={:.3}ms p99={:.3}ms p999={:.3}ms",
-            pct(&mut get_lats, 50.0) * 1000.0, pct(&mut get_lats, 99.0) * 1000.0, pct(&mut get_lats, 99.9) * 1000.0);
-        println!("delete latency: p50={:.3}ms p99={:.3}ms p999={:.3}ms",
-            pct(&mut del_lats, 50.0) * 1000.0, pct(&mut del_lats, 99.0) * 1000.0, pct(&mut del_lats, 99.9) * 1000.0);
+        println!(
+            "put latency:    p50={:.3}ms p99={:.3}ms p999={:.3}ms",
+            pct(&mut put_lats, 50.0) * 1000.0,
+            pct(&mut put_lats, 99.0) * 1000.0,
+            pct(&mut put_lats, 99.9) * 1000.0
+        );
+        println!(
+            "get latency:    p50={:.3}ms p99={:.3}ms p999={:.3}ms",
+            pct(&mut get_lats, 50.0) * 1000.0,
+            pct(&mut get_lats, 99.0) * 1000.0,
+            pct(&mut get_lats, 99.9) * 1000.0
+        );
+        println!(
+            "delete latency: p50={:.3}ms p99={:.3}ms p999={:.3}ms",
+            pct(&mut del_lats, 50.0) * 1000.0,
+            pct(&mut del_lats, 99.0) * 1000.0,
+            pct(&mut del_lats, 99.9) * 1000.0
+        );
     }
 
     println!("verify errors: {verify_errors} / {}", verify_keys.len());

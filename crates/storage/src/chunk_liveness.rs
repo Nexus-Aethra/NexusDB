@@ -188,11 +188,7 @@ impl ChunkLiveness {
     /// ⭐ B-drain: 选能容纳 need 个活页的 dst chunk (死槽充足且自身有活页,
     /// live 最小优先 — 同时推进 dst 自身的密实度). 无宿主 → None
     /// (caller 兑底开 bump 新 chunk).
-    pub fn pick_dst_for(
-        &self,
-        need: usize,
-        exclude: &dyn Fn(PageKey) -> bool,
-    ) -> Option<PageKey> {
+    pub fn pick_dst_for(&self, need: usize, exclude: &dyn Fn(PageKey) -> bool) -> Option<PageKey> {
         let mut best: Option<(PageKey, u8)> = None;
         for (idx, &l) in self.live.iter().enumerate() {
             if l == 0 || (l as usize) + need > PAGES_PER_CHUNK {
@@ -229,10 +225,7 @@ impl ChunkLiveness {
                 file_id: (idx / CHUNKS_PER_BLOCK) as u32,
                 chunk_idx: (idx % CHUNKS_PER_BLOCK) as u8,
             };
-            if exclude(key)
-                || self.pending_free.contains(&key)
-                || self.free_chunks.contains(&key)
-            {
+            if exclude(key) || self.pending_free.contains(&key) || self.free_chunks.contains(&key) {
                 continue;
             }
             out.push(key);
@@ -340,14 +333,32 @@ mod tests {
         lv.on_page_alloc(pid(0, 0, 0));
         lv.on_page_alloc(pid(0, 0, 1));
         lv.on_page_alloc(pid(0, 1, 0));
-        assert_eq!(lv.live_pages(PageKey { file_id: 0, chunk_idx: 0 }), 2);
-        assert_eq!(lv.live_pages(PageKey { file_id: 0, chunk_idx: 1 }), 1);
+        assert_eq!(
+            lv.live_pages(PageKey {
+                file_id: 0,
+                chunk_idx: 0
+            }),
+            2
+        );
+        assert_eq!(
+            lv.live_pages(PageKey {
+                file_id: 0,
+                chunk_idx: 1
+            }),
+            1
+        );
         assert!(!lv.block_fully_free(0));
 
         lv.on_page_dead(pid(0, 0, 0));
         lv.on_page_dead(pid(0, 0, 1));
         lv.on_page_dead(pid(0, 1, 0));
-        assert_eq!(lv.live_pages(PageKey { file_id: 0, chunk_idx: 0 }), 0);
+        assert_eq!(
+            lv.live_pages(PageKey {
+                file_id: 0,
+                chunk_idx: 0
+            }),
+            0
+        );
         assert!(lv.block_fully_free(0), "全部死光后 block 无活跃 chunk");
     }
 
@@ -366,8 +377,20 @@ mod tests {
         }
         let (dst, src) = lv.pick_compact_victims(32, &|_| false).expect("victims");
         // src = live 最小 (0,0), dst = 次小 (0,1)
-        assert_eq!(src, PageKey { file_id: 0, chunk_idx: 0 });
-        assert_eq!(dst, PageKey { file_id: 0, chunk_idx: 1 });
+        assert_eq!(
+            src,
+            PageKey {
+                file_id: 0,
+                chunk_idx: 0
+            }
+        );
+        assert_eq!(
+            dst,
+            PageKey {
+                file_id: 0,
+                chunk_idx: 1
+            }
+        );
     }
 
     #[test]
@@ -425,12 +448,18 @@ mod tests {
         // block 内 src: file0 选 live 最小的 chunk3 (5 < 10)
         assert_eq!(
             lv.pick_src_in_block(0, &|_| false),
-            Some(PageKey { file_id: 0, chunk_idx: 3 })
+            Some(PageKey {
+                file_id: 0,
+                chunk_idx: 3
+            })
         );
         // dst 容量: need=40 → 需 live <= 24 的宿主 → chunk(0,3) live=5 最小
         assert_eq!(
             lv.pick_dst_for(40, &|_| false),
-            Some(PageKey { file_id: 0, chunk_idx: 3 })
+            Some(PageKey {
+                file_id: 0,
+                chunk_idx: 3
+            })
         );
         // need=60 → 无宿主 (5+60 / 10+60 / 40+60 均 > 64)
         assert_eq!(lv.pick_dst_for(60, &|_| false), None);
@@ -439,7 +468,10 @@ mod tests {
     #[test]
     fn pending_free_promote_flow() {
         let mut lv = ChunkLiveness::new();
-        let key = PageKey { file_id: 0, chunk_idx: 3 };
+        let key = PageKey {
+            file_id: 0,
+            chunk_idx: 3,
+        };
         lv.stage_pending_free(key);
         lv.stage_pending_free(key); // 幂等
         assert_eq!(lv.pending_free_count(), 1);
@@ -455,9 +487,18 @@ mod tests {
     fn drain_free_of_file_and_forget_block() {
         let mut lv = ChunkLiveness::new();
         lv.on_page_alloc(pid(1, 0, 0));
-        lv.stage_pending_free(PageKey { file_id: 0, chunk_idx: 0 });
-        lv.stage_pending_free(PageKey { file_id: 0, chunk_idx: 1 });
-        lv.stage_pending_free(PageKey { file_id: 1, chunk_idx: 2 });
+        lv.stage_pending_free(PageKey {
+            file_id: 0,
+            chunk_idx: 0,
+        });
+        lv.stage_pending_free(PageKey {
+            file_id: 0,
+            chunk_idx: 1,
+        });
+        lv.stage_pending_free(PageKey {
+            file_id: 1,
+            chunk_idx: 2,
+        });
         lv.promote_pending_free();
 
         let of0 = lv.drain_free_chunks_of_file(0);
@@ -467,6 +508,12 @@ mod tests {
         lv.on_page_dead(pid(1, 0, 0));
         assert!(lv.block_fully_free(1));
         lv.forget_block(1);
-        assert_eq!(lv.live_pages(PageKey { file_id: 1, chunk_idx: 0 }), 0);
+        assert_eq!(
+            lv.live_pages(PageKey {
+                file_id: 1,
+                chunk_idx: 0
+            }),
+            0
+        );
     }
 }

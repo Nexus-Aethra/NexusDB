@@ -9,8 +9,8 @@
 use std::io::{Read, Seek, Write};
 use std::os::unix::fs::FileExt;
 
-use storage::{PID_ALIVE, SLOTS_PER_WINDOW};
 use storage::test_support::{MetaCache, PidLocation};
+use storage::{PID_ALIVE, SLOTS_PER_WINDOW};
 
 mod common;
 
@@ -24,7 +24,8 @@ fn make_mate_file(tmp: &tempfile::TempDir, total_vpids: u64) -> std::path::PathB
         let pid_bytes: [u8; 8] = [
             (i & 0xFF) as u8,
             ((i >> 8) & 0xFF) as u8,
-            0, 0,
+            0,
+            0,
             0,
             (i & 0xFF) as u8,
             0,

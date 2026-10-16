@@ -158,12 +158,19 @@ pub fn page_free_space(page: &[u8]) -> usize {
     let key_count = page_key_count(page) as usize;
     let free_off = page_free_off(page) as usize;
 
-    // checkpoint header (8) + key_count / 16 个 checkpoint (每 14B), 至少 1 个
-    let cp_count = (key_count / 16).max(1);
-    let cp_size = 8 + cp_count * crate::checkpoint::CHECKPOINT_SIZE;
+    // ⚠️ 段数取两个来源的**较大值**:
+    //   - 页头 checkpoint_count: 写入方记录的精确段数 (权威)
+    //   - needed_checkpoint_count(key_count) = ceil(k/32): 每段 ≤32 故这是段数下界
+    // 取大值保证: 页头尚未随扩段更新时不会**高估**可用空间。
+    // 旧实现在此处另写了一份 `key_count / 16` 的估算, 与权威算法差最多 2 倍
+    // (页越满偏得越多), 且 `.max(1)` 在空页上凭空多算一个 checkpoint。
+    let (hdr, _) = crate::checkpoint::read_checkpoint_header(page);
+    let seg_count =
+        (hdr.checkpoint_count as usize).max(crate::checkpoint::needed_checkpoint_count(key_count));
+    let cp_size = crate::checkpoint::checkpoint_area_size(seg_count);
 
-    // checkpoint array 起始 = PAGE_SIZE - PAGE_FOOTER_SIZE - cp_size
-    let cp_start = CHECKPOINT_AREA_END - cp_size;
+    // checkpoint array 起始 = CHECKPOINT_AREA_END - cp_size
+    let cp_start = CHECKPOINT_AREA_END.saturating_sub(cp_size);
 
     cp_start.saturating_sub(free_off)
 }
