@@ -864,3 +864,87 @@ fn pg_named_statement_registry_capped() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+/// ⭐ 审计 P2 (2026-10-17): 范围/全表扫描的读必须进 OCC 读集 (PG 门面).
+///
+/// 旧实现只有 pk 点查登记读集 — 扫描读不参与提交验证, 并发事务改/删已读行
+/// 不被发现 (丢失更新). 本事务的写只覆盖 id=1, 从而单独暴露 SELECT 扫描
+/// 路径未登记的漏洞.
+#[test]
+fn pg_serializable_scan_reads_enter_read_set() {
+    let (server, mgr) = start_pg_server(None);
+    let mut c1 = PgConn::login(&server, None, false).expect("login");
+    let mut c2 = PgConn::login(&server, None, false).expect("login");
+    c1.query("CREATE TABLE isos (id BIGINT PRIMARY KEY, v INT)");
+    for i in 1..=5i64 {
+        c1.query(&format!("INSERT INTO isos VALUES ({i}, {})", i * 10));
+    }
+
+    // 范围扫描 (主键区间) 读过的行被并发改 → COMMIT 必须 40001
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(
+        c1.query("SELECT v FROM isos WHERE id >= 2 AND id <= 4"),
+        PgResult::Rows(
+            vec!["v".into()],
+            vec![
+                vec![Some("20".into())],
+                vec![Some("30".into())],
+                vec![Some("40".into())]
+            ]
+        )
+    );
+    c2.query("UPDATE isos SET v = 99 WHERE id = 3");
+    c1.query("UPDATE isos SET v = 11 WHERE id = 1");
+    let r = c1.query("COMMIT");
+    assert!(
+        matches!(r, PgResult::Err(ref code, _) if code == "40001"),
+        "扫描读应参与 OCC 验证: {r:?}"
+    );
+    assert_eq!(c1.last_ready, b'I', "commit 失败后事务已结束");
+    assert_eq!(
+        c2.query("SELECT v FROM isos WHERE id = 3"),
+        PgResult::Rows(vec!["v".into()], vec![vec![Some("99".into())]]),
+        "冲突事务未应用"
+    );
+
+    // 全表扫描同样登记
+    // 注: 上一个 COMMIT 虽整体回绝 (40001), 但跨 shard 是 best-effort —
+    // 持有 id=1 的 shard 本地无冲突已先行应用 (已知边界, 见 AGENTS.md),
+    // 故这里只断言行数, 不断言具体值.
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(
+        c1.query("SELECT v FROM isos"),
+        PgResult::Rows(
+            vec!["v".into()],
+            vec![
+                vec![Some("11".into())],
+                vec![Some("20".into())],
+                vec![Some("99".into())],
+                vec![Some("40".into())],
+                vec![Some("50".into())]
+            ]
+        ),
+        "全表扫读到 5 行 (id=1 已被上个 best-effort 提交应用)"
+    );
+    c2.query("UPDATE isos SET v = 77 WHERE id = 5");
+    c1.query("UPDATE isos SET v = 12 WHERE id = 1");
+    let r = c1.query("COMMIT");
+    assert!(
+        matches!(r, PgResult::Err(ref code, _) if code == "40001"),
+        "全表扫读应参与 OCC 验证: {r:?}"
+    );
+
+    // 无并发修改 → 不误报
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    c1.query("SELECT v FROM isos WHERE id >= 2 AND id <= 4");
+    c1.query("UPDATE isos SET v = 13 WHERE id = 2");
+    assert!(
+        matches!(c1.query("COMMIT"), PgResult::Complete(_)),
+        "读到的行未变 → 正常提交"
+    );
+
+    drop(c1);
+    drop(c2);
+    server.shutdown().unwrap();
+    drop(mgr);
+}

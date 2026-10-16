@@ -87,7 +87,7 @@ pub(crate) use sql_state::{
     PendingRespSqlIncr, PendingSql, RespHQueryCtx, RespSqlHGetCtx, RespSqlHSetCtx,
     RespSqlIncrDelta, RespSqlReadMode, SUBQ_IN_MAX, SharedSqlCache, SqlDmlAgg, SqlFkIns, SqlPlan,
     SqlRowCtx, SqlTxnAgg, SqlUniqueIns, SqlWorkerCache, SubqCtx, TXN_MAX_BYTES, TXN_MAX_OPS,
-    TxnState, UniquePhase,
+    TXN_MAX_READ_SET, TxnState, UniquePhase,
 };
 /// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
 mod sql_dispatch;
@@ -255,6 +255,10 @@ pub(crate) struct SqlSelectAgg {
     remaining: usize,
     error: Option<String>,
     rows: Vec<storage::sql_rows::IndexEntry>,
+    /// ⭐ v2 (F62): 本语句若是事务内的读 → (db, table) 坐标; 回包到达时把
+    /// 每行 (pk, row 指纹) 登记进 conn.txn.read_set (OCC 验证用).
+    /// None = 非事务内读, 零开销.
+    txn_read: Option<(String, String)>,
     schema: std::sync::Arc<TableSchema>,
     conds: Pred<Cond>,
     limit: Option<u32>,
@@ -995,6 +999,23 @@ fn sql_read_key(
         .as_ref()
         .filter(|t| t.iso == sql::TxnIso::Serializable)
         .map(|_| (db.to_string(), table.to_string(), pk.to_vec()))
+}
+
+/// ⭐ 审计 P2 (2026-10-17): SERIALIZABLE 事务内的**扫描**读 → 读集坐标
+/// (db, table); RC/非事务回 None (零开销).
+///
+/// 旧实现只有 pk 点查 (`sql_read_key`) 登记读集, 范围/全表扫描的读完全不
+/// 参与提交验证 → 并发事务改/删已读行不被发现 (丢失更新). 这里给出扫描
+/// 聚合的坐标, 回包到达时逐行登记 (见 resp_shard 的 Rows 臂).
+pub(crate) fn txn_read_ctx(
+    conn: &ConnState,
+    db: &std::sync::Arc<str>,
+    table: &str,
+) -> Option<(String, String)> {
+    conn.txn
+        .as_ref()
+        .filter(|t| t.iso == sql::TxnIso::Serializable)
+        .map(|_| (db.to_string(), table.to_string()))
 }
 
 /// ⭐ 事务 v1 (F61): 写 op 进 write_set (上限护栏; 超限自动回滚).

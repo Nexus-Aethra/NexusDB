@@ -31,7 +31,13 @@ pub struct TxnState {
     pub read_only: bool,
     /// ⭐ v2 (F62): OCC 读集 — 首读指纹为准 (不覆盖); ROLLBACK TO 后
     /// 保留 (保守更严格, 正确性无损).
+    ///
+    /// ⭐ 审计 P2 (2026-10-17): 范围/全表扫描的读也登记于此 (旧实现仅 pk
+    /// 点查登记 → 扫描读不参与提交验证, SERIALIZABLE 出现丢失更新).
     pub read_set: HashMap<(String, String, Vec<u8>), Option<u32>>,
+    /// ⭐ 审计 P2 (2026-10-17): 读集登记数超过 `TXN_MAX_READ_SET` 时置位 —
+    /// COMMIT 直接报错 (宁可拒事务也不放行一个验证不全的事务).
+    pub read_set_overflow: bool,
     /// ⭐ v2 (F62): savepoint 栈 (name, ops 水位).
     pub savepoints: Vec<(String, usize)>,
 }
@@ -45,6 +51,7 @@ impl TxnState {
             iso,
             read_only,
             read_set: HashMap::new(),
+            read_set_overflow: false,
             savepoints: Vec::new(),
         }
     }
@@ -53,6 +60,10 @@ impl TxnState {
 /// 事务缓冲上限 (超限报错并自动回滚 — 巨型事务非 v1 目标).
 pub const TXN_MAX_OPS: usize = 8192;
 pub const TXN_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// ⭐ 审计 P2 (2026-10-17): OCC 读集行数上限. 扫描读登记后, 一个事务内扫
+/// 多少行就读集记多少行 — 需护栏防巨型扫描把 worker 内存吃穿 (超限 → COMMIT
+/// 报错, 提示收窄事务范围; 不放行验证不全的事务).
+pub const TXN_MAX_READ_SET: usize = 1 << 18;
 
 /// ⭐ 事务 v1 (F61): COMMIT 的 TxnApply 多 shard 计数聚合.
 pub struct SqlTxnAgg {

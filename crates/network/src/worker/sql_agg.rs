@@ -170,6 +170,7 @@ pub(crate) fn sql_run_agg_select(
     conn.sql_select_agg.insert(
         seq,
         SqlSelectAgg {
+            txn_read: txn_read_ctx(conn, db, &table),
             remaining: num_shards,
             error: None,
             rows: Vec::new(),

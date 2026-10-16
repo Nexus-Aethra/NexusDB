@@ -707,7 +707,37 @@ pub(crate) fn handle_resp_shard_result(
             let agg = conn.sql_select_agg.get_mut(&seq).expect("just checked");
             if !agg.done {
                 match result {
-                    BatchResult::Rows(rows) => agg.rows.extend(rows.iter().cloned()),
+                    BatchResult::Rows(rows) => {
+                        // ⭐ 审计 P2 (2026-10-17): 扫描读登记 OCC 读集.
+                        // 旧实现只有 pk 点查 (SqlRowCtx.read_key) 登记 — 范围/全表
+                        // 扫描的读完全不参与提交验证, 并发事务改/删已读行不被发现
+                        // (丢失更新). 这里逐行登记 (pk, row 指纹); 索引下推的界是
+                        // 超集, 未通过残余过滤的候选行也一并登记 (保守: 只可能多拒,
+                        // 不会漏检).
+                        if let Some((d, t)) = agg.txn_read.as_ref()
+                            && let Some(txn) = conn.txn.as_mut()
+                        {
+                            for (_, pk, row) in rows.iter() {
+                                if txn.read_set.len() >= TXN_MAX_READ_SET {
+                                    txn.read_set_overflow = true;
+                                    break;
+                                }
+                                // 只登记**真正读过**的行 (通过残余过滤的); 索引下推的界
+                                // 是超集, 未命中的候选行不算读 (登记它们只会制造假冲突).
+                                // 解码失败 → 保守登记 (该行随后也会让物化报错).
+                                let read = match storage::row::decode_row(&agg.schema, row) {
+                                    Ok(values) => eval_pred(&agg.schema, &values, &agg.conds),
+                                    Err(_) => true,
+                                };
+                                if read {
+                                    txn.read_set
+                                        .entry((d.clone(), t.clone(), pk.clone()))
+                                        .or_insert(Some(storage::wal::crc32(row)));
+                                }
+                            }
+                        }
+                        agg.rows.extend(rows.iter().cloned());
+                    }
                     // ⭐ P0-2: 投影下推路径 — shard 回 row_cols 列, 收进 plain_rows
                     BatchResult::ProjRows(rows) if !agg.down_proj.is_empty() => {
                         agg.plain_rows.extend(rows.iter().cloned());

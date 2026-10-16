@@ -248,3 +248,46 @@ worker OOM. worker 是单线程事件循环, 一个连接的内存泄漏会拖�
 | `pg_named_statement_registry_capped` | ✅ 上限内 ParseComplete; 超限 ErrorResponse "too many prepared statements"; Close 后可继续 Parse+Execute |
 | network 全量串行 | ✅ 230 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: 事务读集仅覆盖 pk 点查 (P2) — 同批次修复
+
+**问题**: SERIALIZABLE 的 OCC 读集**只有 pk 点查**登记
+(`SqlRowCtx.read_key` / `sql_read_key`) — 范围扫描 / 全表扫 / 索引扫 / 聚合
+的读完全不进 `read_set` → 提交验证看不见它们: 并发事务改/删本事务已读的行
+不被发现 (丢失更新 / 不可重复读). 复现: 事务 A 全表扫读 5 行 → 事务 B 改
+其中一行并提交 → A 只写另一行 → A 的 COMMIT **成功** (旧值写覆盖).
+
+**修复** (worker 侧, 行级 OCC 语义不变):
+1. `SqlSelectAgg` 新增 `txn_read: Option<(db, table)>` — 仅 SERIALIZABLE
+   事务内的语句才填 (RC/非事务零开销); 7 处构造点统一经
+   `txn_read_ctx(conn, db, &table)`.
+2. 回包到达即逐行登记 `(pk, crc32(row))` 进 `conn.txn.read_set`
+   (`or_insert` 首读指纹为准, 与点查一致); **只登记通过残余过滤的行**
+   (索引下推的界是超集, 未命中的候选行不算"读过", 登记只会制造假冲突);
+   解码失败保守登记.
+3. 覆盖索引 (`cover`, 免回表) 与投影下推 (`down_proj`) 在事务内**禁用** —
+   两者都只回投影列值, 没有 row 字节, 读集无从登记指纹 (正确性优先).
+4. 主键区间 SELECT 在事务内改走 `ScanFilteredRows` (回包带 pk + row 字节),
+   与原 DML phase1 同款 (ProjRows 路径无 pk).
+5. 新增护栏 `TXN_MAX_READ_SET` (2^18 行): 扫描读登记后读集随扫描行数增长,
+   超限置 `read_set_overflow` → COMMIT 显式报错 (宁可拒事务也不放行一个
+   验证不全的事务), 防巨型扫描把 worker 内存吃穿.
+
+**遗留边界 (文档化, 非本轮范围)**: ① 幻读 (并发**插入**落进已扫区间) 仍不
+防 — 行级 OCC 无谓词/范围指纹, 与 PG SSI 有差距 (AGENTS.md/CHANGELOG 原有
+声明, 本轮把"扫描读"补齐后剩下的就是这一条); ② JOIN 的 gather 走
+`ScanFiltered` (ProjRows, 无 pk/row) 仍未登记; ③ 跨 shard COMMIT 仍是
+best-effort (某 shard 验证失败时其余 shard 可能已应用 — 原有边界).
+
+**测试** (反向验证: stash 掉 6 个 worker 源文件后, 两用例均 "事务成功提交"
+→ 断言失败):
+
+| 用例 | 结果 |
+|---|---|
+| `mysql_serializable_scan_reads_enter_read_set` | ✅ 范围扫/全表扫读过的行被并发改 → COMMIT 1213; 冲突未应用; 无并发修改不误报 |
+| `pg_serializable_scan_reads_enter_read_set` | ✅ 同上 (PG 门面, 40001 + ReadyForQuery=I) |
+| network 全量串行 | ✅ 232 passed / 0 failed |
+| storage + page 全量串行 | ✅ 662 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

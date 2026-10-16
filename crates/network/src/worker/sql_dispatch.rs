@@ -180,6 +180,21 @@ fn sql_dispatch_stmt_inner(
                 // failed 事务的 COMMIT = 回滚 (PG 语义); 无事务/空事务 no-op
                 None => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0)),
                 Some(_) if failed => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0)),
+                Some(txn) if txn.read_set_overflow => {
+                    // ⭐ 审计 P2 (2026-10-17): 读集超护栏 → 拒事务 (宁可拒也不放行
+                    // 一个验证不全的事务). 提示收窄范围 (更小的 WHERE / 更短的事务).
+                    conn.txn = None;
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(
+                            conn.proto,
+                            &format!(
+                                "transaction read set too large (> {TXN_MAX_READ_SET} rows); \
+                                 narrow the transaction scope"
+                            ),
+                        ),
+                    );
+                }
                 Some(txn) if txn.ops.is_empty() => {
                     // 纯读事务: 序列化点可取 BEGIN 时刻, 无需验证直接成功
                     conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));

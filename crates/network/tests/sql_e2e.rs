@@ -274,6 +274,14 @@ fn mysql_auth_password_and_failures() {
 }
 
 impl QueryResult {
+    /// 结果集行数 (非结果集 → panic, 测试断言用).
+    fn rows_len(&self) -> usize {
+        match self {
+            QueryResult::Rows(rows) => rows.len(),
+            other => panic!("expect rows, got {other:?}"),
+        }
+    }
+
     fn err_code(&self) -> Option<u16> {
         match self {
             QueryResult::Err { code, .. } => Some(*code),
@@ -4280,6 +4288,89 @@ fn mysql_prepared_stmt_registry_capped() {
     );
 
     drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P2 (2026-10-17): 范围/全表扫描的读必须进 OCC 读集.
+///
+/// 旧实现只有 pk 点查 (`SqlRowCtx.read_key`) 登记读集 — 扫描读完全不参与
+/// 提交验证: 并发事务改/删已读行不被发现 (丢失更新). 用例特意让本事务的
+/// 写只覆盖 id=1 (DML phase1 只登记 id=1), 从而单独暴露 SELECT 扫描路径
+/// 未登记的漏洞.
+#[test]
+fn mysql_serializable_scan_reads_enter_read_set() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c1 = MyConn::handshake_login(&server, "");
+    let mut c2 = MyConn::handshake_login(&server, "");
+    c1.query("CREATE TABLE iso (id INT PRIMARY KEY, v INT)");
+    for i in 1..=5 {
+        c1.query(&format!("INSERT INTO iso VALUES ({i}, {})", i * 10));
+    }
+
+    // --- 范围扫描 (主键区间, 非点查) 读过的行被并发改 → commit 必须 1213 ---
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(
+        c1.query("SELECT v FROM iso WHERE id >= 2 AND id <= 4"),
+        QueryResult::Rows(vec![
+            vec![Some("20".into())],
+            vec![Some("30".into())],
+            vec![Some("40".into())]
+        ]),
+        "范围扫描读到 3 行"
+    );
+    assert_eq!(
+        c2.query("UPDATE iso SET v = 99 WHERE id = 3"),
+        QueryResult::Ok { affected: 1 },
+        "并发修改扫描读过的 id=3"
+    );
+    // 本事务只写 id=1 (DML phase1 只登记 id=1) — 冲突只能来自 SELECT 的登记
+    c1.query("UPDATE iso SET v = 11 WHERE id = 1");
+    let r = c1.query("COMMIT");
+    assert!(
+        matches!(r, QueryResult::Err { code: 1213, .. }),
+        "扫描读应参与 OCC 验证: {r:?}"
+    );
+    assert_eq!(
+        c2.query("SELECT v FROM iso WHERE id = 3"),
+        QueryResult::Rows(vec![vec![Some("99".into())]]),
+        "冲突事务未应用"
+    );
+
+    // --- 全表扫描同样登记 ---
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(
+        c1.query("SELECT v FROM iso").rows_len(),
+        5,
+        "全表扫读到 5 行"
+    );
+    assert_eq!(
+        c2.query("UPDATE iso SET v = 77 WHERE id = 5"),
+        QueryResult::Ok { affected: 1 }
+    );
+    c1.query("UPDATE iso SET v = 12 WHERE id = 1");
+    let r = c1.query("COMMIT");
+    assert!(
+        matches!(r, QueryResult::Err { code: 1213, .. }),
+        "全表扫读应参与 OCC 验证: {r:?}"
+    );
+
+    // --- 无并发修改 → 不误报 ---
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(
+        c1.query("SELECT v FROM iso WHERE id >= 2 AND id <= 4")
+            .rows_len(),
+        3
+    );
+    c1.query("UPDATE iso SET v = 13 WHERE id = 2");
+    assert_eq!(
+        c1.query("COMMIT"),
+        QueryResult::Ok { affected: 1 },
+        "读到的行未变 → 正常提交"
+    );
+
+    drop(c1);
+    drop(c2);
     server.shutdown().unwrap();
     drop(mgr);
 }
