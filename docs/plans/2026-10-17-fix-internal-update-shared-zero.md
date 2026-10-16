@@ -291,3 +291,32 @@ best-effort (某 shard 验证失败时其余 shard 可能已应用 — 原有边
 | network 全量串行 | ✅ 232 passed / 0 failed |
 | storage + page 全量串行 | ✅ 662 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: SELECT 结果集无内存护栏 (P2) — 同批次修复
+
+**问题**: `materialize_select_agg` 把全部命中行堆进 `out_rows` 再排序/截断 —
+无 LIMIT 的大表 ORDER BY / 大结果集渲染会把 worker 内存吃穿 (OOM). 对比
+JOIN 路径早有 `JOIN_MAX_ROWS = 262_144` 护栏, SELECT 侧一直没有.
+附带: COUNT(*) 也走同一条物化路径 (堆全部行只为了取 len), 大表 COUNT 白白
+吃内存.
+
+**修复**:
+1. 新增 `SELECT_MAX_ROWS = 262_144` (与 JOIN_MAX_ROWS 对齐): 物化行数超限 →
+   返回错误 "result set too large (limit N rows); add LIMIT or narrow WHERE"
+   (客户端可加 LIMIT / 收窄 WHERE 重试); 护栏在聚合分支**之前**, GROUP BY
+   的输入同样受保护.
+2. COUNT(*) 改计数不物化 (`count_only` 快路径) — 大表 COUNT 内存恒定,
+   且不再受护栏限制 (计数不需要物化).
+
+**测试** (反向验证: 中和护栏判断后 `caps_result_set` 失败 — 262152 行全部
+物化返回 Ok):
+
+| 用例 | 结果 |
+|---|---|
+| `materialize_select_agg_caps_result_set` | ✅ 262152 行无 LIMIT → Err "result set too large" |
+| `materialize_select_agg_count_does_not_materialize` | ✅ COUNT(*) 同样行数 → Ok 且计数正确 (不物化) |
+| `materialize_select_agg_limit_under_cap_ok` | ✅ LIMIT 10 早停 → 只回 10 行, 不触发护栏 |
+| network 全量串行 | ✅ 235 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

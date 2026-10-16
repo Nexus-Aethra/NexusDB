@@ -3,6 +3,11 @@
 
 use super::*;
 
+/// ⭐ 审计 P2 (2026-10-17): SELECT 结果集内存护栏 (对齐 JOIN_MAX_ROWS) —
+/// ORDER BY / 聚合需全量物化, 无 LIMIT 的大表查询会把 worker 内存吃穿 (OOM).
+/// 超限返回错误 (与 JOIN_MAX_ROWS 同款处理), 客户端可加 LIMIT / 收窄 WHERE 重试.
+pub(crate) const SELECT_MAX_ROWS: usize = 262_144;
+
 // Aggregation is invoked by the SQL dispatcher with explicit execution resources.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sql_run_agg_select(
@@ -875,6 +880,11 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
     // 仅简单 SELECT 启用: order 空/无聚合/无 COUNT). 行展开回全列 (未下推列 = NULL,
     // down_proj 契约已含过滤/排序/投影所需列) 后走既有过滤/投影逻辑.
     let mut out_rows: Vec<Vec<ColValue>> = Vec::new();
+    // ⭐ 审计 P2 (2026-10-17): COUNT(*) 只需计数, 不必物化行 (原实现把全部
+    // 命中行堆进 out_rows 再取 len — 大表 COUNT 白白吃内存).
+    // agg_spec (GROUP BY/聚合) 优先, 与下方分支顺序一致.
+    let count_only = agg.count && agg.agg_spec.is_none();
+    let mut counted: usize = 0;
     if !agg.down_proj.is_empty() {
         let n = agg.schema.columns.len();
         let plain = std::mem::take(&mut agg.plain_rows);
@@ -896,6 +906,10 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
         let early_cut: Option<usize> = agg.limit.map(|l| (l + agg.offset) as usize);
         for values in &full {
             if eval_pred(&agg.schema, values, &agg.conds) {
+                if count_only {
+                    counted += 1;
+                    continue;
+                }
                 out_rows.push(values.clone());
                 if let Some(cut) = early_cut
                     && out_rows.len() >= cut
@@ -935,6 +949,10 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
             };
             let values = decoded?;
             if eval_pred(&agg.schema, &values, &agg.conds) {
+                if count_only {
+                    counted += 1;
+                    continue;
+                }
                 out_rows.push(values);
                 if let Some(cut) = early_cut
                     && out_rows.len() >= cut
@@ -944,15 +962,22 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
             }
         }
     }
+    // ⭐ 审计 P2 (2026-10-17): 结果集内存护栏 — 无 LIMIT 的大表 ORDER BY /
+    // 大结果集渲染会把 worker 内存吃穿 (OOM). 与 JOIN_MAX_ROWS 同款处理.
+    if out_rows.len() > SELECT_MAX_ROWS {
+        return Err(format!(
+            "result set too large (limit {SELECT_MAX_ROWS} rows); add LIMIT or narrow WHERE"
+        ));
+    }
     // ⭐ G2: 广义聚合
     if let Some(spec) = agg.agg_spec.take() {
         return materialize_agg_groups(&spec, out_rows, agg.offset, agg.limit);
     }
     // ⭐ S2: COUNT(*)
-    if agg.count {
+    if count_only {
         return Ok((
             vec![("COUNT(*)".to_string(), ColType::I64)],
-            vec![vec![ColValue::I64(out_rows.len() as i64)]],
+            vec![vec![ColValue::I64(counted as i64)]],
         ));
     }
     // ⭐ M2b: 排序消排 — sorted=true 时 out_rows 已按索引序 (= ORDER BY 序),
@@ -1007,3 +1032,100 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
 // =====================================================================
 // ⭐ Z2 (MySQL wire 门面): 帧循环 — 握手/登录状态机 + COM_QUERY
 // =====================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_col_schema() -> std::sync::Arc<TableSchema> {
+        std::sync::Arc::new(
+            storage::schema::TableSchema::new(
+                vec![
+                    storage::schema::Column {
+                        name: "id".into(),
+                        ty: storage::schema::ColType::I64,
+                        nullable: false,
+                        default: None,
+                    },
+                    storage::schema::Column {
+                        name: "v".into(),
+                        ty: storage::schema::ColType::I64,
+                        nullable: true,
+                        default: None,
+                    },
+                ],
+                0,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn agg_with_plain_rows(
+        schema: std::sync::Arc<TableSchema>,
+        n: usize,
+        count: bool,
+    ) -> SqlSelectAgg {
+        // down_proj 路径: plain_rows 直接给 (免构造 row 字节); 空 And = 恒真谓词
+        let plain_rows: Vec<Vec<ColValue>> = (0..n)
+            .map(|i| vec![ColValue::I64(i as i64), ColValue::I64(0)])
+            .collect();
+        SqlSelectAgg {
+            remaining: 0,
+            error: None,
+            rows: Vec::new(),
+            txn_read: None,
+            schema,
+            conds: Pred::And(Vec::new()),
+            limit: None,
+            proj: vec![0, 1],
+            cover: None,
+            unique_early: false,
+            done: true,
+            dml: None,
+            dml_target: None,
+            order: vec![(0, false)],
+            sorted: false,
+            offset: 0,
+            count,
+            agg_spec: None,
+            out_names: Vec::new(),
+            expr_proj: Vec::new(),
+            down_proj: vec![0, 1],
+            plain_rows,
+        }
+    }
+
+    /// ⭐ 审计 P2 (2026-10-17): 无 LIMIT 的大结果集必须报错, 不得把 worker
+    /// 内存吃穿 (对齐 JOIN_MAX_ROWS).
+    #[test]
+    fn materialize_select_agg_caps_result_set() {
+        let n = SELECT_MAX_ROWS + 8;
+        let mut agg = agg_with_plain_rows(two_col_schema(), n, false);
+        let err = materialize_select_agg(&mut agg).unwrap_err();
+        assert!(err.contains("result set too large"), "超限应报错: {err}");
+    }
+
+    /// COUNT(*) 只计数不物化 → 不受护栏影响 (且不再白白堆内存).
+    #[test]
+    fn materialize_select_agg_count_does_not_materialize() {
+        let n = SELECT_MAX_ROWS + 8;
+        let mut agg = agg_with_plain_rows(two_col_schema(), n, true);
+        let (cols, rows) = materialize_select_agg(&mut agg).expect("count 不受护栏限制");
+        assert_eq!(cols[0].0, "COUNT(*)");
+        assert_eq!(rows, vec![vec![ColValue::I64(n as i64)]]);
+    }
+
+    /// LIMIT 早停的查询即使表很大也不触发护栏 (行数被 limit 截断).
+    #[test]
+    fn materialize_select_agg_limit_under_cap_ok() {
+        let mut agg = agg_with_plain_rows(two_col_schema(), SELECT_MAX_ROWS + 8, false);
+        agg.limit = Some(10);
+        let (_, rows) = materialize_select_agg(&mut agg).expect("limit 内应正常");
+        assert_eq!(rows.len(), 10);
+    }
+}
