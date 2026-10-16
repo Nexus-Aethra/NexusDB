@@ -49,6 +49,18 @@ impl PageIndex {
         let key_count = page_key_count(page) as usize;
         let (hdr, _) = crate::checkpoint::read_checkpoint_header(page);
         let cp_count = hdr.checkpoint_count as usize;
+        // ⭐ 2026-10-17 (审计 P2): cp_count 来自磁盘, 不可信. 旧实现直接
+        // `for i in 0..cp_count` 读 cp: 损坏页 (cp_count >= 4093) 会使
+        // `hdr_off-(i+1)*4` usize 下溢, debug/release 均 panic. 先校验
+        // 容量上界: 整个 cp 数组必须能放进 [PAGE_HEADER_SIZE,
+        // CHECKPOINT_AREA_END) 区间.
+        let cp_capacity = (crate::header::CHECKPOINT_AREA_END
+            - crate::header::PAGE_HEADER_SIZE
+            - crate::checkpoint::CHECKPOINT_HEADER_SIZE)
+            / crate::checkpoint::CHECKPOINT_SIZE;
+        if cp_count > cp_capacity {
+            return Err(PageError::InvalidHeader);
+        }
         dprintln!(
             index,
             "[PAGE_INDEX_LOAD] BEGIN key_count={} cp_count={} free_off={}",
