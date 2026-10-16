@@ -538,7 +538,17 @@ impl Pager {
             file_id: pid.file_id(),
             chunk_idx: pid.chunk_idx(),
         };
-        let page_idx = pid.page_idx() as u8;
+        // ⭐ 2026-10-17 (审计 P2): checked 转换 — 损坏 pid (page_idx >= 64)
+        // 显式报错, 不静默截断寻址错误页 / 切片越界 panic.
+        let page_idx = crate::types::pid_page_idx_checked(&pid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt pid for vpid {vpid}: page_idx {} >= PAGES_PER_CHUNK",
+                    pid.page_idx()
+                ),
+            )
+        })?;
 
         // 2. nowchunks 优先 (有最新未 flush 数据)
         if let Some(chunk_bytes) = self.nowchunks.peek_chunk(key) {
@@ -662,7 +672,16 @@ impl Pager {
             file_id: pid.file_id(),
             chunk_idx: pid.chunk_idx(),
         };
-        let page_idx = pid.page_idx() as u8;
+        // ⭐ 2026-10-17 (审计 P2): checked 转换 (同上)
+        let page_idx = crate::types::pid_page_idx_checked(&pid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt pid for vpid {vpid}: page_idx {} >= PAGES_PER_CHUNK",
+                    pid.page_idx()
+                ),
+            )
+        })?;
         let off = page_idx as usize * PAGE_SIZE;
 
         if let Some(chunk_bytes) = self.nowchunks.peek_chunk(key) {

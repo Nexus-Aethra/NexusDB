@@ -125,3 +125,21 @@ Batch 臂: `Err(ShardErrorKind::StorageError("WAL persist failed: ..."))`
 
 **测试**: shard_manager 串行 65 passed / 0 failed; clippy 0; fmt 0.
 (barrier 失败需 IO 故障注入, 仓库无该设施, 按构造验证.)
+
+---
+
+## 附: pid page_idx u16→u8 截断 (P2) — 同批次修复
+
+**问题**: `PidLocation::page_idx()` 是 u16, 但 chunk 只有 64 个页.
+pager/pager_write 的 3 处消费点直接 `as u8`: 损坏/陈旧 pid 若带
+page_idx >= 64, 截断后寻址到**错误页** (静默数据损坏), 且截断值 >= 64
+时 `chunk_bytes[off..off+PAGE_SIZE]` 切片越界 panic.
+
+**修复**: `types::pid_page_idx_checked()` (page_idx < PAGES_PER_CHUNK
+才转 u8); pager 两条读路径 + pager_write 写路径改用它, 损坏 pid →
+`InvalidData` 显式错误. recover.rs 的 pid.state 水位守卫从
+`<= u8::MAX` 收紧为 `< PAGES_PER_CHUNK`. (meta_cache 加载时净化的初版
+方案已回退 — 测试将 page_idx 用作不透明 u16 负载, 该层不应假设地址语义.)
+
+**测试**: `pid_page_idx_checked_bounds` (0..63 合法; 64/200/255/256/1000
+拒绝); storage 串行 508 passed / 0 failed; clippy 0; fmt 0.

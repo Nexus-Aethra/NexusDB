@@ -124,7 +124,16 @@ impl PageWriteBatch {
                 file_id: pid.file_id(),
                 chunk_idx: pid.chunk_idx(),
             };
-            let page_idx = pid.page_idx() as u8;
+            // ⭐ 2026-10-17 (审计 P2): checked 转换 — 损坏 pid 显式报错
+            let page_idx = crate::types::pid_page_idx_checked(&pid).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt pid for vpid {vpid}: page_idx {} >= PAGES_PER_CHUNK",
+                        pid.page_idx()
+                    ),
+                )
+            })?;
             // ⭐ 驻留兜底: chunk 不在 nowchunks 时加载完整视图, 避免全 0
             //    ChunkBuf 覆盖历史 page. 触发: reopen 首写 / 固定位置页 (MetaPage)
             //    所在 chunk 被 swap 后再写 / COW rotate 首写新 chunk.

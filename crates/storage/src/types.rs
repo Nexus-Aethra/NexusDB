@@ -164,6 +164,18 @@ pub fn pid_to_offset(pid: &PidLocation) -> u64 {
     block_off + chunk_off + page_off
 }
 
+/// ⭐ 2026-10-17 (审计 P2): chunk 内页索引的 checked 转换.
+///
+/// `page_idx` 字段是 u16, 但一个 chunk 只有 `PAGES_PER_CHUNK` (64) 个页.
+/// 磁盘损坏/陈旧 slot 可能携带 >= 64 的值: 下游 `page_idx() as u8` 会**静默
+/// 截断**并寻址到错误页 (静默数据损坏), 且截断值 >= 64 时
+/// `chunk_bytes[off..off+PAGE_SIZE]` 直接切片越界 panic.
+/// 调用方应将 `None` 转为显式 IO 错误.
+pub fn pid_page_idx_checked(pid: &PidLocation) -> Option<u8> {
+    let v = pid.page_idx();
+    (v < PAGES_PER_CHUNK as u16).then_some(v as u8)
+}
+
 /// chunk 边界向下取整 (找到该 pid 所在 chunk 的起始 byte 偏移).
 ///
 /// 用于 io_uring read chunk 时: 给一个具体 page 的 pid, 计算其所在 1MB chunk 的起始 offset.

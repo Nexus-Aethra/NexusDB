@@ -187,7 +187,10 @@ pub fn recover_for_shard(
         let saved_tuple = (saved.file_id, saved.chunk_idx, saved.page_idx);
         let cur = pid_alloc.current();
         let scanned_tuple = (cur.0, cur.1, cur.2 as u16);
-        if saved_tuple > scanned_tuple && saved.page_idx <= u8::MAX as u16 {
+        // ⭐ 2026-10-17 (审计 P2): page_idx 的有效上界是 PAGES_PER_CHUNK (64)
+        // 而非 u8::MAX — 旧守卫 `<= u8::MAX` 放行 64..255 的损坏值,
+        // `as u8` 不截断但寻址到 chunk 外 (静默错页).
+        if saved_tuple > scanned_tuple && saved.page_idx < crate::types::PAGES_PER_CHUNK as u16 {
             pid_alloc = PidAllocator::new(saved.file_id, saved.chunk_idx, saved.page_idx as u8);
         }
     }
