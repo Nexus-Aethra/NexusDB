@@ -476,13 +476,26 @@ fn main() {
     if let Err(e) = server.shutdown() {
         nlog::warn!("main", "network shutdown error: {e}");
     }
+    // ⭐ 2026-10-17 (审计新 P1-18): 先经 &self 关闭 — flush 全部 shard
+    // (nowchunks dirty data 落盘) + Shutdown 握手. 旧实现用
+    // Arc::try_unwrap(mgr) 拿独占引用再 close(): sql_shared.cluster_ctl
+    // 持有 Arc → try_unwrap 必失败 → close 被跳过 → shard 被进程退出硬杀,
+    // 每次关机都丢最近写入窗口的数据.
+    if let Err(e) = mgr.shutdown() {
+        nlog::warn!("main", "shard manager shutdown error: {e}");
+    }
+    // 线程 join 仅在确能独占所有权时进行 (进程退出前的清理;
+    // flush 已完成, join 失败不影响 durability).
     match Arc::try_unwrap(mgr) {
         Ok(m) => {
             if let Err(e) = m.close() {
                 nlog::warn!("main", "shard manager close error: {e}");
             }
         }
-        Err(_) => nlog::warn!("main", "shard manager still referenced, skip close"),
+        Err(_) => nlog::info!(
+            "main",
+            "shard manager still referenced; flush+shutdown done, skipping thread join"
+        ),
     }
     // ⭐ 探针 dump: NLOG_PROBE=1 时各阶段耗时直方图输出到 stderr.
     // 客户端可直接 `2>probe.log` 捕获, 用于长尾定位.

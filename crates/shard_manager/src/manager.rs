@@ -111,6 +111,9 @@ pub struct ShardManager {
     pub reply_bus_set: Arc<crate::task_reply_bus::ReplyBusSet>,
     /// ⭐ D2 (分库): KV 数字 id ↔ db name 双向翻译视图 (resolver 内存镜像).
     db_view: Arc<DbDirView>,
+    /// ⭐ 2026-10-17 (审计新 P1-18): shutdown 幂等标记 — close(self) 与
+    /// shutdown(&self) 共用同一套停机握手, 重复调用不得重复发指令.
+    shutdown_started: std::sync::atomic::AtomicBool,
 }
 
 /// ⭐ D2 (分库): KV 数字 id ↔ db name 双向翻译视图.
@@ -266,6 +269,7 @@ impl ShardManager {
             reply_sink: reply_sink_arc,
             reply_bus_set,
             db_view: Arc::new(DbDirView::default()),
+            shutdown_started: std::sync::atomic::AtomicBool::new(false),
         };
         // ⭐ D2 (分库): 从 shard 0 (resolver SoT 副本) 初始化 id↔name 视图
         mgr.refresh_db_view();
@@ -1389,15 +1393,44 @@ impl ShardManager {
     }
 
     /// 关闭所有 shard 线程, 干净退出.
-    pub fn close(self) -> ShardResult<()> {
-        // 1. 发送 Shutdown 给所有 shard
+    /// ⭐ 优雅关闭 (经 `&self`, **不要求 Arc 独占**) — 审计新 P1-18.
+    ///
+    /// 旧退出路径 (main.rs) 用 `Arc::try_unwrap(mgr)` 拿独占引用再调
+    /// `close(self)`; 但 `sql_shared.cluster_ctl` 等处持有 Arc 克隆,
+    /// try_unwrap 必失败 → close 被跳过 → shard 线程被进程退出硬杀,
+    /// nowchunks 里的 dirty data **每次关机都丢** (最近写入窗口).
+    ///
+    /// 本方法两步: ① flush 全部 shard (dirty data 落盘, durability 关键);
+    /// ② 发 Shutdown 等各 shard 确认退出. 幂等 (重复调用直接返回).
+    pub fn shutdown(&self) -> ShardResult<()> {
+        if self
+            .shutdown_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        // 1. flush: 把各 shard nowchunks 的 dirty data 落盘
+        for shard in &self.shards {
+            let (tx, fut) = PendingReply::new();
+            shard.inbox.push_spin(ShardRequest::Flush { reply: tx });
+            if block_on_v2(fut).is_err() {
+                return Err(ShardError::ChannelClosed);
+            }
+        }
+        // 2. Shutdown: 等各 shard 确认 (它们随后自行退出循环)
         for shard in &self.shards {
             let (tx, fut) = PendingReply::new();
             // 忽略 send 错误 (shard 可能已死)
             shard.inbox.push_spin(ShardRequest::Shutdown { reply: tx });
-            // 等 reply (设 timeout, 避免死锁)
+            // 等 reply (block_on_v2 已有超时, 不会死锁)
             let _ = block_on_v2(fut);
         }
+        Ok(())
+    }
+
+    pub fn close(self) -> ShardResult<()> {
+        // 1. 停机握手 (flush + Shutdown; 若调用方已 shutdown 过则为幂等 no-op)
+        self.shutdown()?;
 
         // 2. drop senders (让 mpsc 关闭, shard loop 也会 break)
         drop(self.shards);
