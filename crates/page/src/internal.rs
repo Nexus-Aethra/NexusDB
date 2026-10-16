@@ -869,7 +869,17 @@ pub fn internal_update(
 
     let old_off = ptr.byte_offset();
     let old_n = ptr.total_len();
-    let prev_key = prev_ptr.key().to_vec();
+    // ⭐ 2026-10-17 (审计 P2, 对齐 leaf.rs:932-936 的 2026-07-26 修复):
+    // target 恰好是段首 item 时 (seg_idx > 0, 扫描第一个就命中), prev_ptr 仍是
+    // target 自身 → prev_key == key → 重编码后 shared = key.len(), **破坏段首
+    // shared=0 自包含不变量** (PageIndex::load / InternalItemPtr::new 随后
+    // 对该段首的解析会错). 段首的编码语义 prev 必须视为空 (shared=0),
+    // 与原 encoding 一致.
+    let prev_key = if prev_ptr.byte_offset() == old_off {
+        Vec::new()
+    } else {
+        prev_ptr.key().to_vec()
+    };
 
     // 计算新 item 字节数. prev_key 不变, key 不变, child_vpid 字节固定 8B,
     // 所以 new_n 通常 == old_n (除非 shared/key_unshared 字节数变化, 极少见).
