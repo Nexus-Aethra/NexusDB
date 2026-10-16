@@ -121,6 +121,7 @@ impl ConnState {
             pg_batch: PgBatch::default(),
             pg_ext: HashMap::new(),
             close_after_flush: false,
+            coro_worker: false,
         }
     }
 

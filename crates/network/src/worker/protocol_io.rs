@@ -411,6 +411,18 @@ pub(crate) fn process_sql_input(
             let caps = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
             if caps & my::CLIENT_SSL != 0 && payload.len() <= 36 {
                 if let Some(cfg) = tls_config {
+                    if conn.coro_worker {
+                        // ⭐ 2026-10-17 (审计新 P1-4): 协程 worker 的
+                        // recv_async 无 TLS 解密分支 — 升级后密文被当明文
+                        // 解析, 握手挂死. 显式拒绝 (客户端可回落明文).
+                        conn.send_bytes(&my::build_err(
+                            pkt_seq.wrapping_add(1),
+                            1043,
+                            "TLS not supported on this connection",
+                        ));
+                        conn.close_after_flush = true;
+                        break;
+                    }
                     if !conn.start_tls(cfg.clone()) {
                         conn.close_after_flush = true;
                     }
@@ -718,7 +730,12 @@ pub(crate) fn process_pg_input(
                             match code {
                                 // ⭐ F83: SSLRequest — 配置了 TLS → 回 'S' 并升级; 否则回 'N' 明文回落
                                 pg::SSL_REQUEST_CODE => {
-                                    if let Some(cfg) = tls_config {
+                                    // ⭐ 2026-10-17 (审计新 P1-4): 协程 worker
+                                    // 无 TLS 解密分支, 升级即挂死 — 回落明文
+                                    // ('N' 与未配置 TLS 时行为一致).
+                                    if let Some(cfg) = tls_config
+                                        && !conn.coro_worker
+                                    {
                                         conn.send_bytes(b"S"); // 明文 'S' (升级前最后一个明文字节)
                                         if !conn.start_tls(cfg.clone()) {
                                             conn.close_after_flush = true;

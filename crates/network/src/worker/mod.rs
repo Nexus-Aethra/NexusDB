@@ -378,6 +378,10 @@ pub(crate) struct ConnState {
     pub(crate) write_buf: Vec<u8>,
     pub(crate) write_pos: usize,
     pub(crate) epoll_write_buffering: bool,
+    /// ⭐ 2026-10-17 (审计新 P1-4): 本连接由**协程** worker 服务.
+    /// 协程的 recv_async 读路径无 TLS 解密分支 — TLS 升级后密文会被当
+    /// 明文解析 (握手挂死). 该标记让协议层在协程连接上显式拒绝 TLS 升级.
+    pub(crate) coro_worker: bool,
     /// 当前 epoll 是否已注册 EPOLLOUT；仅状态切换时 EPOLL_CTL_MOD，避免每条
     /// 回包额外 syscall。
     pub(crate) epoll_write_armed: bool,

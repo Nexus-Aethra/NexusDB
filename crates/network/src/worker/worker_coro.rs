@@ -181,6 +181,8 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                     nc.auth_password.clone(),
                     nc.tls_config.clone(),
                 );
+                // ⭐ 审计新 P1-4: 标记协程 worker (协议层据此拒绝 TLS 升级)
+                state.coro_worker = true;
                 // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
                 if proto == ProtocolKind::Sql {
                     let salt = mysql_gen_salt(id, worker_id2);
