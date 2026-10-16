@@ -974,6 +974,17 @@ pub fn leaf_update_with<R>(
     } else {
         // 慢路径: new_n != old_n, 需要 shift 后续 items
         let delta = new_n as isize - old_n as isize;
+        // ⭐ 2026-10-16 (审计新 P0-2): 移位前空间检查.
+        // 旧实现无检查: 近满页上 new_n > old_n 时 copy_within 目的端越过
+        // checkpoint 区 (静默覆盖, 页损坏) 或越过 PAGE_SIZE (panic
+        // "dest is out of bounds") — 合法输入 (KvLimits 内) 打崩服务,
+        // release 探针实证. 空间不足返回 PageFull, 与 btree_update 既定
+        // 契约一致 (其文档明示 caller 应改走 delete + insert).
+        let cp_size = crate::checkpoint::checkpoint_area_size(idx.segments.len());
+        let new_free = free_off_before as isize + delta;
+        if new_free < 0 || new_free as usize + cp_size + PAGE_FOOTER_SIZE > PAGE_SIZE {
+            return Err(PageError::PageFull);
+        }
         dprintln!(
             leaf,
             "[LEAF_UPDATE] shift at off={} old_n={} new_n={} delta={}",

@@ -11,9 +11,9 @@
 //! 左半重建 cp[0] 时的 off-by-one (幽灵 item).
 
 use page::{
-    CHECKPOINT_AREA_END, ItemKind, PAGE_HEADER_SIZE, PageIndex, decode_item, internal_child,
-    internal_insert, internal_new, internal_split, leaf_get, leaf_insert, leaf_new, page_free_off,
-    page_key_count, page_set_vpid, pre_split_segment,
+    CHECKPOINT_AREA_END, ItemKind, PAGE_HEADER_SIZE, PageError, PageIndex, decode_item,
+    internal_child, internal_insert, internal_new, internal_split, leaf_get, leaf_insert, leaf_new,
+    leaf_update, page_free_off, page_key_count, page_set_vpid, pre_split_segment,
 };
 
 /// 从 PAGE_HEADER_SIZE 顺序走 item 链, 返回实际 item 数; 结构损坏返回 None.
@@ -232,4 +232,73 @@ fn failed_leaf_insert_leaves_page_unchanged() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 6. leaf_update 慢路径: 空间不足必须干净拒绝且不碰页 (审计新 P0-2).
+//    修复前: 近满页上 value 增大导致 copy_within 目的端越界 — 越过 PAGE_SIZE
+//    panic ("dest is out of bounds") 或静默覆盖 checkpoint 区. 探针实证:
+//    152 key 填满页后 value 100B→4000B (合法输入) 即复现.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn leaf_update_grow_on_full_page_rejects_cleanly() {
+    let mut page = leaf_new();
+    let v100 = vec![b'v'; 100];
+    let mut n = 0usize;
+    loop {
+        let key = format!("k{n:08}");
+        match leaf_insert(&mut page, key.as_bytes(), &v100) {
+            Ok(()) => n += 1,
+            Err(_) => break,
+        }
+        assert!(n < 100_000);
+    }
+    assert!(n > 50, "应已填得相当满 (实际 {n})");
+
+    // 合法输入: value 100B → 4000B (key+value 远在 KvLimits 上限内)
+    let key = format!("k{:08}", 10);
+    let before = page; // [u8; PAGE_SIZE] is Copy
+    let r = leaf_update(&mut page, key.as_bytes(), &vec![b'V'; 4000]);
+    assert!(
+        matches!(r, Err(PageError::PageFull)),
+        "近满页增长 value 应返回 PageFull, 实际 {r:?}"
+    );
+    assert_eq!(page, before, "失败的 update 不得改变页字节");
+    // 全部 key 仍可读且值仍是旧的
+    for i in 0..n {
+        let k = format!("k{i:08}");
+        assert_eq!(
+            leaf_get(&page, k.as_bytes()),
+            Some(v100.clone()),
+            "key #{i} 读回失败"
+        );
+    }
+    assert_page_consistent_leaf(&page, "leaf_update 拒绝后");
+}
+
+/// leaf 页自洽性 (free_off 不越界 + PageIndex 可加载).
+fn assert_page_consistent_leaf(page: &[u8], ctx: &str) {
+    let free = page_free_off(page) as usize;
+    assert!(free <= CHECKPOINT_AREA_END, "{ctx}: free_off {free} 越界");
+    assert!(
+        PageIndex::load(page, ItemKind::Leaf).is_ok(),
+        "{ctx}: PageIndex::load 失败"
+    );
+}
+
+#[test]
+fn leaf_update_grow_within_capacity_succeeds() {
+    // 防过度拒绝: 放得下的增长仍必须成功
+    let mut page = leaf_new();
+    let v100 = vec![b'v'; 100];
+    for i in 0..50 {
+        leaf_insert(&mut page, format!("k{i:08}").as_bytes(), &v100).unwrap();
+    }
+    let v2000 = vec![b'V'; 2000];
+    assert!(leaf_update(&mut page, b"k00000010", &v2000).unwrap());
+    assert_eq!(leaf_get(&page, b"k00000010"), Some(v2000));
+    // 相邻 key 不受影响
+    assert_eq!(leaf_get(&page, b"k00000011"), Some(v100.clone()));
+    assert_eq!(leaf_get(&page, b"k00000009"), Some(v100));
 }
