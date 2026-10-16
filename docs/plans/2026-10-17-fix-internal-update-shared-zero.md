@@ -369,3 +369,50 @@ fk_incoming / cluster_ctl), 毒化后数据最多停在一次未完成的结构�
 | `poisoned_lock_access_does_not_panic` | ✅ 持写锁 panic 制造毒化 → `cluster_ctl()`/`unregister_fks()`/`incoming_fks()` 均不 panic |
 | network 全量串行 | ✅ 237 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: PageIndex::load 前 4 段全量 decode 性能 (P2) — 同批次修复
+
+**问题**: `PageIndex::load` 里有一段**纯诊断**代码 (`if i < 4`): 对前 4 个
+cp 段逐 item `decode_item` + `full_key` 只为喂 `dprintln!`. 因 `full_key` 带
+Err 语义 (不可 DCE), release 也全额执行 — 实测 **1392ns/次**, 而 load 是
+每次读页的热路径.
+
+**修复**: 该循环收敛到 `cfg!(debug_assertions)` — debug/测试保留完整校验,
+release 编译期消除.
+
+**测试**: `page_index_load_rejects_corrupt_item_in_first_segments`
+(`#[cfg(debug_assertions)]` — 段内第 2 个 item 的 shared 改成 9999, load 必须
+Err, 锁定"收敛不等于丢校验"); 性能探针 (release, 同页同调用次数):
+**1392ns → 210ns/op (6.6×)**; page 全量 152 passed / 0 failed; clippy 0; fmt 0.
+
+---
+
+## 附: leaf_delete 冗余 O(N) 全页扫描 (P2) — 同批次修复
+
+**问题**: `leaf_delete` 每次删除都调 `reconstruct_key_before` (从页头顺序
+decode 到 target = O(N) 全页扫描) 算 `target_prev_key`, 而该值**只喂给
+`dprintln!`** — release 里纯白做.
+
+**修复**: 与 `dprintln!` 同条件惰性化 (`debug::debug_on("leaf")`, 新增 helper;
+`DEBUG_PAGE` 是 const false → 编译期折叠, 零成本).
+
+**测试**: 性能探针 (release, 100 insert + 1 delete/轮): **174642ns →
+103603ns/op (1.69×)**; page 全量 152 passed / 0 failed (删除语义不变);
+clippy 0; fmt 0.
+
+---
+
+## 附: ptr next 双重 decode (P2) — 同批次修复
+
+**问题**: `LeafItemPtr::next` / `InternalItemPtr::next` 先调
+`inner.next()` (decode 一次), 再 `decode_item` 解第二遍拿 value_len /
+child_vpid — 段内每次前进都双倍解码.
+
+**修复**: 新增 `ItemPtr::next_decoded(kind)` 一次解码同时返回新游标和解出的
+`Item` (零拷贝借用 page); `next()` 复用它 (丢弃 Item), 两个子类型的
+`next()` 改走单次解码路径.
+
+**测试**: page 全量 152 passed / 0 failed (游标语义/取值不变);
+clippy 0; fmt 0.
