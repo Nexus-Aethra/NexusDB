@@ -4425,3 +4425,82 @@ fn mysql_join_cross_product_capped() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+/// ⭐ 审计 P2 (2026-10-17): 单 worker 连接数上限 — 超限的新连接必须被拒绝
+/// (旧实现无上限, 连接可无限堆积 → fd / ConnState 内存耗尽 = DoS).
+#[test]
+fn mysql_connection_cap_rejects_excess() {
+    let limits = KvLimits {
+        max_connections_per_worker: 2,
+        idle_timeout_secs: 0, // 关掉 idle 回收, 单独验证连接数上限
+        ..Default::default()
+    };
+    let (server, mgr) = start_sql_server_with_limits(None, limits);
+    let addr = server.local_addr();
+
+    // 占满 2 个槽位 (握手成功 = 已被 worker 接收)
+    let mut c1 = MyConn::handshake_login(&server, "");
+    let _c2 = MyConn::handshake_login(&server, "");
+
+    // 第 3 个: worker 超限 → 直接关 fd (客户端读到 EOF/重置, 拿不到握手包)
+    let mut s = std::net::TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set timeout");
+    let mut b = [0u8; 1];
+    let n = s.read(&mut b);
+    assert!(
+        matches!(n, Ok(0)) || n.is_err(),
+        "超限连接应被立即关闭, 实际 {n:?}"
+    );
+
+    // 已建立的连接不受影响
+    assert_eq!(
+        c1.query("CREATE TABLE cap_t (id INT PRIMARY KEY, v INT)"),
+        QueryResult::Ok { affected: 0 }
+    );
+    assert_eq!(
+        c1.query("SELECT COUNT(*) FROM cap_t").rows_len(),
+        1,
+        "已有连接仍可用"
+    );
+    drop(c1);
+    drop(_c2);
+    // 释放一个槽位后新连接可进来
+    let c3 = MyConn::handshake_login(&server, "");
+    drop(c3);
+
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P2 (2026-10-17): 空闲连接超时回收 (旧实现无 idle 回收 —
+/// 客户端连上不关 / 半死连接永久占用 worker 槽位).
+#[test]
+fn mysql_idle_connection_reaped() {
+    let limits = KvLimits {
+        max_connections_per_worker: 8,
+        idle_timeout_secs: 1, // 1s 空闲即回收
+        ..Default::default()
+    };
+    let (server, mgr) = start_sql_server_with_limits(None, limits);
+
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE idle_t (id INT PRIMARY KEY, v INT)");
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM idle_t").rows_len(),
+        1,
+        "连接可用"
+    );
+    // 空闲 > 1s (不关连接, 也不发命令) → worker 主循环扫到并关闭.
+    // 断言收紧为 **Ok(0) (对端 FIN)**: 读超时 (Err) 意味着连接还活着 = 未回收.
+    std::thread::sleep(Duration::from_millis(2500));
+    let mut b = [0u8; 1];
+    let n = c.stream.read(&mut b);
+    assert!(
+        matches!(n, Ok(0)),
+        "空闲连接应被服务端回收 (读到 EOF), 实际 {n:?}"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}

@@ -202,6 +202,9 @@ fn main() {
         max_value_bytes: cfg.server.max_value_bytes,
         // 单连接 prepared 语句注册表上限 (审计 P2: 防单连接 OOM 拖死 worker)
         max_prepared_stmts: 1024,
+        // 单 worker 连接数上限 + 空闲连接回收 (审计 P2: 防连接无限堆积)
+        max_connections_per_worker: 4096,
+        idle_timeout_secs: 300,
     };
     // ⭐ ORM-B2: 进程级共享 SQL 路由缓存 (五门面同集群共用一个)
     let sql_shared = network::new_sql_shared();
@@ -637,6 +640,9 @@ fn main() {
         max_value_bytes: cfg.server.max_value_bytes,
         // 单连接 prepared 语句注册表上限 (审计 P2: 防单连接 OOM 拖死 worker)
         max_prepared_stmts: 1024,
+        // 单 worker 连接数上限 + 空闲连接回收 (审计 P2: 防连接无限堆积)
+        max_connections_per_worker: 4096,
+        idle_timeout_secs: 300,
     };
     let listen_addr: std::net::SocketAddr = cfg.server.listen_addr.parse().expect("validated addr");
     let binary_server = match NetworkServer::start(NetworkServerConfig {

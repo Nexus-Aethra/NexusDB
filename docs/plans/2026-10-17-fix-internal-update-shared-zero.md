@@ -475,3 +475,34 @@ DefaultHasher 输出**不跨 Rust 版本稳定**, 故只用于同进程内分片
 | `hash_route_key_matches_shard_manager_single_source` (network 单测) | ✅ worker 侧路由与规范实现逐位相同 (4 组输入 × 4 种 num_shards) |
 | shard_manager 全量串行 / network 全量串行 | ✅ 65 / 238 passed, 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: 无连接数上限 / 无 idle 超时 (P2) — 同批次修复
+
+**问题**: acceptor/worker 对连接数**无上限**, 也无 idle 回收 — 连接可无限
+堆积 (fd + `ConnState` 内存耗尽 = 拒绝服务), 客户端连上不关 / 半死连接会
+**永久**占用 worker 槽位. 顺带: worker 里的 `let _limits = cfg.limits` 把整个
+limits 配置丢掉 (连接相关字段从未被读取).
+
+**修复** (kv 放进已有的 `KvLimits`, 零新增构造点):
+1. `KvLimits` 新增 `max_connections_per_worker` (默认 4096; 全局上限 ≈
+   本值 × worker_count) 与 `idle_timeout_secs` (默认 300; 0 = 关闭).
+2. `ConnState::last_activity` (Instant) — `recv`/`recv_async` 读到数据即刷新
+   (TLS 与明文两条路径都刷).
+3. epoll worker: `reject_over_cap` (超限直接 `close(fd)`, 不建状态) 接入两条
+   新连接路径 (循环顶部 drain + NEW_CONN_TOKEN 分支); `sweep_idle_conns`
+   按 1s 节流在主循环扫描回收 (主循环本就 ≤100ms 一轮, 零额外唤醒成本).
+4. coro worker (`NEXUS_CORO_WORKER=1`, 默认关闭): 同样接入连接数上限
+   (复用已有的 `active` 原子计数). **idle 回收未覆盖** — 协程 worker 阻塞在
+   `poll(conn_eventfd)` 上无周期 tick, 且 scheduler 无定时唤醒原语;
+   记录为遗留边界 (默认路径不受影响).
+
+**测试** (反向验证: 中和 `reject_over_cap` / `sweep_idle_conns` 后两用例均失败):
+
+| 用例 | 结果 |
+|---|---|
+| `mysql_connection_cap_rejects_excess` | ✅ cap=2 时第 3 个连接被立即关闭 (读到 EOF); 已有连接仍可用; 释放槽位后可再连 |
+| `mysql_idle_connection_reaped` | ✅ idle_timeout=1s, 空闲 2.5s 后服务端关闭连接 (读到 EOF; 超时算失败) |
+| network 全量串行 | ✅ 240 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

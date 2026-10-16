@@ -33,6 +33,7 @@ impl ConnState {
         Self {
             fd,
             stream,
+            last_activity: std::time::Instant::now(),
             tls: None,
             default_table,
             limits,
@@ -234,6 +235,7 @@ impl ConnState {
                 match tls.reader().read(&mut tmp) {
                     Ok(0) => break,
                     Ok(n) => {
+                        self.last_activity = std::time::Instant::now();
                         self.read_buf.extend_from_slice(&tmp[..n]);
                         // ⭐ 审计新 P1-6: 同明文路径的单轮 recv 上限.
                         if self.read_buf.len()
@@ -255,6 +257,7 @@ impl ConnState {
             match self.stream.read(&mut tmp) {
                 Ok(0) => return Ok(false), // EOF
                 Ok(n) => {
+                    self.last_activity = std::time::Instant::now();
                     self.read_buf.extend_from_slice(&tmp[..n]);
                     // ⭐ 2026-10-17 (审计新 P1-6): 单轮 recv 上限 — 防客户端
                     // 持续灌数据使 read_buf 在一轮事件内无界增长 (OOM).
@@ -292,6 +295,8 @@ impl ConnState {
             if n == 0 {
                 return Ok(false); // EOF
             }
+            // ⭐ 审计 P2 (2026-10-17): 读到数据 = 连接活跃 (idle 回收依据)
+            self.last_activity = std::time::Instant::now();
             self.read_buf.extend_from_slice(&tmp[..n]);
             if n < tmp.len() {
                 return Ok(true); // 读完了本次可用数据

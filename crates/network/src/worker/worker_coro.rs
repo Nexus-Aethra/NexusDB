@@ -123,7 +123,7 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
     let reply_bus2 = reply_bus.clone();
     let _db2 = db.clone();
     let _table2 = table.clone();
-    let _limits2 = limits;
+    let limits2 = limits;
     let sql_cache2 = sql_cache.clone();
     let sql_shared2 = sql_shared.clone();
     let db_view2 = db_view.clone();
@@ -160,6 +160,19 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 }
             }
             for nc in new_conns {
+                // ⭐ 审计 P2 (2026-10-17): 连接数上限 (超限直接关 fd, 不建协程).
+                // 协程 worker 无周期性 tick (阻塞在 conn_eventfd 的 poll 上), 故
+                // idle 回收仅在 epoll worker 落地 — 见模块文档.
+                let live = active2.load(std::sync::atomic::Ordering::Relaxed);
+                if live >= limits2.max_connections_per_worker {
+                    nlog::warn!(
+                        "worker",
+                        "worker-{worker_id} connection cap reached ({}), rejecting new conn",
+                        limits2.max_connections_per_worker
+                    );
+                    unsafe { libc::close(nc.fd) };
+                    continue;
+                }
                 let id = next_conn_id;
                 next_conn_id += 1;
                 // ⭐ 解耦 (Phase 3): 协议与 per-conn 配置随连接传递 (acceptor 按端口打标).

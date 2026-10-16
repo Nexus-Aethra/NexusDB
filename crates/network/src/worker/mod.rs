@@ -375,6 +375,9 @@ const JOIN_KEYSET_MAX: usize = 1024;
 pub(crate) struct ConnState {
     pub(crate) fd: RawFd,
     pub(crate) stream: TcpStream,
+    /// ⭐ 审计 P2 (2026-10-17): 最近一次从该连接读到数据的时刻 (idle 回收用).
+    /// worker 主循环按 `KvLimits::idle_timeout_secs` 周期性扫描.
+    pub(crate) last_activity: std::time::Instant,
     /// ⭐ F83: TLS 会话 (None = 明文; Some = 已 STARTTLS 升级, recv/send 走 rustls).
     pub(crate) tls: Option<Box<rustls::ServerConnection>>,
     pub(crate) read_buf: Vec<u8>,
