@@ -808,6 +808,39 @@ fn sql_dispatch_stmt_inner(
     }
 }
 
+/// ⭐ 审计 P2 (2026-10-17): IN 集合元素与列类型跨型 → 显式报错.
+///
+/// 旧实现: `eval_cond_leaf` 的线性路径对每个集合元素调 `sql_cmp`, 跨型返回
+/// `None` 按 false 处理 → **静默空集**. 客户端无法区分"类型不匹配"和
+/// "确实没有匹配行" (IN 子查询折叠产物与字面量 IN 列表同一 Cond 结构,
+/// 两者都中招).
+///
+/// 修复: 计划期逐元素尝试转到列类型 (`sql_to_col`), 失败即报错 —
+/// PG 兼容语义 ("IN types ... cannot be matched"), 与 `>SUBQ_IN_MAX`
+/// 的超限报错同一层级.
+pub(crate) fn check_in_set_types(schema: &TableSchema, pred: &Pred<Cond>) -> Result<(), String> {
+    for c in pred.leaves() {
+        if c.op != CmpOp::In || c.set.is_empty() {
+            continue;
+        }
+        // 未知名由调用方的列名校验负责报错, 这里跳过
+        let Some(cidx) = schema.col_by_name(&c.col) else {
+            continue;
+        };
+        let ty = schema.columns[cidx as usize].ty;
+        for v in &c.set {
+            sql_to_col(ty, v).map_err(|e| {
+                format!(
+                    "IN types cannot be matched: column '{}' is {}, element {v:?}: {e}",
+                    c.col,
+                    coltype_sql_name(ty)
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// ⭐ F65: 提取 schema 的全局唯一列 (iid, col); 空 = 无全局唯一.
 pub(crate) fn conds_to_scan_preds(
     schema: &TableSchema,
@@ -882,6 +915,8 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
             return Err(format!("unknown column '{}'", c.col));
         }
     }
+    // ⭐ 审计 P2 (2026-10-17): IN 集合跨型 → 显式报错 (旧实现静默空集)
+    check_in_set_types(schema, pred)?;
     // ⭐ F69: 含 OR/NOT → 无单一区间, 回退全表扫 (正确性由完成点 eval_pred 兼底)
     let Some(conds) = pred.as_conjuncts() else {
         // ⭐ M2: OR → 索引并集 — 顶层 OR 的各单叶分支若均命中间一索引列的

@@ -197,3 +197,28 @@ unlink (仅 fd 存活 → 无共享路径、无残留、退出即回收).
 | page 全量串行 | ✅ 152 passed / 0 failed |
 | storage 全量串行 (leaf_get_with 热路径消费方) | ✅ 510 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: IN 子查询跨类型折叠恒 false (静默空集) (P2) — 同批次修复
+
+**问题**: IN 集合元素与列类型跨型时, `eval_cond_leaf` 线性路径对每个元素调
+`sql_cmp`, 跨型返回 `None` 按 false → **静默空集**. 例:
+`SELECT id FROM u WHERE id IN (SELECT uid FROM o)` (id=bigint, uid=text)
+返回 0 行且无任何提示 — 客户端无法区分"类型不匹配"与"确实没有匹配行".
+IN 子查询折叠产物 (`fold_one_subq`) 与字面量 IN 列表同一 Cond 结构, 两条
+路径都中招; SELECT/DELETE/UPDATE 都受影响.
+
+**修复**: 计划期显式报错 (PG 兼容语义 "IN types ... cannot be matched"):
+新增 `check_in_set_types(schema, pred)` — 逐元素 `sql_to_col(col_ty, v)`,
+失败即 Err; 挂在 `sql_plan_select` (覆盖全部 SELECT 计划路径) 与
+`sql_run_dml` 入口 (覆盖 Delete/Update). 可 coercion 的文本字面量
+(`id IN ('1','3')`) 与同型集合不受影响.
+
+**测试** (反向验证: stash 掉 worker 两文件后 `跨型 IN 子查询应报错, 实际 Rows([])` 失败):
+
+| 用例 | 结果 |
+|---|---|
+| `mysql_in_type_mismatch_errors_not_silent_empty` | ✅ 同型 IN 子查询/可 coercion 文本仍正常; 跨型 IN 子查询、跨型字面量列表、DELETE 跨型 IN 均报 "IN types cannot be matched"; 报错后数据未被误删 |
+| network 全量串行 | ✅ 228 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

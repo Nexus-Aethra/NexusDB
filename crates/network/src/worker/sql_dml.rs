@@ -1,5 +1,5 @@
 // ⭐ 解耦 2026-08: DML 执行 (INSERT/UPDATE/DELETE 分布式执行) — 从 sql_dispatch.rs 拆出.
-use super::sql_dispatch::conds_to_scan_preds;
+use super::sql_dispatch::{check_in_set_types, conds_to_scan_preds};
 use super::*;
 
 /// ⭐ F76: 剥列名的表名限定前缀 (`表.列`/`别名.列` → `列`); 仅当前缀匹配时.
@@ -143,6 +143,16 @@ pub(crate) fn sql_run_dml(
     // ⭐ F76: 单表限定列 `表.列` → 剥为 `列` (ORM 单表查询也带表名限定符)
     let mut stmt = stmt;
     strip_qual_in_stmt(&mut stmt);
+    // ⭐ 审计 P2 (2026-10-17): IN 集合与列类型跨型 → 显式报错 (旧实现由
+    // eval_cond_leaf 线性路径把 sql_cmp 的 None 当 false → 静默空集,
+    // 客户端无法区分"类型不匹配"与"没有匹配行"). SELECT 走 sql_plan_select
+    // 内同名校验, 这里覆盖 Delete/Update 两条 DML 路径.
+    if let Some(conds) = stmt_where_conds(&stmt)
+        && let Err(e) = check_in_set_types(&schema, conds)
+    {
+        conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+        return;
+    }
     match stmt {
         // ⭐ compat: 无 FROM 标量函数投影在 sql_dispatch_stmt 已处理
         SqlStmt::ScalarSelect { .. } => unreachable!("ScalarSelect 在 sql_dispatch_stmt 处理"),

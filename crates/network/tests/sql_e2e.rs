@@ -4157,3 +4157,71 @@ fn mysql_derived_tables() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+/// ⭐ 审计 P2 (2026-10-17): IN 集合与列类型跨型 → 显式报错.
+///
+/// 旧实现: `eval_cond_leaf` 线性路径对每个集合元素调 `sql_cmp`, 跨型返回
+/// None 按 false → **静默空集** (客户端无法区分"类型不匹配"与"没有匹配行").
+/// IN 子查询折叠产物与字面量 IN 列表同一 Cond 结构, 两条路径都中招.
+#[test]
+fn mysql_in_type_mismatch_errors_not_silent_empty() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT, age INT, INDEX(age))");
+    c.query("CREATE TABLE o (id INT PRIMARY KEY, uid TEXT, amt INT)");
+    for i in 1..=3 {
+        c.query(&format!("INSERT INTO u VALUES ({i}, 'u{i}', {})", 20 + i));
+    }
+    c.query("INSERT INTO o VALUES (1, 'u1', 100)");
+    c.query("INSERT INTO o VALUES (2, 'u3', 50)");
+
+    // 对照: 同型 (TEXT vs TEXT) IN 子查询正常
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE name IN (SELECT uid FROM o) ORDER BY id"),
+        vec!["1", "3"],
+        "同型 IN 子查询不受影响"
+    );
+    // 对照: 数字文本对 bigint 列可 coercion, 合法
+    assert_eq!(
+        c.ids("SELECT id FROM u WHERE id IN ('1', '3') ORDER BY id"),
+        vec!["1", "3"],
+        "可 coercion 的文本字面量不受影响"
+    );
+
+    // 跨型 IN 子查询: id (bigint) IN (SELECT uid (text)) → 报错而非静默空集
+    match c.query("SELECT id FROM u WHERE id IN (SELECT uid FROM o) ORDER BY id") {
+        QueryResult::Err { msg, .. } => assert!(
+            msg.contains("IN types cannot be matched"),
+            "错误信息应指明类型不匹配: {msg}"
+        ),
+        other => panic!("跨型 IN 子查询应报错, 实际 {other:?}"),
+    }
+
+    // 跨型字面量 IN 列表: name (text) IN (1, 2) → 报错
+    match c.query("SELECT id FROM u WHERE name IN (1, 2)") {
+        QueryResult::Err { msg, .. } => assert!(
+            msg.contains("IN types cannot be matched"),
+            "错误信息应指明类型不匹配: {msg}"
+        ),
+        other => panic!("跨型 IN 列表应报错, 实际 {other:?}"),
+    }
+
+    // DML 路径同样报错 (DELETE ... WHERE id IN (SELECT uid ...))
+    match c.query("DELETE FROM u WHERE id IN (SELECT uid FROM o)") {
+        QueryResult::Err { msg, .. } => assert!(
+            msg.contains("IN types cannot be matched"),
+            "错误信息应指明类型不匹配: {msg}"
+        ),
+        other => panic!("跨型 IN 子查询 (DELETE) 应报错, 实际 {other:?}"),
+    }
+    // 报错不得误删数据
+    assert_eq!(
+        c.ids("SELECT id FROM u ORDER BY id"),
+        vec!["1", "2", "3"],
+        "报错后数据不得被改动"
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
