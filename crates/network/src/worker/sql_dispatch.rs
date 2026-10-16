@@ -7,9 +7,59 @@ use super::sql_join::*;
 use super::sql_sysquery::*;
 use super::*;
 
-// This is the protocol-to-SQL handoff; its inputs are distinct connection and routing resources.
-#[allow(clippy::too_many_arguments)]
+/// ⭐ 2026-10-17 (审计新 P1-9): 语句级 panic 隔离原语.
+///
+/// worker 是单线程事件循环: 任意一处 panic 会杀死线程, 拖死其上的**全部**
+/// 连接 (等效全服 DoS). 在语句边界捕获: panic → 回 ERR 并断连该连接
+/// (状态可能不完整, 不复用), 同 worker 的其他连接不受影响.
+///
+/// 这是防御性兜底 — sql_join.rs 等处的 unwrap 目前多被前置校验挡住, 但
+/// 任何遗漏/未来改动触发的 panic 都不再具备全局杀伤力.
+pub(crate) fn guard_stmt_panic<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)] // 既有豁免: 协议→SQL 交接需要连接/路由/分片等 distinct 资源
 pub(crate) fn sql_dispatch_stmt(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    db: &std::sync::Arc<str>,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    stmt: SqlStmt,
+) {
+    // ⭐ 审计新 P1-9: panic 隔离 — 见 guard_stmt_panic 文档.
+    if guard_stmt_panic(|| {
+        sql_dispatch_stmt_inner(
+            conn,
+            conn_id,
+            seq,
+            worker_id,
+            db,
+            default_db,
+            db_view,
+            shard_inboxes,
+            num_shards,
+            stmt,
+        )
+    })
+    .is_err()
+    {
+        conn.resp_complete(
+            seq,
+            sql_err_bytes(conn.proto, "internal error: statement execution failed"),
+        );
+        // 状态可能不完整 — 断连该连接, 不复用.
+        conn.close_after_flush = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // 同 sql_dispatch_stmt
+fn sql_dispatch_stmt_inner(
     conn: &mut ConnState,
     conn_id: u64,
     seq: u64,
@@ -1082,6 +1132,19 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
 }
 #[cfg(test)]
 mod tests {
+    /// ⭐ 审计新 P1-9: panic 隔离原语 — panic 必须被捕获为 Err (而非杀死
+    /// worker 线程), 正常路径不受影响.
+    #[test]
+    fn guard_stmt_panic_isolates_panic() {
+        // 正常路径
+        assert_eq!(super::guard_stmt_panic(|| 42), Ok(42));
+        // panic 路径: 静音默认 hook 避免测试输出刷屏, 随后恢复
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = super::guard_stmt_panic(|| -> u32 { panic!("boom") });
+        std::panic::set_hook(prev);
+        assert!(r.is_err(), "panic 必须被捕获为 Err");
+    }
     use super::*;
     use storage::schema::{ColType, Column};
 
