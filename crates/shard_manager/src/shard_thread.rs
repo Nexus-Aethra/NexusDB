@@ -393,6 +393,16 @@ pub(crate) fn drain_async_flush(
     rt: &scheduler::SchedHandle,
     flush_done: &FlushDoneSlot,
 ) {
+    // ⭐ 2026-10-17 (审计新 P1-14): **有界** drain.
+    // 旧实现无限循环: IO 持续故障时 backlog 永远排不空 (完成事件永不到达,
+    // 重试无上限无退避) — shard 线程卡死在此, 整个 shard 数据面停摆.
+    // 现在: 轮次/总时限双上限, 超限记 error 并返回 (backlog 留给下一轮
+    // drain, 事件循环继续服务该 shard; Flush handler 后续的同步 flush 仍
+    // 保证 durability).
+    const MAX_ROUNDS: u32 = 1024;
+    const MAX_TOTAL: std::time::Duration = std::time::Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    let mut rounds = 0u32;
     loop {
         drive_async_flush(engine, rt, flush_done, 256, usize::MAX, true);
         let drained = {
@@ -404,6 +414,16 @@ pub(crate) fn drain_async_flush(
             }
         };
         if drained && flush_done.borrow().is_empty() {
+            break;
+        }
+        rounds += 1;
+        if rounds >= MAX_ROUNDS || start.elapsed() >= MAX_TOTAL {
+            nlog::error!(
+                "shard",
+                "async flush backlog not draining after {} rounds / {:?} —                  leaving backlog for next cycle (possible persistent IO failure)",
+                rounds,
+                start.elapsed()
+            );
             break;
         }
         rt.clone().drive_until_idle(1000);

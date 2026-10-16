@@ -36,3 +36,17 @@
 失败"的中间态, 现有 harness 无 per-shard 故障注入 (无 kill 单 shard / 无
 mock reply), 故该路径按构造验证 (三处循环同型修改 + 编译期类型保证) +
 happy path 全量回归. 建议后续为 ShardManager 补 fault-injection 测试设施.
+
+---
+
+## 附: P1-14 (drain_async_flush 无限循环) — 同批次修复
+
+**问题**: `drain_async_flush` 无限循环 — IO 持续故障时 async flush backlog
+永远排不空 (完成事件永不到达), shard 线程卡死, 整个 shard 数据面停摆.
+
+**修复**: 轮次 (1024) + 总时限 (10s) 双上限; 超限记 `nlog::error!` 并返回 —
+backlog 留给下一轮 drain, 事件循环继续服务; Flush handler 后续的**同步**
+flush 仍保证 durability (提前返回不丢数据).
+
+**验证**: shard_manager 串行 65/0; clippy/fmt 全清. (IO 持续故障无注入设施,
+按构造验证 — 与 P1-13 同一测试设施缺口.)
