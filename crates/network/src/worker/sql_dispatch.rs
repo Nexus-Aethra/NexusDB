@@ -302,9 +302,18 @@ fn sql_dispatch_stmt_inner(
                 sql_err_bytes(conn.proto, "DDL is not allowed inside a transaction"),
             );
         }
-        // ⭐ compat: 独立 CREATE INDEX — 表内联索引已在建表时支持, 这里 v1 吞掉返回 OK
+        // ⭐ 2026-10-17 (审计 P2): 独立 CREATE INDEX 显式报错.
+        // 旧实现吞掉返回 OK — 客户端以为索引已建, 实际查询计划毫无变化
+        // (静默降级). 表内联索引 (CREATE TABLE ... INDEX(col)) 本就支持,
+        // 这里明确指引, 绝不静默.
         SqlStmt::CreateIndex { .. } => {
-            conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+            conn.resp_complete(
+                seq,
+                sql_err_bytes(
+                    conn.proto,
+                    "standalone CREATE INDEX is not supported;                      declare indexes inline: CREATE TABLE t (..., INDEX(col))",
+                ),
+            );
         }
         // ⭐ compat: PG 专有 DDL 吞掉 (EXTENSION/FUNCTION/TRIGGER/SEQUENCE/DROP TRIGGER/INDEX)
         SqlStmt::DdlStub => {

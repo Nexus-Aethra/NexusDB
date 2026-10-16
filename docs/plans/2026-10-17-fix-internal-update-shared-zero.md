@@ -23,3 +23,18 @@ leaf 侧同型 bug 已于 2026-07-26 修复 (leaf.rs:932-936), internal 侧漏�
 | `internal_update_segment_head_keeps_shared_zero` | ✅ 40 separator 造多段, 更新段首 child 后段首仍 shared=0, 页自洽 |
 | page 全量 | ✅ 151 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: 事务中 DDL 静默回 OK (P2) — 同批次修复
+
+**问题**: 独立 `CREATE INDEX` 在 worker 被吞并返回 OK — 客户端以为索引
+已建, 实际查询计划无任何变化 (静默降级).
+
+**修复**: `SqlStmt::CreateIndex` 改为显式报错并指引支持的内联写法
+("declare indexes inline: CREATE TABLE t (..., INDEX(col))").
+(CreateTable/DropTable/AlterTable 在事务中此前已正确拒绝; DdlStub 为
+PG 兼容 deliberately-OK, 保留并在注释中说明.)
+
+**测试**: `create_index_rejected_not_silently_ok` (报错且信息含指引;
+内联 INDEX 不受影响); network 串行 223 passed / 0 failed; clippy 0; fmt 0.

@@ -2085,6 +2085,32 @@ fn mysql_stalled_oversized_stream_rejected() {
     drop(mgr);
 }
 
+/// ⭐ 审计 P2 回归 (2026-10-17): 独立 CREATE INDEX 必须显式报错,
+/// 不得静默回 OK (客户端以为索引已建, 实际无任何效果).
+#[test]
+fn create_index_rejected_not_silently_ok() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, a INT)");
+    match c.query("CREATE INDEX ta ON t(a)") {
+        QueryResult::Err { msg, .. } => {
+            assert!(
+                msg.contains("CREATE INDEX") && msg.contains("INDEX(col)"),
+                "错误信息应指明不支持并指引内联写法: {msg}"
+            );
+        }
+        other => panic!("独立 CREATE INDEX 必须显式报错, 实际 {other:?}"),
+    }
+    // 内联索引仍然正常 (支持的形式不受影响)
+    assert!(matches!(
+        c.query("CREATE TABLE t2 (id INT PRIMARY KEY, a INT, INDEX(a))"),
+        QueryResult::Ok { .. }
+    ));
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ F81 + 审计新 P0-3 回归 (2026-10-16): DECIMAL 主键/外键的
 /// ON DELETE CASCADE 必须真正删掉引用行.
 ///
