@@ -19,9 +19,19 @@ pub(crate) fn sql_dispatch_stmt(
     db_view: &std::sync::Arc<shard_manager::DbDirView>,
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
-    stmt: SqlStmt,
+    mut stmt: SqlStmt,
 ) {
     crate::metrics::SQL_QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // ⭐ 审计新 P0-3 (2026-10-16): 表限定名校验. 解析器保留 `db.tbl` 原样,
+    // 在此统一处理 — 同库剥离, 跨库显式报错. 修复前解析器静默剥离库名,
+    // `USE app; SELECT * FROM otherdb.users` 会按当前库解析: 读返回错误库
+    // 数据, 写污染当前库, 无日志无指标.
+    if let Err(e) = crate::worker::sql_dbqual::normalize_stmt_tables(&mut stmt, db.as_ref(), &|q| {
+        q == default_db.as_ref() || db_view.id_of(q).is_some()
+    }) {
+        conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+        return;
+    }
     // ⭐ ORM-B2: DDL epoch 检查 — DROP/重建后本 worker 陈旧 schema 缓存整体
     // 失效 (一次 relaxed load 热路径; DDL 低频, 全量清空重拉可接受)
     {

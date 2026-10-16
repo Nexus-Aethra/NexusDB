@@ -39,6 +39,7 @@ type JoinRanges = Vec<HashMap<u32, JoinRange>>;
 type CascadePending = (std::sync::Arc<str>, String, Vec<Vec<u8>>);
 
 /// ⭐ 拆分 (2026-08): SQL 纯工具函数 (不依赖 ConnState 状态).
+mod sql_dbqual;
 mod sql_util;
 use sql_util::*;
 /// ⭐ 拆分 (2026-08): SQL 聚合执行 (GROUP BY/聚合函数/HAVING).

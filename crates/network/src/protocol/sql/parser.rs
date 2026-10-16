@@ -399,9 +399,14 @@ impl P {
         }
     }
 
-    /// ⭐ F76: 表位置标识符 — 读 ident 并剥 db 限定前缀 (`db.tbl` → `tbl`).
+    /// ⭐ F76: 表位置标识符 — 读 ident, **保留 `db.tbl` 限定名原样**.
+    ///
+    /// 2026-10-16 (审计新 P0-3): 旧实现在此静默剥离 db 限定前缀, 导致
+    /// `USE app; SELECT * FROM otherdb.users` 按当前库解析 — 读返回错误库
+    /// 的数据, 写污染当前库, 且无日志无指标. 现由 worker 侧
+    /// `sql_dbqual::normalize_stmt_tables` 统一校验 (同库剥离/跨库显式报错).
     pub(crate) fn table_ident(&mut self) -> Result<String, String> {
-        Ok(strip_db_qual(self.ident()?))
+        self.ident()
     }
 
     pub(crate) fn expect(&mut self, want: &Tok, what: &str) -> Result<(), String> {

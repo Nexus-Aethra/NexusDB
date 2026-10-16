@@ -47,15 +47,6 @@ pub fn sort_in_set(set: &mut Vec<SqlValue>) {
     }
 }
 
-/// ⭐ F76: 剥 db 限定前缀 — `db.tbl` / `db.tbl` (反引号已在 tokenizer 拼为单 Ident) → `tbl`.
-/// 表名不含 '.', 取最后一段即去 db 限定. v1 不支持真跨库 (归一为当前库同名表).
-pub(crate) fn strip_db_qual(name: String) -> String {
-    match name.rsplit_once('.') {
-        Some((_, tbl)) => tbl.to_string(),
-        None => name,
-    }
-}
-
 /// 比较算子 (WHERE 条件).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {

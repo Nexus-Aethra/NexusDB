@@ -138,9 +138,13 @@ pub(crate) fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
         if !(p.try_kw("FROM") || p.try_kw("IN")) {
             return Err("expected FROM after SHOW COLUMNS".into());
         }
-        let table = p.table_ident()?;
+        let mut table = p.table_ident()?;
         if p.try_kw("FROM") || p.try_kw("IN") {
-            let _ = p.ident()?;
+            // ⭐ 审计新 P0-3: `SHOW COLUMNS FROM t FROM db` 的库限定曾被
+            // `let _ = p.ident()` 静默丢弃 (恒查当前库). 拼成 `db.t` 交
+            // worker normalize_stmt_tables 统一校验.
+            let db = p.ident()?;
+            table = format!("{db}.{table}");
         }
         p.done()?;
         Ok(mk(
@@ -685,8 +689,9 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             offset_param,
         });
     }
-    // ⭐ F76: 非系统表 → 剥 db 限定前缀 (`default.t` → `t`); 系统表已在上方按全名分派
-    let table = strip_db_qual(table);
+    // ⭐ F76: 非系统表 — 保留 `db.tbl` 限定名原样 (系统表已在上方按全名分派).
+    // 2026-10-16 (审计新 P0-3): 限定名交 worker sql_dbqual::normalize_stmt_tables
+    // 统一校验: 同库剥离, 跨库显式报错 (旧实现在此静默剥离 → 跨库错数据).
     // ⭐ F67 (JOIN): 表名后 3 token 内出现 JOIN/INNER/LEFT → 转 JOIN 解析
     if is_join_ahead(p) {
         if distinct {

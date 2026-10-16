@@ -541,6 +541,8 @@ pub(crate) fn sql_err_bytes(proto: ProtocolKind, msg: &str) -> Vec<u8> {
             "25P02"
         } else if msg.contains("Unknown database") {
             "3D000"
+        } else if msg.contains("Cross-database access is not supported") {
+            "0A000"
         } else if msg.contains("expected")
             || msg.contains("unexpected")
             || msg.contains("unterminated")

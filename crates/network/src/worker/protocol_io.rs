@@ -335,6 +335,8 @@ pub(crate) fn mysql_err_packet(msg: &str) -> Vec<u8> {
         1792
     } else if msg.contains("Unknown database") {
         1049
+    } else if msg.contains("Cross-database access is not supported") {
+        1235 // ER_NOT_SUPPORTED_YET — 跨库访问 v1 不支持 (显式报错, 非静默错数据)
     } else if msg.contains("has no schema") || msg.contains("doesn't exist") {
         1146 // ER_NO_SUCH_TABLE — ORM has_table 据此判表不存在后发 CREATE
     } else if msg.contains("expected") || msg.contains("unexpected") || msg.contains("unterminated")

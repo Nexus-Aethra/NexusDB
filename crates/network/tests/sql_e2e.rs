@@ -3084,12 +3084,18 @@ fn mysql_derived_join() {
 }
 
 /// ⭐ F76: ORM 对接 P0 — 列别名 AS / 单表限定列 / db.table 限定 / LIMIT n,m / DESCRIBE 1146.
+///
+/// ⭐ 2026-10-16 (审计新 P0-3): `db.table` 限定名的语义修正为"限定名须等于
+/// session 库才剥离放行; 跨库显式报错 (1235/1049)". 旧实现静默剥离库名按
+/// 当前库解析 (跨库错数据), 故本测试原用 `default.orm_t` (session=app) 实为
+/// 依赖 bug 行为; 现改用同库限定 `app.orm_t`, 并新增跨库报错断言.
+/// 完整跨库矩阵见 sql_cross_db_regression.rs.
 #[test]
 fn mysql_orm_shapes() {
     let (server, mgr) = start_sql_server(None);
     let mut c = MyConn::handshake_login(&server, "");
     // DESCRIBE 不存在表 → 1146 (ORM has_table 据此判不存在后发 CREATE)
-    assert_eq!(c.query("DESCRIBE default.orm_t").err_code(), Some(1146));
+    assert_eq!(c.query("DESCRIBE app.orm_t").err_code(), Some(1146));
     c.query("CREATE TABLE orm_t (id INT PRIMARY KEY, name TEXT, age INT, INDEX(age))");
     for i in 1..=5 {
         c.query(&format!(
@@ -3114,18 +3120,22 @@ fn mysql_orm_shapes() {
         panic!("{r:?}")
     };
     assert_eq!(rows, &vec![vec![Some("2".into())]]);
-    // db.table 限定 (裸 + 反引号)
+    // db.table 限定 (同库: 裸 + 反引号)
+    assert_eq!(c.ids("SELECT id FROM app.orm_t WHERE id = 3"), vec!["3"]);
     assert_eq!(
-        c.ids("SELECT id FROM default.orm_t WHERE id = 3"),
+        c.ids("SELECT id FROM `app`.`orm_t` WHERE id = 3"),
         vec!["3"]
     );
+    // 跨库限定名 → 显式报错 (session=app; `default` 非已注册库 → 1049).
+    // 修复前此处静默按当前库解析, 返回 app.orm_t 的数据 (跨库错数据).
     assert_eq!(
-        c.ids("SELECT id FROM `default`.`orm_t` WHERE id = 3"),
-        vec!["3"]
+        c.query("SELECT id FROM default.orm_t WHERE id = 3")
+            .err_code(),
+        Some(1049)
     );
     // DESCRIBE 现存在表 → 成功
     assert!(matches!(
-        c.query("DESCRIBE default.orm_t"),
+        c.query("DESCRIBE app.orm_t"),
         QueryResult::Rows(_)
     ));
     // LIMIT offset,count 逗号形态 → 第 2 行起 1 行 = id2
