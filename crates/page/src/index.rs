@@ -128,7 +128,11 @@ impl PageIndex {
                 )));
             }
             // 调试: 遍历该段内所有 item, 验证 keys
-            if i < 4 {
+            // ⭐ 审计 P2 (2026-10-17): 这段是**纯诊断**代码, 但 decode/full_key
+            // 带 Err 语义 (不可被 DCE), release 也全额执行 — 实测 ~1.29µs/次,
+            // 而 load 是每次读页的热路径. 收敛到 debug_assertions: debug/测试
+            // 保留完整校验, release 零成本 (页级正确性由读取路径的 decode 兼底).
+            if cfg!(debug_assertions) && i < 4 {
                 let mut off = cp.first_item_off as usize;
                 let mut prev_key: Vec<u8> = Vec::new();
                 for j in 0..cp.item_count {
