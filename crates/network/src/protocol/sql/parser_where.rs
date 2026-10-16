@@ -8,8 +8,10 @@ use super::parser_select::{
 
 pub(crate) fn parse_paren_subselect(p: &mut P) -> Result<Box<SqlStmt>, String> {
     p.expect(&Tok::LParen, "(")?;
+    p.enter_subq()?; // ⭐ 审计新 P1-10: 子查询嵌套递归防爆栈 (独立更严上限)
     let inner = parse_select(p, false)?;
     p.expect(&Tok::RParen, ")")?;
+    p.leave_subq();
     Ok(Box::new(inner))
 }
 
@@ -119,7 +121,10 @@ pub(crate) fn parse_and_expr(p: &mut P) -> Result<Pred<Cond>, String> {
 /// ⭐ F69: NOT 层.
 pub(crate) fn parse_not_expr(p: &mut P) -> Result<Pred<Cond>, String> {
     if p.try_kw("NOT") {
-        Ok(Pred::Not(Box::new(parse_not_expr(p)?)))
+        p.enter_rec()?; // ⭐ 审计新 P1-10: NOT 前缀递归防爆栈
+        let inner = parse_not_expr(p)?;
+        p.leave_rec();
+        Ok(Pred::Not(Box::new(inner)))
     } else {
         parse_primary(p)
     }
@@ -139,9 +144,11 @@ pub(crate) fn parse_primary(p: &mut P) -> Result<Pred<Cond>, String> {
         }));
     }
     if p.peek() == Some(&Tok::LParen) {
+        p.enter_rec()?; // ⭐ 审计新 P1-10: 括号嵌套递归防爆栈
         p.next()?;
         let inner = parse_or_expr(p)?;
         p.expect(&Tok::RParen, ")")?;
+        p.leave_rec();
         Ok(inner)
     } else {
         parse_where_atom(p)
@@ -532,8 +539,10 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
                         Ok(ScalarExpr::Lit(SqlValue::Int(0)))
                     }
                     "NOT" => {
+                        p.enter_rec()?; // ⭐ 审计新 P1-10: NOT 前缀递归防爆栈
                         p.next()?;
                         let e = atom(p)?;
+                        p.leave_rec();
                         Ok(ScalarExpr::Not(Box::new(e)))
                     }
                     _ => {

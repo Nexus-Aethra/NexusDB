@@ -28,6 +28,50 @@ pub use parser::{bind_params, parse, parse_prepared, split_sql_statements};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ 审计新 P1-10 (2026-10-17): 深嵌套括号/子查询不得打爆线程栈
+    /// (一条 SQL 的远程 DoS) — 必须显式报错.
+    #[test]
+    fn deeply_nested_parens_rejected_not_stack_overflow() {
+        for depth in [200usize, 5_000, 50_000] {
+            let sql = format!(
+                "SELECT * FROM t WHERE {}1=1{}",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            );
+            let r = parse(sql.as_bytes());
+            assert!(r.is_err(), "{depth} 层括号必须显式报错 (而非栈溢出)");
+            assert!(
+                r.unwrap_err().contains("too deep"),
+                "错误信息应指明嵌套过深"
+            );
+        }
+        // 合理深度 (含 ORM 生成查询的常见量级) 必须放行
+        let ok = format!(
+            "SELECT * FROM t WHERE {}1=1{}",
+            "(".repeat(20),
+            ")".repeat(20)
+        );
+        assert!(parse(ok.as_bytes()).is_ok(), "20 层括号应正常解析");
+    }
+
+    #[test]
+    fn deeply_nested_not_rejected_not_stack_overflow() {
+        let sql = format!("SELECT * FROM t WHERE {}x = 1", "NOT ".repeat(5_000));
+        let r = parse(sql.as_bytes());
+        assert!(r.is_err(), "5000 层 NOT 必须显式报错");
+    }
+
+    #[test]
+    fn deeply_nested_subselect_rejected_not_stack_overflow() {
+        // EXISTS (SELECT ... ) 层层嵌套
+        let mut sql = String::from("SELECT * FROM t WHERE x = 1");
+        for _ in 0..2_000 {
+            sql = format!("SELECT * FROM t WHERE EXISTS ({sql})");
+        }
+        let r = parse(sql.as_bytes());
+        assert!(r.is_err(), "2000 层子查询必须显式报错 (而非栈溢出)");
+    }
     use storage::schema::ColType;
 
     #[test]
