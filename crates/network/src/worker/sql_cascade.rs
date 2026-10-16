@@ -260,7 +260,14 @@ fn pk_enc_to_sql(ty: ColType, enc: &[u8]) -> SqlValue {
         Some(ColValue::I64(x)) => SqlValue::Int(x),
         Some(ColValue::F64(x)) => SqlValue::Float(x),
         Some(ColValue::Bytes(b)) => SqlValue::Str(b),
-        Some(ColValue::Decimal(x, _)) => SqlValue::Str(format!("{x}").into_bytes()),
+        // ⭐ 2026-10-16 (审计新 P0-3): 必须用与 eval 侧 parse_decimal 互为
+        // 逆运算的规范十进制文本 (render_decimal). 旧实现直接 format 定标整数
+        // (Decimal(12345,2) → "12345"), 而 parse_decimal 把无小数点串按
+        // "整数×10^scale" 解释 (→1234500), 两者相差 10^scale 倍 → IN 条件
+        // 永不匹配, 级联静默失效, 孤儿行残留.
+        Some(ColValue::Decimal(x, sc)) => {
+            SqlValue::Str(crate::worker::sql_encode::render_decimal(x, sc).into_bytes())
+        }
         _ => SqlValue::Null,
     }
 }

@@ -2037,6 +2037,50 @@ fn mysql_foreign_key_cascade() {
     drop(mgr);
 }
 
+/// ⭐ F81 + 审计新 P0-3 回归 (2026-10-16): DECIMAL 主键/外键的
+/// ON DELETE CASCADE 必须真正删掉引用行.
+///
+/// 修复前: 级联侧 `pk_enc_to_sql` 把定标整数直接 `format!("{x}")` 成裸串
+/// (Decimal(12345,2) → "12345"), 而 eval 侧 `parse_decimal("12345", 2)`
+/// 按"整数部分=12345, 小数补00"解释为 1234500 — 与真实值 12345 相差
+/// 10^scale 倍, IN 条件永不匹配 → 孤儿行静默残留, 无告警.
+#[test]
+fn mysql_foreign_key_cascade_decimal_pk() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE fkd_parent (id DECIMAL(18,2) PRIMARY KEY)");
+    c.query(
+        "CREATE TABLE fkd_child (id INT PRIMARY KEY, pid DECIMAL(18,2) \
+         REFERENCES fkd_parent(id) ON DELETE CASCADE)",
+    );
+    c.query("INSERT INTO fkd_parent VALUES (123.45), (67.89)");
+    c.query("INSERT INTO fkd_child VALUES (10, 123.45), (11, 123.45), (12, 67.89)");
+    // DELETE parent 123.45 → child 10/11 必须被级联删掉
+    c.query("DELETE FROM fkd_parent WHERE id = 123.45");
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fkd_child"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "DECIMAL 级联删除必须生效 (修复前孤儿行静默残留, 计数为 3)"
+    );
+    // 负值 + scale=4 再验一轮 (render/parse 对称性覆盖符号与补零)
+    c.query("CREATE TABLE fkn_parent (id DECIMAL(18,4) PRIMARY KEY)");
+    c.query(
+        "CREATE TABLE fkn_child (id INT PRIMARY KEY, pid DECIMAL(18,4) \
+         REFERENCES fkn_parent(id) ON DELETE CASCADE)",
+    );
+    c.query("INSERT INTO fkn_parent VALUES (-0.0005), (1.5000)");
+    c.query("INSERT INTO fkn_child VALUES (20, -0.0005), (21, 1.5000)");
+    c.query("DELETE FROM fkn_parent WHERE id = -0.0005");
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM fkn_child"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "负 DECIMAL scale=4 级联删除必须生效"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ PG 兼容 (UPDATE SET 表达式): `SET col = col + 1` 乐观锁, `NOT col` toggle,
 /// 链式算术. 由 shard 端 row_update 读旧行求值 (原子读改写).
 #[test]
