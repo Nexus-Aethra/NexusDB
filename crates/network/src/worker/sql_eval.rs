@@ -447,11 +447,51 @@ pub(crate) fn eval_pred(schema: &TableSchema, values: &[ColValue], pred: &Pred<C
 pub(crate) fn eval_pred_sysq(schema: &TableSchema, values: &[ColValue], pred: &Pred<Cond>) -> bool {
     match pred {
         Pred::Leaf(c) if c.col.starts_with("__") => true,
-        Pred::Leaf(c) => eval_cond_leaf(schema, values, c),
+        Pred::Leaf(c) => eval_cond_leaf_sysq(schema, values, c),
         Pred::And(v) => v.iter().all(|p| eval_pred_sysq(schema, values, p)),
         Pred::Or(v) => v.iter().any(|p| eval_pred_sysq(schema, values, p)),
         Pred::Not(b) => !eval_pred_sysq(schema, values, b),
     }
+}
+
+/// ⭐ 2026-10-17 (审计 P2): 系统表虚拟列**全为 Str schema** — 数值字面量
+/// 比较 (如 `ordinal_position > 5`) 会退化成字典序 ("10" < "5").
+/// 数值字面量 vs 可解析为数值的文本列值 → 按数值比较; 否则回退通用路径.
+fn eval_cond_leaf_sysq(schema: &TableSchema, values: &[ColValue], c: &Cond) -> bool {
+    use std::cmp::Ordering;
+    if !matches!(c.op, CmpOp::In | CmpOp::JsonExists)
+        && matches!(c.val, SqlValue::Int(_) | SqlValue::Float(_))
+        && let Some(i) = schema.col_by_name(&c.col)
+        && let Some((a, b)) = sysq_numeric_pair(&values[i as usize], &c.val)
+        && let Some(o) = a.partial_cmp(&b)
+    {
+        return match c.op {
+            CmpOp::Eq => o == Ordering::Equal,
+            CmpOp::Ne => o != Ordering::Equal,
+            CmpOp::Gt => o == Ordering::Greater,
+            CmpOp::Ge => o != Ordering::Less,
+            CmpOp::Lt => o == Ordering::Less,
+            CmpOp::Le => o != Ordering::Greater,
+            _ => unreachable!("上方已排除 In/JsonExists"),
+        };
+    }
+    eval_cond_leaf(schema, values, c)
+}
+
+/// 文本/数值列值 vs 数值字面量 → (f64, f64); 任一不可按数值解析 → None.
+fn sysq_numeric_pair(cv: &ColValue, lit: &SqlValue) -> Option<(f64, f64)> {
+    let a = match cv {
+        ColValue::Bytes(b) => std::str::from_utf8(b).ok()?.trim().parse::<f64>().ok()?,
+        ColValue::I64(v) => *v as f64,
+        ColValue::F64(v) => *v,
+        _ => return None,
+    };
+    let b = match lit {
+        SqlValue::Int(v) => *v as f64,
+        SqlValue::Float(v) => *v,
+        _ => return None,
+    };
+    Some((a, b))
 }
 
 /// ⭐ F80: WHERE/比较字面量按目标列类型强制转换 — DATE/TIME/TIMESTAMP 的

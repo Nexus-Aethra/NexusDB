@@ -2085,6 +2085,52 @@ fn mysql_stalled_oversized_stream_rejected() {
     drop(mgr);
 }
 
+/// ⭐ 审计 P2 回归 (2026-10-17): 系统表 (information_schema) 的数值列
+/// 比较/排序不得退化为字典序. 旧实现虚拟列全 Str schema: `ordinal_position
+/// > 2` 在 12 列表上会漏掉 10/11/12 ("10" < "2"), ORDER BY 同样错序.
+#[test]
+fn information_schema_numeric_compare_and_order() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    // 12 列的表 — 两位数 ordinal_position 是字典序陷阱
+    let cols: Vec<String> = (0..12).map(|i| format!("c{i:02} INT")).collect();
+    c.query(&format!(
+        "CREATE TABLE t (id INT PRIMARY KEY, {})",
+        cols.join(", ")
+    ));
+
+    // WHERE ordinal_position > 2 → 应命中 c02..c11 (10 行; 字典序只有 7 行)
+    let r = c.query(
+        "SELECT column_name FROM information_schema.columns          WHERE table_name = 't' AND ordinal_position > 2 ORDER BY ordinal_position",
+    );
+    let QueryResult::Rows(rows) = r else {
+        panic!("expected rows, got {r:?}")
+    };
+    let names: Vec<String> = rows.iter().map(|r| r[0].clone().unwrap()).collect();
+    // 表有 id 主键 (ordinal 1) + c00..c11 (ordinal 2..13);
+    // ordinal_position > 2 → c01..c11 (11 行). 字典序会漏掉 c10/c11
+    // ("10"/"11" < "2") 只剩 7 行.
+    assert_eq!(
+        names,
+        (1..12).map(|i| format!("c{i:02}")).collect::<Vec<_>>(),
+        "ordinal_position > 2 必须按数值语义命中 c01..c11 (旧实现字典序只剩 7 行)"
+    );
+
+    // ORDER BY DESC 同样按数值
+    let r2 = c.query(
+        "SELECT column_name FROM information_schema.columns          WHERE table_name = 't' ORDER BY ordinal_position DESC LIMIT 3",
+    );
+    let QueryResult::Rows(rows2) = r2 else {
+        panic!("expected rows, got {r2:?}")
+    };
+    let names2: Vec<String> = rows2.iter().map(|r| r[0].clone().unwrap()).collect();
+    assert_eq!(names2, vec!["c11", "c10", "c09"], "DESC 应按数值序");
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ 审计 P2 回归 (2026-10-17): UUID 列 IN >64 元素不得恒空集.
 /// 旧实现二分路径漏了 UUID 文本→16B coercion: ≤64 元素正确、>64 恒空.
 #[test]

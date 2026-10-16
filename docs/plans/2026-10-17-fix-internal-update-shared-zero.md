@@ -70,3 +70,21 @@ clippy 0; fmt 0.
 ≤64 行为不变); 反向验证旧实现返回 []; network 串行 225 passed / 0 failed;
 clippy 0; fmt 0. (注: 期间一次失败为 /tmp tmpfs 配额耗尽的环境问题,
 清理后复跑通过.)
+
+---
+
+## 附: 系统表数值比较/排序退化为字典序 (P2) — 同批次修复
+
+**问题**: `information_schema` 等系统表虚拟列全为 Str schema —
+`WHERE ordinal_position > 2` 这类数值比较走 `sql_cmp(Bytes, Int)` 无匹配
+分支 → 条件恒 false, **整个查询返回空集** (比字典序错序更严重);
+ORDER BY 数值列也按字典序 ("10" < "2").
+
+**修复**:
+- `eval_pred_sysq` 叶子改走 `eval_cond_leaf_sysq`: 数值字面量 vs 可解析
+  为数值的文本列值 → 按数值比较, 否则回退通用路径;
+- 系统表 ORDER BY 改 `sysq_cmp`: 双方可解析为数值时按数值排序.
+
+**测试**: `information_schema_numeric_compare_and_order` (12 列表,
+`ordinal_position > 2` → c01..c11 共 11 行; DESC 数值序); 反向验证旧实现
+返回空集 []; network 串行 226 passed / 0 failed; clippy 0; fmt 0.
