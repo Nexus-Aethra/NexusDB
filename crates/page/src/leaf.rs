@@ -477,7 +477,10 @@ pub fn leaf_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
     }
     // target_full_key = prev_key (循环退出时 prev_key = target 的 full key)
     let target_full_key = prev_key.clone();
-    let target_prev_key = if target_off > PAGE_HEADER_SIZE {
+    // ⭐ 审计 P2 (2026-10-17): target_prev_key 只喂给下面的 dprintln! (调试
+    // 打印), 旧实现每次删除都白做一次全页扫描 (reconstruct_key_before 从页头
+    // 顺序 decode 到 target = O(N)). 与 dprintln! 同条件惰性化.
+    let target_prev_key = if crate::debug::debug_on("leaf") && target_off > PAGE_HEADER_SIZE {
         reconstruct_key_before(page, target_off, ItemKind::Leaf)?
     } else {
         Vec::new() // target 是哨兵, 但实际我们禁止空 key 删除, 所以不会到这里
