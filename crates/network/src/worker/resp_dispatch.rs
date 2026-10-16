@@ -59,14 +59,12 @@ pub(crate) fn push_task_grouped(
 }
 
 /// key 级路由 (与 hash_route_op 同 hash 逻辑, 分组场景用).
+///
+/// ⭐ 审计 P2 (2026-10-17): 委托 `shard_manager::router::route_hash` — 旧实现
+/// 在这里第三份复制同一哈希, 任一处漂移都会让同一 key 的写入路由与读集验证 /
+/// 索引查询落到不同 shard (写成功却查不到).
 pub(crate) fn hash_route_key(db: &str, table: &str, key: &[u8], num_shards: usize) -> usize {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    db.hash(&mut h);
-    table.hash(&mut h);
-    key.hash(&mut h);
-    (h.finish() as usize) % num_shards
+    shard_manager::router::route_hash(db, table, key, num_shards)
 }
 
 /// 尝试把 `HGET table:pk field` 路由为 SQL 行点查。
@@ -1010,4 +1008,31 @@ pub(crate) fn getrange_slice(data: &[u8], start: i64, end: i64) -> &[u8] {
         return &[];
     }
     &data[s as usize..=e as usize]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⭐ 审计 P2 (2026-10-17): worker 侧路由必须与 shard_manager 的规范实现
+    /// (`router::route_hash`) 逐位相同 — 旧实现在三处复制 DefaultHasher 逻辑,
+    /// 任一处漂移都会让同一 key 的写入路由与读集验证/索引查询落到不同 shard
+    /// ("写成功却查不到"). 本测试把漂移直接变成红灯.
+    #[test]
+    fn hash_route_key_matches_shard_manager_single_source() {
+        for (db, table, key) in [
+            ("default", "users", &b"alice"[..]),
+            ("app", "orders", b"o-123"),
+            ("db", "t", b""),
+            ("x", "y", &[0u8, 255, 1, 2, 3][..]),
+        ] {
+            for n in [1usize, 3, 8, 64] {
+                assert_eq!(
+                    hash_route_key(db, table, key, n),
+                    shard_manager::router::route_hash(db, table, key, n),
+                    "worker 路由与 shard_manager 规范实现漂移: {db}/{table}/{key:?} n={n}"
+                );
+            }
+        }
+    }
 }

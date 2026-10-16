@@ -448,3 +448,30 @@ non-zero on bad pages" 完全没落地: 两种模式行为一模一样 (永远 t
 | 真机 CLI (合成坏页目录) | ✅ `--strict vpid 1` / `--strict verify 1` → 退出码 **2** + `fatal: bad page in strict mode: ...`; 不带 `--strict` → 退出码 0 且仍打印 `[BAD-PAGE]` 行 |
 | scanner 单测 | ✅ 70 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: DefaultHasher 路由逻辑三份拷贝 (P2) — 同批次修复
+
+**问题**: 同一套 (db, table, key) → shard 路由哈希在三处复制:
+`shard_manager/src/router.rs:40` (`HashRouter::route`)、
+`manager.rs:1382` (`route_db_table_key`)、
+`network/src/worker/resp_dispatch.rs:65` (`hash_route_key`, 被 `hash_route_op`
+复用). 任一处漂移 (输入顺序 / hasher / 取模) 都会让**同一个 key 在不同路径
+落到不同 shard** — 例如 worker 把写发去 shard A, 而 OCC 读集验证 / 索引查询
+去 shard B, 表现为"写成功却查不到"这类极难排查的数据不一致. 另外
+`DefaultHasher` 的跨版本稳定性从未写明 (标准库不保证).
+
+**修复**: 收敛为唯一实现 `shard_manager::router::route_hash(db, table, key,
+num_shards)`, 三处全部委托; `lib.rs` 导出. 同时在文档里写明稳定性契约:
+DefaultHasher 输出**不跨 Rust 版本稳定**, 故只用于同进程内分片选择 (数据布局
+不跨进程/跨版本持久化; 若未来要跨版本稳定必须换固定算法并重分布数据).
+
+**测试**:
+
+| 用例 | 结果 |
+|---|---|
+| `route_hash_is_the_single_source_of_truth` (shard_manager) | ✅ trait 入口与自由函数同值; 输入顺序敏感; num_shards 敏感 |
+| `hash_route_key_matches_shard_manager_single_source` (network 单测) | ✅ worker 侧路由与规范实现逐位相同 (4 组输入 × 4 种 num_shards) |
+| shard_manager 全量串行 / network 全量串行 | ✅ 65 / 238 passed, 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

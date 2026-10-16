@@ -1434,14 +1434,9 @@ impl ShardManager {
     }
 
     /// 路由: 用 db name + table + key hash.
+    /// ⭐ 审计 P2 (2026-10-17): 委托 `router::route_hash` (唯一实现, 防三处漂移).
     fn route_db_table_key(&self, db: &str, table: &str, key: &[u8]) -> ShardId {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        db.hash(&mut hasher);
-        table.hash(&mut hasher);
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) % self.num_shards
+        crate::router::route_hash(db, table, key, self.num_shards)
     }
 
     /// 关闭所有 shard 线程, 干净退出.

@@ -69,6 +69,6 @@ pub use request::{
     BatchOp, BatchResult, ShardId, ShardReply, ShardRequest, ShardResponse, ShardTask, TaskResult,
 };
 pub use request::{PredOp, ScanPred};
-pub use router::{HashRouter, Router};
+pub use router::{HashRouter, Router, route_hash};
 pub use task_inbox::{SharedTaskInbox, TaskInbox};
 pub use task_reply_bus::{ReplyBusSet, SharedTaskReplyBus, TaskReplyBus};
