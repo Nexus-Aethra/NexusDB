@@ -65,6 +65,20 @@ impl<'a> ItemPtr<'a> {
     /// 顺序前进到下一个 item. 内部用 cached cur_key 拼接下一个 key.
     /// 返回 None 表示已到 item 区末尾.
     pub fn next(&self, kind: ItemKind) -> Result<Option<ItemPtr<'a>>, PageError> {
+        Ok(self.next_decoded(kind)?.map(|(ptr, _item)| ptr))
+    }
+
+    /// ⭐ 审计 P2 (2026-10-17): `next()` + 解出下一 item 的附加字段
+    /// (value / child_vpid) 只需**一次** decode.
+    ///
+    /// 旧实现: `LeafItemPtr::next` / `InternalItemPtr::next` 先调
+    /// `inner.next()` (decode 一次), 再 `decode_item` 解第二遍拿 value_len /
+    /// child_vpid — 段内每次前进都双倍解码. 这里把解出的 `Item` (零拷贝借用
+    /// page) 一并返回, 调用方直接取字段.
+    pub fn next_decoded(
+        &self,
+        kind: ItemKind,
+    ) -> Result<Option<(ItemPtr<'a>, crate::item::Item<'a>)>, PageError> {
         let next_off = self.off + self.cur_n;
         let free_off = crate::header::page_free_off(self.page) as usize;
         if next_off >= free_off {
@@ -73,12 +87,15 @@ impl<'a> ItemPtr<'a> {
         let (next_item, next_n) = decode_item(self.page, next_off, kind)?;
         // 用 self.cur_key 作为 prev_key
         let full = next_item.full_key(&self.cur_key)?;
-        Ok(Some(ItemPtr {
-            page: self.page,
-            off: next_off,
-            cur_key: full,
-            cur_n: next_n,
-        }))
+        Ok(Some((
+            ItemPtr {
+                page: self.page,
+                off: next_off,
+                cur_key: full,
+                cur_n: next_n,
+            },
+            next_item,
+        )))
     }
 }
 
@@ -143,17 +160,14 @@ impl<'a> LeafItemPtr<'a> {
 
     /// 顺序前进到下一个 item. 内部用 cached cur_key 拼接下一个 key.
     pub fn next(&self) -> Result<Option<LeafItemPtr<'a>>, PageError> {
-        let next_inner = self.inner.next(ItemKind::Leaf)?;
-        match next_inner {
+        // ⭐ 审计 P2 (2026-10-17): 单次 decode (旧实现 next + 再 decode 一遍)
+        match self.inner.next_decoded(ItemKind::Leaf)? {
             None => Ok(None),
-            Some(inner) => {
-                let (item, _) = decode_item(inner.page, inner.off, ItemKind::Leaf)?;
-                Ok(Some(LeafItemPtr {
-                    value_len: item.value_len,
-                    value_ptr: item.value.as_ptr(),
-                    inner,
-                }))
-            }
+            Some((inner, item)) => Ok(Some(LeafItemPtr {
+                value_len: item.value_len,
+                value_ptr: item.value.as_ptr(),
+                inner,
+            })),
         }
     }
 }
@@ -205,16 +219,13 @@ impl<'a> InternalItemPtr<'a> {
     }
 
     pub fn next(&self) -> Result<Option<InternalItemPtr<'a>>, PageError> {
-        let next_inner = self.inner.next(ItemKind::Internal)?;
-        match next_inner {
+        // ⭐ 审计 P2 (2026-10-17): 单次 decode (旧实现 next + 再 decode 一遍)
+        match self.inner.next_decoded(ItemKind::Internal)? {
             None => Ok(None),
-            Some(inner) => {
-                let (item, _) = decode_item(inner.page, inner.off, ItemKind::Internal)?;
-                Ok(Some(InternalItemPtr {
-                    child_vpid: item.child_vpid,
-                    inner,
-                }))
-            }
+            Some((inner, item)) => Ok(Some(InternalItemPtr {
+                child_vpid: item.child_vpid,
+                inner,
+            })),
         }
     }
 }
