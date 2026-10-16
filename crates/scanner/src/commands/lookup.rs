@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use page::{decode_item, page_free_off, page_type, ItemKind};
+use page::{decode_item, page_free_off, page_type, page_vpid, ItemKind};
 
 use crate::cli::Globals;
 use crate::dir;
@@ -77,15 +77,19 @@ fn lookup_key<W: Write>(
                 let free_off = page_free_off(page_bytes) as usize;
                 let mut off = page::PAGE_HEADER_SIZE;
                 let mut prev_key: Vec<u8> = Vec::new();
-                let mut child_vpid = 0u64;
+                // ⭐ 2026-10-17 (审计新 P1-19): first_child 在**页头 vpid
+                // 字段**, 哨兵 item 的 child_vpid 恒为 0 (不可用). 旧实现从
+                // 哨兵取 first child (恒 0) → target < 首个 separator 时
+                // 误报 "dead end / not found" (左子树整个查不到).
+                let mut child_vpid = page_vpid(page_bytes);
 
                 while off < free_off {
                     match decode_item(page_bytes, off, ItemKind::Internal) {
                         Ok((item, n)) => {
                             let full = item.full_key(&prev_key);
                             if off == page::PAGE_HEADER_SIZE {
-                                // Sentinel: first child is the rightmost
-                                child_vpid = item.child_vpid;
+                                // Sentinel: child_vpid unused; first child
+                                // comes from the page header (see above).
                             }
                             // If separator <= target_key, the child after
                             // this separator is the right subtree

@@ -100,7 +100,15 @@ impl PageReport {
         let vpid = page::page_vpid(bytes);
 
         // 4. vpid match
-        let vpid_matches = magic_ok && vpid == expected_vpid;
+        // ⭐ 2026-10-17 (审计新 P1-19): **Internal 页的页头 vpid 字段被 page
+        // crate 复用为 first_child** (引擎 chunk_writer.rs:131-136 明确注释:
+        // "Internal page 的 vpid 字段被 page crate 复用作 first_child, 必须保留
+        // caller 设置", 且仅对非 Internal 页自动填自身 vpid). 因此 internal 页
+        // 的页头 vpid **理应 != 自身 vpid** — 旧实现对所有页一律校验相等, 把
+        // 每个 internal 页误判为 VpidMismatch/bad, walk_tree 因而不下降,
+        // 真实多层树的扫描/导出从来就是残的.
+        // Internal 页跳过该校验 (其"正确性"由 first_child 语义承担).
+        let vpid_matches = magic_ok && (page_type == PageType::Internal || vpid == expected_vpid);
 
         // 5. header fields
         let key_count = page::page_key_count(bytes);

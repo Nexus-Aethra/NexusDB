@@ -32,7 +32,7 @@
 
 use std::collections::BTreeSet;
 
-use page::{decode_item, PageType};
+use page::{decode_item, page_vpid, PageType};
 
 use crate::dir::ShardDir;
 use crate::page_decode::BadKind;
@@ -221,6 +221,13 @@ fn do_in_order<F>(
             }
         }
         PageType::Internal => {
+            // ⭐ 2026-10-17 (审计新 P1-19): 先递归最左子树 — first_child
+            // 在页头 vpid, 旧实现漏掉它导致 export 丢失每个 internal 页
+            // 左子树的全部数据.
+            let first_child = page_vpid(page_bytes);
+            if first_child != 0 && first_child != vpid {
+                do_in_order(shard, locate, first_child, on_entry, summary);
+            }
             // Enumerate all children in order, recurse.
             let free_off = page::page_free_off(page_bytes) as usize;
             let mut off = page::PAGE_HEADER_SIZE;
@@ -380,6 +387,14 @@ fn page_read_reason(r: &page_io::PageRead) -> String {
 /// skipping the sentinel at offset 0.
 fn iter_internal_children(buf: &[u8; PAGE_SIZE]) -> Vec<u64> {
     let mut out = Vec::new();
+    // ⭐ 2026-10-17 (审计新 P1-19): internal 页的最左子树 (keys < 首个
+    // separator) 的 child 存在**页头 vpid 字段**, 不在任何 item 里
+    // (哨兵 item 的 child_vpid 恒为 0). 旧实现只收集 item 的 child_vpid,
+    // 每个 internal 页漏掉整个左子树 — export/walk 数据不完整.
+    let first_child = page_vpid(buf);
+    if first_child != 0 {
+        out.push(first_child);
+    }
     let free_off = page::page_free_off(buf) as usize;
     let mut off = page::PAGE_HEADER_SIZE;
     let mut prev_key: Vec<u8> = Vec::new();
@@ -652,4 +667,77 @@ mod tests {
     fn _placeholder_keeps_page_use() {
         let _ = page::leaf_new();
     }
+}
+
+/// ⭐ 审计新 P1-19 回归: internal 页的最左子树 (first_child 存于页头
+/// vpid) 必须被 in-order 遍历覆盖. 旧实现只跟 item child_vpid —
+/// 每个 internal 页漏掉整个左子树 (export 数据不完整).
+#[test]
+fn in_order_walk_includes_first_child_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard_dir = dir.path().join("shard_0");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+    let mut block = vec![0u8; PAGE_SIZE * 3];
+    // vpid 0: internal root — 页头 first_child=1, separator "m" → child 2
+    let mut root = page::internal_new();
+    page::page_set_vpid(&mut root, 1);
+    page::internal_insert(&mut root, b"m", 2).unwrap();
+    block[..PAGE_SIZE].copy_from_slice(&root);
+    // vpid 1: 左子树叶子 (修复前整个被漏)
+    let mut l = page::leaf_new();
+    page::page_set_vpid(&mut l, 1);
+    page::leaf_insert(&mut l, b"a", b"va").unwrap();
+    page::leaf_insert(&mut l, b"b", b"vb").unwrap();
+    block[PAGE_SIZE..2 * PAGE_SIZE].copy_from_slice(&l);
+    // vpid 2: 右子树叶子
+    let mut r = page::leaf_new();
+    page::page_set_vpid(&mut r, 2);
+    page::leaf_insert(&mut r, b"x", b"vx").unwrap();
+    page::leaf_insert(&mut r, b"y", b"vy").unwrap();
+    block[2 * PAGE_SIZE..3 * PAGE_SIZE].copy_from_slice(&r);
+    std::fs::write(shard_dir.join("000000.block"), &block).unwrap();
+    // page.mate: slot i = vpid i 的 pid (file 0, chunk 0, page i).
+    // 注意: 全零 mate 会被 lookup_mate 无校验地解码成 pid 0 — 所有 vpid
+    // 都指到 page 0 (scanner 既有行为), 测试必须写真值 slot.
+    let mut mate = vec![0u8; 8 * 4];
+    for (vpid, slot) in mate.chunks_exact_mut(8).enumerate().take(3) {
+        let pid = page::PidLocation {
+            file_id: 0,
+            chunk_idx: 0,
+            page_idx: vpid as u16,
+            flags: 0,
+        };
+        slot.copy_from_slice(&pid.to_bytes());
+    }
+    std::fs::write(shard_dir.join("page.mate"), &mate).unwrap();
+
+    let shard = ShardDir {
+        id: 0,
+        path: shard_dir.clone(),
+        block_files: vec![crate::dir::BlockFile {
+            file_id: 0,
+            path: shard_dir.join("000000.block"),
+            size_bytes: (PAGE_SIZE * 3) as u64,
+        }],
+        page_mate: Some(shard_dir.join("page.mate")),
+        pid_state: None,
+        wal_segments: Vec::new(),
+    };
+    let locate = Locate::open(&shard).unwrap();
+
+    // in-order 遍历必须含全部 4 个 key (修复前只有 x,y)
+    let mut keys = Vec::new();
+    walk_tree_in_order(&shard, &locate, 0, |k, _| keys.push(k.to_vec()));
+    assert_eq!(
+        keys,
+        vec![b"a".to_vec(), b"b".to_vec(), b"x".to_vec(), b"y".to_vec()],
+        "in-order 遍历漏掉了 first_child 子树"
+    );
+
+    // BFS walk 也必须覆盖左子树页
+    let mut seen = Vec::new();
+    let s2 = walk_tree(&shard, &locate, 0, |n| seen.push(n.vpid));
+    assert_eq!(s2.bad, 0, "合成树不应有坏页: {s2:?}");
+    assert!(seen.contains(&1), "walk_tree 漏掉 first_child 页 (vpid 1)");
+    assert!(seen.contains(&2), "walk_tree 漏掉 separator 页 (vpid 2)");
 }
