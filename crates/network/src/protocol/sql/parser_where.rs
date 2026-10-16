@@ -382,17 +382,33 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
 /// ⭐ P0-1: 折叠 cond 右值的字面量算术 (`a = 1+2` → `a = 3`). 仅数值;
 /// 含列引用/字符串遇算术符报错 (v1).
 pub(crate) fn fold_cond_arith(p: &mut P, first: SqlValue) -> Result<SqlValue, String> {
-    let mut acc = first;
+    // ⭐ 2026-10-17 (审计新 P1-8): 标准优先级, 与 UPDATE SET 侧统一:
+    // term 层先折 `*` `/`, expr 层再折 `+` `-`. 旧实现单层左结合,
+    // `a = 2 + 3 * 4` 会折成 20 而非 14.
+    fn fold_term(p: &mut P, first: SqlValue) -> Result<SqlValue, String> {
+        let mut acc = first;
+        loop {
+            let op = match p.peek() {
+                Some(Tok::Star) => ArithOp::Mul,
+                Some(Tok::Slash) => ArithOp::Div,
+                _ => break,
+            };
+            p.next()?;
+            let rhs = p.value()?;
+            acc = eval_const_bin(op, acc, rhs)?;
+        }
+        Ok(acc)
+    }
+    let mut acc = fold_term(p, first)?;
     loop {
         let op = match p.peek() {
             Some(Tok::Plus) => ArithOp::Add,
             Some(Tok::Minus) => ArithOp::Sub,
-            Some(Tok::Star) => ArithOp::Mul,
-            Some(Tok::Slash) => ArithOp::Div,
             _ => break,
         };
         p.next()?;
-        let rhs = p.value()?;
+        let first = p.value()?;
+        let rhs = fold_term(p, first)?;
         acc = eval_const_bin(op, acc, rhs)?;
     }
     Ok(acc)
@@ -577,32 +593,41 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
     // ⭐ 2026-10-17 (审计新 P1-7): atom 的解析错误必须传播.
     // 旧实现 `Err(_) => Lit(Null)` 把任何 SET 值解析失败静默变成 NULL 写入 —
     // 不可逆数据破坏, 且用户以为执行了表达式.
-    let left = atom(p)?;
-    // 链式二元算术: 左结合, 支持 `a + b - c * d` (v1: 无优先级, 从左到右)
-    let mut acc = left;
-    let mut saw_op = false;
-    while let Some(op) = match p.peek() {
-        Some(Tok::Plus) => Some(ArithOp::Add),
-        Some(Tok::Minus) => Some(ArithOp::Sub),
-        Some(Tok::Star) => Some(ArithOp::Mul),
-        Some(Tok::Slash) => Some(ArithOp::Div),
-        _ => None,
-    } {
+    // ⭐ 2026-10-17 (审计新 P1-8): 标准运算符优先级 — `*` `/` 紧于 `+` `-`.
+    // 旧实现单层左结合: `a + 2 * 3` 算成 (a+2)*3, 任何混合运算 UPDATE 都写坏
+    // 数据. 与 WHERE 侧 fold_cond_arith 统一为同一套两级结构.
+    // term 层: atom (('*'|'/') atom)*  — 左结合
+    fn term(p: &mut P) -> Result<ScalarExpr, String> {
+        let mut lhs = atom(p)?;
+        while matches!(p.peek(), Some(Tok::Star) | Some(Tok::Slash)) {
+            let op = match p.peek() {
+                Some(Tok::Star) => ArithOp::Mul,
+                _ => ArithOp::Div,
+            };
+            p.next()?;
+            let rhs = atom(p)?;
+            lhs = ScalarExpr::Bin {
+                op,
+                l: Box::new(lhs),
+                r: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+    // expr 层: term (('+'|'-') term)*  — 左结合
+    let mut acc = term(p)?;
+    while matches!(p.peek(), Some(Tok::Plus) | Some(Tok::Minus)) {
+        let op = match p.peek() {
+            Some(Tok::Plus) => ArithOp::Add,
+            _ => ArithOp::Sub,
+        };
         p.next()?;
-        // ⭐ 2026-10-17 (审计新 P1-7): 右侧解析失败必须传播. 旧实现
-        // `else { break }` 会静默丢弃右侧 — `SET c = a + UPPER(b)` 变成
-        // `c = a`, 表达式被悄悄截断.
-        let right = atom(p)?;
+        let rhs = term(p)?;
         acc = ScalarExpr::Bin {
             op,
             l: Box::new(acc),
-            r: Box::new(right),
+            r: Box::new(rhs),
         };
-        saw_op = true;
-    }
-    // 有算术 → 表达式; 无算术 → 折叠为原 SqlValue (列引用 / 字面量 / NOT)
-    if saw_op {
-        return Ok(SqlValue::Expr(Box::new(acc)));
     }
     Ok(match acc {
         ScalarExpr::Col(c) => SqlValue::ColRef(c),

@@ -2210,6 +2210,57 @@ fn mysql_update_set_expr() {
     drop(mgr);
 }
 
+/// ⭐ 审计新 P1-8 回归 (2026-10-17): UPDATE SET 与 WHERE 的算术必须有标准
+/// 优先级 (`*` `/` 紧于 `+` `-`). 修复前两侧都是单层左结合:
+/// `SET v = v + 2 * 3` 算成 (v+2)*3, 混合运算必写坏数据.
+#[test]
+fn mysql_arith_operator_precedence() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE ar (id INT PRIMARY KEY, v INT)");
+    c.query("INSERT INTO ar VALUES (1, 10), (2, 14), (3, 20)");
+
+    // UPDATE SET: 10 + 2*3 = 16 (旧左结合: (10+2)*3 = 36)
+    c.query("UPDATE ar SET v = v + 2 * 3 WHERE id = 1");
+    assert_eq!(
+        c.query("SELECT v FROM ar WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("16".into())]]),
+        "SET v = v + 2*3 必须按优先级算成 v+6"
+    );
+    // UPDATE SET: 10 - 2 * 3 = 4 (旧: (10-2)*3 = 24)
+    c.query("UPDATE ar SET v = 10 - 2 * 3 WHERE id = 1");
+    assert_eq!(
+        c.query("SELECT v FROM ar WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("4".into())]]),
+        "SET v = 10 - 2*3 必须算成 4"
+    );
+    // UPDATE SET: 连锁混合 2 + 3 * 4 - 1 = 13 (旧: (((2+3)*4)-1)=19)
+    c.query("UPDATE ar SET v = 2 + 3 * 4 - 1 WHERE id = 1");
+    assert_eq!(
+        c.query("SELECT v FROM ar WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("13".into())]]),
+        "SET 连锁混合算术按优先级"
+    );
+
+    // WHERE 侧常量折叠同律: 2 + 3*4 = 14 → 命中 id=2, 不命中 id=3(20)
+    assert_eq!(
+        c.ids("SELECT id FROM ar WHERE v = 2 + 3 * 4"),
+        vec!["2"],
+        "WHERE 常量算术必须按优先级折叠 (14)"
+    );
+    // WHERE: 20 - 2 * 3 = 14 → 同样命中 id=2 (旧左结合 20-(2*3) 也是 14, 但
+    // 20 - 6 * 2 = 8 旧算法 (20-6)*2=28 — 用可区分用例)
+    c.query("INSERT INTO ar VALUES (4, 8)");
+    assert_eq!(
+        c.ids("SELECT id FROM ar WHERE v = 20 - 6 * 2"),
+        vec!["4"],
+        "WHERE 20-6*2 必须折叠为 8"
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): INSERT 拒绝悬空外键引用.
 /// 父行存在 → 成功; 父行缺失 → 拒 (23503); NULL 外键允许; 多行含无效 → 整体拒.
 #[test]
