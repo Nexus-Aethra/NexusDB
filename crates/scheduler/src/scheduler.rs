@@ -484,6 +484,13 @@ impl Scheduler {
         }
     }
 
+    /// ⭐ 把 slot  push 进 ready queue (审计新 P1-15: 供 io_ops 的 poll_cqe!
+    /// 在 mark **其他** task 的 CQE 后唤醒 owner — 与 drain_completions 的
+    /// 入队路径一致).
+    pub(crate) fn wake_slot(&mut self, slot_id: usize) {
+        crate::ready::push(&self.ready, slot_id);
+    }
+
     pub fn io_registry_stats(&self) -> crate::io_registry::IoRegistryStats {
         self.registry.stats()
     }
@@ -689,4 +696,106 @@ pub(crate) fn with_current_slot<R>(f: impl FnOnce(usize) -> R) -> Option<R> {
 /// 必须在调度线程上被 poll 的协程内调用 (即 spawn 出来的 task).
 pub fn current_task_id() -> usize {
     with_current_slot(|id| id).expect("current_task_id() called outside scheduler poll context")
+}
+
+#[cfg(test)]
+mod p1_15_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Context;
+    use std::time::Duration;
+
+    /// ⭐ 审计新 P1-15: `poll_cqe!` 的批量 CQ 扫描会消费**其他** task 的 CQE
+    /// (drive_once 先 poll 后 drain), 必须把 owner slot 入 ready — 否则 owner
+    /// 永远 park 且 CQE 已被消费, 后续 drain 看到空 CQ (永久死锁).
+    ///
+    /// 白盒构造: 只 poll B 的 future (A 不被 poll), 让 B 的扫描消费 A 的
+    /// CQE, 然后断言 A 的 slot 已入 ready.
+    #[test]
+    fn cross_task_cqe_mark_enqueues_ready() {
+        let mkpipe = || {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], fds[1])
+        };
+        let (r1, w1) = mkpipe();
+        let (r2, w2) = mkpipe();
+
+        let a_done = Arc::new(AtomicBool::new(false));
+        let a2 = a_done.clone();
+
+        let sched = SchedHandle::new(Scheduler::new());
+        sched.set_current();
+
+        // A (slot 0): poll(pipe1) — 提交 SQE 后 park
+        crate::spawn_on(&sched, async move {
+            let _ = crate::io_ops::poll(r1, libc::POLLIN).await;
+            a2.store(true, Ordering::Release);
+        });
+        sched.clone().drive_until_idle(4096);
+        assert!(!a_done.load(Ordering::Acquire), "pipe1 未写, A 不应完成");
+
+        // A 的 io 完成 → CQE 到达 (未被 drain)
+        let v: u64 = 1;
+        unsafe { libc::write(w1, &v as *const u64 as *mut libc::c_void, 8) };
+        std::thread::sleep(Duration::from_millis(100));
+
+        // B (slot 1): poll(pipe2) — 永不完成
+        crate::spawn_on(&sched, async move {
+            let _ = crate::io_ops::poll(r2, libc::POLLIN).await;
+        });
+
+        // 白盒第一步 (持 borrow): B 入 pool+ready, 取出 B 的 future
+        let (b_slot, mut b_fut, ready_rc) = {
+            let rc = CURRENT.with(|c| c.borrow().clone().expect("current"));
+            let mut s = rc.borrow_mut();
+            s.drain_task_queue_phase();
+            let mut work = s.extract_pending();
+            assert_eq!(work.len(), 1, "ready 里应只有 B (A 已 park)");
+            let (slot, fut) = work.remove(0);
+            (slot, fut, Rc::clone(&s.ready))
+        };
+        // 白盒第二步 (释放 borrow): 只 poll B — 其 CQ 扫描会消费 A 的 CQE
+        let waker = make_waker(b_slot, &ready_rc);
+        let mut cx = Context::from_waker(&waker);
+        set_current_slot(b_slot);
+        // 第一次 poll: 注册 + 提交 SQE (不扫 CQ); 第二次: poll_cqe! 扫 CQ —
+        // 此时会消费 A 的 CQE.
+        let p1 = b_fut.as_mut().poll(&mut cx);
+        let p2 = b_fut.as_mut().poll(&mut cx);
+        clear_current_slot();
+        assert!(
+            p1.is_pending() && p2.is_pending(),
+            "pipe2 无数据, B 应 Pending"
+        );
+
+        // 白盒第三步: B 放回 slot, 检查 ready (修复后 A 已被 B 的扫描入队)
+        let rc2 = CURRENT.with(|c| c.borrow().clone().expect("current"));
+        let mut s = rc2.borrow_mut();
+        s.pool.slot(b_slot).future = Some(b_fut);
+        let ready_len = crate::ready::len(&s.ready);
+        drop(s);
+
+        assert!(
+            ready_len >= 1,
+            "P1-15: B 的扫描消费了 A 的 CQE 但未把 A 入队 ready (修复前 A 永久挂起)"
+        );
+
+        // 端到端确认: 继续驱动, A 必须完成
+        let t0 = std::time::Instant::now();
+        while !a_done.load(Ordering::Acquire) {
+            sched.clone().drive_until_idle(4096);
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "A 未被唤醒 — P1-15 死锁"
+            );
+        }
+        unsafe {
+            libc::close(r1);
+            libc::close(w1);
+            libc::close(r2);
+            libc::close(w2);
+        }
+    }
 }

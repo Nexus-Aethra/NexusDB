@@ -40,6 +40,7 @@ macro_rules! poll_cqe {
             // ⭐ 批量提交: 扫描 CQ 前先提交攒下的 SQE, 否则 CQE 永不出现
             // (block_on_io 同步忙等路径不经过驱动循环, 靠这里保证正确性).
             s.flush_sq();
+            let mut cross_woke: Vec<usize> = Vec::new();
             let mut cq = s.ring.completion();
             cq.sync();
             // 也扫 CQ, 把任何还没 mark 的 CQE 都 mark 进 registry (drain_completions 可能还没跑).
@@ -48,9 +49,24 @@ macro_rules! poll_cqe {
                 let ud = cqe.user_data();
                 let result = cqe.result();
                 crate::trace!("io_ops CQE ud={} result={}", ud, result);
-                s.registry.mark_completed(ud, result);
+                // ⭐ 2026-10-17 (审计新 P1-15): 批量 CQ 扫描会 mark **其他**
+                // task 的 CQE (drive_once 先 poll 后 drain: 两轮之间到达的
+                // CQE 都会被下一个被 poll 任务的扫描消费). 旧实现只 mark 不
+                // 唤醒 — owner 永远 park 成 Pending, 且其 CQE 已被消耗、
+                // 后续 drain_completions 看到空 CQ → 永久死锁.
+                // 与 drain_completions 对齐: mark 后把 owner slot 入 ready
+                // (借用规则: cq 持有 s.ring 的借用, 先收集 slot_id,
+                //  drop(cq) 后统一入队).
+                if s.registry.mark_completed(ud, result)
+                    && let Some(st) = s.registry.inner_peek(ud)
+                {
+                    cross_woke.push(st.slot_id);
+                }
             }
             drop(cq);
+            for slot_id in cross_woke {
+                s.wake_slot(slot_id);
+            }
             if let Some(r) = s.registry.take_result($ud) {
                 crate::trace!("io_ops take_result(ud={}) → {:?}", $ud, r);
                 Some(r)
