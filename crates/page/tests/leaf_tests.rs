@@ -259,7 +259,10 @@ fn verify_page_integrity(page: &[u8]) {
     // 循环到 free_off (可能含哨兵)
     while off < free_off {
         let (item, n) = decode_item(page, off, ItemKind::Leaf).unwrap();
-        let full = item.full_key(&prev_key);
+        let full = match item.full_key(&prev_key) {
+            Ok(k) => k,
+            Err(e) => panic!("corrupt item: {e}"),
+        };
 
         let actual_shared = std::iter::zip(&prev_key, &full)
             .take_while(|(a, b)| a == b)

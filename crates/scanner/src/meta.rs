@@ -31,7 +31,9 @@ fn walk_meta_items(page: &[u8; PAGE_SIZE]) -> Result<Vec<(String, u64)>, String>
     for i in 0..key_count + 1 {
         let (item, n) = page::decode_item(page, off, ItemKind::Leaf)
             .map_err(|e| format!("decode_item[{i}]: {e:?}"))?;
-        let full_key = item.full_key(&prev_key);
+        let full_key = item
+            .full_key(&prev_key)
+            .map_err(|e| format!("corrupt item: {e}"))?;
         off += n;
 
         if i == 0 {

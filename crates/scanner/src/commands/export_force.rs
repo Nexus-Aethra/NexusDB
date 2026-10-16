@@ -255,7 +255,10 @@ fn decode_leaf_items(page: &[u8], map: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> u64 {
         while off < free_off && off < page.len() {
             match decode_item(page, off, ItemKind::Leaf) {
                 Ok((item, n)) => {
-                    let full = item.full_key(&prev_key);
+                    // ⭐ 损坏 item (shared 越界): 停止解析, 不静默错 key
+                    let Ok(full) = item.full_key(&prev_key) else {
+                        break;
+                    };
                     if !full.is_empty() {
                         map.insert(full.clone(), item.value.to_vec());
                         total += 1;

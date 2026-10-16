@@ -335,7 +335,7 @@ pub fn internal_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
         );
         // k+1 的 full key 用**原 prev** (target 的 full key) 还原, 不是 new_prev_key.
         // 因为 k1_item 编码时 shared_prefix_len 是基于 target (旧 prev) 的.
-        k1_full_key = k1_item.full_key(&target_full_key);
+        k1_full_key = k1_item.full_key(&target_full_key)?;
         dprintln!(
             internal,
             "[INTERNAL_DELETE] k1 full_key={:?} new_prev={:?} k1_is_seg_start={} target_was_seg_start={} target_seg_idx={} segments.len={}",
@@ -535,7 +535,7 @@ pub fn internal_split(
         // Loop: i=0=sentinel, i=1..=mid=mid 真实 keys, i=mid+1=mid+1-th 真实 key (right 第一)
         for i in 0..(mid + 2) {
             let (item, n) = decode_item(left, off, ItemKind::Internal)?;
-            let full = item.full_key(&prev_key);
+            let full = item.full_key(&prev_key)?;
             dprintln!(
                 internal,
                 "[INTERNAL_SPLIT] i={} off={} n={} key={:?} child={}",
@@ -564,7 +564,7 @@ pub fn internal_split(
         // 循环跑到 i=mid+1, 这样能取到 i=mid 的 mid_n.
         for i in 0..(mid + 2) {
             let (item, n) = decode_item(left, off, ItemKind::Internal)?;
-            let full = item.full_key(&prev_key);
+            let full = item.full_key(&prev_key)?;
             dprintln!(
                 internal,
                 "[INTERNAL_SPLIT] [no-sentinel] i={} off={} n={} key={:?} child={}",
@@ -631,7 +631,7 @@ pub fn internal_split(
     let mut cur = mid_off + mid_n;
     while cur < left_orig_free {
         let (item, n) = decode_item(left, cur, ItemKind::Internal)?;
-        let full = item.full_key(&new_prev_key);
+        let full = item.full_key(&new_prev_key)?;
         let mut buf = [0u8; 4096];
         let enc_n = encode_internal_item(&mut buf, &new_prev_key, &full, item.child_vpid)?;
         right[write_off..write_off + enc_n].copy_from_slice(&buf[..enc_n]);
@@ -735,7 +735,7 @@ pub fn internal_push_back(
     if k1_off_orig < free_off_before {
         let (k1_item, k1_old_n) = decode_item(page, k1_off_orig, ItemKind::Internal)?;
         if k1_item.shared_prefix_len > 0 {
-            let k1_full_key = k1_item.full_key(prev_key);
+            let k1_full_key = k1_item.full_key(prev_key)?;
             k1_new_n =
                 encode_internal_item(&mut k1_buf, sep_key, &k1_full_key, k1_item.child_vpid)?;
             k1_delta = k1_new_n as isize - k1_old_n as isize;

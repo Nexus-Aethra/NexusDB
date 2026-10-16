@@ -129,7 +129,7 @@ pub fn apply_pre_merge(
     let mut left_last_key: Vec<u8> = Vec::new();
     while cur_off < right_first_off {
         let (item, n) = decode_item(page, cur_off, kind)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         prev_key = full.clone();
         left_last_key = full;
         cur_off += n;
@@ -141,7 +141,7 @@ pub fn apply_pre_merge(
     let mut cur = right_first_off;
     while cur < right_segment_end {
         let (item, n) = decode_item(page, cur, kind)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         right_items.push((full.clone(), item.value.to_vec(), item.child_vpid, n));
         prev_key = full;
         cur += n;
@@ -291,7 +291,7 @@ pub fn apply_pre_merge_steal(
     let mut prev_key: Vec<u8> = Vec::new();
     while cur < right_first_off {
         let (item, n) = decode_item(page, cur, kind)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         prev_key = full;
         cur += n;
     }
@@ -308,7 +308,7 @@ pub fn apply_pre_merge_steal(
     let mut stolen: usize = 0;
     while stolen < need && cur < right_segment_end {
         let (item, n) = decode_item(page, cur, kind)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         prev_key = full;
         cur += n;
         stolen += 1;
@@ -322,7 +322,7 @@ pub fn apply_pre_merge_steal(
 
     // 3. 解码 new_split_off 处的 item 并用 shared=0 重编码
     let (boundary_item, old_n_0) = decode_item(page, new_split_off, kind)?;
-    let boundary_full_key = boundary_item.full_key(&prev_key);
+    let boundary_full_key = boundary_item.full_key(&prev_key)?;
     let mut buf = [0u8; 4096];
     let new_n_0 = match kind {
         ItemKind::Leaf => encode_leaf_item(&mut buf, &[], &boundary_full_key, boundary_item.value)?,

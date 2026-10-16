@@ -86,7 +86,9 @@ fn lookup_key<W: Write>(
                 while off < free_off {
                     match decode_item(page_bytes, off, ItemKind::Internal) {
                         Ok((item, n)) => {
-                            let full = item.full_key(&prev_key);
+                            let full = item
+                                .full_key(&prev_key)
+                                .map_err(|e| format!("corrupt item: {e}"))?;
                             if off == page::PAGE_HEADER_SIZE {
                                 // Sentinel: child_vpid unused; first child
                                 // comes from the page header (see above).
@@ -128,7 +130,9 @@ fn lookup_key<W: Write>(
                 while off < free_off {
                     match decode_item(page_bytes, off, ItemKind::Leaf) {
                         Ok((item, n)) => {
-                            let full = item.full_key(&prev_key);
+                            let full = item
+                                .full_key(&prev_key)
+                                .map_err(|e| format!("corrupt item: {e}"))?;
                             if item_idx > 0 && full == target_key {
                                 // Found it!
                                 let key_hex = hex::encode(&full);

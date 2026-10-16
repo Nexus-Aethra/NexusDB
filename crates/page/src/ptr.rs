@@ -72,7 +72,7 @@ impl<'a> ItemPtr<'a> {
         }
         let (next_item, next_n) = decode_item(self.page, next_off, kind)?;
         // 用 self.cur_key 作为 prev_key
-        let full = next_item.full_key(&self.cur_key);
+        let full = next_item.full_key(&self.cur_key)?;
         Ok(Some(ItemPtr {
             page: self.page,
             off: next_off,

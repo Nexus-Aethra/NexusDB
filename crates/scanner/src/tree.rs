@@ -204,7 +204,11 @@ fn do_in_order<F>(
             while off < free_off {
                 match page::decode_item(page_bytes, off, page::ItemKind::Leaf) {
                     Ok((item, n)) => {
-                        let full = item.full_key(&prev_key);
+                        // ⭐ 损坏 item (shared 越界): 记 bad 并停止, 不静默错 key
+                        let Ok(full) = item.full_key(&prev_key) else {
+                            summary.bad += 1;
+                            break;
+                        };
                         if count > 0 && !full.is_empty() {
                             on_entry(&full, item.value);
                             summary.ok += 1;
@@ -235,7 +239,11 @@ fn do_in_order<F>(
             while off < free_off {
                 match page::decode_item(page_bytes, off, page::ItemKind::Internal) {
                     Ok((item, n)) => {
-                        let full = item.full_key(&prev_key);
+                        // ⭐ 损坏 item (shared 越界): 记 bad 并停止
+                        let Ok(full) = item.full_key(&prev_key) else {
+                            summary.bad += 1;
+                            break;
+                        };
                         // The sentinel (item 0) has empty key, but its
                         // child_vpid is the first child. Every other item
                         // has a separator key and its child_vpid is the
@@ -403,7 +411,10 @@ fn iter_internal_children(buf: &[u8; PAGE_SIZE]) -> Vec<u64> {
     while off < free_off {
         match decode_item(buf, off, page::ItemKind::Internal) {
             Ok((item, n)) => {
-                let full = item.full_key(&prev_key);
+                // ⭐ 损坏 item (shared 越界): 停止收集, 不静默错 key
+                let Ok(full) = item.full_key(&prev_key) else {
+                    break;
+                };
                 if count > 0 && !full.is_empty() {
                     out.push(item.child_vpid);
                 }

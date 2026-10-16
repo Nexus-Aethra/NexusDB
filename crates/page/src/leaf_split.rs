@@ -35,14 +35,14 @@ fn force_split_segment_at_mid(
     let mut off = seg.first_item_off as usize;
     for _ in 0..mid_offset {
         let (item, n) = decode_item(page, off, kind)?;
-        prev_key = item.full_key(&prev_key);
+        prev_key = item.full_key(&prev_key)?;
         off += n;
     }
     let mid_item_off = off;
 
     // 解码 mid item 并重编码为 shared=0
     let (mid_item, mid_old_n) = decode_item(page, mid_item_off, kind)?;
-    let mid_full_key = mid_item.full_key(&prev_key);
+    let mid_full_key = mid_item.full_key(&prev_key)?;
     let mut buf = [0u8; 4096];
     let mid_new_n = encode_leaf_item(&mut buf, &[], &mid_full_key, mid_item.value)?;
     let delta_mid = mid_new_n as isize - mid_old_n as isize;
@@ -73,7 +73,7 @@ fn force_split_segment_at_mid(
         let free_off = page_free_off(page) as usize;
         if k1_off < free_off {
             let (k1_item, k1_old_n) = decode_item(page, k1_off, kind)?;
-            let k1_full_key = k1_item.full_key(&mid_full_key);
+            let k1_full_key = k1_item.full_key(&mid_full_key)?;
             let mut k1_buf = [0u8; 4096];
             let k1_new_n =
                 encode_leaf_item(&mut k1_buf, &mid_full_key, &k1_full_key, k1_item.value)?;
@@ -158,8 +158,11 @@ fn try_bulk_leaf_split(left: &mut [u8; PAGE_SIZE], right: &mut [u8; PAGE_SIZE]) 
         while off < free {
             match decode_item(left, off, ItemKind::Leaf) {
                 Ok((item, n)) => {
-                    let _full = item.full_key(&prev_key);
-                    prev_key = _full;
+                    // ⭐ 损坏 item (shared 越界) → 放弃 bulk split (回退常规路径)
+                    let Ok(full) = item.full_key(&prev_key) else {
+                        return None;
+                    };
+                    prev_key = full;
                     actual_count += 1;
                     off += n;
                 }
@@ -334,7 +337,7 @@ fn leaf_split_minimal(
     let mut mid_n: usize = 0;
     for i in 0..mid + 2 {
         let (item, n) = decode_item(left, off, ItemKind::Leaf)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         if i == mid {
             mid_off = off + n;
         }
@@ -370,7 +373,7 @@ fn leaf_split_minimal(
     let mut cur = mid_off + mid_n;
     while cur < left_orig_free {
         let (item, n) = decode_item(left, cur, ItemKind::Leaf)?;
-        let full = item.full_key(&new_prev_key);
+        let full = item.full_key(&new_prev_key)?;
         let mut buf = [0u8; 4096];
         let enc_n = encode_leaf_item(&mut buf, &new_prev_key, &full, item.value)?;
         right[write_off..write_off + enc_n].copy_from_slice(&buf[..enc_n]);

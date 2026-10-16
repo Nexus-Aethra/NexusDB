@@ -146,7 +146,7 @@ impl PageIndex {
                             return Err(e);
                         }
                     };
-                    let full = it.full_key(&prev_key);
+                    let full = it.full_key(&prev_key)?;
                     dprintln!(
                         index,
                         "[PAGE_INDEX_LOAD]   cp[{}].item[{}] off={} key={:?} value={:?}",
@@ -378,14 +378,14 @@ pub(crate) fn plan_pre_split(
     let mut off = seg.first_item_off as usize;
     for _ in 0..mid_offset {
         let (item, n) = decode_item(page, off, kind)?;
-        prev_key = item.full_key(&prev_key);
+        prev_key = item.full_key(&prev_key)?;
         off += n;
     }
     let mid_item_off = off;
 
     // 解码 mid item 并计算完整 key
     let (mid_item, mid_old_n) = decode_item(page, mid_item_off, kind)?;
-    let mid_full_key = mid_item.full_key(&prev_key);
+    let mid_full_key = mid_item.full_key(&prev_key)?;
 
     // 重编码 mid item 为 shared=0 (full key)
     let mut buf = [0u8; 4096];
@@ -409,7 +409,7 @@ pub(crate) fn plan_pre_split(
         if k1_off_orig < free_off_orig {
             let (k1_item, k1_old_n) = decode_item(page, k1_off_orig, kind)?;
             // k1 的 full key 用 mid_full_key 还原 (k+1 的 shared 是相对 mid 算的)
-            let k1_full_key = k1_item.full_key(&mid_full_key);
+            let k1_full_key = k1_item.full_key(&mid_full_key)?;
             let mut k1_buf = [0u8; 4096];
             let k1_new_n = match kind {
                 ItemKind::Leaf => {

@@ -100,7 +100,10 @@ pub fn run<W: Write>(
     while off < free_off {
         match decode_item(page_bytes, off, ItemKind::Leaf) {
             Ok((item, n)) => {
-                let full = item.full_key(&prev_key);
+                // ⭐ 损坏 item (shared 越界): 停止遍历, 不静默错 key
+                let Ok(full) = item.full_key(&prev_key) else {
+                    break;
+                };
                 if item_idx > 0 {
                     // Check if key is within range
                     let in_range = match (&start_key, &end_key) {

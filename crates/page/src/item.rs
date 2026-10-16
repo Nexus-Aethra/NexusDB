@@ -47,14 +47,25 @@ pub struct Item<'a> {
 }
 
 impl<'a> Item<'a> {
-    /// 仅对 LeafItem: 获取完整 key (用前缀 + 不重合部分).
+    /// 获取完整 key (用前缀 + 不重合部分).
     /// `prev_key` = 上一 item 的完整 key.
-    pub fn full_key(&self, prev_key: &[u8]) -> Vec<u8> {
-        let take = (self.shared_prefix_len as usize).min(prev_key.len());
+    ///
+    /// ⚠️ 2026-10-17 (审计 P2): `shared_prefix_len > prev_key.len()` 说明
+    /// 页数据损坏 (item 声明的共享前缀超过前一 key 的实际长度). 旧实现
+    /// `min()` 静默截断 → 产出**错误 key** 且无任何提示 (损坏页被静默
+    /// 错读). 现在返回 `Err(PageError::ItemDecode)`.
+    pub fn full_key(&self, prev_key: &[u8]) -> Result<Vec<u8>, PageError> {
+        let take = self.shared_prefix_len as usize;
+        if take > prev_key.len() {
+            return Err(PageError::ItemDecode(format!(
+                "corrupt item: shared_prefix_len={take} exceeds prev_key len {}",
+                prev_key.len()
+            )));
+        }
         let mut key = Vec::with_capacity(take + self.key_unshared_len as usize);
         key.extend_from_slice(&prev_key[..take]);
         key.extend_from_slice(self.key_unshared);
-        key
+        Ok(key)
     }
 }
 
@@ -258,7 +269,7 @@ mod tests {
         assert_eq!(item.key_unshared_len, 5); // "there"
         assert_eq!(item.key_unshared, b"there");
         assert_eq!(item.value, value);
-        assert_eq!(item.full_key(prev), key.to_vec());
+        assert_eq!(item.full_key(prev).unwrap(), key.to_vec());
     }
 
     #[test]
@@ -272,6 +283,6 @@ mod tests {
         let (item, total) = decode_item(&buf, 0, ItemKind::Internal).unwrap();
         assert_eq!(total, n);
         assert_eq!(item.child_vpid, child);
-        assert_eq!(item.full_key(prev), key.to_vec());
+        assert_eq!(item.full_key(prev).unwrap(), key.to_vec());
     }
 }

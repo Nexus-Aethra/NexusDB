@@ -461,7 +461,7 @@ pub fn leaf_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
             return Ok(false);
         }
         let (next_item, next_n) = decode_item(page, cur_off, ItemKind::Leaf)?;
-        prev_key = next_item.full_key(&prev_key);
+        prev_key = next_item.full_key(&prev_key)?;
         target_off = cur_off;
         target_n = next_n;
     }
@@ -530,7 +530,7 @@ pub fn leaf_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
         );
         // k+1 的 full key 用**原 prev** (target 的 full key) 还原, 不是 new_prev_key.
         // 因为 k1_item 编码时 shared_prefix_len 是基于 target (旧 prev) 的.
-        k1_full_key = k1_item.full_key(&target_full_key);
+        k1_full_key = k1_item.full_key(&target_full_key)?;
         dprintln!(
             leaf,
             "[LEAF_DELETE] k1 full_key={:?} new_prev={:?} k1_is_seg_start={} target_seg_idx={} segments.len={}",
@@ -713,7 +713,7 @@ pub(crate) fn reconstruct_key_before(
     let mut result = Vec::new();
     while cur_off < off {
         let (item, n) = decode_item(page, cur_off, kind)?;
-        result = item.full_key(&prev_key);
+        result = item.full_key(&prev_key)?;
         prev_key = result.clone();
         cur_off += n;
     }
@@ -755,7 +755,7 @@ pub fn leaf_push_back(
         );
         if k1_item.shared_prefix_len > 0 {
             // k+1 的 full key 用旧 prev_key 还原
-            let k1_full_key = k1_item.full_key(prev_key);
+            let k1_full_key = k1_item.full_key(prev_key)?;
             dprintln!(
                 leaf,
                 "[LEAF_PUSH_BACK]   k1_full_key={:?} (re-encoded with new prev={:?})",
