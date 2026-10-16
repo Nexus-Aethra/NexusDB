@@ -38,7 +38,8 @@ pub enum ShardError {
         /// 失败原因.
         reason: String,
     },
-    /// 2PC Commit 阶段失败.
+    /// 2PC Commit 阶段失败 (⭐ 2026-10-17 审计新 P1-13: 此前调用方吞掉
+    /// commit 失败仍返回 Ok — 变体存在却从未被使用).
     #[error("2PC commit failed: {op} on shard {shard_id}: {reason}")]
     CommitFailed {
         /// 操作描述.

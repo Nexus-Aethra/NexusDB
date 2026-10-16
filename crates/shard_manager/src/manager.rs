@@ -1032,6 +1032,10 @@ impl ShardManager {
 
         // 4. 决定 Commit 或 Abort
         if all_ok {
+            // ⭐ 2026-10-17 (审计新 P1-13): Commit 失败必须显式报错 —
+            // 旧实现 `if block_on_v2(fut).is_ok()` 吞掉失败后仍返回 Ok,
+            // 客户端以为建库成功, 实际可能只有部分 shard 提交 (不一致状态).
+            let mut commit_failed: Option<(usize, String)> = None;
             for i in 0..num_shards {
                 let (tx, fut) = PendingReply::new();
                 let req = ShardRequest::CommitCreateDb {
@@ -1040,13 +1044,29 @@ impl ShardManager {
                     reply: tx,
                 };
                 self.shards[i].inbox.push_spin(req);
-                if block_on_v2(fut).is_ok() {
-                    self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                match block_on_v2(fut) {
+                    Ok(_) => {
+                        self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                    }
+                    Err(kind) => {
+                        if commit_failed.is_none() {
+                            commit_failed = Some((i, format!("{kind:?}")));
+                        }
+                    }
                 }
             }
-            // ⭐ D2 (分库): 建库成功 → 刷新 id↔name 翻译视图
-            self.refresh_db_view();
-            Ok(())
+            match commit_failed {
+                // 全部提交成功 → 刷新视图 (失败时不刷: db 处于不一致状态)
+                None => {
+                    self.refresh_db_view();
+                    Ok(())
+                }
+                Some((shard_id, reason)) => Err(ShardError::CommitFailed {
+                    op: format!("create_db({db})"),
+                    shard_id,
+                    reason,
+                }),
+            }
         } else {
             let (err_shard, err_reason) = first_error.unwrap_or((0, "unknown".into()));
             for (i, result) in results.iter().enumerate() {
@@ -1122,6 +1142,7 @@ impl ShardManager {
         }
 
         if all_ok {
+            let mut commit_failed: Option<(usize, String)> = None;
             for i in 0..num_shards {
                 let (tx, fut) = PendingReply::new();
                 let req = ShardRequest::CommitCreateTable {
@@ -1131,11 +1152,26 @@ impl ShardManager {
                     reply: tx,
                 };
                 self.shards[i].inbox.push_spin(req);
-                if block_on_v2(fut).is_ok() {
-                    self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                // ⭐ 审计新 P1-13: commit 失败显式报错 (勿静默 Ok)
+                match block_on_v2(fut) {
+                    Ok(_) => {
+                        self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                    }
+                    Err(kind) => {
+                        if commit_failed.is_none() {
+                            commit_failed = Some((i, format!("{kind:?}")));
+                        }
+                    }
                 }
             }
-            Ok(0)
+            match commit_failed {
+                None => Ok(0),
+                Some((shard_id, reason)) => Err(ShardError::CommitFailed {
+                    op: format!("create_table({db}.{table})"),
+                    shard_id,
+                    reason,
+                }),
+            }
         } else {
             let (err_shard, err_reason) = first_error.unwrap_or((0, "unknown".into()));
             for (i, result) in results.iter().enumerate() {
@@ -1345,12 +1381,28 @@ impl ShardManager {
                 self.shards[i].inbox.push_spin(req);
                 commit_futs.push(Box::pin(fut));
             }
+            let mut commit_failed: Option<(usize, String)> = None;
             for (i, f) in commit_futs.into_iter().enumerate() {
-                if f.await.is_ok() {
-                    self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                // ⭐ 审计新 P1-13: commit 失败显式报错 (勿静默 Ok)
+                match f.await {
+                    Ok(_) => {
+                        self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                    }
+                    Err(kind) => {
+                        if commit_failed.is_none() {
+                            commit_failed = Some((i, format!("{kind:?}")));
+                        }
+                    }
                 }
             }
-            Ok(0)
+            match commit_failed {
+                None => Ok(0),
+                Some((shard_id, reason)) => Err(ShardError::CommitFailed {
+                    op: format!("create_table({db}.{table})"),
+                    shard_id,
+                    reason,
+                }),
+            }
         } else {
             let (err_shard, err_reason) = first_error.unwrap_or((0, "unknown".into()));
             let mut abort_futs: Vec<(usize, BoxedShardFuture)> = Vec::new();
