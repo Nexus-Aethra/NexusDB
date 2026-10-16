@@ -164,12 +164,27 @@ impl PendingReply {
     }
 }
 
-/// 轻量级 block_on: AtomicPtr + thread::park.
-///
-/// 比旧版 (Mutex + Waker) 简化: 纯 atomic + 精确 unpark.
-/// - 快速路径: spin 128 次检查 (~50-100ns)
-/// - 慢路径: 注册线程为 waiter, park 等 shard unpark (单次 futex)
-pub fn block_on_v2(fut: ReplyFuture) -> ShardResponse {
+/// 默认回复超时 — 正常回复延迟为亚毫秒级 (shard eventfd 精确唤醒),
+/// 30s 留有 4+ 个数量级余量, 仅用于把"永久挂起"降级为"显式失败".
+const DEFAULT_REPLY_TIMEOUT_SECS: u64 = 30;
+
+/// 从环境变量读超时 (秒); `0` = 不限 (兼容旧行为). 解析失败用默认值.
+fn reply_timeout_from_env() -> Option<std::time::Duration> {
+    match std::env::var("NEXUSDB_SHARD_REPLY_TIMEOUT_SECS") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(std::time::Duration::from_secs(n)),
+            Err(_) => Some(std::time::Duration::from_secs(DEFAULT_REPLY_TIMEOUT_SECS)),
+        },
+        Err(_) => Some(std::time::Duration::from_secs(DEFAULT_REPLY_TIMEOUT_SECS)),
+    }
+}
+
+/// 带显式超时的 block_on (None = 不限). 单测注入短超时用.
+pub fn block_on_v2_timeout(
+    fut: ReplyFuture,
+    timeout: Option<std::time::Duration>,
+) -> ShardResponse {
     // 立即检查 (cheap load)
     if !fut.slot.ptr.load(Ordering::Acquire).is_null() {
         return fut.slot.try_take().unwrap();
@@ -191,19 +206,66 @@ pub fn block_on_v2(fut: ReplyFuture) -> ShardResponse {
         return fut.slot.try_take().unwrap();
     }
 
-    // park 等 shard unpark
+    // park 等 shard unpark — **有界** (审计新 P1-11):
+    // 旧实现无限 park: shard 丢回复或死亡时, 调用方 (如 create_db 的
+    // refresh_db_view) 永久挂起, 无超时无断连感知 — 实测在测试套件中随机
+    // 复现 (每进程累积多个 ShardManager 的高负载场景).
+    // 现在分段 park_timeout, 到 deadline 返回 ReplyTimeout 显式失败.
+    // (迟到回复无害: ReplySlot::drop 会释放 ptr/waiter/waker.)
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
     loop {
-        std::thread::park();
+        let slice = match deadline {
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if now >= d {
+                    return Err(crate::request::ShardErrorKind::ReplyTimeout);
+                }
+                (d - now).min(std::time::Duration::from_millis(250))
+            }
+            None => std::time::Duration::from_millis(250),
+        };
+        std::thread::park_timeout(slice);
         if !fut.slot.ptr.load(Ordering::Acquire).is_null() {
             return fut.slot.try_take().unwrap();
         }
     }
 }
 
+/// 轻量级 block_on: AtomicPtr + thread::park.
+///
+/// 比旧版 (Mutex + Waker) 简化: 纯 atomic + 精确 unpark.
+/// - 快速路径: spin 128 次检查 (~50-100ns)
+/// - 慢路径: 注册线程为 waiter, park 等 shard unpark (单次 futex)
+/// - 慢路径**有界**: 默认 30s 超时 (`NEXUSDB_SHARD_REPLY_TIMEOUT_SECS`
+///   覆盖, 0=不限), 超时返回 `ReplyTimeout` 而非无限挂起 (审计新 P1-11).
+pub fn block_on_v2(fut: ReplyFuture) -> ShardResponse {
+    block_on_v2_timeout(fut, reply_timeout_from_env())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::request::ShardReply;
+
+    #[test]
+    fn timeout_returns_error_instead_of_hanging() {
+        // 审计新 P1-11: 永不回复的 slot 必须超时返回 Err, 而非无限 park.
+        let (tx, fut) = PendingReply::new();
+        std::mem::forget(tx); // 不 send, 模拟 shard 丢回复
+        let r = block_on_v2_timeout(fut, Some(std::time::Duration::from_millis(120)));
+        assert!(matches!(
+            r,
+            Err(crate::request::ShardErrorKind::ReplyTimeout)
+        ));
+    }
+
+    #[test]
+    fn reply_within_timeout_ok() {
+        let (tx, fut) = PendingReply::new();
+        tx.send(Ok(crate::request::ShardReply::ShutdownOk));
+        let r = block_on_v2_timeout(fut, Some(std::time::Duration::from_secs(5)));
+        assert!(r.is_ok());
+    }
 
     #[test]
     fn immediate_send_then_poll() {

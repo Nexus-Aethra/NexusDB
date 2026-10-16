@@ -1145,6 +1145,9 @@ pub enum ShardErrorKind {
     ChannelClosed,
     /// Shard 线程 join 时 panic.
     JoinPanic,
+    /// 等待 shard 回复超时 (shard 无响应/丢回复 — 见 reply.rs block_on_v2).
+    /// 2026-10-17 (审计新 P1-11): 旧实现无限 park, 调用方永久挂起.
+    ReplyTimeout,
 }
 
 impl ShardErrorKind {

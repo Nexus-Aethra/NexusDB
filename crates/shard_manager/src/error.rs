@@ -64,6 +64,10 @@ pub enum ShardError {
         /// 超时的操作.
         op: String,
     },
+    /// 等待 shard 回复超时 (审计新 P1-11: shard 丢回复/无响应时显式失败,
+    /// 不再无限挂起).
+    #[error("shard reply timeout: shard did not respond (lost reply or unresponsive shard)")]
+    ReplyTimeout,
 }
 
 impl ShardError {
@@ -77,6 +81,7 @@ impl ShardError {
             ShardErrorKind::StorageError(s) => ShardError::StorageError(s),
             ShardErrorKind::ChannelClosed => ShardError::ChannelClosed,
             ShardErrorKind::JoinPanic => ShardError::JoinPanic(0),
+            ShardErrorKind::ReplyTimeout => ShardError::ReplyTimeout,
         }
     }
 }
