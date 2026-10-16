@@ -464,9 +464,24 @@ pub(crate) fn process_sql_input(
                         .as_deref()
                         .is_none_or(|p| p == "mysql_native_password");
                     let is_caching = login.plugin.as_deref() == Some("caching_sha2_password");
+                    // ⭐ 审计 P2 (2026-10-17): 认证失败限速 — 锁定期内直接拒
+                    // (不比对口令), 失败计数进进程级滑动窗口.
+                    if let Err(remain) = conn.sql_shared.auth_throttle.check() {
+                        conn.send_bytes(&my::build_err(
+                            pkt_seq.wrapping_add(1),
+                            1045,
+                            &format!("Access denied (too many failures, retry in {remain}s)"),
+                        ));
+                        conn.close_after_flush = true;
+                    }
                     // ⭐ F82: caching_sha2 fast-auth — 服务端知明文口令直接验证 (免 RSA/TLS).
                     //   成功 → fast_auth_success(0x01 0x03)+OK; 失败/其他 → 走 AuthSwitch 兜底.
-                    if is_caching && my::caching_sha2_password_ok(&salt, &login.auth_resp, pwd) {
+                    else if is_caching
+                        && my::caching_sha2_password_ok(&salt, &login.auth_resp, pwd)
+                    {
+                        conn.sql_shared.auth_throttle.record_success();
+                        conn.auth_failures = 0;
+                        conn.send_bytes(&my::build_fast_auth_success(pkt_seq.wrapping_add(1)));
                         conn.send_bytes(&my::build_fast_auth_success(pkt_seq.wrapping_add(1)));
                         conn.send_bytes(&my::build_ok(pkt_seq.wrapping_add(2), 0));
                         if let Some(d) = want_db {
@@ -483,6 +498,8 @@ pub(crate) fn process_sql_input(
                             st.pending_db = want_db;
                         }
                     } else if my::native_password_ok(&salt, &login.auth_resp, pwd) {
+                        conn.sql_shared.auth_throttle.record_success();
+                        conn.auth_failures = 0;
                         conn.send_bytes(&my::build_ok(pkt_seq.wrapping_add(1), 0));
                         if let Some(d) = want_db {
                             conn.current_db = std::sync::Arc::from(d.as_str());
@@ -491,6 +508,9 @@ pub(crate) fn process_sql_input(
                             st.phase = 2;
                         }
                     } else {
+                        // ⭐ 审计 P2 (2026-10-17): 记一次认证失败 (进程级限速)
+                        conn.auth_failures += 1;
+                        conn.sql_shared.auth_throttle.record_failure();
                         conn.send_bytes(&my::build_err(
                             pkt_seq.wrapping_add(1),
                             1045,
@@ -507,6 +527,8 @@ pub(crate) fn process_sql_input(
             // ---- 等 AuthSwitch 响应 (payload = 裸 native token) ----
             1 => {
                 if my::native_password_ok(&salt, &payload, pwd) {
+                    conn.sql_shared.auth_throttle.record_success();
+                    conn.auth_failures = 0;
                     conn.send_bytes(&my::build_ok(pkt_seq.wrapping_add(1), 0));
                     // ⭐ S5: 二段认证通过 → 应用登录时的 database
                     let pending = conn.mysql.as_mut().and_then(|st| st.pending_db.take());
@@ -517,6 +539,9 @@ pub(crate) fn process_sql_input(
                         st.phase = 2;
                     }
                 } else {
+                    // ⭐ 审计 P2 (2026-10-17): 记一次认证失败 (进程级限速)
+                    conn.auth_failures += 1;
+                    conn.sql_shared.auth_throttle.record_failure();
                     conn.send_bytes(&my::build_err(
                         pkt_seq.wrapping_add(1),
                         1045,
@@ -804,6 +829,15 @@ pub(crate) fn process_pg_input(
                                 if pwd.is_empty() {
                                     conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
                                     conn.pg_phase = 2;
+                                } else if let Err(remain) = conn.sql_shared.auth_throttle.check() {
+                                    // ⭐ 审计 P2 (2026-10-17): 锁定期内直接拒
+                                    conn.send_bytes(&pg::build_error(
+                                        "28P01",
+                                        &format!(
+                                            "too many authentication failures, retry in {remain}s"
+                                        ),
+                                    ));
+                                    conn.close_after_flush = true;
                                 } else {
                                     // ⭐ F82: 宣告 SCRAM-SHA-256 (取代明文口令), 进 SASL 交换
                                     conn.send_bytes(&pg::build_auth_sasl());
@@ -869,11 +903,17 @@ pub(crate) fn process_pg_input(
                     let state = conn.pg_scram.take().expect("scram state present");
                     match pg::scram_verify_final(&state, payload, pwd) {
                         Some(server_final) => {
+                            // ⭐ 审计 P2 (2026-10-17): 认证成功清零限速计数
+                            conn.sql_shared.auth_throttle.record_success();
+                            conn.auth_failures = 0;
                             conn.send_bytes(&pg::build_auth_sasl_final(&server_final));
                             conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
                             conn.pg_phase = 2;
                         }
                         None => {
+                            // ⭐ 审计 P2 (2026-10-17): 记一次认证失败 (集群级限速)
+                            conn.auth_failures += 1;
+                            conn.sql_shared.auth_throttle.record_failure();
                             conn.send_bytes(&pg::build_error(
                                 "28P01",
                                 "password authentication failed",

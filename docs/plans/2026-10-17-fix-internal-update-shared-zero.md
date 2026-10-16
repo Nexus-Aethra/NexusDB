@@ -506,3 +506,36 @@ limits 配置丢掉 (连接相关字段从未被读取).
 | `mysql_idle_connection_reaped` | ✅ idle_timeout=1s, 空闲 2.5s 后服务端关闭连接 (读到 EOF; 超时算失败) |
 | network 全量串行 | ✅ 240 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: 认证无失败限速 (P2) — 同批次修复
+
+**问题**: 认证失败**无限次** — MySQL/PG 每次失败关连接 (一次 TCP 连接只能猜
+一次), 但攻击者可以全速重连重试; RESP (AUTH) 失败只回错误、**不关连接**,
+一次连接即可无限猜. 等同于无速率限制的暴力破解.
+
+**修复** (新增 `worker/auth_throttle.rs`):
+- `AuthThrottle` 实例挂在进程级共享的 `SqlSharedRoutes` 上 (同一数据集群的
+  全部门面/worker 共用一把闸; 不同集群互相独立 → 测试各起一个不会连锁锁定);
+- 滑动窗口 + 锁定: `AUTH_WINDOW_SECS`(60s) 内失败达 `AUTH_MAX_FAILS`(10) 次
+  → 锁定 `AUTH_LOCKOUT_SECS`(30s); 锁定期间任何认证请求**直接拒** (连口令都
+  不比对), 错误信息带剩余秒数; 认证成功清零并解除锁定;
+- `ConnState.auth_failures` + `MAX_FAILS_PER_CONN`(5): 单连接连续失败达上限
+  即断开 (堵死"一次连接无限猜");
+- 三门面接线: RESP `AUTH` (锁定期检查 + 失败计数 + 单连接断开)、MySQL
+  handshake/AuthSwitch (锁定期检查 + 失败/成功计数)、PG startup/SASL
+  (锁定期检查 + 失败/成功计数).
+
+**遗留边界**: 粗粒度 (集群级, 不按来源 IP 细分); 按 IP 的精细限流需要
+acceptor 侧连接来源状态, 留作后续项.
+
+**测试** (反向验证: 移除 `record_failure` 调用后锁定期不出现 → 用例失败):
+
+| 用例 | 结果 |
+|---|---|
+| `failures_then_lockout_then_success_resets` | ✅ 达阈值锁定、锁定期间拒、成功后解锁 |
+| `below_threshold_not_locked` | ✅ 未达阈值不锁定 |
+| `resp_auth_failures_are_rate_limited` | ✅ 单连接连续失败被断开; 两连接累计达阈值后新连接直接收 "too many authentication failures" (正确口令同样被拒) |
+| network 全量串行 | ✅ 244 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

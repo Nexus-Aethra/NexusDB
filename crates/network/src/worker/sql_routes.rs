@@ -32,6 +32,10 @@ pub struct SqlSharedRoutes {
     /// ⭐ PG 兼容 (FMT_VER 8): 外键反向引用 — (db, ref_table) → 引用它的表.
     /// 由 CREATE TABLE 注册 / DROP TABLE 移除; 级联删除按此分发.
     fk_incoming: std::sync::RwLock<FkIncomingMap>,
+    /// ⭐ 审计 P2 (2026-10-17): 认证失败限速 (跨门面/跨 worker 共享一把闸).
+    /// 放这里是因为 `SqlSharedRoutes` 本身就是"同一数据集群的进程级共享状态"
+    /// 容器 (main/测试 每逻辑集群一个, 传给同数据的全部门面).
+    pub(crate) auth_throttle: crate::worker::auth_throttle::AuthThrottle,
 }
 
 /// ⭐ 审计 P2 (2026-10-17): 读锁 — 毒化不 panic.
@@ -59,6 +63,7 @@ impl Default for SqlSharedRoutes {
             route_bypassed: std::sync::atomic::AtomicU64::new(0),
             cluster_ctl: std::sync::RwLock::new(None),
             fk_incoming: std::sync::RwLock::new(HashMap::new()),
+            auth_throttle: Default::default(),
         }
     }
 }

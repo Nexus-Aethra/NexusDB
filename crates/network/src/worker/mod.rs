@@ -51,6 +51,8 @@ pub(crate) use sql_cascade::{CascadeJob, cascade_job_done, cascade_kickoff, is_c
 mod sql_fk;
 pub(crate) use sql_fk::{all_parents_cached, sql_fk_on_reply, sql_fk_start};
 /// ⭐ ORM-B2 (解耦 2026-08): 进程级共享路由缓存 (SqlSharedRoutes/FkIncoming).
+mod auth_throttle;
+pub(crate) use auth_throttle::MAX_FAILS_PER_CONN;
 mod sql_routes;
 pub use sql_routes::{FkIncoming, SqlSharedRoutes, new_sql_shared};
 pub(crate) use sql_routes::{rlock, wlock};
@@ -405,6 +407,9 @@ pub(crate) struct ConnState {
     pub(crate) tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// RESP: 是否已通过 AUTH (无密码配置时恒 true).
     pub(crate) authenticated: bool,
+    /// ⭐ 审计 P2 (2026-10-17): 本连接连续认证失败次数 (达 `MAX_FAILS_PER_CONN`
+    /// 即断开, 防单连接内无限猜口令).
+    pub(crate) auth_failures: u32,
     /// RESP: 下一条命令分配的 seq (作为 ShardTask.req_id).
     pub(crate) next_seq: u64,
     /// RESP: 下一个应发送的 seq (FIFO 重排游标).

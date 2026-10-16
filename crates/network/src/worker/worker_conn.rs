@@ -47,6 +47,7 @@ impl ConnState {
             output_overflowed: false,
             proto,
             authenticated: !auth_required,
+            auth_failures: 0,
             next_seq: 0,
             next_to_send: 0,
             pending: BTreeMap::new(),
