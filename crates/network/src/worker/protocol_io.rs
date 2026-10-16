@@ -367,7 +367,36 @@ pub(crate) fn process_sql_input(
     let mut cursor = 0usize;
     // read_packet_full: 长度字段满 0xFFFFFF 时会继续拼接续包, 否则大请求
     // (如 >16MB 的 COM_QUERY) 只会看到第一段.
-    while let Some((pkt_seq, n, payload)) = my::read_packet_full(&conn.read_buf[cursor..]) {
+    loop {
+        let (pkt_seq, n, payload) = match my::read_packet_full(&conn.read_buf[cursor..]) {
+            Ok(t) => t,
+            Err(my::PacketRead::Incomplete) => {
+                // 半包: 等更多数据. 但若未消费缓冲区已超过单包上限, 该逻辑包
+                // 必然超限 (其续片永远到不齐 — recv 也已在上限处停止读入),
+                // 立即拒绝, 否则事件循环会在"读不进/解不出"之间空转.
+                if conn.read_buf.len() - cursor > my::MAX_PACKET_TOTAL {
+                    let seq = conn.read_buf.get(cursor + 3).copied().unwrap_or(0);
+                    conn.send_bytes(&my::build_err(
+                        seq.wrapping_add(1),
+                        1153,
+                        "got a packet bigger than 'max_allowed_packet' bytes",
+                    ));
+                    conn.close_after_flush = true;
+                }
+                break;
+            }
+            Err(my::PacketRead::TooLarge { first_seq }) => {
+                // ⭐ 审计新 P1-6: 续包累积超过 16MB (max_allowed_packet) —
+                // 显式 ERR + 断连. 旧实现无限累积 → 远程 OOM.
+                conn.send_bytes(&my::build_err(
+                    first_seq.wrapping_add(1),
+                    1153, // ER_NET_PACKET_TOO_LARGE
+                    "got a packet bigger than 'max_allowed_packet' bytes",
+                ));
+                conn.close_after_flush = true;
+                break;
+            }
+        };
         cursor += n;
         if conn.close_after_flush {
             break;

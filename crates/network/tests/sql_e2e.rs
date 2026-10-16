@@ -2037,6 +2037,54 @@ fn mysql_foreign_key_cascade() {
     drop(mgr);
 }
 
+/// ⭐ 审计新 P1-6 回归 (2026-10-17): 超过 MAX_PACKET_TOTAL (64MB) 的续包
+/// 序列必须被显式拒绝 (ERR 1153 + 断连). 修复前 read_packet_full 无限累积
+/// 续包 — 恶意客户端可持续发送满包 → 服务端 OOM.
+#[test]
+fn mysql_oversized_packet_rejected() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    // 65MB COM_QUERY (超 64MB 上限); write_packet 自动拆成续包序列
+    let huge = format!("SELECT '{}'", "x".repeat(65 * 1024 * 1024));
+    match c.query(&huge) {
+        QueryResult::Err { code, msg } => {
+            assert_eq!(code, 1153, "超限包应回 ER_NET_PACKET_TOO_LARGE: {msg}");
+        }
+        other => panic!("超限包应被拒绝, 实际 {other:?}"),
+    }
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ P1-6 配套: 超过上限且**永不到齐**的续包流 (客户端发一半 stall) 也必须
+/// 被显式拒绝 — 否则 recv 上限与"解不出包"之间会空转, 连接与内存一起挂住.
+#[test]
+fn mysql_stalled_oversized_stream_rejected() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    // 4 个满包 (64MB) + 第 5 个包的头部+少量载荷 (永不发完) — 逻辑包必然超限
+    let mut raw = Vec::new();
+    for _ in 0..4 {
+        raw.extend_from_slice(&(my::MAX_PAYLOAD as u32).to_le_bytes()[..3]);
+        raw.push(0);
+        raw.extend_from_slice(&vec![0u8; my::MAX_PAYLOAD]);
+    }
+    raw.extend_from_slice(&(my::MAX_PAYLOAD as u32).to_le_bytes()[..3]);
+    raw.push(0);
+    raw.extend_from_slice(&vec![0u8; 4096]); // 第 5 包只发 4KB 就停
+    c.stream.write_all(&raw).unwrap();
+    c.stream.flush().unwrap();
+    // 期望 ERR 1153 (而不是挂起/空转)
+    let (_, first) = c.read_frame();
+    assert_eq!(first[0], 0xFF, "应收到 ERR 帧");
+    let code = u16::from_le_bytes([first[1], first[2]]);
+    assert_eq!(code, 1153, "停滞超限流应回 ER_NET_PACKET_TOO_LARGE");
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ F81 + 审计新 P0-3 回归 (2026-10-16): DECIMAL 主键/外键的
 /// ON DELETE CASCADE 必须真正删掉引用行.
 ///

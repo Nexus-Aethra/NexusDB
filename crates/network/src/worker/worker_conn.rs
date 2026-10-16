@@ -232,7 +232,15 @@ impl ConnState {
             loop {
                 match tls.reader().read(&mut tmp) {
                     Ok(0) => break,
-                    Ok(n) => self.read_buf.extend_from_slice(&tmp[..n]),
+                    Ok(n) => {
+                        self.read_buf.extend_from_slice(&tmp[..n]);
+                        // ⭐ 审计新 P1-6: 同明文路径的单轮 recv 上限.
+                        if self.read_buf.len()
+                            >= crate::protocol::mysql::MAX_PACKET_TOTAL + 64 * 1024
+                        {
+                            break;
+                        }
+                    }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
@@ -247,6 +255,13 @@ impl ConnState {
                 Ok(0) => return Ok(false), // EOF
                 Ok(n) => {
                     self.read_buf.extend_from_slice(&tmp[..n]);
+                    // ⭐ 2026-10-17 (审计新 P1-6): 单轮 recv 上限 — 防客户端
+                    // 持续灌数据使 read_buf 在一轮事件内无界增长 (OOM).
+                    // 超出部分留给后续事件轮次 (process 会先消费);
+                    // 单逻辑包超限由 read_packet_full 拒绝并断连.
+                    if self.read_buf.len() >= crate::protocol::mysql::MAX_PACKET_TOTAL + 64 * 1024 {
+                        return Ok(true);
+                    }
                     if n < tmp.len() {
                         return Ok(true); // 读完了本次可用数据
                     }
