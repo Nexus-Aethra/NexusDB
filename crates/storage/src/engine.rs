@@ -433,9 +433,21 @@ impl StorageEngine {
     async fn replay_wal_segments(&mut self, segs: &[std::path::PathBuf]) {
         let mut applied = 0u64;
         let mut skipped = 0u64;
+        let mut errors = 0u64;
         for seg in segs {
-            let Ok(data) = std::fs::read(seg) else {
-                continue;
+            // ⭐ 2026-10-17 (审计新 P1-2): 段文件读失败必须显式记录.
+            // 旧实现 `let Ok(data) = ... else { continue }` 静默跳过 —
+            // 段被 purge/损坏时, 该段全部记录丢失且无迹可查.
+            let data = match std::fs::read(seg) {
+                Ok(d) => d,
+                Err(e) => {
+                    errors += 1;
+                    eprintln!(
+                        "[storage] WAL replay ERROR: segment {} unreadable: {e} (records lost)",
+                        seg.display()
+                    );
+                    continue;
+                }
             };
             for rec in crate::wal::decode_records(&data) {
                 let r = match &rec.value {
@@ -457,13 +469,29 @@ impl StorageEngine {
                 };
                 match r {
                     Ok(()) => applied += 1,
-                    Err(_) => skipped += 1, // db/table 已删等陈旧记录, 跳过
+                    // db/table 已删等陈旧记录 — 预期内, 计次不刷屏
+                    Err(e) if is_stale_replay_err(&e) => {
+                        skipped += 1;
+                    }
+                    // ⭐ 2026-10-17 (审计新 P1-2): 其他错误 (IO/页损坏/解码失败)
+                    // 必须显式记录. 旧实现全部计入 skipped 并归因 "stale db/table",
+                    // 真实故障被静默吞掉 → 数据丢失且无日志无指标.
+                    Err(e) => {
+                        errors += 1;
+                        if errors <= 10 {
+                            // 防刷屏: 前 10 条打详情, 其余计入总数
+                            eprintln!(
+                                "[storage] WAL replay ERROR: db={} table={} : {e}",
+                                rec.db, rec.table
+                            );
+                        }
+                    }
                 }
             }
         }
-        if applied + skipped > 0 {
+        if applied + skipped + errors > 0 {
             eprintln!(
-                "[storage] WAL replay: {applied} applied, {skipped} skipped (stale db/table)"
+                "[storage] WAL replay: {applied} applied, {skipped} skipped (stale db/table), {errors} ERRORS"
             );
         }
     }
@@ -732,11 +760,44 @@ impl StorageEngine {
     }
 }
 
+/// WAL replay 错误分类 (审计新 P1-2): db/table 已删的陈旧记录 → true
+/// (预期内, 静默计次); 其他错误 (IO/页损坏/解码失败) → false (必须显式
+/// 记录 — 旧实现把它们全部吞进 "stale" 计数, 数据丢失且无迹可查).
+fn is_stale_replay_err(e: &RegistryError) -> bool {
+    matches!(
+        e,
+        RegistryError::DbNotFound(_) | RegistryError::TableNotFound(..)
+    )
+}
+
 // 单元测试 (集成测试在 tests/engine_e2e.rs)
 // =====================================================================
 
 #[cfg(test)]
 mod tests {
+    use super::is_stale_replay_err;
+
+    #[test]
+    fn stale_replay_err_classification() {
+        // 陈旧记录 (drop 后残留) → 静默计次
+        assert!(is_stale_replay_err(&RegistryError::DbNotFound(
+            "gone".into()
+        )));
+        assert!(is_stale_replay_err(&RegistryError::TableNotFound(
+            "db".into(),
+            "t".into()
+        )));
+        // 真实故障 → 必须显式记录
+        for e in [
+            RegistryError::Io(std::io::Error::other("disk")),
+            RegistryError::TableOp("corrupt".into()),
+            RegistryError::WrongType,
+            RegistryError::BadValueSize(3),
+            RegistryError::NonUtf8Name,
+        ] {
+            assert!(!is_stale_replay_err(&e), "{e:?} 不得被当作陈旧记录静默吞掉");
+        }
+    }
     use super::*;
 
     /// **T17 测试 helper**: 跑 async 测试在一个新的 scheduler 上.
