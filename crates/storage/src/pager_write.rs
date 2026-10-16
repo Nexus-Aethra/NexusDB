@@ -154,7 +154,13 @@ impl PageWriteBatch {
                             }
                             b
                         }
-                        Err(_) => vec![0u8; CHUNK_SIZE],
+                        // ⭐ 2026-10-17 (审计新 P1-1): 仅"块不存在/尾部未写"
+                        // 可退化为全零 — 那是新 chunk 的初始内容. 其他 IO 错误
+                        // (权限/硬件/...) 必须传播: 旧实现 `Err(_) => 全零` 吞掉
+                        // 一切错误, 全零 chunk 随后参与 flush → **历史数据被
+                        // 静默覆盖为零** (数据毁灭).
+                        Err(e) if chunk_absent(&e) => vec![0u8; CHUNK_SIZE],
+                        Err(e) => return Err(e),
                     }
                 };
                 pager.nowchunks.load_full_view(key, bytes);
@@ -200,5 +206,53 @@ impl PageWriteBatch {
 impl Default for PageWriteBatch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 驻留兜底从磁盘加载 chunk 失败时, 判断是否为"块不存在/尾部未写".
+///
+/// 这两种情况全零 chunk 是正确的初始内容 (新 chunk 首写 / 文件尾部未写区域):
+/// - `NotFound`: `.block` 文件不存在 (StdFs `File::open` / io_uring `open_file`
+///   均产出该 kind);
+/// - `UnexpectedEof`: 文件存在但比目标 chunk 偏移短 (StdFs `read_exact_at` /
+///   io_uring 短读分支均产出该 kind).
+///
+/// ⭐ 2026-10-17 (审计新 P1-1): 其他 IO 错误 (PermissionDenied / 硬件错误 / ...)
+/// **不得**退化为全零 — 见调用点注释.
+pub(crate) fn chunk_absent(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn chunk_absent_classification() {
+        // 新 chunk / 尾部未写 → 可退化全零
+        assert!(chunk_absent(&io::Error::new(
+            ErrorKind::NotFound,
+            "no file"
+        )));
+        assert!(chunk_absent(&io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "short read"
+        )));
+        // 真实 IO 错误 → 必须传播 (旧实现吞掉 → 全零覆盖历史数据)
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(
+                !chunk_absent(&io::Error::new(kind, "io failure")),
+                "{kind:?} 不得退化为全零 chunk"
+            );
+        }
     }
 }
