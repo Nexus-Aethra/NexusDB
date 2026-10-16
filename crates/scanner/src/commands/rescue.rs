@@ -77,7 +77,7 @@ fn run_human<W: Write>(
     let mut bad_tree_roots: Vec<(String, String, u64, WalkSummary)> = Vec::new();
 
     for (db, table, root_vpid) in &tables {
-        let summary = tree::walk_tree(shard, locate, *root_vpid, |_node| {});
+        let summary = tree::walk_tree(shard, locate, *root_vpid, globals.is_strict(), |_node| {});
         total_visited += summary.visited;
         total_bad += summary.bad;
         total_unread += summary.unread;
@@ -195,7 +195,7 @@ fn run_json<W: Write>(
 
     // Phase 2: verify each tree
     for (db, table, root_vpid) in &tables {
-        let summary = tree::walk_tree(shard, locate, *root_vpid, |_node| {});
+        let summary = tree::walk_tree(shard, locate, *root_vpid, globals.is_strict(), |_node| {});
         let obj = JsonObject::new()
             .field("event", "rescue_verify")
             .field("db", db.clone())

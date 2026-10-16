@@ -27,7 +27,7 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, mut out: W) -> Result<u8
             })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
-    match globals.output_mode() {
+    let summary = match globals.output_mode() {
         crate::output::OutputMode::Human => {
             let columns: &[ColumnName] = &[
                 "vpid",
@@ -39,20 +39,25 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, mut out: W) -> Result<u8
                 "detail",
             ];
             human_header(&mut out, columns)?;
-            let summary = tree::walk_tree(shard, &locate, tree_root, |node| {
+            let summary = tree::walk_tree(shard, &locate, tree_root, globals.is_strict(), |node| {
                 emit_human_row(&mut out, globals, node);
             });
             emit_summary_human(&mut out, &summary);
             summary
         }
         crate::output::OutputMode::Json => {
-            let summary = tree::walk_tree(shard, &locate, tree_root, |node| {
+            let summary = tree::walk_tree(shard, &locate, tree_root, globals.is_strict(), |node| {
                 emit_json_row(&mut out, globals, node);
             });
             emit_summary_json(&mut out, &summary);
             summary
         }
     };
+
+    // ⭐ 审计 P2 (2026-10-17): strict 模式撞到坏页 → 非零退出 (CI 语义)
+    if let Some(hit) = &summary.strict_hit {
+        return Err(crate::error::ScannerError::BadPage(hit.clone()));
+    }
 
     Ok(0)
 }

@@ -167,6 +167,14 @@ pub fn run<W: Write>(globals: &Globals, format: ExportForceFormat, mut out: W) -
         .ok();
     }
 
+    // ⭐ 审计 P2 (2026-10-17): strict 模式 — 扫到坏页即非零退出 (CI 语义)
+    if stats.bad > 0 {
+        globals.strict_gate(format!(
+            "export-force: {} bad page(s) of {} scanned",
+            stats.bad, stats.scanned
+        ))?;
+    }
+
     if emitted == 0 {
         writeln!(
             out,

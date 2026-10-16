@@ -44,11 +44,17 @@ pub fn run<W: Write>(
     let merged_ref = RefCell::new(merged);
     let ok_ref = RefCell::new(0u64);
 
-    let summary = tree::walk_tree_in_order(shard, &locate, tree_root, |key, value| {
-        let mut m = merged_ref.borrow_mut();
-        m.insert(key.to_vec(), value.to_vec());
-        *ok_ref.borrow_mut() += 1;
-    });
+    let summary = tree::walk_tree_in_order(
+        shard,
+        &locate,
+        tree_root,
+        globals.is_strict(),
+        |key, value| {
+            let mut m = merged_ref.borrow_mut();
+            m.insert(key.to_vec(), value.to_vec());
+            *ok_ref.borrow_mut() += 1;
+        },
+    );
 
     let page_pool_bad = (summary.bad + summary.unread) as u64;
     let page_pool_ok = ok_ref.into_inner();

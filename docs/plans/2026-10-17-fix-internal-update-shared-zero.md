@@ -416,3 +416,35 @@ child_vpid — 段内每次前进都双倍解码.
 
 **测试**: page 全量 152 passed / 0 failed (游标语义/取值不变);
 clippy 0; fmt 0.
+
+---
+
+## 附: scanner --strict/--tolerant 均为无效 flag (P2) — 同批次修复
+
+**问题**: `--strict` / `--tolerant` 解析后**从不读取** — `Globals::is_strict()`
+零调用方, `page_io::read_page_strict` 零调用方. 设计文档 §3.1 承诺的
+"strict: abort on first bad page (CI only) / tolerant (默认): never exit
+non-zero on bad pages" 完全没落地: 两种模式行为一模一样 (永远 tolerant).
+
+**修复**:
+1. `ScannerError::BadPage(String)` 新变体; `Globals::strict_gate(what)` 闸门
+   (strict → Err → main 退出码 2; tolerant → Ok).
+2. `WalkSummary` 新增 `strict_hit: Option<String>`; `walk_tree` /
+   `walk_tree_in_order` / `do_in_order` 新增 `strict` 参数 — strict 下撞到
+   第一个坏页/不可读页/损坏 item 即记录并**中止遍历** (不再扫完整个目录).
+3. 命令层接线: `verify` / `export` / `rescue` / `merge` (走 walk, 传
+   `globals.is_strict()`, 结束按 `strict_hit` 返回 Err)、`export_force`
+   (`stats.bad > 0` 时闸门)、`vpid` / `header` (单页命令: 坏页/不可读即闸门).
+4. `range` / `lookup` 本来就对坏页返回 `Ok(1)` (非零退出), 无需改动 —
+   但它们这样做意味着 tolerant 模式下也会非零退出, 与设计文档 §3.1 的
+   "tolerant 永不非零" 有出入 (记录为遗留边界, 不在本项范围).
+
+**测试** (反向验证: strict 参数恒 false 时 CLI 退出码回到 0):
+
+| 用例 | 结果 |
+|---|---|
+| `strict_gate_only_fires_in_strict_mode` (cli) | ✅ tolerant → Ok; strict → Err 且带坏页详情 |
+| `walk_strict_mode_halts_on_first_bad_page` (tree) | ✅ tolerant: `strict_hit=None` 只记数; strict: 记录 `vpid 1: ...` |
+| 真机 CLI (合成坏页目录) | ✅ `--strict vpid 1` / `--strict verify 1` → 退出码 **2** + `fatal: bad page in strict mode: ...`; 不带 `--strict` → 退出码 0 且仍打印 `[BAD-PAGE]` 行 |
+| scanner 单测 | ✅ 70 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

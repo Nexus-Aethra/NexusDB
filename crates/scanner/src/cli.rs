@@ -8,10 +8,10 @@
 //!
 //! `clap` does all of this for us. We split into `Args` (globals) and
 //! `Command` (enum) so dispatch stays trivial in `main.rs`.
-// `is_strict`, `name`, and `parse` are scaffolding: `is_strict` will be
-// used by `--strict` failure paths in PR2+, `name` is reserved for
-// per-command help rendering, and `parse` is a future PR-friendly entry
-// point alongside the current `clap::Parser` derive.
+// `name` and `parse` are scaffolding: `name` is reserved for per-command
+// help rendering, and `parse` is a future PR-friendly entry point alongside
+// the current `clap::Parser` derive. (`is_strict` 已由 `--strict` 落地使用,
+// 见 `Globals::strict_gate`.)
 #[allow(dead_code)]
 use clap::{Args, Parser, Subcommand};
 
@@ -92,6 +92,20 @@ impl Globals {
 
     pub fn is_strict(&self) -> bool {
         self.strict
+    }
+
+    /// ⭐ 审计 P2 (2026-10-17): `--strict` 语义落地 (设计文档 §3.1:
+    /// "abort on first bad page, CI only").
+    ///
+    /// 旧实现两个 flag 解析后从不读取 — `--strict` 是空操作. 各命令在观测到
+    /// 坏页/不可读页时调这个闸门: tolerant (默认) 恒 Ok (继续扫, 退出码 0),
+    /// strict → `Err(BadPage)` → main 以退出码 2 中止.
+    pub fn strict_gate(&self, what: impl Into<String>) -> crate::error::Result<()> {
+        if self.strict {
+            Err(crate::error::ScannerError::BadPage(what.into()))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -362,6 +376,28 @@ mod tests {
             "dbs",
         ]);
         assert!(r.is_err(), "--strict should conflict with --tolerant");
+    }
+
+    /// ⭐ 审计 P2 (2026-10-17): `--strict` 不再是空操作 flag — 闸门在 strict 下
+    /// 返回 Err (main → 退出码 2), tolerant (默认) 恒 Ok.
+    #[test]
+    fn strict_gate_only_fires_in_strict_mode() {
+        let tol = Top::try_parse_from(["nexusdb-scanner", "--dir", "E:/study", "dbs"]).unwrap();
+        assert!(
+            tol.globals.strict_gate("bad page").is_ok(),
+            "tolerant (默认) 不得因坏页失败"
+        );
+        let strict =
+            Top::try_parse_from(["nexusdb-scanner", "--dir", "E:/study", "--strict", "dbs"])
+                .unwrap();
+        let err = strict
+            .globals
+            .strict_gate("vpid 1: BadMagic")
+            .expect_err("strict 必须失败");
+        assert!(
+            err.to_string().contains("vpid 1: BadMagic"),
+            "错误应带坏页详情: {err}"
+        );
     }
 
     #[test]

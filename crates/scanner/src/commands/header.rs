@@ -33,8 +33,16 @@ pub fn run<W: Write>(globals: &Globals, vpid: u64, neighbors: bool, mut out: W) 
     match read {
         page_io::PageRead::Ok(buf) => {
             emit_row(&mut out, globals, vpid, &buf);
+            // ⭐ 审计 P2 (2026-10-17): strict 模式 — 坏页即非零退出 (CI 语义)
+            let r = crate::page_decode::PageReport::decode(&buf, vpid);
+            if let Some(b) = &r.bad {
+                globals.strict_gate(format!("vpid {vpid}: {:?}: {}", b.kind, b.detail))?;
+            }
         }
-        other => emit_bad(&mut out, globals, vpid, &other),
+        other => {
+            emit_bad(&mut out, globals, vpid, &other);
+            globals.strict_gate(format!("vpid {vpid}: unreadable page"))?;
+        }
     }
 
     if neighbors {

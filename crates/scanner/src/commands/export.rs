@@ -40,27 +40,37 @@ pub fn run<W: Write>(
     let out_rc = RefCell::new(&mut out);
     let row_count = RefCell::new(0u64);
 
-    let summary = tree::walk_tree_in_order(shard, &locate, tree_root, |key, value| {
-        let mut out_b = out_rc.borrow_mut();
-        let mut rc = row_count.borrow_mut();
-        match format {
-            ExportFormat::Kv => {
-                let k_hex = hex::encode(key);
-                let v_hex = hex::encode(value);
-                let _ = writeln!(*out_b, "{}\t{}", k_hex, v_hex);
-                *rc += 1;
+    let summary = tree::walk_tree_in_order(
+        shard,
+        &locate,
+        tree_root,
+        globals.is_strict(),
+        |key, value| {
+            let mut out_b = out_rc.borrow_mut();
+            let mut rc = row_count.borrow_mut();
+            match format {
+                ExportFormat::Kv => {
+                    let k_hex = hex::encode(key);
+                    let v_hex = hex::encode(value);
+                    let _ = writeln!(*out_b, "{}\t{}", k_hex, v_hex);
+                    *rc += 1;
+                }
+                ExportFormat::Json => {
+                    let k_hex = hex::encode(key);
+                    let v_hex = hex::encode(value);
+                    let _ = writeln!(*out_b, r#"{{"key":"{}","value":"{}"}}"#, k_hex, v_hex);
+                    *rc += 1;
+                }
             }
-            ExportFormat::Json => {
-                let k_hex = hex::encode(key);
-                let v_hex = hex::encode(value);
-                let _ = writeln!(*out_b, r#"{{"key":"{}","value":"{}"}}"#, k_hex, v_hex);
-                *rc += 1;
-            }
-        }
-    });
+        },
+    );
 
     let _ = skip_bad;
     let rc = row_count.into_inner();
+    // ⭐ 审计 P2 (2026-10-17): strict 模式撞到坏页 → 非零退出 (CI 语义)
+    if let Some(hit) = &summary.strict_hit {
+        return Err(crate::error::ScannerError::BadPage(hit.clone()));
+    }
     let skipped = (summary.bad + summary.unread) as u64;
 
     if skipped > 0 {

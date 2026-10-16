@@ -31,8 +31,15 @@ pub fn run<W: Write>(globals: &Globals, vpid: u64, raw: bool, mut out: W) -> Res
             } else {
                 emit_full(&mut out, globals, vpid, &r);
             }
+            // ⭐ 审计 P2 (2026-10-17): strict 模式 — 坏页即非零退出 (CI 语义)
+            if let Some(b) = &r.bad {
+                globals.strict_gate(format!("vpid {vpid}: {:?}: {}", b.kind, b.detail))?;
+            }
         }
-        other => emit_bad(&mut out, globals, vpid, &other),
+        other => {
+            emit_bad(&mut out, globals, vpid, &other);
+            globals.strict_gate(format!("vpid {vpid}: unreadable page"))?;
+        }
     }
     Ok(0)
 }
