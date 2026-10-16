@@ -2085,6 +2085,54 @@ fn mysql_stalled_oversized_stream_rejected() {
     drop(mgr);
 }
 
+/// ⭐ 审计 P2 回归 (2026-10-17): UUID 列 IN >64 元素不得恒空集.
+/// 旧实现二分路径漏了 UUID 文本→16B coercion: ≤64 元素正确、>64 恒空.
+#[test]
+fn uuid_in_large_set_matches() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, uid UUID)");
+    let target = "550e8400-e29b-41d4-a716-446655440000";
+    c.query(&format!(
+        "INSERT INTO u VALUES (1, '{target}'), (2, '550e8400-e29b-41d4-a716-446655440001')"
+    ));
+
+    // 70 个 UUID 的 IN (含目标) — 走二分路径 (>64)
+    let mut uuids: Vec<String> = (0..70)
+        .map(|i| format!("{i:08x}-0000-4000-8000-000000000000"))
+        .collect();
+    uuids[37] = target.to_string();
+    let sql = format!(
+        "SELECT id FROM u WHERE uid IN ({})",
+        uuids
+            .iter()
+            .map(|u| format!("'{u}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert_eq!(c.ids(&sql), vec!["1"], ">64 元素 IN 必须命中 (旧实现恒空)");
+
+    // 不含目标的 70 元素 IN → 空
+    let miss: Vec<String> = (100..170)
+        .map(|i| format!("{i:08x}-0000-4000-8000-000000000000"))
+        .collect();
+    let sql_miss = format!(
+        "SELECT id FROM u WHERE uid IN ({})",
+        miss.iter()
+            .map(|u| format!("'{u}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert_eq!(c.ids(&sql_miss), Vec::<String>::new(), "不含目标应为空");
+
+    // ≤64 元素行为不变 (线性路径)
+    let small = format!("SELECT id FROM u WHERE uid IN ('{target}')");
+    assert_eq!(c.ids(&small), vec!["1"]);
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ 审计 P2 回归 (2026-10-17): 恒假谓词短路必须保持**真实投影**的列
 /// 定义. 旧实现硬编码单列 ("", I64): `SELECT a, b FROM t WHERE 1=0`
 /// 返回 1 列空名结果集, 列数/列名与投影不符 (破坏客户端结果集契约).

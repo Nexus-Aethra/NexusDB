@@ -54,3 +54,19 @@ PG 兼容 deliberately-OK, 保留并在注释中说明.)
 **测试**: `always_false_predicate_keeps_real_projection_shape` (捕获列定义
 帧断言 [a, b]; 反向验证旧实现返回 [""]); network 串行 224 passed / 0 failed;
 clippy 0; fmt 0.
+
+---
+
+## 附: UUID 列 IN >64 元素恒空集 (P2) — 同批次修复
+
+**问题**: `eval_cond_leaf` 的 IN 二分路径 (>64 元素) 对 UUID 列直接拿 36
+字符文本与 16B 存储值比较, 漏了 `coerce_cmp_lit_uuid` 的文本→16B 转换 —
+同查询 64 元素正确、70 元素恒空, 语义不一致.
+
+**修复**: 二分路径对 UUID 列逐元素 coercion (text→16B) 后重排二分;
+含非法 UUID 文本则回退线性路径 (保守正确).
+
+**测试**: `uuid_in_large_set_matches` (70 元素含目标→命中; 不含→空;
+≤64 行为不变); 反向验证旧实现返回 []; network 串行 225 passed / 0 failed;
+clippy 0; fmt 0. (注: 期间一次失败为 /tmp tmpfs 配额耗尽的环境问题,
+清理后复跑通过.)

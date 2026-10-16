@@ -361,13 +361,48 @@ pub(crate) fn eval_cond_leaf(schema: &TableSchema, values: &[ColValue], c: &Cond
                         .is_ok();
                 }
                 ColValue::Bytes(x) if c.set.iter().all(|v| matches!(v, SqlValue::Str(_))) => {
-                    return c
-                        .set
-                        .binary_search_by(|v| match v {
-                            SqlValue::Str(b) => b.as_slice().cmp(x.as_slice()),
-                            _ => std::cmp::Ordering::Less,
-                        })
-                        .is_ok();
+                    // ⭐ 2026-10-17 (审计 P2): UUID 列的集合元素是 36 字符
+                    // 文本而存储是 16B — 二分前必须逐元素 coercion. 旧实现
+                    // 直接拿文本与 16B 比较, >64 元素的 IN **恒空集**
+                    // (与 ≤64 的线性路径语义不一致).
+                    if colty == ColType::Uuid {
+                        let mut coerced: Vec<Vec<u8>> = Vec::with_capacity(c.set.len());
+                        let mut all_valid = true;
+                        for v in &c.set {
+                            match v {
+                                SqlValue::Str(t) => {
+                                    match std::str::from_utf8(t).ok().and_then(parse_uuid) {
+                                        Some(b) => coerced.push(b),
+                                        None => {
+                                            all_valid = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    all_valid = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_valid {
+                            // 文本序与二进制序在大小写混用等情形下可能不同,
+                            // 重排保证二分正确.
+                            coerced.sort_unstable();
+                            return coerced
+                                .binary_search_by(|b| b.as_slice().cmp(x.as_slice()))
+                                .is_ok();
+                        }
+                        // 含非法 UUID 文本 → 落到下方线性路径 (保守正确)
+                    } else {
+                        return c
+                            .set
+                            .binary_search_by(|v| match v {
+                                SqlValue::Str(b) => b.as_slice().cmp(x.as_slice()),
+                                _ => std::cmp::Ordering::Less,
+                            })
+                            .is_ok();
+                    }
                 }
                 _ => {}
             }
