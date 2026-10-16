@@ -555,15 +555,11 @@ pub(crate) fn sql_run_dml(
             // ⭐ 优化器 M1 (2026-08): 谓词归一 (NOT 下推/恒真恒假短路) 后再规划
             let (ncond, cond_false) = sql::normalize_pred_cond(&conds);
             conds = ncond;
-            if cond_false {
-                // 恒假谓词 → 直接返回空结果 (短路广播)
-                let bin = conn.mysql_binary.remove(&seq);
-                conn.resp_complete(
-                    seq,
-                    sql_rows_bytes(conn.proto, bin, &[("", storage::schema::ColType::I64)], &[]),
-                );
-                return;
-            }
+            // ⭐ 2026-10-17 (审计 P2): 恒假谓词短路**移到投影解析之后** —
+            // 旧实现在此处硬编码单列 ("", I64) 返回空结果:
+            // `SELECT a, b FROM t WHERE 1=0` 会返回 1 列空名列的结果集,
+            // 列数/列名与真实投影不符, 破坏客户端结果集契约.
+            // cond_false 标记保留到投影解析后使用 (见下方 short-circuit).
             // ⭐ G1/G2 (F63): 投影分型 — 纯列 / COUNT(*) 特例 (旧路径) /
             // 广义聚合 (分桶完成点)
             let has_agg = items
@@ -661,6 +657,20 @@ pub(crate) fn sql_run_dml(
                         return;
                     }
                 }
+            }
+            // ⭐ 2026-10-17 (审计 P2): 恒假谓词 → 空结果, 但列定义必须是
+            // **真实投影** (proj/out_names 已解析), 而非硬编码单列.
+            if cond_false {
+                let bin = conn.mysql_binary.remove(&seq);
+                if count {
+                    conn.resp_complete(seq, render_sql_count(conn.proto, bin, 0));
+                } else {
+                    conn.resp_complete(
+                        seq,
+                        render_sql_rows(conn.proto, bin, &schema, &proj, &out_names, &[]),
+                    );
+                }
+                return;
             }
             let offset = offset.unwrap_or(0);
             match sql_plan_select(&schema, &conds) {

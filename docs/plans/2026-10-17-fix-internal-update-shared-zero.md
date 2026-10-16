@@ -38,3 +38,19 @@ PG 兼容 deliberately-OK, 保留并在注释中说明.)
 
 **测试**: `create_index_rejected_not_silently_ok` (报错且信息含指引;
 内联 INDEX 不受影响); network 串行 223 passed / 0 failed; clippy 0; fmt 0.
+
+---
+
+## 附: 恒假谓词短路返回错误列定义 (P2) — 同批次修复
+
+**问题**: `SELECT a, b FROM t WHERE 1=0` 的恒假短路发生在投影解析**之前**,
+硬编码单列 ("", I64) 返回空结果 — 列数/列名与真实投影不符, 破坏客户端
+结果集契约 (驱动/ORM 按列名取数直接错位).
+
+**修复**: 短路移到投影解析 (proj/out_names) 与 ORDER BY 列校验之后,
+用 `render_sql_rows(proto, bin, &schema, &proj, &out_names, &[])` 渲染
+**真实投影形状**的空结果集; COUNT(*) 恒假渲染 0.
+
+**测试**: `always_false_predicate_keeps_real_projection_shape` (捕获列定义
+帧断言 [a, b]; 反向验证旧实现返回 [""]); network 串行 224 passed / 0 failed;
+clippy 0; fmt 0.

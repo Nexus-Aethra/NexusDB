@@ -2085,6 +2085,64 @@ fn mysql_stalled_oversized_stream_rejected() {
     drop(mgr);
 }
 
+/// ⭐ 审计 P2 回归 (2026-10-17): 恒假谓词短路必须保持**真实投影**的列
+/// 定义. 旧实现硬编码单列 ("", I64): `SELECT a, b FROM t WHERE 1=0`
+/// 返回 1 列空名结果集, 列数/列名与投影不符 (破坏客户端结果集契约).
+#[test]
+fn always_false_predicate_keeps_real_projection_shape() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
+    c.query("INSERT INTO t VALUES (1, 10, 20)");
+
+    // 自定义查询: 捕获列定义帧 (query() 会丢弃列定义, 这里手工解析)
+    let mut p = vec![my::COM_QUERY];
+    p.extend_from_slice(b"SELECT a, b FROM t WHERE 1 = 0");
+    c.stream.write_all(&my::write_packet(0, &p)).unwrap();
+    let (_, first) = c.read_frame();
+    assert_ne!(first[0], 0xFF, "恒假查询不应报错");
+    let ncols = first[0] as usize;
+    let mut col_names = Vec::new();
+    for _ in 0..ncols {
+        let (_, cd) = c.read_frame();
+        // 列定义包: 5 个 lenenc 字符串 (catalog/schema/table/org_table/name)
+        let mut pos = 0usize;
+        for field in 0..5 {
+            let len = cd[pos] as usize;
+            pos += 1;
+            let val = String::from_utf8_lossy(&cd[pos..pos + len]).into_owned();
+            pos += len;
+            if field == 4 {
+                col_names.push(val);
+            }
+        }
+    }
+    assert_eq!(
+        col_names,
+        vec!["a".to_string(), "b".to_string()],
+        "恒假结果集必须保持真实投影列 (旧实现返回单列空名 I64)"
+    );
+    let (_, eof1) = c.read_frame();
+    assert_eq!(eof1[0], 0xFE, "列定义后应有 EOF");
+    // 空结果集: 行尾 EOF 也要消费掉 (否则残留包会干扰后续 query)
+    let (_, eof2) = c.read_frame();
+    assert_eq!(eof2[0], 0xFE, "行尾应有 EOF");
+
+    // COUNT(*) 恒假 → 0 行 1 列
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM t WHERE 1 = 0"),
+        QueryResult::Rows(vec![vec![Some("0".into())]])
+    );
+    // 对照: 同一投影的真查询仍返回正确数据
+    assert_eq!(
+        c.query("SELECT a, b FROM t WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("10".into()), Some("20".into())]])
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ 审计 P2 回归 (2026-10-17): 独立 CREATE INDEX 必须显式报错,
 /// 不得静默回 OK (客户端以为索引已建, 实际无任何效果).
 #[test]
