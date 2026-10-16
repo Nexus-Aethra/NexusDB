@@ -290,7 +290,13 @@ pub fn leaf_insert(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), Page
             return Err(PageError::PageFull);
         }
     }
+    // ⭐ 2026-10-16 (审计新 P0-1 同根因): 上面的 est 预检是启发式上界,
+    // 仍存在 "pre_split 成功改写页 → push_back 才失败" 的窗口. 存快照兜底,
+    // 恢复"失败的插入不改变页"强不变量 (pre_split_segment 内部已有精确
+    // 边界自检, 放不下时不会改字节; 快照覆盖的是其之后的 push_back 失败).
+    let mut snapshot: Option<Vec<u8>> = None;
     if need_pre_split {
+        snapshot = Some(page.to_vec());
         pre_split_segment(page, &mut idx, cur_seg_idx, ItemKind::Leaf)?;
         cur_seg_idx = idx.locate_segment(key);
     }
@@ -344,7 +350,7 @@ pub fn leaf_insert(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), Page
     // ptr 借用 page, 必须先 drop 再 mut borrow
     drop(ptr);
     drop(prev_ptr);
-    leaf_push_back(
+    if let Err(e) = leaf_push_back(
         page,
         &mut idx,
         &prev_key,
@@ -352,7 +358,13 @@ pub fn leaf_insert(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), Page
         key,
         value,
         seg_idx_for_push,
-    )?;
+    ) {
+        // ⭐ L2: pre_split 可能已改写页字节; 恢复快照, 失败的插入不得留下污染页
+        if let Some(snap) = &snapshot {
+            page.copy_from_slice(snap);
+        }
+        return Err(e);
+    }
 
     // 6. 写回 PageIndex (cp array + header.key_count)
     dprintln!(

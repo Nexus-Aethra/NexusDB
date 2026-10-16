@@ -96,3 +96,47 @@ internal.rs:180-190 已是这么做的), 页进入"已 pre_split 的有效态"; 
 仅 `crates/page` (internal_insert / pre_split_segment / leaf_insert) + 测试。
 对外行为变化: 原先 "PageFull + 页污染" 或 panic → 干净的 PageFull (页原样)。
 btree.rs 的 PageFull 分裂路径无需改动, 修复后其输入即变为可信。
+
+---
+
+## 8. 实施记录 (2026-10-16, 已完成)
+
+### 8.1 实际改动 (3 个文件 + 2 个测试文件)
+
+| 文件 | 改动 |
+|---|---|
+| `crates/page/src/index.rs` | `pre_split_segment` 重构为三件套: `plan_pre_split` (只读演算) / `pre_split_fits` (边界判定) / `apply_pre_split` (落字节); `pre_split_segment` = plan + fits(L3 硬自检) + apply, **在任何字节被修改前**拒绝放不下的分裂 |
+| `crates/page/src/internal.rs` | L1: pre_split 前 plan + `pre_split_fits` 精确预检, 不足直接 `PageFull` (页不动); L2: pre_split 路径存 16KiB 快照, push_back 失败即回滚, 保证"失败的插入不改变页" |
+| `crates/page/src/leaf.rs` | L2 同型快照回滚 (est 预检是启发式, 兜底 est 之后的 push_back 失败窗口) |
+| `crates/page/tests/insert_atomicity_tests.rs` | 新增 5 个回归测试 (见 8.3) |
+| `crates/storage/tests/internal_split_long_prefix_regression.rs` | 新增存储级 e2e 回归 (600B 前缀 × 8000 行 × 2KB value, 全量读回 + flush + reopen 后全量读回) |
+
+### 8.2 实施中发现并修复的第二个潜伏 bug
+
+`internal_split` Step 5 对左页重建 cp[0] 时硬编码 `item_count = left_kc + 1` ("含哨兵"),
+但**无哨兵页** (上一次 split 产生的 right 页再分裂时的左半) 会多数一个**幽灵 item**
+(探针实测: cp 总数 199 vs 实际 item 198)。后果: 段内 walk 越过 free_off 踩零区,
+表现为 push_back `copy_within` 的 "slice index starts at X but ends at Y" panic
+或静默错路由。已按 `has_sentinel` 修正计数。leaf_split 无此问题 (leaf 页必有哨兵)。
+
+该 bug 在修复前**不可达**: 进程在 internal_insert 的 pre_split 阶段就会 panic,
+永远走不到 internal_split。属"修复暴露的下一层腐烂", 与审计报告"修复不对称/
+同类问题仍有潜伏实例"的判断互相印证。
+
+**实施教训 (重构 plan/apply 的坑)**: plan 阶段在**未移位的原页**上演算, k+1 必须按
+原位置 `mid_item_off + mid_old_n` 解码; 若误用移位后位置 `mid_item_off + mid_new_n`
+会解码到错误字节, apply 把错误 k+1 写回即毁掉 item 链。该回归由探针在 5 分钟内捕获,
+最终形态以 `K1Plan { k1_off_orig, k1_off }` 两个字段区分"解码位置"与"落地位置"。
+
+### 8.3 验证结果 (全部实测)
+
+| 验证 | 结果 |
+|---|---|
+| 修复前复现 (存储级 e2e, 未修代码) | ❌ 0.12s panic @ `index.rs:327` `dest is out of bounds` |
+| 修复后存储级 e2e | ✅ 1.44s 通过 (8000 行全量读回 + reopen 后全量读回) |
+| 独立探针 (release, 11 种前缀长度 0–750B) | ✅ 全部干净 `PageFull`: 无 panic / 页零改写 / free_off 不越界 / `PageIndex::load` OK / 路由不变 |
+| `cargo test -p page` | ✅ 145 passed / 0 failed (原 140 + 新 5) |
+| `cargo test -p storage` | ✅ 503 passed / 0 failed |
+| **全 workspace 串行回归** (干净 TMPDIR) | ✅ **1066 passed / 0 failed / 22 ignored, exit 0** (基线 1049+33; 差值 = 本机多跑通 11 个 + 新增 6 个) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 警告 |
+| `cargo fmt --all -- --check` | ✅ 0 差异 |

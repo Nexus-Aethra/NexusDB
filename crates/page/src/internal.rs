@@ -100,7 +100,7 @@ pub fn internal_child_with_bounds(
 /// 使用 PageIndex + push_back (与 leaf_insert 流程一致).
 pub fn internal_insert(page: &mut [u8], sep_key: &[u8], child_vpid: u64) -> Result<(), PageError> {
     use crate::checkpoint::MAX_PER_CHECKPOINT;
-    use crate::index::pre_split_segment;
+    use crate::index::{apply_pre_split, plan_pre_split, pre_split_fits};
     use crate::ptr::InternalItemPtr;
 
     if page_type(page) != PageType::Internal {
@@ -142,9 +142,27 @@ pub fn internal_insert(page: &mut [u8], sep_key: &[u8], child_vpid: u64) -> Resu
     let seg_idx = idx.locate_segment(sep_key);
     let mut cur_seg_idx = seg_idx;
 
-    // 2. pre_split
+    // 2. ⭐ 空间预检 + pre_split (2026-10-16 修复, 审计新 P0-1):
+    //
+    //    旧实现无任何预检直接执行 pre_split: 近满页上 mid item 的 full-key
+    //    重编码 (长共享前缀 key 可膨胀数百字节) 使 copy_within 越界 panic,
+    //    或使 free_off 写穿 checkpoint 区; 且随后 push_back 的 PageFull
+    //    错误路径上 write_back 不执行 — 调用方 (btree split 路径) 会把
+    //    污染页拆分后持久化 → 静默丢数据. 与 2026-08-02 leaf 冷启动事故
+    //    (docs/bug-cold-start-data-loss.md) 同根因, 当年只修了 leaf 侧.
+    //
+    //    修法 (对齐 leaf.rs 的 2026-08-02 模式, 但用精确值而非估算):
+    //    a. 只读演算 plan, 精确边界检查 — 放不下则 PageFull, 页数据未修改;
+    //    b. 快照兜底 — 万一 pre_split 之后 push_back 才失败, 恢复
+    //       "失败的插入不改变页"强不变量.
+    let mut snapshot: Option<Vec<u8>> = None;
     if idx.segments[cur_seg_idx].item_count >= MAX_PER_CHECKPOINT {
-        pre_split_segment(page, &mut idx, cur_seg_idx, ItemKind::Internal)?;
+        let plan = plan_pre_split(page, &idx, cur_seg_idx, ItemKind::Internal)?;
+        if !pre_split_fits(page, &idx, &plan) {
+            return Err(PageError::PageFull); // 页数据未修改, checkpoint 一致
+        }
+        snapshot = Some(page.to_vec());
+        apply_pre_split(page, &mut idx, cur_seg_idx, &plan)?;
         cur_seg_idx = idx.locate_segment(sep_key);
     }
 
@@ -198,7 +216,7 @@ pub fn internal_insert(page: &mut [u8], sep_key: &[u8], child_vpid: u64) -> Resu
     let seg_idx_for_push = idx.find_segment_by_offset(prev_ptr.byte_offset());
     drop(ptr);
     drop(prev_ptr);
-    internal_push_back(
+    if let Err(e) = internal_push_back(
         page,
         &mut idx,
         &prev_key,
@@ -206,7 +224,15 @@ pub fn internal_insert(page: &mut [u8], sep_key: &[u8], child_vpid: u64) -> Resu
         sep_key,
         child_vpid,
         seg_idx_for_push,
-    )?;
+    ) {
+        // ⭐ L2: pre_split 可能已改写页字节 (item 移位 + free_off 前进),
+        // 而 write_back 尚未执行 — 直接返回会把"污染页"交给调用方.
+        // 恢复快照, 保证失败的插入不改变页字节 (checkpoint 数组保持一致).
+        if let Some(snap) = &snapshot {
+            page.copy_from_slice(snap);
+        }
+        return Err(e);
+    }
     idx.write_back(page)?;
     Ok(())
 }
@@ -628,11 +654,21 @@ pub fn internal_split(
     let left_idx = PageIndex::load(left, ItemKind::Internal)?;
     if left_idx.segments.is_empty() && left_kc > 0 {
         // 防御性: 与 leaf_split 一致, load 返回 0 segments 时手动建 cp[0].
+        //
+        // ⚠️ 2026-10-16 修复 (新 P0-1 下游): item_count 必须按**本页有无哨兵**计算:
+        //   - 有哨兵页 (root 等): items = 哨兵 + left_kc 个真实 key → left_kc + 1
+        //   - 无哨兵页 (上一次 split 产生的 right 页再分裂时的左半):
+        //     items = left_kc 个真实 key → left_kc
+        // 旧实现硬编码 +1, 对无哨兵页多数一个**幽灵 item** — 段表声称的 item 数
+        // 超过实际数据, 后续 insert 的段内 walk 会越过 free_off 踩到零区/垃圾,
+        // 表现为 push_back copy_within 的 "slice index starts at X but ends at Y"
+        // panic 或静默错路由. (leaf_split 无此问题: leaf 页必有哨兵.)
+        let left_item_count = if has_sentinel { left_kc + 1 } else { left_kc };
         write_checkpoint(
             left,
             0,
             Checkpoint {
-                item_count: left_kc + 1, // +1 含哨兵
+                item_count: left_item_count,
                 first_item_off: PAGE_HEADER_SIZE as u16,
             },
         );
