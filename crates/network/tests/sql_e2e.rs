@@ -4374,3 +4374,54 @@ fn mysql_serializable_scan_reads_enter_read_set() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+/// ⭐ 审计 P2 (2026-10-17): JOIN 中间积护栏 — 笛卡尔积超过 JOIN_MAX_ROWS
+/// 必须报错 (旧实现只在整块构建后查护栏, 中间积已先吃穿 worker 内存).
+/// 600 × 600 = 360000 > 262144.
+#[test]
+fn mysql_join_cross_product_capped() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    assert_eq!(
+        c.query("CREATE TABLE a (id INT PRIMARY KEY, v INT)"),
+        QueryResult::Ok { affected: 0 }
+    );
+    assert_eq!(
+        c.query("CREATE TABLE b (id INT PRIMARY KEY, v INT)"),
+        QueryResult::Ok { affected: 0 }
+    );
+    for t in ["a", "b"] {
+        for base in 0..3usize {
+            let vals: Vec<String> = (0..200)
+                .map(|i| format!("({}, {})", base * 200 + i + 1, i))
+                .collect();
+            assert_eq!(
+                c.query(&format!("INSERT INTO {t} VALUES {}", vals.join(", "))),
+                QueryResult::Ok { affected: 200 },
+                "batch insert {t}"
+            );
+        }
+    }
+
+    match c.query("SELECT a.id, b.id FROM a CROSS JOIN b") {
+        QueryResult::Err { msg, .. } => {
+            assert!(
+                msg.contains("row cap exceeded"),
+                "错误信息应指明超限: {msg}"
+            )
+        }
+        QueryResult::Rows(rows) => {
+            panic!("笛卡尔积超限应报错, 实际返回 {} 行", rows.len())
+        }
+        other => panic!("笛卡尔积超限应报错: {other:?}"),
+    }
+    // 护栏生效后服务端仍健康 (未被 OOM/拖死)
+    assert_eq!(
+        c.ids("SELECT id FROM a ORDER BY id LIMIT 3"),
+        vec!["1", "2", "3"]
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}

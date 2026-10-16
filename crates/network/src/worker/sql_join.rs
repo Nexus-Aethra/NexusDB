@@ -3,6 +3,9 @@
 // 依赖: 通过 `use super::*` 访问 ConnState / SqlJoinCtx / BatchOp 等 worker 级定义.
 use super::*;
 
+/// ⭐ 审计 P2 (2026-10-17): JOIN 结果/中间积超护栏的统一错误消息.
+const JOIN_OVER_CAP_MSG: &str = "JOIN result too large (row cap exceeded)";
+
 // ==================== JOIN 编排核心 ====================
 /// ⭐ F67 (JOIN): handle_resp 认领 — 按 phase 推进. 返回 true = 已处理此 seq.
 /// `group` 仅 EstimateRows 行数批使用 (0=tables[0], 1=tables[1]).
@@ -292,6 +295,13 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
                     && let Some(cands) = hash.get(&k)
                 {
                     for &ri in cands {
+                        // ⭐ 审计 P2 (2026-10-17): 逐行护栏 — 旧实现只在整块
+                        // 构建后查 JOIN_MAX_ROWS, 笛卡尔积/多匹配的中间积已先
+                        // 吃穿内存. 边构建边查, 内存上界 = 护栏本身.
+                        if out.len() > JOIN_MAX_ROWS {
+                            conn.resp_complete(seq, sql_err_bytes(conn.proto, JOIN_OVER_CAP_MSG));
+                            return;
+                        }
                         let mut w = Vec::with_capacity(col_offset[2]);
                         w.extend_from_slice(&p_rows[ri]); // tables[0] 列
                         w.extend_from_slice(d_row); // tables[1] 列
@@ -303,10 +313,7 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
             out
         };
         if acc.len() > JOIN_MAX_ROWS {
-            conn.resp_complete(
-                seq,
-                sql_err_bytes(conn.proto, "JOIN result too large (row cap exceeded)"),
-            );
+            conn.resp_complete(seq, sql_err_bytes(conn.proto, JOIN_OVER_CAP_MSG));
             return;
         }
     } else {
@@ -379,6 +386,11 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
             for acc_row in &acc {
                 if jc.kind == JoinKind::Cross {
                     for right_row in right_rows.iter() {
+                        // ⭐ 审计 P2 (2026-10-17): 逐行护栏 (笛卡尔积中间积)
+                        if new_acc.len() > JOIN_MAX_ROWS {
+                            conn.resp_complete(seq, sql_err_bytes(conn.proto, JOIN_OVER_CAP_MSG));
+                            return;
+                        }
                         new_acc.push(extend(acc_row, Some(right_row)));
                     }
                     continue;
@@ -390,6 +402,14 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
                 {
                     for &ri in cands {
                         if on_cmp_pass(acc_row, &right_rows[ri]) {
+                            // ⭐ 审计 P2 (2026-10-17): 逐行护栏 (同键多匹配的放大)
+                            if new_acc.len() > JOIN_MAX_ROWS {
+                                conn.resp_complete(
+                                    seq,
+                                    sql_err_bytes(conn.proto, JOIN_OVER_CAP_MSG),
+                                );
+                                return;
+                            }
                             new_acc.push(extend(acc_row, Some(&right_rows[ri])));
                             matched_right[ri] = true;
                             any = true;
@@ -411,10 +431,7 @@ pub(crate) fn sql_join_finish(conn: &mut ConnState, seq: u64) {
                 }
             }
             if new_acc.len() > JOIN_MAX_ROWS {
-                conn.resp_complete(
-                    seq,
-                    sql_err_bytes(conn.proto, "JOIN result too large (row cap exceeded)"),
-                );
+                conn.resp_complete(seq, sql_err_bytes(conn.proto, JOIN_OVER_CAP_MSG));
                 return;
             }
             acc = new_acc;

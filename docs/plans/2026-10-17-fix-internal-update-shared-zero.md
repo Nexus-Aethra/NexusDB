@@ -320,3 +320,29 @@ JOIN 路径早有 `JOIN_MAX_ROWS = 262_144` 护栏, SELECT 侧一直没有.
 | `materialize_select_agg_limit_under_cap_ok` | ✅ LIMIT 10 早停 → 只回 10 行, 不触发护栏 |
 | network 全量串行 | ✅ 235 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: JOIN cross 中间积无逐行检查 (P2) — 同批次修复
+
+**问题**: JOIN 累加器的 `JOIN_MAX_ROWS` 护栏只在**整块构建后**检查
+(`if new_acc.len() > JOIN_MAX_ROWS`) — 笛卡尔积 / 同键多匹配的中间积在检查
+之前就已全额物化: 两侧各 262144 行 (gather 侧各自合规) 时中间积可达 68B 行,
+worker 先 OOM 才走到检查.
+
+**修复**: 3 处内层 push 点改为**边构建边查** (驱动交换路径 / Cross 分支 /
+等值匹配分支), 内存上界 = 护栏本身; 原有构建后检查保留为兜底. 错误消息统一
+为 `JOIN_OVER_CAP_MSG` (文本不变, 客户端无感知).
+
+**测试** (反向验证: 把 `JOIN_MAX_ROWS` 临时改成 `usize::MAX` 后用例失败 —
+"笛卡尔积超限应报错, 实际返回 360000 行"):
+
+| 用例 | 结果 |
+|---|---|
+| `mysql_join_cross_product_capped` | ✅ 600×600 = 360000 > 262144 → 报 "row cap exceeded"; 服务端后续查询仍健康 |
+| network 全量串行 | ✅ 236 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |
+
+注: 本项缺陷的**可观测行为不变** (超限两种情况都报错), 差异在峰值内存 —
+逐行护栏把中间积的内存上界从"乘积全额"压到"护栏值"; e2e 用例锁定护栏行为
+(去掉护栏即失败), 逐行生效点由代码位置保证.
