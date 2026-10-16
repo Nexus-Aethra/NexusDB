@@ -53,6 +53,7 @@ pub(crate) use sql_fk::{all_parents_cached, sql_fk_on_reply, sql_fk_start};
 /// ⭐ ORM-B2 (解耦 2026-08): 进程级共享路由缓存 (SqlSharedRoutes/FkIncoming).
 mod sql_routes;
 pub use sql_routes::{FkIncoming, SqlSharedRoutes, new_sql_shared};
+pub(crate) use sql_routes::{rlock, wlock};
 /// ⭐ 解耦 2026-08: RESP 跨 shard 聚合状态结构体.
 mod resp_agg;
 pub(crate) use resp_agg::{
@@ -891,7 +892,7 @@ pub(crate) fn feed_route_bloom(
 ) {
     let sh = &conn.sql_shared;
     let ckey = (db.to_string(), table.to_string());
-    if !sh.created_here.read().unwrap().contains(&ckey) {
+    if !rlock(&sh.created_here).contains(&ckey) {
         return;
     }
     let BatchOp::RowPut { values, .. } = op else {
@@ -899,10 +900,7 @@ pub(crate) fn feed_route_bloom(
     };
     for idx in schema.indexes.iter() {
         if let Some(enc) = storage::sql_rows::index_vals_bytes(schema, idx, values) {
-            let entry = sh
-                .routes
-                .read()
-                .unwrap()
+            let entry = rlock(&sh.routes)
                 .get(&(ckey.0.clone(), ckey.1.clone(), idx.iid))
                 .cloned();
             if let Some(blooms) = entry {

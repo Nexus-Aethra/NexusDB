@@ -1089,13 +1089,10 @@ pub(crate) fn handle_resp_shard_result(
                         // DDL epoch +1 (其它 worker 靠 epoch 失效重拉)
                         conn.sql_cache.borrow_mut().schemas.remove(&key);
                         let sh = &conn.sql_shared;
-                        sh.created_here.write().unwrap().remove(&key);
+                        wlock(&sh.created_here).remove(&key);
                         // ⭐ FK 级联 (FMT_VER 8): 移除该表的外键反向引用
                         sh.unregister_fks(&key.0, &key.1);
-                        sh.routes
-                            .write()
-                            .unwrap()
-                            .retain(|(d, t, _), _| !(d == &key.0 && t == &key.1));
+                        wlock(&sh.routes).retain(|(d, t, _), _| !(d == &key.0 && t == &key.1));
                         sh.ddl_epoch
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         0
@@ -1127,7 +1124,7 @@ pub(crate) fn handle_resp_shard_result(
                     // 应用 DDL schema 副作用 (CREATE 成功注册)
                     if agg.error.is_none() {
                         // 复用下方逻辑: 提取 key/schema 做注册
-                        let mut routes = conn.sql_shared.routes.write().unwrap();
+                        let mut routes = wlock(&conn.sql_shared.routes);
                         for idx in &agg.schema.indexes {
                             routes
                                 .entry((agg.key.0.clone(), agg.key.1.clone(), idx.iid))
@@ -1140,11 +1137,7 @@ pub(crate) fn handle_resp_shard_result(
                                 });
                         }
                         drop(routes);
-                        conn.sql_shared
-                            .created_here
-                            .write()
-                            .unwrap()
-                            .insert(agg.key.clone());
+                        wlock(&conn.sql_shared.created_here).insert(agg.key.clone());
                         conn.sql_cache
                             .borrow_mut()
                             .schemas
@@ -1184,7 +1177,7 @@ pub(crate) fn handle_resp_shard_result(
                     // 空 bloom 即完备; 跨 worker/门面 INSERT 都喂同一实例)
                     {
                         let sh = &conn.sql_shared;
-                        let mut routes = sh.routes.write().unwrap();
+                        let mut routes = wlock(&sh.routes);
                         for idx in &agg.schema.indexes {
                             routes
                                 .entry((agg.key.0.clone(), agg.key.1.clone(), idx.iid))
@@ -1197,7 +1190,7 @@ pub(crate) fn handle_resp_shard_result(
                                 });
                         }
                         drop(routes);
-                        sh.created_here.write().unwrap().insert(agg.key.clone());
+                        wlock(&sh.created_here).insert(agg.key.clone());
                     }
                     conn.sql_cache
                         .borrow_mut()

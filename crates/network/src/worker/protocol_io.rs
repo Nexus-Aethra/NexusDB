@@ -170,8 +170,8 @@ pub(crate) fn handle_http_request(
                 let sh = &conn.sql_shared;
                 serde_json::json!({
                     "worker_schemas": conn.sql_cache.borrow().schemas.len(),
-                    "routes": sh.routes.read().unwrap().len(),
-                    "created_here": sh.created_here.read().unwrap().len(),
+                    "routes": rlock(&sh.routes).len(),
+                    "created_here": rlock(&sh.created_here).len(),
                     "ddl_epoch": sh.ddl_epoch.load(Relaxed),
                     "route_pruned": sh.route_pruned.load(Relaxed),
                     "route_bypassed": sh.route_bypassed.load(Relaxed),

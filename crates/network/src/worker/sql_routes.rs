@@ -34,6 +34,21 @@ pub struct SqlSharedRoutes {
     fk_incoming: std::sync::RwLock<FkIncomingMap>,
 }
 
+/// ⭐ 审计 P2 (2026-10-17): 读锁 — 毒化不 panic.
+///
+/// 这些锁保护的都是缓存/注册表 (routes/created_here/fk_incoming/cluster_ctl),
+/// 毒化后数据最多停在一次未完成的结构更新上 (下次写入/查询自然修正); 若按
+/// `expect` 直接 panic, 一个持锁 panic 会连带杀死**全部** SQL 门面 worker
+/// (`SqlSharedRoutes` 是进程级单例), 也让语句级 panic 隔离失去意义.
+pub(crate) fn rlock<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// ⭐ 审计 P2 (2026-10-17): 写锁 — 毒化不 panic (见 `rlock`).
+pub(crate) fn wlock<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Default for SqlSharedRoutes {
     fn default() -> Self {
         Self {
@@ -51,12 +66,12 @@ impl Default for SqlSharedRoutes {
 impl SqlSharedRoutes {
     /// ⭐ PG 兼容: 注入集群控制面 (建库 2PC). 未注入时 CREATE DATABASE 报错.
     pub fn set_cluster_ctl(&self, mgr: std::sync::Arc<shard_manager::ShardManager>) {
-        *self.cluster_ctl.write().expect("cluster_ctl lock") = Some(mgr);
+        *wlock(&self.cluster_ctl) = Some(mgr);
     }
 
     /// 取集群控制面 (None = 未注入, 测试/无管理面场景).
     pub fn cluster_ctl(&self) -> Option<std::sync::Arc<shard_manager::ShardManager>> {
-        self.cluster_ctl.read().expect("cluster_ctl lock").clone()
+        rlock(&self.cluster_ctl).clone()
     }
 
     /// ⭐ PG 兼容 (FMT_VER 8): CREATE TABLE 注册外键反向引用.
@@ -64,7 +79,7 @@ impl SqlSharedRoutes {
         if schema.fks.is_empty() {
             return;
         }
-        let mut m = self.fk_incoming.write().expect("fk_incoming lock");
+        let mut m = wlock(&self.fk_incoming);
         for fk in &schema.fks {
             m.entry((std::sync::Arc::from(db), fk.ref_table.clone()))
                 .or_default()
@@ -78,7 +93,7 @@ impl SqlSharedRoutes {
 
     /// ⭐ PG 兼容 (FMT_VER 8): DROP TABLE 移除外键反向引用.
     pub fn unregister_fks(&self, db: &str, table: &str) {
-        let mut m = self.fk_incoming.write().expect("fk_incoming lock");
+        let mut m = wlock(&self.fk_incoming);
         m.remove(&(std::sync::Arc::from(db), table.to_string()));
         m.retain(|_, v| {
             v.retain(|i| i.table != table);
@@ -88,9 +103,7 @@ impl SqlSharedRoutes {
 
     /// ⭐ PG 兼容 (FMT_VER 8): 反向引用 — 谁引用了 `ref_table` (级联删除分发用).
     pub fn incoming_fks(&self, db: &str, ref_table: &str) -> Vec<FkIncoming> {
-        self.fk_incoming
-            .read()
-            .expect("fk_incoming lock")
+        rlock(&self.fk_incoming)
             .get(&(std::sync::Arc::from(db), ref_table.to_string()))
             .cloned()
             .unwrap_or_default()
@@ -108,4 +121,29 @@ pub struct FkIncoming {
 /// 进程级实例构造 (main/测试 每逻辑集群一个, 传给同数据的全部 SQL 门面).
 pub fn new_sql_shared() -> std::sync::Arc<SqlSharedRoutes> {
     std::sync::Arc::new(SqlSharedRoutes::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⭐ 审计 P2 (2026-10-17): 锁中毒后访问不得 panic.
+    ///
+    /// 旧实现 `expect("... lock")`: 任意持锁 panic 之后, 该进程级单例的每次
+    /// 访问都 panic → 拖死全部 SQL 门面 worker (语句级 panic 隔离被架空).
+    #[test]
+    fn poisoned_lock_access_does_not_panic() {
+        let sh = SqlSharedRoutes::default();
+        // 制造毒化: 持写锁时 panic (guard 在 unwind 时 drop → 锁标记为毒化)
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = sh.cluster_ctl.write().unwrap();
+            panic!("poison on purpose");
+        }));
+        assert!(r.is_err(), "内层 panic 应被 catch_unwind 捕获");
+
+        // 毒后读写都不得 panic (恢复 guard 继续用)
+        assert!(sh.cluster_ctl().is_none(), "毒后读锁仍可用");
+        sh.unregister_fks("db", "t"); // 写锁路径
+        assert!(sh.incoming_fks("db", "t").is_empty(), "毒后读写均可用");
+    }
 }

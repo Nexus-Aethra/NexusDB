@@ -346,3 +346,26 @@ worker 先 OOM 才走到检查.
 注: 本项缺陷的**可观测行为不变** (超限两种情况都报错), 差异在峰值内存 —
 逐行护栏把中间积的内存上界从"乘积全额"压到"护栏值"; e2e 用例锁定护栏行为
 (去掉护栏即失败), 逐行生效点由代码位置保证.
+
+---
+
+## 附: SqlSharedRoutes 锁 expect 中毒即 panic (P2) — 同批次修复
+
+**问题**: `SqlSharedRoutes` (进程级单例, 跨 worker 跨 SQL 门面共用) 的 4 把
+`RwLock` 全部用 `.expect("... lock")` 取值. 任意持锁 panic 把锁毒化后, 该
+单例的**每一次**访问都 panic — 一个 panic 级联杀死全部 SQL 门面 worker, 也
+让此前加的语句级 panic 隔离 (`guard_stmt_panic`) 失去意义.
+
+**修复**: 新增毒容错的 `rlock`/`wlock` (`unwrap_or_else(PoisonError::into_inner)`),
+替换全部 13 处访问点 (sql_routes.rs 自身 + resp_shard.rs / protocol_io.rs /
+mod.rs). 这些锁保护的都是缓存/注册表 (routes bloom / created_here /
+fk_incoming / cluster_ctl), 毒化后数据最多停在一次未完成的结构更新上,
+后续写入自然修正 — 优于"整个进程陪葬".
+
+**测试** (反向验证: 把 `rlock` 换回 `expect` 后用例失败 — 毒化锁上 panic):
+
+| 用例 | 结果 |
+|---|---|
+| `poisoned_lock_access_does_not_panic` | ✅ 持写锁 panic 制造毒化 → `cluster_ctl()`/`unregister_fks()`/`incoming_fks()` 均不 panic |
+| network 全量串行 | ✅ 237 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |
