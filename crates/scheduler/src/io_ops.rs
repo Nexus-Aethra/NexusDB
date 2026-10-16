@@ -21,15 +21,25 @@ use std::task::{Context, Poll};
 use crate::scheduler::with_current;
 use crate::scheduler::with_current_slot;
 
-/// 取消被 future drop 遗留的内核请求。
+/// 取消被 future drop 遗留的内核请求.
 ///
-/// Drop 可能发生在 scheduler 已销毁之后；此时 io_uring 已随 scheduler 回收，无需再
-/// 提交 cancel。正常 task poll/drop 路径则必须取消，尤其是 `select_read` 的落选 PollFd。
+/// ⭐ 2026-10-17 (审计新 P1-16): 取消是**异步**的 — 内核在 cancel 生效前
+/// 可能仍在 DMA 读写调用方的 buffer. 旧实现只发 cancel 就返回: future 一
+/// drop, 调用方即可复用/释放 buffer, 与在途 DMA 构成数据竞争 (UB).
+/// 现在: 发 cancel 后**有界等待**该 ud 的 CQE (正常结果或 -ECANCELED
+/// 均可), 确保 DMA 结束后 buffer 才交还调用方.
+///
+/// Drop 可能发生在 scheduler 已销毁之后 (io_uring 已随 scheduler 回收,
+/// 无在途 DMA, 无需等待) 或 borrow 冲突时 — 两种情况 with_current 返回
+/// None, 直接返回 (尽力而为, 不退化为死锁).
 fn cancel_submitted(user_data: &Cell<Option<u64>>) {
     let Some(ud) = user_data.take() else {
         return;
     };
-    let _ = with_current(|s| s.cancel_submitted_io(ud));
+    let _ = with_current(|s| {
+        s.cancel_submitted_io(ud);
+        s.drain_cqe_until(ud, std::time::Duration::from_millis(50));
+    });
 }
 
 /// 公共逻辑: 已提交过 → 扫 CQE

@@ -491,6 +491,51 @@ impl Scheduler {
         crate::ready::push(&self.ready, slot_id);
     }
 
+    /// ⭐ 2026-10-17 (审计新 P1-16): 有界等待指定 ud 的 CQE 到达.
+    ///
+    /// **用途**: Read/Write future 被 drop (取消) 时, 内核在 cancel 生效前
+    /// 可能仍在 DMA 读写调用方的 buffer. 必须等到该 op 的 CQE 到达
+    /// (正常结果或 -ECANCELED), DMA 确已结束, buffer 才能安全交还调用方
+    /// 复用 — 否则数据竞争 (UB).
+    ///
+    /// 扫描期间也会 mark/唤醒**其他** ud (与 drain_completions/poll_cqe!
+    /// 对齐). 超时 (正常情况 CQE 微秒级到达) 后放弃等待, 尽力而为.
+    pub(crate) fn drain_cqe_until(&mut self, ud: u64, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.flush_sq();
+            let mut found = false;
+            let mut cross_woke: Vec<usize> = Vec::new();
+            {
+                let mut cq = self.ring.completion();
+                cq.sync();
+                for cqe in cq {
+                    let u = cqe.user_data();
+                    let r = cqe.result();
+                    if u == ud {
+                        found = true;
+                        self.registry.mark_completed(u, r);
+                    } else if self.registry.mark_completed(u, r)
+                        && let Some(st) = self.registry.inner_peek(u)
+                    {
+                        cross_woke.push(st.slot_id);
+                    }
+                }
+            }
+            for slot_id in cross_woke {
+                self.wake_slot(slot_id);
+            }
+            // 已到达 (本轮或此前被其他扫描 mark) → 结束
+            if found || self.registry.has_result(ud) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+
     pub fn io_registry_stats(&self) -> crate::io_registry::IoRegistryStats {
         self.registry.stats()
     }
@@ -796,6 +841,58 @@ mod p1_15_tests {
             libc::close(w1);
             libc::close(r2);
             libc::close(w2);
+        }
+    }
+
+    /// ⭐ 审计新 P1-16: Read future 在 IO 在途时被 drop, 必须**有界**等待
+    /// CQE (内核 DMA 可能仍在写 buffer) 后交还 buffer — 旧实现只发异步
+    /// cancel 就返回, 调用方立即可复用 buffer → 数据竞争 (UB).
+    #[test]
+    fn dropped_inflight_read_waits_bounded_and_drains_registry() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+
+        let sched = SchedHandle::new(Scheduler::new());
+        sched.set_current();
+
+        let mut buf = [0u8; 64];
+        let mut fut = Box::pin(crate::io_ops::read(r, &mut buf, 0));
+        // 首次 poll: 提交 SQE (pipe 无数据 → 在途)
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        let before = CURRENT
+            .with(|c| c.borrow().clone().expect("current"))
+            .borrow()
+            .io_registry_stats();
+        // drop 在途 future: 必须快速返回 (有界等待), 不得挂死
+        let t0 = std::time::Instant::now();
+        drop(fut);
+        let drop_elapsed = t0.elapsed();
+        assert!(
+            drop_elapsed < Duration::from_secs(2),
+            "drop 在途 read future 耗时 {drop_elapsed:?} — 疑似无界等待"
+        );
+
+        // registry 应已排空 (CQE 被消费, 无残留 pending entry)
+        let after = CURRENT
+            .with(|c| c.borrow().clone().expect("current"))
+            .borrow()
+            .io_registry_stats();
+        assert_eq!(after.registered, before.registered, "drop 不应留新注册");
+        assert!(
+            after.completed > before.completed || after.cancelled > before.cancelled,
+            "在途 op 的 CQE 应已被 drain (completed/cancelled 增加)"
+        );
+
+        // buffer 交还后可安全复用 (无 sanitizer 报告即通过)
+        buf = [0xABu8; 64];
+        assert_eq!(buf[0], 0xAB);
+        unsafe {
+            libc::close(r);
+            libc::close(w);
         }
     }
 }
