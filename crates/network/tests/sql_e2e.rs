@@ -2081,6 +2081,69 @@ fn mysql_foreign_key_cascade_decimal_pk() {
     drop(mgr);
 }
 
+/// ⭐ 审计新 P1-7 回归 (2026-10-17): UPDATE SET 未知函数必须显式报错.
+/// 修复前回退 Lit(Null): `SET c = UPPER(name)` 把整列静默刷成 NULL —
+/// 不可逆数据破坏, 且用户以为执行了函数.
+#[test]
+fn mysql_update_set_unknown_function_errors() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, note TEXT)");
+    c.query("INSERT INTO t VALUES (1, 'alice', 'keep')");
+
+    // 未知函数 → 显式报错 (修复前: Ok 且 note 被刷成 NULL)
+    let r = c.query("UPDATE t SET note = UPPER(name) WHERE id = 1");
+    let QueryResult::Err { msg, .. } = &r else {
+        panic!("未知函数应报错, 实际 {r:?}")
+    };
+    assert!(
+        msg.contains("unknown function"),
+        "错误信息应指明未知函数: {msg}"
+    );
+
+    // 多列 SET 中混入未知函数 → 整条语句失败, 且**不得部分应用**
+    // (note 保持 'keep', name 不被改动)
+    let r2 = c.query("UPDATE t SET name = 'bob', note = BADFN(name) WHERE id = 1");
+    assert!(
+        matches!(r2, QueryResult::Err { .. }),
+        "多列 SET 含未知函数应报错: {r2:?}"
+    );
+    assert_eq!(
+        c.query("SELECT name, note FROM t WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("alice".into()), Some("keep".into())]]),
+        "失败的 UPDATE 不得留下部分应用"
+    );
+
+    // 畸形值 → 显式报错 (修复前兜底 Ok(Lit(Null)) 静默写 NULL)
+    assert!(matches!(
+        c.query("UPDATE t SET note = , WHERE id = 1"),
+        QueryResult::Err { .. }
+    ));
+    // 算术右侧夹带未知函数 → 整条报错 (修复前 break 静默丢弃右侧)
+    assert!(matches!(
+        c.query("UPDATE t SET name = name || UPPER(name) WHERE id = 1"),
+        QueryResult::Err { .. }
+    ));
+    // 上述失败不得改动数据
+    assert_eq!(
+        c.query("SELECT name, note FROM t WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("alice".into()), Some("keep".into())]]),
+        "失败的 UPDATE 不得留下部分应用"
+    );
+    // 支持的时间函数保持工作 (NOW() 族; 修复前 peek 语义 bug 使该分支整个不可达)
+    assert!(matches!(
+        c.query("UPDATE t SET note = NOW() WHERE id = 1"),
+        QueryResult::Ok { .. }
+    ));
+    assert!(matches!(
+        c.query("UPDATE t SET note = CURRENT_TIMESTAMP() WHERE id = 1"),
+        QueryResult::Ok { .. }
+    ));
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ PG 兼容 (UPDATE SET 表达式): `SET col = col + 1` 乐观锁, `NOT col` toggle,
 /// 链式算术. 由 shard 端 row_update 读旧行求值 (原子读改写).
 #[test]

@@ -523,11 +523,13 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
                     _ => {
                         // ⭐ PG 兼容 (UPDATE SET): 函数调用 `NOW()` / `CURRENT_TIMESTAMP`
                         // 等 — 吞掉括号及参数, 解析为当前时间字面量 (时间列默认/更新).
-                        // 其他未知函数同样吞掉调用, 回退 Null (避免 `SET c = fn()` 报
-                        // "trailing tokens" 卡死后续多列 SET 解析).
-                        if p.peek() == Some(&Tok::LParen) {
+                        // ⚠️ 必须用 peek2_is_lparen: 此处当前 token 仍是 Ident 本身,
+                        // `p.peek() == LParen` 恒 false — 旧实现因此从未支持
+                        // `SET c = NOW()` (文档宣称支持), 函数分支整段是死代码.
+                        if p.peek2_is_lparen() {
                             let fname = s.to_ascii_lowercase();
-                            p.next()?; // (
+                            p.next()?; // 函数名 Ident
+                            p.next()?; // "("
                             let mut depth = 1;
                             while depth > 0 {
                                 match p.next()? {
@@ -540,7 +542,14 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
                                 "now" | "current_timestamp" | "current_date" | "current_time" => {
                                     Ok(ScalarExpr::Lit(SqlValue::Now))
                                 }
-                                _ => Ok(ScalarExpr::Lit(SqlValue::Null)),
+                                // ⭐ 2026-10-17 (审计新 P1-7): 未知函数**显式报错**.
+                                // 旧实现回退 Lit(Null): `UPDATE t SET c = SOMEFN(x)`
+                                // 把整列静默刷成 NULL — 不可逆数据破坏, 且用户以为
+                                // 执行了函数. 先吞掉平衡括号再报错, 避免 "trailing
+                                // tokens" 混淆信息 (旧注释的顾虑), 错误本身明确.
+                                _ => Err(format!(
+                                    "unknown function '{fname}' in UPDATE SET expression"
+                                )),
                             };
                         }
                         // 列引用
@@ -558,13 +567,17 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
                 let v = p.value()?;
                 Ok(ScalarExpr::Lit(v))
             }
-            _ => Ok(ScalarExpr::Lit(SqlValue::Null)),
+            // ⭐ 2026-10-17 (审计新 P1-7): 意外 token 显式报错. 旧实现兜底
+            // `Ok(Lit(Null))` — `SET c = ,` / `SET c = )` 之类会把列静默写 NULL.
+            other => Err(format!(
+                "unexpected token in UPDATE SET expression: {other:?}"
+            )),
         }
     }
-    let left = match atom(p) {
-        Ok(e) => e,
-        Err(_) => ScalarExpr::Lit(SqlValue::Null),
-    };
+    // ⭐ 2026-10-17 (审计新 P1-7): atom 的解析错误必须传播.
+    // 旧实现 `Err(_) => Lit(Null)` 把任何 SET 值解析失败静默变成 NULL 写入 —
+    // 不可逆数据破坏, 且用户以为执行了表达式.
+    let left = atom(p)?;
     // 链式二元算术: 左结合, 支持 `a + b - c * d` (v1: 无优先级, 从左到右)
     let mut acc = left;
     let mut saw_op = false;
@@ -576,7 +589,10 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
         _ => None,
     } {
         p.next()?;
-        let Ok(right) = atom(p) else { break };
+        // ⭐ 2026-10-17 (审计新 P1-7): 右侧解析失败必须传播. 旧实现
+        // `else { break }` 会静默丢弃右侧 — `SET c = a + UPPER(b)` 变成
+        // `c = a`, 表达式被悄悄截断.
+        let right = atom(p)?;
         acc = ScalarExpr::Bin {
             op,
             l: Box::new(acc),
