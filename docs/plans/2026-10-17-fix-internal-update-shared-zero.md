@@ -143,3 +143,34 @@ page_idx >= 64, 截断后寻址到**错误页** (静默数据损坏), 且截断�
 
 **测试**: `pid_page_idx_checked_bounds` (0..63 合法; 64/200/255/256/1000
 拒绝); storage 串行 508 passed / 0 failed; clippy 0; fmt 0.
+
+---
+
+## 附: recover 固定共享临时文件 /tmp/nexus_recover_empty.mate (P2) — 同批次修复
+
+**问题**: `recover_for_shard` 在 `page.mate` 缺失时用**固定共享路径**
+`/tmp/nexus_recover_empty.mate` 兜底并直接返回空状态, 两个后果:
+
+1. **数据损坏 (严重)**: `.block` 有数据但 `page.mate` 丢失 → 扫描被整体跳过,
+   存量页全部变孤儿; 且 `next_vpid/next_file_id/pid_alloc` 全部归零 →
+   重启后新写入从 `000001.block` page 1 开始, **覆写 .block 里的活页**.
+2. **多实例互踩**: 多进程/多测试 recover 全新库时打开同一 /tmp 文件 —
+   同步 `flush_dirty` 互相覆写; 且同步刷盘落 `/tmp` 而异步刷盘落
+   `block_dir/page.mate` (pager_backend `take_meta_flush_batch`), 两条路径
+   分家 → 重启后元数据丢失/不一致; 文件还永久残留在 /tmp.
+
+**修复**: 不再走临时文件分支 — 直接在库目录 `MetaCache::open(page.mate)`
+(自带 `create(true)`), 元数据落点与异步刷盘一致, mate 缺失时扫描照常执行
+(从 page header 重建映射); 仅当**库目录本身不存在** (调用方未
+`create_if_missing` 的全新路径, 无 `.block` 可扫) 才回退到
+`open_ephemeral_mate()`: 名字带 pid+纳秒时间戳 (多实例不撞名), 打开后立即
+unlink (仅 fd 存活 → 无共享路径、无残留、退出即回收).
+
+**测试** (反向验证: `git stash` 掉 recover.rs 后两条均失败):
+
+| 用例 | 结果 |
+|---|---|
+| `recover_scans_blocks_when_mate_missing` | ✅ 有 .block 无 page.mate → 5 个 vpid 全部扫回, pid 水位 (0,0,5) 不回退 |
+| `recover_mate_backend_is_db_local_not_shared_tmp` | ✅ 全新 shard 目录: flush 落库目录 page.mate 且重启读回; 固定共享 /tmp 文件内容不被写/不被截断; 匿名 mate unlink 无残留 |
+| storage 全量串行 | ✅ 510 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |
