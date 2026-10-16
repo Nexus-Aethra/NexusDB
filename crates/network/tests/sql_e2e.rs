@@ -2085,6 +2085,43 @@ fn mysql_stalled_oversized_stream_rejected() {
     drop(mgr);
 }
 
+/// ⭐ 审计 P2 回归 (2026-10-17): AVG(DECIMAL) 必须走定标整数累加.
+/// 旧实现转 f64 累加: 0.10/0.20 的均值会渲染成 0.15000000000000002.
+#[test]
+fn avg_decimal_exact() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE d (id INT PRIMARY KEY, amt DECIMAL(18,2))");
+    c.query("INSERT INTO d VALUES (1, '0.10'), (2, '0.20'), (3, '0.30')");
+    // (0.10+0.20+0.30)/3 = 0.20 精确值; 输出 scale+6 = 8 位小数
+    assert_eq!(
+        c.query("SELECT AVG(amt) FROM d"),
+        QueryResult::Rows(vec![vec![Some("0.20000000".into())]]),
+        "AVG(DECIMAL) 必须精确 (旧实现 f64 浮点误差)"
+    );
+    // 除不尽场景: (0.10+0.20)/2 = 0.15 → 8 位精度
+    c.query("DELETE FROM d WHERE id = 3");
+    assert_eq!(
+        c.query("SELECT AVG(amt) FROM d"),
+        QueryResult::Rows(vec![vec![Some("0.15000000".into())]])
+    );
+    // SUM(DECIMAL) 既有精确行为不受影响
+    assert_eq!(
+        c.query("SELECT SUM(amt) FROM d"),
+        QueryResult::Rows(vec![vec![Some("0.30".into())]])
+    );
+    // INT 列 AVG 维持 F64 行为
+    c.query("CREATE TABLE i (id INT PRIMARY KEY, v INT)");
+    c.query("INSERT INTO i VALUES (1, 10), (2, 20)");
+    assert_eq!(
+        c.query("SELECT AVG(v) FROM i"),
+        QueryResult::Rows(vec![vec![Some("15".into())]])
+    );
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ 审计 P2 回归 (2026-10-17): 系统表 (information_schema) 的数值列
 /// 比较/排序不得退化为字典序. 旧实现虚拟列全 Str schema: `ordinal_position
 /// > 2` 在 12 列表上会漏掉 10/11/12 ("10" < "2"), ORDER BY 同样错序.

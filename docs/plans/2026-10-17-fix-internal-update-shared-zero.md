@@ -88,3 +88,22 @@ ORDER BY 数值列也按字典序 ("10" < "2").
 **测试**: `information_schema_numeric_compare_and_order` (12 列表,
 `ordinal_position > 2` → c01..c11 共 11 行; DESC 数值序); 反向验证旧实现
 返回空集 []; network 串行 226 passed / 0 failed; clippy 0; fmt 0.
+
+---
+
+## 附: AVG(DECIMAL) 精度回退 f64 (P2) — 同批次修复
+
+**问题**: AVG 累加器全走 f64 — DECIMAL 列先转 f64 再累加, 金额均值出现
+浮点误差 (0.10/0.20/0.30 的均值渲染成 0.20000000000000004).
+
+**修复**: 新增 `AvgDec { acc: i128, scale, n }` 定标累加器:
+- DECIMAL 源列 → 定标整数累加 (checked, 混合 scale 显式报错);
+- finish: `(acc × 10^extra) / n` 整数除法, 输出 scale+extra (≤6 位附加
+  精度, scale 38 封顶) 的 Decimal; 溢出兜底 f64;
+- AVG 输出列类型对 Decimal 源声明为 Decimal{scale+6}; 其余源列维持 F64;
+- scale 由首个入值推定 ( Accum::new 收到的 col_ty 对 AVG 是 out_ty,
+  其 scale 不可信).
+
+**测试**: `avg_decimal_exact` (0.20 精确 8 位; 0.15 除不尽; SUM 不受影响;
+INT 列 AVG 维持 F64); 反向验证旧实现 0.20000000000000004;
+network 串行 227 passed / 0 failed; clippy 0; fmt 0.

@@ -84,7 +84,15 @@ pub(crate) fn sql_run_agg_select(
                 let out_ty = match func {
                     sql::AggFn::Count => ColType::I64,
                     sql::AggFn::Sum => src_ty.unwrap_or(ColType::I64),
-                    sql::AggFn::Avg => ColType::F64,
+                    // ⭐ 2026-10-17 (审计 P2): AVG(DECIMAL) 输出定标 Decimal
+                    // (scale+6 附加精度), 其余源列维持 F64.
+                    sql::AggFn::Avg => match src_ty {
+                        Some(ColType::Decimal { scale, .. }) => ColType::Decimal {
+                            precision: 38,
+                            scale: (scale + 6).min(38),
+                        },
+                        _ => ColType::F64,
+                    },
                     sql::AggFn::Min | sql::AggFn::Max => src_ty.unwrap_or(ColType::Bytes),
                 };
                 let inner = match arg {
@@ -467,6 +475,14 @@ pub(crate) enum Accum {
         sum: f64,
         n: u64,
     },
+    /// ⭐ 2026-10-17 (审计 P2): AVG(DECIMAL) → i128 定标累加, 输出
+    /// scale+6 的 Decimal. 旧实现把 Decimal 转 f64 累加, 金额均值出现
+    /// 浮点误差 (且渲染成 DOUBLE 格式).
+    AvgDec {
+        acc: i128,
+        scale: u8,
+        n: u64,
+    },
     Min(Option<ColValue>),
     Max(Option<ColValue>),
 }
@@ -493,7 +509,16 @@ impl Accum {
                     seen: false,
                 },
             },
-            sql::AggFn::Avg => Accum::Avg { sum: 0.0, n: 0 },
+            sql::AggFn::Avg => match col_ty {
+                // ⚠️ 此处 col_ty 对 AVG 是**输出**类型 (scale+6 的 Decimal),
+                // 其 scale 不可信; 真实 scale 由首个入值推定 (见 feed).
+                Some(ColType::Decimal { .. }) => Accum::AvgDec {
+                    acc: 0,
+                    scale: 0,
+                    n: 0,
+                },
+                _ => Accum::Avg { sum: 0.0, n: 0 },
+            },
             sql::AggFn::Min => Accum::Min(None),
             sql::AggFn::Max => Accum::Max(None),
         }
@@ -559,6 +584,21 @@ impl Accum {
                 ColValue::Null => {}
                 _ => return Err("AVG requires a numeric column".into()),
             },
+            Accum::AvgDec { acc, scale, n } => match v {
+                ColValue::Decimal(x, sc) => {
+                    if *n == 0 {
+                        *scale = *sc; // 首个非 NULL 值推定 scale (列内一致)
+                    } else if *scale != *sc {
+                        return Err("AVG(DECIMAL): mixed scales in column".into());
+                    }
+                    *acc = acc
+                        .checked_add(*x)
+                        .ok_or_else(|| "AVG(DECIMAL) overflow".to_string())?;
+                    *n += 1;
+                }
+                ColValue::Null => {}
+                _ => return Err("AVG requires a numeric column".into()),
+            },
             Accum::Min(cur) => {
                 if !matches!(v, ColValue::Null)
                     && cur.as_ref().is_none_or(|c| cmp_colvalue(v, c).is_lt())
@@ -591,6 +631,20 @@ impl Accum {
             Accum::SumDec { acc, scale, .. } => ColValue::Decimal(acc, scale),
             Accum::Avg { n: 0, .. } => ColValue::Null,
             Accum::Avg { sum, n } => ColValue::F64(sum / n as f64),
+            // AVG(DECIMAL): 均值 = acc/n, 保留至多 6 位附加精度 (定标整数除法).
+            // 溢出兜底回退 f64 (理论边界: scale 38 的极端列).
+            Accum::AvgDec { n: 0, .. } => ColValue::Null,
+            Accum::AvgDec { acc, scale, n } => {
+                let extra = (38u8.saturating_sub(scale)).min(6);
+                let factor = 10i128.pow(extra as u32);
+                match acc
+                    .checked_mul(factor)
+                    .and_then(|v| v.checked_div(n as i128))
+                {
+                    Some(v) => ColValue::Decimal(v, scale + extra),
+                    None => ColValue::F64(acc as f64 / 10f64.powi(scale as i32) / n as f64),
+                }
+            }
             Accum::Min(v) | Accum::Max(v) => v.unwrap_or(ColValue::Null),
         }
     }
