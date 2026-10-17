@@ -56,6 +56,70 @@ fn sweep_idle_conns(
     }
 }
 
+/// ⭐ 审计 P3-2 (2026-10-17): 连接建立逻辑唯一实现.
+///
+/// 旧实现在"循环顶部 drain"与"NEW_CONN_TOKEN 唤醒"两处**逐字重复**这段
+/// (ConnState 构建 + MySQL 握手 + epoll 注册) — 任一处改动漏同步另一处即
+/// 产生难查的行为分叉 (如只在一处加 idle 计时/连接上限).
+#[allow(clippy::too_many_arguments)]
+fn accept_one_conn(
+    epoll_fd: RawFd,
+    conn_map: &mut HashMap<u64, ConnState>,
+    new_conn: NewConn,
+    id: u64,
+    worker_id: u32,
+    num_shards: usize,
+    sql_cache: &SharedSqlCache,
+    sql_shared: &std::sync::Arc<SqlSharedRoutes>,
+    reply_bus: &SharedTaskReplyBus,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+) {
+    let proto = new_conn.protocol;
+    // ⭐ 解耦 (T3.3): per-conn 配置 (limits/auth/tls) 从 NewConn 取.
+    let mut state = ConnState::new(
+        new_conn.fd,
+        proto,
+        new_conn.auth_password.is_some(),
+        new_conn.default_db.clone(),
+        new_conn.default_table.clone(),
+        sql_cache.clone(),
+        sql_shared.clone(),
+        reply_bus.clone(),
+        db_view.clone(),
+        worker_id,
+        num_shards,
+        shard_inboxes.to_vec(),
+        new_conn.limits,
+        new_conn.auth_password.clone(),
+        new_conn.tls_config.clone(),
+    );
+    // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
+    if proto == ProtocolKind::Sql {
+        let salt = mysql_gen_salt(id, worker_id);
+        state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
+            &salt,
+            id as u32,
+            new_conn.tls_config.is_some(),
+        ));
+        state.mysql = Some(MysqlState {
+            salt,
+            phase: 0,
+            pending_db: None,
+        });
+    }
+    if std::env::var("NEXUS_EPOLL_WRITE_BUFFER").ok().as_deref() != Some("0") {
+        state.enable_epoll_write_buffering();
+    }
+    epoll_add(epoll_fd, state.fd, id);
+    conn_map.insert(id, state);
+    nlog::debug!(
+        "worker",
+        "worker-{worker_id} conn {id} from {}",
+        new_conn.peer
+    );
+}
+
 pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll_fd >= 0, "epoll_create1 failed");
@@ -110,49 +174,18 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                     }
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    // ⭐ 解耦 (Phase 3): 协议随连接传递 (acceptor 按端口打标), worker 不再用固定 proto_kind.
-                    let proto = new_conn.protocol;
-                    // ⭐ 解耦 (T3.3): per-conn 配置 (limits/auth/tls) 从 NewConn 取.
-                    let mut state = ConnState::new(
-                        new_conn.fd,
-                        proto,
-                        new_conn.auth_password.is_some(),
-                        new_conn.default_db.clone(),
-                        new_conn.default_table.clone(),
-                        sql_cache.clone(),
-                        sql_shared.clone(),
-                        reply_bus.clone(),
-                        db_view.clone(),
+                    accept_one_conn(
+                        epoll_fd,
+                        &mut conn_map,
+                        new_conn,
+                        id,
                         worker_id,
                         num_shards,
-                        shard_inboxes.clone(),
-                        new_conn.limits,
-                        new_conn.auth_password.clone(),
-                        new_conn.tls_config.clone(),
-                    );
-                    // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
-                    if proto == ProtocolKind::Sql {
-                        let salt = mysql_gen_salt(id, worker_id);
-                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
-                            &salt,
-                            id as u32,
-                            new_conn.tls_config.is_some(),
-                        ));
-                        state.mysql = Some(MysqlState {
-                            salt,
-                            phase: 0,
-                            pending_db: None,
-                        });
-                    }
-                    if std::env::var("NEXUS_EPOLL_WRITE_BUFFER").ok().as_deref() != Some("0") {
-                        state.enable_epoll_write_buffering();
-                    }
-                    epoll_add(epoll_fd, state.fd, id);
-                    conn_map.insert(id, state);
-                    nlog::debug!(
-                        "worker",
-                        "worker-{worker_id} conn {id} from {}",
-                        new_conn.peer
+                        &sql_cache,
+                        &sql_shared,
+                        &reply_bus,
+                        &db_view,
+                        &shard_inboxes,
                     );
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -243,48 +276,18 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                     }
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let proto = new_conn.protocol;
-                    // ⭐ 解耦 (T3.3): per-conn 配置 (limits/auth/tls) 从 NewConn 取.
-                    let mut state = ConnState::new(
-                        new_conn.fd,
-                        proto,
-                        new_conn.auth_password.is_some(),
-                        new_conn.default_db.clone(),
-                        new_conn.default_table.clone(),
-                        sql_cache.clone(),
-                        sql_shared.clone(),
-                        reply_bus.clone(),
-                        db_view.clone(),
+                    accept_one_conn(
+                        epoll_fd,
+                        &mut conn_map,
+                        new_conn,
+                        id,
                         worker_id,
                         num_shards,
-                        shard_inboxes.clone(),
-                        new_conn.limits,
-                        new_conn.auth_password.clone(),
-                        new_conn.tls_config.clone(),
-                    );
-                    // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
-                    if proto == ProtocolKind::Sql {
-                        let salt = mysql_gen_salt(id, worker_id);
-                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
-                            &salt,
-                            id as u32,
-                            new_conn.tls_config.is_some(),
-                        ));
-                        state.mysql = Some(MysqlState {
-                            salt,
-                            phase: 0,
-                            pending_db: None,
-                        });
-                    }
-                    if std::env::var("NEXUS_EPOLL_WRITE_BUFFER").ok().as_deref() != Some("0") {
-                        state.enable_epoll_write_buffering();
-                    }
-                    epoll_add(epoll_fd, state.fd, id);
-                    conn_map.insert(id, state);
-                    nlog::debug!(
-                        "worker",
-                        "worker-{worker_id} conn {id} from {}",
-                        new_conn.peer
+                        &sql_cache,
+                        &sql_shared,
+                        &reply_bus,
+                        &db_view,
+                        &shard_inboxes,
                     );
                 }
             } else {
