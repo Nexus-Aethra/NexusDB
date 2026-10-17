@@ -3,6 +3,7 @@
 > 审查对象：`/home/wpp/nexus/NexusDB` @ `c4f9eaf`（main）+ 工作区未提交修复（约 +3865/−1570 行，含 2026-10-14 P0/C1-C6 修复）
 > 审查日期：2026-10-16　　审查方式：7 名分析员并行模块审计 + 交叉核对 [`CODE-AUDIT-REPORT.md`](./CODE-AUDIT-REPORT.md)（2026-10-13 版）条目现状 + 独立探针程序 release 模式实证
 > 本文档为审查产物，可随时移走或删除。**全程只读，未修改任何代码。**
+> **修复进度见 [§五](#五修复进度2026-10-17)**：截至 2026-10-17 已修 87 项条目 / 剩 6 项 + 文档化边界（§5.6）。
 
 ---
 
@@ -278,6 +279,129 @@
 | 5 | 其余 P2 按模块分批 | 性能与一致性打磨 |
 
 ---
+
+---
+
+## 五、修复进度（2026-10-17）
+
+> 基线 commit：`be95b5e`。自审计基线 `c4f9eaf` 以来共 **68 个提交**（其中 62 个为修复提交），覆盖 §一 旧条目残留 14 项 + §二 新发现 P0×4 / P1×20 / P2 表中 34 项 / P3 15 项 = **87 项条目**，全部已提交。
+> 质量门禁：workspace 全量串行 **1154 passed / 0 failed**，clippy `-D warnings` 0 警告，`cargo fmt --check` 0 差异。
+> 修复方法论：先写回归测试（未修代码上必须失败）→ 修复 → 通过 → stash 源文件反向验证 → 全量回归。
+
+### 5.1 §一 既有审计条目（24 项）现状
+
+| 条目 | 审计时结论 | 当前状态 | commit |
+|---|---|---|---|
+| C1 | 已修（工作区未提交） | ✅ 已提交 | `035b72b` |
+| C2 | 已修（工作区未提交） | ✅ 已提交 | `035b72b` |
+| C4 | 已修（工作区未提交） | ✅ 已提交 | `035b72b` |
+| C5 | 已修（工作区未提交） | ✅ 已提交 | `035b72b` |
+| C6 | 已修（工作区未提交） | ✅ 已提交 | `035b72b` |
+| P2-11 | 已修（工作区未提交） | ✅ 已提交 | `035b72b` |
+| P2-2 | 报告自身过时 | ✅ 确认误报（实现已存在，见 §三.2） | — |
+| C3 | ⚠️ 部分修复（2/3） | ✅ 残留已修：`InternalItemPtr::new` 改硬错误 `PageError::NotSegmentHead` | `d104723` |
+| P0-4 | ⚠️ 部分修复（①②③） | ✅ 已修：外网 IP 告警补全 + Binary 协议 `auth_password: None` 不再硬编码绕过 | `c949ec7` |
+| P1-2 | ❌ 路由无 affinity | ⚪ **文档化**：DESIGN.md 改为"未实现"并说明留作性能项；功能正确性不依赖绑核 | `6616b45` |
+| P1-3 | ❌ CHECK 静默丢弃 | ✅ 已修：保留既有迁移兼容（仍吞表达式）但每条 CHECK 打 WARN，"静默"→"显式" | `d104723` |
+| P1-4 | ❌ FK 缓存 miss 静默跳过 | 🔴 **未修**（见 5.6） | — |
+| P1-6 | ❌ block_on_io 自旋 | ✅ 已修：核实为有界退避（64 轮 spin + yield），抽出 `BLOCK_ON_SPIN_ROUNDS` 常量并写明契约 | `be95b5e` |
+| P2-1 | ❌ 复合索引退化全表 | 🔴 **未修**（见 5.6） | — |
+| P2-4 | ⚠️ 协程 worker TLS 半修 | ✅ 已修：协程分支补齐 TLS 升级处理 | `5ee4496` |
+| P2-5 | ❌ SchedHandle Clone+pub Rc | ✅ 已修：移除 `unsafe impl Send`，内层 `Rc` 改私有 | `7257868` |
+| P2-6 | ❌ 未修复 | 🔴 **未修**（见 5.6） | — |
+| P2-12 | ❌ chunk_lock/travel_trees 死代码 | ✅ 已修：清理死代码 + 文档失准标注 | `0df5401` |
+| P3-13 | ❌ 未修 | ✅ 已修 | `0df5401` |
+| P3-14 | ❌ 未修 | ✅ 已修：WAL 名长 `as u16` 截断改 `Result` 显式报错 | `d104723` |
+| P3-2 | ❌ 未修 | ✅ 已修：连接建立重复代码抽 `accept_one_conn` | `7b6b271` |
+| P3-3 | ❌ 未修 | 🔴 **未修**（见 5.6） | — |
+| P3-5 | ❌ 未修 | 🔴 **未修**（见 5.6） | — |
+| P3-6 | ❌ 未修 | 🔴 **未修**（见 5.6） | — |
+| P3-8 | ❌ 未修 | ✅ 已修：RESP 重排缓冲设上限 | `c949ec7` |
+| P3-9 | ❌ 未修 | ✅ 已修：HTTP `find_head_end` O(n²)→增量 `scanned` | `d104723` |
+| P3-10 | ❌ 未修 | ✅ 已修：死代码与文档失准标注 | `0df5401` |
+| P3-11 | ❌ 未修 | ✅ 已修：Binary 解码错误帧 + 指标 | `0df5401` |
+
+### 5.2 §2.1 P0 —— 静默丢数据 / 数据错配（4 项，全部已修）
+
+| # | 问题 | 修复方式 | commit |
+|---|---|---|---|
+| P0-1 | internal_insert 缺空间预检 | 对齐 `leaf.rs` 模式补 est 预检；同时修下游 `internal_split` 无哨兵分支 `item_count` 多算 1 的幽灵 item | `0bbf70b` |
+| P0-2 | leaf_update_with 慢路径 panic | shift 前检查 `free_off + delta ≤ cp_start`，不足返回 `PageFull` 交上层页分裂 | `ddd6d8d` |
+| P0-3 | strip_db_qual 静默改写跨库表名 | 限定名与当前 db 不一致时显式报错 | `98b446d` |
+| P0-4 | FK 级联 Decimal 编码不对称 | 编码侧统一走与 `sql_eval` 对称的可逆格式，补 Decimal 级联 e2e 测试 | `5f9b077` |
+
+### 5.3 §2.2 P1 —— 服务崩溃 / 功能失效 / 数据破坏（20 项，全部已修）
+
+| # | 问题 | commit | # | 问题 | commit |
+|---|---|---|---|---|---|
+| P1-1 | 驻留兜底吞 IO 错误全零覆盖 | `d9619a4` | P1-11 | block_on_v2 无限 park | `634482f` |
+| P1-2 | WAL replay 吞全部错误 | `cb0d1aa` | P1-12 | reply bus 满自旋停摆 | `ce9f3a8` |
+| P1-3 | init_meta_page truncate(true) | `753d9f5` | P1-13 | 2PC 无超时 + Commit 失败静默 Ok | `c1694b8` |
+| P1-4 | 协程 worker TLS 半修 | `5ee4496` | P1-14 | drain_async_flush 无限循环 | `ec4328d` |
+| P1-5 | TLS 写 WouldBlock 自旋 | `927cefc` | P1-15 | poll_cqe! 消费他人 CQE 不唤醒 | `1b61be0` |
+| P1-6 | MySQL 续包累积无上限 | `188dd55` | P1-16 | Read/Write future drop 后 DMA 竞争 | `4c22a7e` |
+| P1-7 | UPDATE SET 未知函数置 NULL | `7a7083a` | P1-17 | nlog 满队自旋全局死锁 | `6f254a3` |
+| P1-8 | UPDATE 算术无优先级 | `1f724b8` | P1-18 | 退出路径跳过 flush 丢数据 | `922675b` |
+| P1-9 | JOIN finish 无 panic 隔离 | `9600ebf` | P1-19 | scanner 漏 internal 页 first_child | `6f90a10` |
+| P1-10 | parser 深递归栈溢出 | `2e6fc41` | P1-20 | fix-mate --auto 硬编码 slot | `d0116e4` |
+
+### 5.4 §2.3 P2 —— 性能 / 一致性 / 健壮性（表中 36 项：34 已修 / 2 未修）
+
+**page crate（10 项全修）**
+
+| 问题 | commit |
+|---|---|
+| PageIndex::load 前 4 段全量 decode | `6e9e8b9` |
+| checksum 从未实现 | `ff7d842` |
+| internal_split 无哨兵分支 item_count 多算 1 | `0bbf70b` |
+| bulk split 单段可超 32 | `ba0b561` |
+| read_checkpoint 损坏 count 下溢 panic | `a951b93` |
+| full_key shared 越界静默截断 | `84b352b` |
+| leaf_get_with 1000 步上限假 miss | `444eb81` |
+| internal_update 破坏段首 shared=0 | `a2d21a8` |
+| leaf_delete 冗余 O(N) 全页扫描 ×2 | `a11d3c5` |
+| ptr next 双重 decode | `5871607` |
+
+**SQL 引擎（10 项全修）**：事务读集仅 pk 点查 `4b77c13`｜SELECT 结果集无护栏 `0f1c07c`｜UUID IN >64 恒空集 `ad7c482`｜IndexUnion Decimal 防护 `7257868`｜IN 子查询跨类型折叠恒 false `624d539`｜恒假谓词错误列定义 `576adae`｜系统表数值比较退化 `62869b8`｜AVG(DECIMAL) 回退 f64 `50f8eb8`｜事务中 DDL 静默回 OK `c1492d2`｜JOIN cross 中间积无逐行检查 `4ebd2ba`
+
+**网络协议层（4 项全修）**：无连接数上限 / idle 超时 `600de02`｜认证无失败限速 `488b779`｜prepared 注册表无上限 `f550b36`｜SqlSharedRoutes 锁中毒 `482eb08`
+
+**分片层（4 项全修）**：双 inbox 无全序 `8d86824`｜WAL strict barrier 失败仍回成功 `fd040fd`｜无 Drop RAII（退出路径根因）`922675b`｜DefaultHasher 三份拷贝 `6616b45`
+
+**调度层（2/3）**：SchedHandle Clone+pub Rc `7257868`｜协程 panic 无隔离 `9600ebf`｜flush_uring 忙轮询 🔴 未修（见 5.6）
+
+**存储层（3 项全修）**：meta_cache flush_dirty in-flight `a3f45c1`｜pid page_idx u16→u8 截断 `8e5169b`｜recover 固定共享临时文件 `5db295d`
+
+**工具链（1/2）**：`--strict/--tolerant` 无效 flag `fa46a8d`｜scanner 只处理第一个 shard 🔴 **未修**（见 5.6）
+
+### 5.5 §2.4 P3 —— 低危 / 文档化建议（20 项，已修 17）
+
+已修：LIKE `_` 通配符报错、RETURNING 报错、非 UUID 列 uuid 默认值报错、CURRENT_DATE/TIME 语义修正、无括号关键字识别、SysVarStub transaction_isolation 按实际级别回答（`5e6e9ac`）；`SELECT 1` 顶层字面量投影（`4e9b1f7`）；varint 第 5 字节非规范编码拒绝、`encode_leaf/internal_item` buf 前置边界检查、AGENTS.md crossbeam 契约澄清（`37e3f0a`）；16KB 栈缓冲改堆分配、dump free_off 越界回归测试、空串主键错误信息、page crate `#![allow(dead_code)]` 改 6 处定点 allow（`eac1486`）；SQL 语法缺口集中标注 → 新增 `docs/SQL-FEATURES.md` 语法支持矩阵（`3806824`）。
+
+未修：协议分派 match 重复两处（P3-3，见 5.6）、错误分类靠字符串匹配（P3-5/P3-6，见 5.6）。
+
+### 5.6 🔴 仍未解决（6 项 + 文档化边界）
+
+| # | 问题 | 位置 | 为什么还没修 |
+|---|---|---|---|
+| **P1-4** | FK 对 DELETE/UPDATE 无 RESTRICT 检查 | `sql_fk.rs` 仅被 `sql_dml.rs:195`（INSERT 路径）调用 | 需新功能：父行删改前反查引用表，跨 shard 需父→子反向索引 |
+| **P2-1** | 复合索引退化全表 | `sql_dispatch.rs:1101` `if idx.cols.len() != 1 { continue; }` | 需扩展 ScanPred 支持多列前缀匹配 |
+| **P2-6** | `JoinInner` UnsafeCell + `unsafe impl<T: Send> Send` | `scheduler/src/task.rs:62-71` | 跨线程 poll 竞争；需设计改 Arc/Mutex 或显式 `!Send`，牵涉 JoinHandle 公共 API |
+| **P2-新** | **scanner 14 个命令全部 `shards.first()`，默认 6 shard 只救 1/6 数据** | `commands/{export,lookup,verify,map,dbs,rescue,header,range,blame,export_force,fix_mate,rescue_json,vpid,wal_*}.rs` | 需遍历全部 shard 合并结果；输出格式与 exit code 语义需重新设计 |
+| **P2** | flush_uring 忙轮询 | `logging/src/lib.rs:344` `drive_until_idle(256)` 自旋等写盘完成 | 仅在写盘期间自旋（非空闲期），影响有限，需引入完成通知机制 |
+| **P3-3** | 协议分派 match 在 worker_epoll / worker_coro 重复两处 | `worker_epoll.rs:231,318` vs `worker_coro.rs:343` | 两处生命周期/借用结构不同，抽取公共层需重构 |
+| **P3-5/6** | 错误分类 / SQLSTATE 靠字符串匹配 | `worker/protocol_io.rs:331-348`、`worker/sql_eval.rs:628-667` | 需引入结构化错误码类型，改动面覆盖全部错误产生点 |
+
+**文档化边界**（已在 `SQL-FEATURES.md` / `DESIGN.md` / `AGENTS.md` 显式标注，非缺陷）：JOIN gather 读不入 OCC 读集、跨 shard COMMIT best-effort、不防幻读、Binary 协议无认证、CPU 亲和未实现。
+
+### 5.7 建议修复顺序（更新）
+
+1. **P2-新 scanner 单 shard** —— 数据救援工具只救 1/6 数据，是"静默丢数据"家族在工具链的残留，且修复路径清晰（遍历 + 合并）。
+2. **P1-4 FK RESTRICT** —— 引用完整性缺口，直接影响数据正确性。
+3. **P2-1 复合索引** —— 影响面是性能，但复合 UNIQUE 建成却用不上属于功能失效。
+4. **P3-5/6 错误分类结构化** —— 收敛字符串匹配，为后续所有错误路径打基础。
+5. **P2-6 / P3-3 / flush_uring** —— 需设计权衡，排最后。
+
 
 ## 附：审计方法与团队
 
