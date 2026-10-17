@@ -153,6 +153,19 @@ pub fn encode_leaf_item(
         return Err(PageError::ItemDecode("key too long for u16 prefix".into()));
     }
     let key_unique = &key[shared..];
+    if key_unique.len() > u16::MAX as usize {
+        return Err(PageError::ItemDecode("key too long for u16".into()));
+    }
+    if value.len() > u32::MAX as usize {
+        return Err(PageError::ItemDecode("value too long for u32".into()));
+    }
+    // ⭐ 审计 P3 (2026-10-17): 一次性前置边界检查. 旧实现只校验 value 段,
+    // header/key/varint 直接下标写 → buf 给小了就是 slice panic (crate 级无
+    // 保护, 全靠调用方 KvLimits 约束). 现在统一返回 PageFull.
+    let need = 4 + key_unique.len() + varint_len(value.len() as u32) + value.len();
+    if need > buf.len() {
+        return Err(PageError::PageFull);
+    }
 
     // 2. 编码 header
     buf[0..2].copy_from_slice(&(shared as u16).to_le_bytes());
@@ -191,6 +204,13 @@ pub fn encode_internal_item(
         return Err(PageError::ItemDecode("key too long for u16 prefix".into()));
     }
     let key_unique = &key[shared..];
+    if key_unique.len() > u16::MAX as usize {
+        return Err(PageError::ItemDecode("key too long for u16".into()));
+    }
+    // ⭐ 审计 P3: 前置边界检查 (旧实现 header/key 段无检查, buf 给小了即 panic)
+    if 4 + key_unique.len() + 8 > buf.len() {
+        return Err(PageError::PageFull);
+    }
 
     buf[0..2].copy_from_slice(&(shared as u16).to_le_bytes());
     buf[2..4].copy_from_slice(&(key_unique.len() as u16).to_le_bytes());
@@ -200,9 +220,6 @@ pub fn encode_internal_item(
     pos += key_unique.len();
 
     // InternalItem 没有 value, 直接 child_vpid (8B)
-    if pos + 8 > buf.len() {
-        return Err(PageError::PageFull);
-    }
     buf[pos..pos + 8].copy_from_slice(&child_vpid.to_le_bytes());
     pos += 8;
 

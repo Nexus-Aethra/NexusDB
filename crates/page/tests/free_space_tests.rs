@@ -81,3 +81,33 @@ fn monotone_non_increasing_in_key_count() {
         let _ = page_key_count(&page);
     }
 }
+
+/// ⭐ 审计 P3 (2026-10-17): encode_leaf_item / encode_internal_item 的 buf
+/// 边界保护 — 旧实现只校验 value 段, header/key/varint 直接下标写, buf 给小了
+/// 就是 slice panic (crate 级无保护). 现在统一返回 `PageFull`.
+#[test]
+fn encode_item_rejects_small_buffer_instead_of_panicking() {
+    // leaf: key 段就超 buf (旧实现在 `buf[4..4+key.len()]` 处直接 panic)
+    let mut tiny = [0u8; 6];
+    assert!(
+        page::encode_leaf_item(&mut tiny, b"", b"abcdefgh", b"").is_err(),
+        "key 超 buf 必须返回 Err 而不是 panic"
+    );
+    // value 段超 buf
+    let mut tiny = [0u8; 8];
+    assert!(
+        page::encode_leaf_item(&mut tiny, b"", b"abc", b"value").is_err(),
+        "value 超 buf 必须返回 Err"
+    );
+    let mut ok = [0u8; 16];
+    assert!(page::encode_leaf_item(&mut ok, b"", b"abc", b"value").is_ok());
+
+    // internal: key 段超 buf (旧实现同样 panic)
+    let mut tiny = [0u8; 6];
+    assert!(
+        page::encode_internal_item(&mut tiny, b"", b"abcdefgh", 42).is_err(),
+        "internal key 超 buf 必须返回 Err 而不是 panic"
+    );
+    let mut ok = [0u8; 16];
+    assert!(page::encode_internal_item(&mut ok, b"", b"abc", 42).is_ok());
+}

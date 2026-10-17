@@ -470,7 +470,8 @@ Workspace: ~549 passed, 0 failed (不含慢 repro 测试).
 
 - **协程 = Rust `async fn` + Future** (不是栈式协程)
 - **Waker 全部自实现**, 不依赖 monoio 的 Reactor
-- **不引入 tokio / crossbeam / monoio**: 全部走 `scheduler::io_ops::{read, write, fsync}`
+- **不引入 tokio / crossbeam / monoio 作为 IO/调度底座**: 全部 IO 走 `scheduler::io_ops::{read, write, fsync}`, 协程模型自实现 (Rust async + 自实现 Waker)
+  - 例外 (审计 P3 2026-10-17 明确): **辅助性 MPSC 队列**可用 `crossbeam-queue` (logging 的 LogQueue / shard_manager 的 ShardInbox+TaskInbox) — 它们是纯内存队列, 不参与 IO/调度, 且都是 workspace 既有依赖; 新增 IO/异步运行时依赖仍然禁止
 - **Future 自取 CQE** via `peek_cqe_by_user_data`, 不走 SharedResult 中转
 
 ### Storage crate (T12 阶段, 实施时遵守)
