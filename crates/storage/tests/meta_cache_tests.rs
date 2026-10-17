@@ -438,3 +438,34 @@ fn db_aware_compat_api_default_is_db_zero() {
         assert_eq!(via_compat, Some(pid));
     });
 }
+
+/// ⭐ 审计 P2 (2026-10-17): `flush_dirty` 的"无 in-flight 快照"前置条件从
+/// debug_assert 升级为运行时硬错误 — release 下也不再静默乱序覆盖.
+#[test]
+fn flush_dirty_rejects_inflight_snapshots() {
+    let path = std::env::temp_dir().join(format!(
+        "nexus_meta_inflight_{}.mate",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut cache = MetaCache::open(&path).unwrap();
+    cache.write(
+        1,
+        storage::PidLocation {
+            file_id: 0,
+            chunk_idx: 0,
+            page_idx: 1,
+            flags: storage::PID_ALIVE,
+        },
+    );
+    // 取快照 → window 0 进入 in-flight (模拟异步刷盘协程还握着旧快照)
+    let snaps = cache.take_dirty_window_snapshots();
+    assert!(!snaps.is_empty(), "应有 in-flight 快照");
+
+    let r = cache.flush_dirty();
+    assert!(
+        r.is_err(),
+        "有 in-flight 快照时 flush_dirty 必须报错 (旧实现 release 下静默覆盖)"
+    );
+    let _ = std::fs::remove_file(&path);
+}
