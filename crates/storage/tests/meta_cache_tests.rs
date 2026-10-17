@@ -443,10 +443,8 @@ fn db_aware_compat_api_default_is_db_zero() {
 /// debug_assert 升级为运行时硬错误 — release 下也不再静默乱序覆盖.
 #[test]
 fn flush_dirty_rejects_inflight_snapshots() {
-    let path = std::env::temp_dir().join(format!(
-        "nexus_meta_inflight_{}.mate",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("nexus_meta_inflight_{}.mate", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut cache = MetaCache::open(&path).unwrap();
     cache.write(
