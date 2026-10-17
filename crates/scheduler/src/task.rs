@@ -200,9 +200,9 @@ where
         let r = future.await;
         inner.set_result(Ok(r));
     });
-    // 通过 handle.0 直接 borrow_mut 提交.
+    // 通过 crate 内访问器提交 (字段对外私有).
     handle
-        .0
+        .rc()
         .borrow()
         .submit_with_priority(wrapper, low_priority);
     join

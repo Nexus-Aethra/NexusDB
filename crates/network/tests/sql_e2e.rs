@@ -4504,3 +4504,39 @@ fn mysql_idle_connection_reaped() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+/// ⭐ 审计 P2 (2026-10-17): Decimal 索引列上的 OR (→ IndexUnion) 必须回退
+/// 全表扫 + 残余过滤, 不得按 ordered-bytes 界直接扫 (与 conds_to_scan_preds
+/// 对 Decimal 的处理保持一致).
+#[test]
+fn mysql_or_on_decimal_indexed_column_stays_correct() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE dt (id INT PRIMARY KEY, amt DECIMAL(18,2), INDEX(amt))");
+    for (i, amt) in [(1, "1.50"), (2, "2.50"), (3, "9.99"), (4, "0.10")] {
+        c.query(&format!("INSERT INTO dt VALUES ({i}, {amt})"));
+    }
+
+    // OR 两个 Decimal 等值 (命中 IndexUnion 规划路径)
+    assert_eq!(
+        c.ids("SELECT id FROM dt WHERE amt = 1.50 OR amt = 9.99 ORDER BY id"),
+        vec!["1", "3"],
+        "Decimal 列 OR 等值必须返回正确行"
+    );
+    // OR 混合范围 + 等值
+    assert_eq!(
+        c.ids("SELECT id FROM dt WHERE amt > 5 OR amt = 0.10 ORDER BY id"),
+        vec!["3", "4"],
+        "Decimal 列 OR 混合条件必须返回正确行"
+    );
+    // 无命中
+    assert_eq!(
+        c.query("SELECT id FROM dt WHERE amt = 7.77 OR amt = 8.88")
+            .rows_len(),
+        0
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}

@@ -34,13 +34,12 @@ fn setup() -> scheduler::SchedHandle {
     scheduler::SchedHandle::new(scheduler::Scheduler::new())
 }
 
+/// ⭐ 审计 P2 (2026-10-17): SchedHandle 不再 `Send` — 跨线程 clone/drive 是
+/// 真 UB (Rc 非原子引用计数 + 双线程 borrow_mut 同一 RefCell). 驱动必须在
+/// 创建 handle 的线程上进行, 因此这里改成当前线程直接推进.
 fn drive_thread(handle: scheduler::SchedHandle, max_iters: usize) -> bool {
-    std::thread::spawn(move || {
-        handle.set_current();
-        handle.drive_until_idle(max_iters)
-    })
-    .join()
-    .unwrap()
+    handle.set_current();
+    handle.drive_until_idle(max_iters)
 }
 
 /// 场景 1: 单协程用 io_uring 读 socket → 内存 → io_uring 写回另一 socket.

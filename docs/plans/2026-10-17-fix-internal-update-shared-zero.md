@@ -637,3 +637,39 @@ shared=0 的字节, 原样拷贝后仍满足段首不变量, 前缀引用的是�
 | `engine_detects_corrupt_page_via_checksum` | ✅ 落盘后翻转数据页一个字节 → reopen 读该页报 checksum 错 (而非静默返回损坏数据) |
 | page + storage + shard_manager + network 全量串行 | ✅ 979 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: IndexUnion IN 界对 Decimal 无防护 (P2) — 同批次修复
+
+**问题**: OR → 索引并集 (`sql_plan_select` 的 IndexUnion 臂) 对 Decimal 索引列
+**没有**防护, 而另一条谓词下推路径 `conds_to_scan_preds` 明确跳过 Decimal —
+两条规划路径语义不一致. Decimal 的界按 ordered-bytes 比较, 与 worker 端定标
+语义 (字面量转同 scale) 有差异, 混合 IN 界可能算出错误区间.
+
+**修复**: IndexUnion 臂遇到 Decimal 列 → `ok = false` 回退全表扫 (正确性由完成
+点残余过滤兜底), 与 `conds_to_scan_preds` 保持一致.
+
+**测试**: `mysql_or_on_decimal_indexed_column_stays_correct` (Decimal 索引列上
+OR 等值 / OR 混合范围 / 无命中三种形态结果正确); network 全量串行通过.
+
+---
+
+## 附: SchedHandle Clone + pub Rc (真 UB) (P2) — 同批次修复
+
+**问题**: `SchedHandle(pub Rc<RefCell<Scheduler>>)` + `unsafe impl Send` +
+手写 `Clone` — 调用方可以 clone 后丢到另一个线程 drive: 两个线程同时持有同一
+`Rc` (非原子引用计数) 且可能同时 `borrow_mut` 同一 `RefCell`, 这是**真正的
+UB**, 而 `unsafe impl Send` 让编译器不再拦它. scheduler 的设计前提"一个 driver
+线程独占"原来只靠运行时检查 (第二个线程 drive 时 panic), 挡不住 UB 发生.
+
+**修复**: 把前提变成类型约束 —
+1. 内层 `Rc` 字段改私有 (外部无法直接拿 Rc), crate 内改用 `rc()` 访问器;
+2. **移除 `unsafe impl Send`** (linux 与 portable 两份实现同步): 跨线程移动/
+   克隆在编译期即报错; 同线程 clone (worker/shard 线程内 spawn 协程的既有用法)
+   不受影响;
+3. 测试侧把"跨线程驱动"的写法改成当前线程驱动 (`drive_thread` 不再 spawn),
+   `driver_ownership.rs` 重写为"该场景已无法表达"的说明 + 同线程 clone 验证.
+
+**测试**: workspace 全量串行 **1143 passed / 0 failed** (scheduler 66);
+clippy -D warnings 0; fmt 0.

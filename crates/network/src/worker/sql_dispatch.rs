@@ -954,6 +954,15 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                     break;
                 }
                 let col_idx = schema.col_by_name(&c.col).unwrap();
+                // ⭐ 审计 P2 (2026-10-17): DECIMAL 不走索引并集 — 与
+                // `conds_to_scan_preds` 保持一致 (那里显式跳过 Decimal):
+                // shard 端按 ordered-bytes 比较界, 与 worker 端 Decimal 定标
+                // 语义 (字面量转同 scale) 不一致, 混合 IN 界可能算出错误区间
+                // → 回退全表扫, 正确性由完成点残余过滤兜底.
+                if matches!(schema.columns[col_idx as usize].ty, ColType::Decimal { .. }) {
+                    ok = false;
+                    break;
+                }
                 // 仅支持索引列
                 let Some(ipos) = schema.indexes.iter().position(|i| i.col == col_idx) else {
                     ok = false;

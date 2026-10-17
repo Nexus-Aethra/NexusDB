@@ -587,11 +587,20 @@ pub fn with_current<R>(f: impl FnOnce(&mut Scheduler) -> R) -> Option<R> {
 
 // SAFETY: handle 只能以唯一所有权 move 到 driver 线程；运行时会在首次 drive 后绑定
 // thread id。它不是 Sync，不能借用共享给多个线程并发驱动。
-pub struct SchedHandle(pub std::rc::Rc<std::cell::RefCell<Scheduler>>);
-// SAFETY: 见上.
-unsafe impl Send for SchedHandle {}
+/// ⭐ 审计 P2 (2026-10-17): **单线程所有权** — 内层 Rc 私有 + **不实现 Send**.
+///
+/// 旧实现 `pub struct SchedHandle(pub Rc<RefCell<Scheduler>>)` + `unsafe impl
+/// Send` + 手写 `Clone`: 调用方可以把 handle clone 后丢到另一个线程 drive —
+/// 两个线程同时持有同一 `Rc` (非原子引用计数) 且可能同时 `borrow_mut` 同一个
+/// `RefCell`, 这是**真正的 UB** (数据竞争 + 双重 borrow panic), 而 `unsafe
+/// impl Send` 让编译器不再拦它. scheduler 的设计前提就是"一个 driver 线程
+/// 独占", 现在把这个前提变成类型约束:
+/// - 字段私有 → 外部无法直接碰 Rc;
+/// - 无 `Send` → 跨线程移动/克隆在编译期即报错 (同线程 clone 仍允许:
+///   worker/shard 线程内 spawn 协程需要共享 handle).
+pub struct SchedHandle(std::rc::Rc<std::cell::RefCell<Scheduler>>);
 
-// ⭐ Manual Clone (既支持 Clone 也让我们能 clone Rc 共享 scheduler).
+// ⭐ Manual Clone (仅同线程共享 scheduler; 跨线程使用已被"无 Send"挡在编译期).
 impl Clone for SchedHandle {
     fn clone(&self) -> Self {
         Self(std::rc::Rc::clone(&self.0))
@@ -602,6 +611,11 @@ impl SchedHandle {
     pub fn new(s: Scheduler) -> Self {
         let rc = std::rc::Rc::new(std::cell::RefCell::new(s));
         Self(rc)
+    }
+
+    /// crate 内部访问底层 Rc (字段私有, 外部无法绕过所有权约束直接拿 Rc).
+    pub(crate) fn rc(&self) -> &std::rc::Rc<std::cell::RefCell<Scheduler>> {
+        &self.0
     }
     /// 设当前 scheduler Rc 到 thread-local. 必须在 driver 线程调.
     /// SAFETY: 需保证 self 不会被 drop, 直到 clear.
