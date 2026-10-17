@@ -53,7 +53,16 @@ pub fn cascade_kickoff(
     pks: Vec<Vec<u8>>,
     affected: u64,
 ) -> bool {
-    let refs = conn.sql_shared.incoming_fks(db, table);
+    // ⭐ 审计 P1-4: 只对可执行动作 (Cascade/SetNull) 进入级联延迟. NoAction
+    // (RESTRICT) 引用由父行删除前的预检处理 (sql_fk_restr.rs) — 不过滤会导致:
+    // root 已插入但 spawn_job 对 NoAction 早退不派 job → active 恒 0 →
+    // cascade_job_done 永不触发 → 根 DELETE 回复被永久延迟 (客户端挂死).
+    let refs: Vec<_> = conn
+        .sql_shared
+        .incoming_fks(db, table)
+        .into_iter()
+        .filter(|r| matches!(r.action, FkAction::Cascade | FkAction::SetNull))
+        .collect();
     if refs.is_empty() {
         return false;
     }
@@ -126,10 +135,16 @@ pub fn cascade_job_done(
     }
     // 递归: Cascade 子任务删了引用表行 → 其被删 pk 的更深引用
     // (递归 spawn 会 active += 1 — 必须在最终计数判断前完成)
+    // ⭐ 审计 P1-4: 同 kickoff — 只派可执行动作 (NoAction 早退不派 job).
     if job.action == FkAction::Cascade
         && let Some((_jdb, ref_table, ref_pks)) = conn.cascade_pending.remove(&seq)
     {
-        let deeper = conn.sql_shared.incoming_fks(&db, &ref_table);
+        let deeper: Vec<_> = conn
+            .sql_shared
+            .incoming_fks(&db, &ref_table)
+            .into_iter()
+            .filter(|r| matches!(r.action, FkAction::Cascade | FkAction::SetNull))
+            .collect();
         for r in deeper {
             spawn_job(
                 conn,

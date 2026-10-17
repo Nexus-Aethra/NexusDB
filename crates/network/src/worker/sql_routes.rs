@@ -80,19 +80,25 @@ impl SqlSharedRoutes {
     }
 
     /// ⭐ PG 兼容 (FMT_VER 8): CREATE TABLE 注册外键反向引用.
+    /// 幂等: 同 (db, ref_table, table, col, action) 已存在则跳过 — schema
+    /// 加载补注 (审计 P1-4) 与 catalog 补注会重复到达同一 FK.
     pub fn register_fks(&self, db: &str, table: &str, schema: &TableSchema) {
         if schema.fks.is_empty() {
             return;
         }
         let mut m = wlock(&self.fk_incoming);
         for fk in &schema.fks {
-            m.entry((std::sync::Arc::from(db), fk.ref_table.clone()))
-                .or_default()
-                .push(FkIncoming {
-                    table: table.to_string(),
-                    col: schema.columns[fk.col as usize].name.clone(),
-                    action: fk.on_delete,
-                });
+            let incoming = FkIncoming {
+                table: table.to_string(),
+                col: schema.columns[fk.col as usize].name.clone(),
+                action: fk.on_delete,
+            };
+            let v = m
+                .entry((std::sync::Arc::from(db), fk.ref_table.clone()))
+                .or_default();
+            if !v.contains(&incoming) {
+                v.push(incoming);
+            }
         }
     }
 

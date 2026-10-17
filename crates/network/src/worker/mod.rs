@@ -50,6 +50,9 @@ pub(crate) use sql_cascade::{CascadeJob, cascade_job_done, cascade_kickoff, is_c
 /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检.
 mod sql_fk;
 pub(crate) use sql_fk::{all_parents_cached, sql_fk_on_reply, sql_fk_start};
+/// ⭐ PG 兼容 (审计 P1-4): 父表 DELETE 前置 RESTRICT 预检.
+mod sql_fk_restr;
+pub(crate) use sql_fk_restr::{FkRestrSt, RestrResume, fk_restr_on_reply, fk_restr_start};
 /// ⭐ ORM-B2 (解耦 2026-08): 进程级共享路由缓存 (SqlSharedRoutes/FkIncoming).
 mod auth_throttle;
 pub(crate) use auth_throttle::MAX_FAILS_PER_CONN;
@@ -78,7 +81,7 @@ mod resp_dispatch_cmd;
 pub(crate) use resp_dispatch_cmd::dispatch_resp_command;
 /// ⭐ 解耦 2026-08: shard 回包处理主函数 (拆自 resp_dispatch).
 mod resp_shard;
-pub(crate) use resp_shard::handle_resp_shard_result;
+pub(crate) use resp_shard::{handle_resp_shard_result, run_dml_phase2};
 /// ⭐ 解耦 2026-08: 协议 wire 入口 (HTTP 处理).
 mod protocol_io;
 pub(crate) use protocol_io::{
@@ -474,6 +477,10 @@ pub(crate) struct ConnState {
     pub(crate) cascade_seq_ctr: u64,
     /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检 (seq → 状态).
     pub(crate) sql_fk_ins: HashMap<u64, SqlFkIns>,
+    /// ⭐ PG 兼容 (审计 P1-4): 父表 DELETE 前置 RESTRICT 预检 (seq → 状态).
+    pub(crate) fk_restr: HashMap<u64, FkRestrSt>,
+    /// ⭐ 审计 P1-4: 已补注全库 FK 反向索引的 db (CatalogDump 一次性, per-conn).
+    pub(crate) fk_catalog_done: std::collections::HashSet<String>,
     /// ⭐ PG 兼容 (multi-statement): 原 seq → 多语句顺序执行状态.
     pub(crate) multi_stmt: HashMap<u64, MultiStmt>,
     /// ⭐ PG 兼容 (multi-statement): 子 seq → 原 seq (DDL/DML 完成时回映射推进).

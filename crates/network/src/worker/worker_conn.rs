@@ -82,6 +82,8 @@ impl ConnState {
             cascade_roots: HashMap::new(),
             cascade_seq_ctr: 0,
             sql_fk_ins: HashMap::new(),
+            fk_restr: HashMap::new(),
+            fk_catalog_done: std::collections::HashSet::new(),
             multi_stmt: HashMap::new(),
             multi_sub_seq: HashMap::new(),
             reply_bus,

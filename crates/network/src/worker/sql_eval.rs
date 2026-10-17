@@ -625,7 +625,7 @@ pub(crate) fn sql_cmp(cv: &ColValue, sv: &SqlValue) -> Option<std::cmp::Ordering
 /// ⭐ H3: HTTP 按消息映射 4xx/5xx JSON).
 pub(crate) fn sql_err_bytes(proto: ProtocolKind, msg: &str) -> Vec<u8> {
     if proto == ProtocolKind::Http {
-        let status = if msg.contains("duplicate key") {
+        let status = if msg.contains("duplicate key") || msg.contains("foreign key violation") {
             409
         } else if msg.contains("unknown column")
             || msg.contains("Unknown database")
@@ -652,6 +652,8 @@ pub(crate) fn sql_err_bytes(proto: ProtocolKind, msg: &str) -> Vec<u8> {
             "42703"
         } else if msg.contains("duplicate key") {
             "23505"
+        } else if msg.contains("foreign key violation") {
+            "23503" // foreign_key_violation — FK RESTRICT 拒删
         } else if msg.contains("serialization failure") {
             "40001"
         } else if msg.contains("read-only transaction") {

@@ -6,6 +6,122 @@
 use super::*;
 
 // Shard replies retain their routing context explicitly to preserve worker isolation.
+/// ⭐ S1: 两阶段 DML 的 phase2 — 逐 pk 按路由下发 (DELETE/UPDATE).
+/// 从事务截断到 DmlAgg 注册+广播的完整后半程. 从 Fire::Dml 处理体抽出,
+/// 供 FK RESTRICT 预检通过后复用 (fk_restr_on_reply → 续跑).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_dml_phase2(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    pks: Vec<Vec<u8>>,
+    action: SqlDmlAction,
+    target: (std::sync::Arc<str>, String),
+) {
+    // ⭐ PG 兼容 (FMT_VER 8): 记录被删 pk — 主 DELETE 或级联 DELETE
+    // 的 phase1 完成即存 (DmlAgg 完成时触发/推进级联); 仅 Delete 需要.
+    if matches!(action, SqlDmlAction::Delete) {
+        conn.cascade_pending
+            .insert(seq, (target.0.clone(), target.1.clone(), pks.clone()));
+    }
+    // ⭐ 事务 v1 (F61): 两阶段 DML 的 phase2 在事务中截流
+    // (phase1 读的是已提交态 — v1 文档化语义)
+    if conn.txn.is_some() {
+        let n = pks.len() as u64;
+        for pk in pks {
+            let op = sql_dml_op(&target.0, &target.1, pk, &action);
+            if let Err(e) = txn_buffer_op(conn, op) {
+                if is_cascade_seq(seq) {
+                    if let Some(job) = conn.cascade_jobs.remove(&seq) {
+                        cascade_job_done(
+                            conn,
+                            conn_id,
+                            seq,
+                            worker_id,
+                            default_db,
+                            db_view,
+                            shard_inboxes,
+                            num_shards,
+                            0,
+                            Some(e),
+                            &job,
+                        );
+                    }
+                } else {
+                    conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+                }
+                return;
+            }
+        }
+        if is_cascade_seq(seq) {
+            if let Some(job) = conn.cascade_jobs.remove(&seq) {
+                cascade_job_done(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    n,
+                    None,
+                    &job,
+                );
+            }
+        } else {
+            conn.resp_complete(seq, sql_ok_bytes(conn.proto, n));
+        }
+        return;
+    }
+    // phase2: 逐 pk 按路由下发 (调用方保证 phase1 已全量回齐 —
+    // Fire::Dml 仅在 drained 后 fire; fk_restr 延迟点也在其之后,
+    // 故同 seq 注册 dml_agg 无双聚合并存)
+    if pks.is_empty() {
+        // ⭐ FK 级联: 级联 job 无匹配引用行 → 推进 (无更深递归)
+        if is_cascade_seq(seq) {
+            if let Some(job) = conn.cascade_jobs.remove(&seq) {
+                cascade_job_done(
+                    conn,
+                    conn_id,
+                    seq,
+                    worker_id,
+                    default_db,
+                    db_view,
+                    shard_inboxes,
+                    num_shards,
+                    0,
+                    None,
+                    &job,
+                );
+            }
+        } else {
+            conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+        }
+    } else {
+        conn.sql_dml_agg.insert(
+            seq,
+            SqlDmlAgg {
+                remaining: pks.len(),
+                affected: 0,
+                error: None,
+                drop_key: None,
+            },
+        );
+        for pk in pks {
+            let op = sql_dml_op(&target.0, &target.1, pk, &action);
+            let sid = hash_route_op(&op, num_shards);
+            push_task_grouped(conn_id, seq, worker_id, sid as u32, sid, op, shard_inboxes);
+        }
+    }
+}
+
+// Shard replies retain their routing context explicitly to preserve worker isolation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_resp_shard_result(
     conn: &mut ConnState,
@@ -463,10 +579,17 @@ pub(crate) fn handle_resp_shard_result(
                     let schema = std::sync::Arc::new(s);
                     // ⭐ W1: 存量表 (GetSchemaOp 拉取) 只填 schema, 不建路由
                     // (启用路由需 CREATE 时刻零数据的完备性前提)
-                    conn.sql_cache
-                        .borrow_mut()
-                        .schemas
-                        .insert((pending.db.to_string(), pending.table), schema.clone());
+                    conn.sql_cache.borrow_mut().schemas.insert(
+                        (pending.db.to_string(), pending.table.clone()),
+                        schema.clone(),
+                    );
+                    // ⭐ 审计 P1-4: 存量表加载时补注 FK 反向索引 (register_fks
+                    // 幂等去重) — 否则重启/多 worker 下 incoming_fks 为空,
+                    // RESTRICT 预检与 CASCADE 都会静默失效.
+                    if !schema.fks.is_empty() {
+                        conn.sql_shared
+                            .register_fks(&pending.db, &pending.table, &schema);
+                    }
                     sql_run_dml(
                         conn,
                         conn_id,
@@ -864,109 +987,40 @@ pub(crate) fn handle_resp_shard_result(
                 action,
                 target,
             } => {
-                // ⭐ PG 兼容 (FMT_VER 8): 记录被删 pk — 主 DELETE 或级联 DELETE
-                // 的 phase1 完成即存 (DmlAgg 完成时触发/推进级联); 仅 Delete 需要.
-                if matches!(action, SqlDmlAction::Delete) {
-                    conn.cascade_pending
-                        .insert(seq, (target.0.clone(), target.1.clone(), pks.clone()));
-                }
-                // ⭐ 事务 v1 (F61): 两阶段 DML 的 phase2 在事务中截流
-                // (phase1 读的是已提交态 — v1 文档化语义)
-                if conn.txn.is_some() {
-                    let n = pks.len() as u64;
-                    for pk in pks {
-                        let op = sql_dml_op(&target.0, &target.1, pk, &action);
-                        if let Err(e) = txn_buffer_op(conn, op) {
-                            if is_cascade_seq(seq) {
-                                if let Some(job) = conn.cascade_jobs.remove(&seq) {
-                                    cascade_job_done(
-                                        conn,
-                                        conn_id,
-                                        seq,
-                                        worker_id,
-                                        default_db,
-                                        db_view,
-                                        shard_inboxes,
-                                        num_shards,
-                                        0,
-                                        Some(e),
-                                        &job,
-                                    );
-                                }
-                            } else {
-                                conn.resp_complete(seq, sql_err_bytes(proto, &e));
-                            }
-                            return;
-                        }
-                    }
-                    if is_cascade_seq(seq) {
-                        if let Some(job) = conn.cascade_jobs.remove(&seq) {
-                            cascade_job_done(
-                                conn,
-                                conn_id,
-                                seq,
-                                worker_id,
-                                default_db,
-                                db_view,
-                                shard_inboxes,
-                                num_shards,
-                                n,
-                                None,
-                                &job,
-                            );
-                        }
-                    } else {
-                        conn.resp_complete(seq, sql_ok_bytes(proto, n));
-                    }
-                    return;
-                }
-                // phase2: 逐 pk 按路由下发 (DML 禁早停保证此刻 phase1 已 drained,
-                // 同 seq 注册 dml_agg 无双聚合并存)
-                debug_assert!(drained, "DML phase1 必须全量回齐后才 fire");
-                if pks.is_empty() {
-                    // ⭐ FK 级联: 级联 job 无匹配引用行 → 推进 (无更深递归)
-                    if is_cascade_seq(seq) {
-                        if let Some(job) = conn.cascade_jobs.remove(&seq) {
-                            cascade_job_done(
-                                conn,
-                                conn_id,
-                                seq,
-                                worker_id,
-                                default_db,
-                                db_view,
-                                shard_inboxes,
-                                num_shards,
-                                0,
-                                None,
-                                &job,
-                            );
-                        }
-                    } else {
-                        conn.resp_complete(seq, sql_ok_bytes(proto, 0));
-                    }
-                } else {
-                    conn.sql_dml_agg.insert(
+                // ⭐ 审计 P1-4: 父表 DELETE 前置 RESTRICT 预检 (非 CASCADE 引用).
+                // 进入预检则延迟 phase2 (pks/action/target 随预检状态暂存);
+                // 探针全净后由 fk_restr_on_reply 回调 run_dml_phase2 续跑.
+                let deferred = matches!(action, SqlDmlAction::Delete)
+                    && fk_restr_start(
+                        conn,
+                        conn_id,
                         seq,
-                        SqlDmlAgg {
-                            remaining: pks.len(),
-                            affected: 0,
-                            error: None,
-                            drop_key: None,
+                        worker_id,
+                        &target.0,
+                        shard_inboxes,
+                        num_shards,
+                        &target.1,
+                        &pks,
+                        RestrResume::Phase2 {
+                            pks: pks.clone(),
+                            action: action.clone(),
+                            target: target.clone(),
                         },
                     );
-                    for pk in pks {
-                        let op = sql_dml_op(&target.0, &target.1, pk, &action);
-                        let sid = hash_route_op(&op, num_shards);
-                        push_task_grouped(
-                            conn_id,
-                            seq,
-                            worker_id,
-                            sid as u32,
-                            sid,
-                            op,
-                            shard_inboxes,
-                        );
-                    }
+                if !deferred {
+                    run_dml_phase2(
+                        conn,
+                        conn_id,
+                        seq,
+                        worker_id,
+                        default_db,
+                        db_view,
+                        shard_inboxes,
+                        num_shards,
+                        pks,
+                        action,
+                        target,
+                    );
                 }
             }
         }
@@ -991,6 +1045,22 @@ pub(crate) fn handle_resp_shard_result(
             };
             conn.resp_complete(seq, bytes);
         }
+        return;
+    }
+    // ⭐ 审计 P1-4: 父表 DELETE RESTRICT 预检回包 (探针 / 子表 schema 拉取 /
+    // catalog 补注; 全净后重放 DELETE 或续 phase2)
+    if fk_restr_on_reply(
+        conn,
+        conn_id,
+        seq,
+        worker_id,
+        default_db,
+        db_view,
+        shard_inboxes,
+        num_shards,
+        group,
+        result,
+    ) {
         return;
     }
     // ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键存在性预检回包

@@ -397,6 +397,28 @@ pub(crate) fn sql_run_dml(
             match sql_plan_select(&schema, &conds) {
                 Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
                 Ok(SqlPlan::PkGet { pk }) => {
+                    // ⭐ 审计 P1-4: 父表 DELETE 前置 RESTRICT 预检 — 非 CASCADE
+                    // 引用 (默认 RESTRICT/NO ACTION) 有子行时拒删. 进入预检则
+                    // 延迟发写; 探针全净后以 cleared 重放本语句 (不会二次预检).
+                    if matches!(action, SqlDmlAction::Delete)
+                        && fk_restr_start(
+                            conn,
+                            conn_id,
+                            seq,
+                            worker_id,
+                            db,
+                            shard_inboxes,
+                            num_shards,
+                            &table,
+                            std::slice::from_ref(&pk),
+                            RestrResume::Redispatch(Box::new(SqlStmt::Delete {
+                                table: table.clone(),
+                                conds: conds.clone(),
+                            })),
+                        )
+                    {
+                        return;
+                    }
                     // ⭐ 事务 v1 (F61): pk 等值 UPDATE/DELETE 截流进 write_set
                     // (affected 乐观估 1, 真实效果 commit 时定 — 文档化)
                     if conn.txn.is_some() {
