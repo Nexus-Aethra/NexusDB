@@ -42,3 +42,6 @@ memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# e2e 回归: 用真实引擎生成多 shard 数据目录 (仅测试用, 不进发布二进制).
+shard_manager = { path = "../shard_manager" }
+storage = { path = "../storage" }

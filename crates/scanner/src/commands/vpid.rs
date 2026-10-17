@@ -11,35 +11,40 @@ use crate::pid::Locate;
 
 pub fn run<W: Write>(globals: &Globals, vpid: u64, raw: bool, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard =
-        layout
-            .shards
-            .first()
-            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-                path: globals.dir.clone(),
-            })?;
-    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
-    let coord = locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic)?;
-    let read = page_io::read_page(shard, coord);
+    // ⭐ 审计 P2-新: 遍历全部 shard — vpid 空间 per-shard, 同一 vpid 在各
+    // shard 是不同页; 逐 shard 解码输出 (带 shard 列).
+    let mut any_ok = false;
+    for shard in &layout.shards {
+        let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
+        let coord = locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic)?;
+        let read = page_io::read_page(shard, coord);
 
-    match read {
-        page_io::PageRead::Ok(buf) => {
-            let r = crate::page_decode::PageReport::decode(&buf, vpid);
-            if raw {
-                emit_header_only(&mut out, globals, vpid, &r);
-            } else {
-                emit_full(&mut out, globals, vpid, &r);
+        match read {
+            page_io::PageRead::Ok(buf) => {
+                any_ok = true;
+                let r = crate::page_decode::PageReport::decode(&buf, vpid);
+                if raw {
+                    emit_header_only(&mut out, globals, shard.id, vpid, &r);
+                } else {
+                    emit_full(&mut out, globals, shard.id, vpid, &r);
+                }
+                // ⭐ 审计 P2 (2026-10-17): strict 模式 — 坏页即非零退出 (CI 语义)
+                if let Some(b) = &r.bad {
+                    globals.strict_gate(format!("vpid {vpid}: {:?}: {}", b.kind, b.detail))?;
+                }
             }
-            // ⭐ 审计 P2 (2026-10-17): strict 模式 — 坏页即非零退出 (CI 语义)
-            if let Some(b) = &r.bad {
-                globals.strict_gate(format!("vpid {vpid}: {:?}: {}", b.kind, b.detail))?;
+            other => {
+                emit_bad(&mut out, globals, shard.id, vpid, &other);
+                globals.strict_gate(format!("vpid {vpid}: unreadable page"))?;
             }
         }
-        other => {
-            emit_bad(&mut out, globals, vpid, &other);
-            globals.strict_gate(format!("vpid {vpid}: unreadable page"))?;
-        }
+    }
+
+    if !any_ok && layout.shards.is_empty() {
+        return Err(crate::error::ScannerError::EmptyDirectory {
+            path: globals.dir.clone(),
+        });
     }
     Ok(0)
 }
@@ -47,6 +52,7 @@ pub fn run<W: Write>(globals: &Globals, vpid: u64, raw: bool, mut out: W) -> Res
 fn emit_header_only<W: Write>(
     out: &mut W,
     globals: &Globals,
+    shard_id: u32,
     vpid: u64,
     r: &crate::page_decode::PageReport,
 ) {
@@ -58,6 +64,7 @@ fn emit_header_only<W: Write>(
     match globals.output_mode() {
         crate::output::OutputMode::Human => {
             let row = HumanRow::new()
+                .field(shard_id.to_string())
                 .field(vpid_str)
                 .field(format!("{:?}", r.page_type))
                 .field(format!("{}", r.vpid))
@@ -70,6 +77,7 @@ fn emit_header_only<W: Write>(
         }
         crate::output::OutputMode::Json => {
             let obj = JsonObject::new()
+                .field("shard", shard_id as u64)
                 .field("vpid", vpid)
                 .field("page_type", format!("{:?}", r.page_type))
                 .field("page_type_raw", r.page_type_raw as u64)
@@ -93,6 +101,7 @@ fn emit_header_only<W: Write>(
 fn emit_full<W: Write>(
     out: &mut W,
     globals: &Globals,
+    shard_id: u32,
     vpid: u64,
     r: &crate::page_decode::PageReport,
 ) {
@@ -107,13 +116,14 @@ fn emit_full<W: Write>(
                 )
                 .ok();
             }
-            writeln!(out, "=== vpid {} ===", vpid_str).ok();
+            writeln!(out, "=== shard {} vpid {} ===", shard_id, vpid_str).ok();
             if let Some(d) = &r.dump {
                 out.write_all(d.as_bytes()).ok();
             }
         }
         crate::output::OutputMode::Json => {
             let obj = JsonObject::new()
+                .field("shard", shard_id as u64)
                 .field("vpid", vpid)
                 .field("page_type", format!("{:?}", r.page_type))
                 .field(
@@ -129,7 +139,13 @@ fn emit_full<W: Write>(
     }
 }
 
-fn emit_bad<W: Write>(out: &mut W, globals: &Globals, vpid: u64, read: &page_io::PageRead) {
+fn emit_bad<W: Write>(
+    out: &mut W,
+    globals: &Globals,
+    shard_id: u32,
+    vpid: u64,
+    read: &page_io::PageRead,
+) {
     let vpid_str = format_vpid(vpid, globals.hex_vpid);
     let reason = match read {
         page_io::PageRead::BlockFileMissing { file_id } => {
@@ -144,12 +160,14 @@ fn emit_bad<W: Write>(out: &mut W, globals: &Globals, vpid: u64, read: &page_io:
     match globals.output_mode() {
         crate::output::OutputMode::Human => {
             let row = HumanRow::new()
+                .field(format!("shard={shard_id}"))
                 .field(format!("[BAD-PAGE] vpid={}", vpid_str))
                 .field(reason);
             human_row(out, &row).ok();
         }
         crate::output::OutputMode::Json => {
             let obj = JsonObject::new()
+                .field("shard", shard_id as u64)
                 .field("bad", true)
                 .field("kind", "page_read")
                 .field("vpid", vpid)

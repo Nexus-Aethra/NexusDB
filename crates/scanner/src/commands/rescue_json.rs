@@ -23,14 +23,26 @@ pub fn run(globals: &Globals, out_dir: &Path, ndjson: bool) -> Result<u8> {
     })?;
 
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
 
-    let (merged, stats) = scan_all_blocks(shard);
+    // ⭐ 审计 P2-新: 遍历全部 shard 合并 (旧实现只扫 shards.first() —
+    // 救援 JSON 同样只出 1/N 的表数据).
+    let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut stats = super::export_force::ScanStats {
+        scanned: 0,
+        bad: 0,
+        leaf: 0,
+        decoded: 0,
+    };
+    for shard in &layout.shards {
+        let (m, s) = scan_all_blocks(shard);
+        for (k, v) in m {
+            merged.insert(k, v);
+        }
+        stats.scanned += s.scanned;
+        stats.bad += s.bad;
+        stats.leaf += s.leaf;
+        stats.decoded += s.decoded;
+    }
 
     // group by table name (parsed from logical_key)
     let mut by_table: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();

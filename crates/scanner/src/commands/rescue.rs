@@ -5,6 +5,9 @@
 //!
 //! This is the command the user reaches for when the engine refuses to
 //! open and they need to know "what's wrong and can I get my data out?".
+//!
+//! ⭐ 审计 P2-新: 遍历全部 shard (旧实现只救 shard_0 — 默认 6 shard 只救
+//! 1/6). 每个 shard 独立发现表/验证树, 报告按 shard 分组汇总.
 
 use std::io::Write;
 
@@ -16,20 +19,33 @@ use crate::page_io;
 use crate::pid::Locate;
 use crate::tree::{self, WalkSummary};
 
+/// (shard id, 该 shard 的表列表, 各表验证摘要).
+type ShardReport = (u32, Vec<(String, String, u64)>, Vec<WalkSummary>);
+
 pub fn run<W: Write>(globals: &Globals, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard =
-        layout
-            .shards
-            .first()
-            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-                path: globals.dir.clone(),
-            })?;
-    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
+
+    // 逐 shard: 发现表 + 验证树
+    let mut per_shard: Vec<ShardReport> = Vec::new();
+    for shard in &layout.shards {
+        let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
+        let tables = discover_tables(shard, &locate);
+        let mut summaries = Vec::with_capacity(tables.len());
+        for (_, _, root_vpid) in &tables {
+            summaries.push(tree::walk_tree(
+                shard,
+                &locate,
+                *root_vpid,
+                globals.is_strict(),
+                |_node| {},
+            ));
+        }
+        per_shard.push((shard.id, tables, summaries));
+    }
 
     match globals.output_mode() {
-        crate::output::OutputMode::Human => run_human(&mut out, globals, &layout, shard, &locate),
-        crate::output::OutputMode::Json => run_json(&mut out, globals, &layout, shard, &locate),
+        crate::output::OutputMode::Human => run_human(&mut out, globals, &layout, &per_shard),
+        crate::output::OutputMode::Json => run_json(&mut out, &per_shard),
     }
     Ok(0)
 }
@@ -38,8 +54,7 @@ fn run_human<W: Write>(
     out: &mut W,
     globals: &Globals,
     layout: &dir::DataDir,
-    shard: &dir::ShardDir,
-    locate: &Locate,
+    per_shard: &[ShardReport],
 ) {
     writeln!(out, "=== NexusDBScan Rescue Report ===").ok();
     writeln!(out, "data dir:   {}", layout.path.display()).ok();
@@ -50,22 +65,25 @@ fn run_human<W: Write>(
 
     // Phase 1: discover tables via dbs logic
     writeln!(out, "--- Phase 1: Table discovery ---").ok();
-    let tables = discover_tables(shard, locate);
-    if tables.is_empty() {
+    let total_tables: usize = per_shard.iter().map(|(_, t, _)| t.len()).sum();
+    if total_tables == 0 {
         writeln!(out, "  (no tables found)").ok();
         writeln!(out).ok();
         return;
     }
-    writeln!(out, "  found {} table(s)", tables.len()).ok();
-    for (db, table, root_vpid) in &tables {
-        writeln!(
-            out,
-            "    db={} table={} root_vpid={}",
-            db,
-            table,
-            format_vpid(*root_vpid, globals.hex_vpid)
-        )
-        .ok();
+    writeln!(out, "  found {} table(s)", total_tables).ok();
+    for (shard_id, tables, _) in per_shard {
+        for (db, table, root_vpid) in tables {
+            writeln!(
+                out,
+                "    shard={} db={} table={} root_vpid={}",
+                shard_id,
+                db,
+                table,
+                format_vpid(*root_vpid, globals.hex_vpid)
+            )
+            .ok();
+        }
     }
     writeln!(out).ok();
 
@@ -74,28 +92,36 @@ fn run_human<W: Write>(
     let mut total_visited: u64 = 0;
     let mut total_bad: u64 = 0;
     let mut total_unread: u64 = 0;
-    let mut bad_tree_roots: Vec<(String, String, u64, WalkSummary)> = Vec::new();
+    let mut bad_tree_roots: Vec<(u32, String, String, u64, WalkSummary)> = Vec::new();
 
-    for (db, table, root_vpid) in &tables {
-        let summary = tree::walk_tree(shard, locate, *root_vpid, globals.is_strict(), |_node| {});
-        total_visited += summary.visited;
-        total_bad += summary.bad;
-        total_unread += summary.unread;
-        writeln!(
-            out,
-            "  tree db={} table={} root_vpid={}: visited={} ok={} bad={} unread={} depth={}",
-            db,
-            table,
-            format_vpid(*root_vpid, globals.hex_vpid),
-            summary.visited,
-            summary.ok,
-            summary.bad,
-            summary.unread,
-            summary.max_depth
-        )
-        .ok();
-        if summary.bad > 0 || summary.unread > 0 {
-            bad_tree_roots.push((db.clone(), table.clone(), *root_vpid, summary));
+    for (shard_id, tables, summaries) in per_shard {
+        for ((db, table, root_vpid), summary) in tables.iter().zip(summaries) {
+            total_visited += summary.visited;
+            total_bad += summary.bad;
+            total_unread += summary.unread;
+            writeln!(
+                out,
+                "  shard={} tree db={} table={} root_vpid={}: visited={} ok={} bad={} unread={} depth={}",
+                shard_id,
+                db,
+                table,
+                format_vpid(*root_vpid, globals.hex_vpid),
+                summary.visited,
+                summary.ok,
+                summary.bad,
+                summary.unread,
+                summary.max_depth
+            )
+            .ok();
+            if summary.bad > 0 || summary.unread > 0 {
+                bad_tree_roots.push((
+                    *shard_id,
+                    db.clone(),
+                    table.clone(),
+                    *root_vpid,
+                    summary.clone(),
+                ));
+            }
         }
     }
     writeln!(out).ok();
@@ -112,10 +138,11 @@ fn run_human<W: Write>(
     if bad_tree_roots.is_empty() {
         writeln!(out, "  no bad pages found — all trees are healthy").ok();
     } else {
-        for (db, table, root_vpid, summary) in &bad_tree_roots {
+        for (shard_id, db, table, root_vpid, summary) in &bad_tree_roots {
             writeln!(
                 out,
-                "  tree db={} table={} root_vpid={} has {} bad pages, {} unreadable",
+                "  shard={} tree db={} table={} root_vpid={} has {} bad pages, {} unreadable",
+                shard_id,
                 db,
                 table,
                 format_vpid(*root_vpid, globals.hex_vpid),
@@ -142,14 +169,15 @@ fn run_human<W: Write>(
         .ok();
         writeln!(
             out,
-            "  Try: cargo run -- -dir <PATH> export -tree <root_vpid> -format json"
+            "  Try: nexusdb-scanner --dir <PATH> export -tree <root_vpid> -format json"
         )
         .ok();
     } else {
-        for (db, table, root_vpid, _summary) in &bad_tree_roots {
+        for (shard_id, db, table, root_vpid, _summary) in &bad_tree_roots {
             writeln!(
                 out,
-                "  Tree db={} table={} (root_vpid={}) has issues.",
+                "  Tree shard={} db={} table={} (root_vpid={}) has issues.",
+                shard_id,
                 db,
                 table,
                 format_vpid(*root_vpid, globals.hex_vpid)
@@ -168,49 +196,45 @@ fn run_human<W: Write>(
             .ok();
         }
     }
-    writeln!(out, "  (export command is available in PR3)").ok();
 }
 
-fn run_json<W: Write>(
-    out: &mut W,
-    globals: &Globals,
-    _layout: &dir::DataDir,
-    shard: &dir::ShardDir,
-    locate: &Locate,
-) {
+fn run_json<W: Write>(out: &mut W, per_shard: &[ShardReport]) {
     // Phase 1: table discovery
-    let tables = discover_tables(shard, locate);
+    let total_tables: usize = per_shard.iter().map(|(_, t, _)| t.len()).sum();
     let obj1 = JsonObject::new()
         .field("event", "rescue_phase1")
-        .field("table_count", tables.len() as u64);
+        .field("table_count", total_tables as u64);
     json_row(out, &obj1).ok();
-    for (db, table, root_vpid) in &tables {
-        let obj = JsonObject::new()
-            .field("event", "rescue_table")
-            .field("db", db.clone())
-            .field("table", table.clone())
-            .field("root_vpid", *root_vpid);
-        json_row(out, &obj).ok();
+    for (shard_id, tables, _) in per_shard {
+        for (db, table, root_vpid) in tables {
+            let obj = JsonObject::new()
+                .field("event", "rescue_table")
+                .field("shard", *shard_id as u64)
+                .field("db", db.clone())
+                .field("table", table.clone())
+                .field("root_vpid", *root_vpid);
+            json_row(out, &obj).ok();
+        }
     }
 
     // Phase 2: verify each tree
-    for (db, table, root_vpid) in &tables {
-        let summary = tree::walk_tree(shard, locate, *root_vpid, globals.is_strict(), |_node| {});
-        let obj = JsonObject::new()
-            .field("event", "rescue_verify")
-            .field("db", db.clone())
-            .field("table", table.clone())
-            .field("root_vpid", *root_vpid)
-            .field("visited", summary.visited)
-            .field("ok", summary.ok)
-            .field("bad", summary.bad)
-            .field("unread", summary.unread)
-            .field("max_depth", summary.max_depth as u64)
-            .field("cycle", summary.cycle);
-        json_row(out, &obj).ok();
+    for (shard_id, tables, summaries) in per_shard {
+        for ((db, table, root_vpid), summary) in tables.iter().zip(summaries) {
+            let obj = JsonObject::new()
+                .field("event", "rescue_verify")
+                .field("shard", *shard_id as u64)
+                .field("db", db.clone())
+                .field("table", table.clone())
+                .field("root_vpid", *root_vpid)
+                .field("visited", summary.visited)
+                .field("ok", summary.ok)
+                .field("bad", summary.bad)
+                .field("unread", summary.unread)
+                .field("max_depth", summary.max_depth as u64)
+                .field("cycle", summary.cycle);
+            json_row(out, &obj).ok();
+        }
     }
-
-    let _ = globals;
 }
 
 /// Discover all (db, table, root_vpid) triples.

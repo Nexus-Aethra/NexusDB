@@ -279,6 +279,8 @@ dependencies = [
  "page",
  "serde",
  "serde_json",
+ "shard_manager",
+ "storage",
  "tempfile",
  "thiserror",
 ]

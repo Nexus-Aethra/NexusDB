@@ -280,6 +280,12 @@ pub enum Command {
         /// dry-run mode and only reports what it would do.
         #[arg(long)]
         apply: bool,
+
+        /// ⭐ 审计 P2-新: 目标 shard id. page.mate 是 per-shard 的 — 多 shard
+        /// 目录下必须显式指定修哪个, 不再默认 shard_0 (静默修错 shard).
+        /// 单 shard 目录可省略.
+        #[arg(short = 's', long)]
+        shard: Option<u32>,
     },
 
     /// Decode all KV pairs into their original JSON form and write one
