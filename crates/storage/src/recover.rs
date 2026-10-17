@@ -68,6 +68,11 @@ pub struct RecoveredState {
     pub next_vpid: u64,
 
     /// 下一个要创建的 block file id (max(seen file_id) + 1).
+    ///
+    /// ⭐ 审计 P3-13 (2026-10-17): **观测字段** — 生产写入路径用的是
+    /// `pid_alloc.current().0` (当前活跃 block), 因为新页要追加进活跃 block
+    /// 而不是新开一个; 本字段是"恢复看到的高水位", 供测试/工具断言与人工
+    /// 核对 (recover_tests 大量断言), 不作为分配依据.
     pub next_file_id: u32,
 }
 

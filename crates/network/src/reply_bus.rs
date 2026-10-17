@@ -1,6 +1,11 @@
 //! ReplyBus: ShardManager → Worker 的 reply 通道.
 //!
 //! Phase 1 stub: 简单包装 crossbeam unbounded channel.
+//!
+//! ⭐ 审计 P3-10 (2026-10-17): 本模块是**辅助/测试用** API — 生产热路径走
+//! `TaskReplyBus` (无锁环形 + per-worker eventfd); 这里保留是因为它实现了
+//! 公开的 `ReplySink` trait, `tests/integration_reply_bus.rs` 用它端到端
+//! 验证 "ShardManager → ReplySink → consumer" 契约. 新增功能不要走这条路.
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 

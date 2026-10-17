@@ -468,6 +468,19 @@ pub(crate) fn process_binary_input(
             }
             Ok(DecodeOutcome::NeedMore) => break,
             Err(_) => {
+                // ⭐ 审计 P3-11 (2026-10-17): 解码错误不再静默重同步 —
+                // 旧实现只跳 1 字节继续, 客户端收不到任何错误帧也无指标,
+                // 协议错乱会被当成"请求丢失". 现在: 计数 + 回一个错误帧,
+                // 再按原策略重同步 (二进制流无可靠边界, 跳 1 字节仍是唯一选择).
+                crate::metrics::BINARY_DECODE_ERRORS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let err_id = peek_req_id(
+                    &conn.read_buf[cursor..cursor + 4.min(conn.read_buf.len() - cursor)],
+                );
+                conn.send_binary_response(
+                    err_id,
+                    &crate::protocol::Response::Error("malformed binary frame".into()),
+                );
                 if cursor < conn.read_buf.len() {
                     cursor += 1; // 重同步: 跳过 1 字节
                 } else {

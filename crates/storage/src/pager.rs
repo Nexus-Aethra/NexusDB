@@ -64,6 +64,8 @@ pub struct Pager {
     pub(crate) chunk_list: ChunkList,
     /// ⭐ 协程级 chunk 锁 (DESIGN §3.0). 同步版本下不会真触发 wait queue,
     /// 数据结构完整保留, T11 polish 接 async 时激活.
+    /// ⭐ 审计 P2-12 (2026-10-17): chunk_lock 尚未接入 Pager::read 热路径
+    /// (DESIGN §3.0 的 chunk 级租约; 目前仅测试可达), 保留结构待接线.
     pub(crate) chunk_lock: ChunkLockMap,
     /// 虚拟 page ID 分配
     pub(crate) vpid_alloc: VpidAllocator,
@@ -79,6 +81,8 @@ pub struct Pager {
     #[allow(dead_code)]
     pub(crate) writer: ChunkWriter,
     /// TravelTrees: task_id → TravelTree. 用于 B+Tree split 传播 (T8 polish)
+    /// ⭐ 审计 P2-12 (2026-10-17): TravelTree (travel_tree_tests 覆盖) 同样
+    /// 未接入读路径, 作为 per-task 路径追踪的实验结构保留.
     pub(crate) travel_trees: HashMap<TaskId, TravelTree>,
     /// ⭐ T16: IO 后端抽象 (StdFs / IoUring). Rc 共享: 异步落盘协程持有克隆
     /// (shard 单线程模型, Rc 安全).
