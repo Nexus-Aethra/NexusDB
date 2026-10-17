@@ -517,7 +517,10 @@ pub(crate) fn shard_thread_main(
     // later requests wait behind an unbounded drain.
     let mut task_window = AdaptiveTaskWindow::from_env();
     let turn_budget = ForegroundTurnBudget::from_env();
-    let mut deferred_tasks: VecDeque<crate::request::ShardTask> = VecDeque::new();
+    // ⭐ 审计 P2 (2026-10-17): 跨 inbox 定序 — deferred 容器也带入队序号.
+    let mut deferred_tasks: VecDeque<(u64, crate::request::ShardTask)> = VecDeque::new();
+    // 本轮先处理 tasks 时被延后的 requests (序号保证它们仍是全局最老的一批).
+    let mut deferred_requests: VecDeque<(u64, crate::request::ShardRequest)> = VecDeque::new();
     const FOREGROUND_DATA_ADMISSION: usize = 2;
     nlog::info!(
         "shard",
@@ -532,7 +535,7 @@ pub(crate) fn shard_thread_main(
         // spin poll 两个 inbox, 任一有数据就退出 spin
         let mut spins = 0u32;
         let (batch, tasks) = loop {
-            let b = inbox.drain();
+            let mut b = inbox.drain();
             let t = if deferred_tasks.is_empty() {
                 task_inbox.drain_up_to(task_window.limit())
             } else {
@@ -540,7 +543,18 @@ pub(crate) fn shard_thread_main(
                     .drain(..deferred_tasks.len().min(task_window.limit()))
                     .collect()
             };
-            if !b.is_empty() || !t.is_empty() {
+            // ⭐ 审计 P2 (2026-10-17): 跨 inbox 全序 — 两个 inbox 各是一个独立
+            // ring, 单看各自都是 FIFO, 但跨 ring 无顺序保证. 入队时打了全局单调
+            // 序号 (ENQ_SEQ), 这里按序号决定本轮处理顺序: 最老的 task 早于最老的
+            // request 时, requests 延到下一轮 (它们仍是全局最老, 下轮必先处理),
+            // 从而保证"同一来源跨 inbox 的消息按发送顺序执行".
+            let tasks_first =
+                crate::inbox::tasks_first(t.first().map(|(s, _)| *s), b.first().map(|(s, _)| *s));
+            if tasks_first {
+                deferred_requests.extend(b.drain(..));
+                b.clear();
+            }
+            if !b.is_empty() || !t.is_empty() || !deferred_requests.is_empty() {
                 break (b, t);
             }
             spins += 1;
@@ -586,7 +600,7 @@ pub(crate) fn shard_thread_main(
                 }
                 #[cfg(not(target_os = "linux"))]
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                let b = inbox.drain();
+                let mut b = inbox.drain();
                 let t = if deferred_tasks.is_empty() {
                     task_inbox.drain_up_to(task_window.limit())
                 } else {
@@ -594,7 +608,16 @@ pub(crate) fn shard_thread_main(
                         .drain(..deferred_tasks.len().min(task_window.limit()))
                         .collect()
                 };
-                if !b.is_empty() || !t.is_empty() {
+                // 同上的跨 inbox 定序 (慢路径)
+                let tasks_first = crate::inbox::tasks_first(
+                    t.first().map(|(s, _)| *s),
+                    b.first().map(|(s, _)| *s),
+                );
+                if tasks_first {
+                    deferred_requests.extend(b.drain(..));
+                    b.clear();
+                }
+                if !b.is_empty() || !t.is_empty() || !deferred_requests.is_empty() {
                     break (b, t);
                 }
                 // timeout 醒来无数据: 驱动异步落盘 + 周期刷盘后继续睡
@@ -617,7 +640,10 @@ pub(crate) fn shard_thread_main(
         rt.clone().drive_until_idle(0);
 
         let mut should_shutdown = false;
-        for req in batch {
+        // deferred requests 序号最老 → 排在本轮新 drain 的请求之前 (保持全序)
+        let batch: Vec<(u64, crate::request::ShardRequest)> =
+            deferred_requests.drain(..).chain(batch).collect();
+        for (_req_seq, req) in batch {
             match req {
                 ShardRequest::Shutdown { reply } => {
                     let _ = reply.send(Ok(ShardReply::ShutdownOk));
@@ -1427,7 +1453,7 @@ pub(crate) fn shard_thread_main(
                         deferred_tasks.append(&mut pending_tasks);
                         break;
                     }
-                    let task = pending_tasks.pop_front().expect("checked non-empty");
+                    let (_task_seq, task) = pending_tasks.pop_front().expect("checked non-empty");
                     served_task_count += 1;
                     let task_start = (crate::PROBE.is_enabled() || turn_budget.enabled())
                         .then(std::time::Instant::now);
@@ -1460,15 +1486,18 @@ pub(crate) fn shard_thread_main(
                         while pairs.len() < PUT_RUN_MAX {
                             let same_table = matches!(
                                 pending_tasks.front(),
-                                Some(crate::request::ShardTask {
-                                    op: crate::request::BatchOp::Put { db: next_db, table: next_table, .. },
-                                    ..
-                                }) if next_db == &db && next_table == &table
+                                Some((
+                                    _,
+                                    crate::request::ShardTask {
+                                        op: crate::request::BatchOp::Put { db: next_db, table: next_table, .. },
+                                        ..
+                                    }
+                                )) if next_db == &db && next_table == &table
                             );
                             if !same_table {
                                 break;
                             }
-                            let next = pending_tasks.pop_front().expect("front checked above");
+                            let (_, next) = pending_tasks.pop_front().expect("front checked above");
                             let crate::request::ShardTask {
                                 conn_id,
                                 req_id,

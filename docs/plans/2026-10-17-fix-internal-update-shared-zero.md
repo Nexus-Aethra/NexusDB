@@ -569,3 +569,37 @@ shared=0 的字节, 原样拷贝后仍满足段首不变量, 前缀引用的是�
 | `bulk_split_keeps_segments_within_max_per_checkpoint` | ✅ split 后两页均 ≥2 段且每段 ≤32; 段 item_count 之和 = key_count+1 (页自洽); 100 个 key 一个不丢 |
 | page + storage 全量串行 | ✅ 154 + 510 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: 双 inbox 无全序 (P2) — 同批次修复
+
+**问题**: 同一 shard 有**两个** inbox — `ShardInbox` (ShardRequest, 管理面 /
+客户端 API) 与 `TaskInbox` (ShardTask, 网络 worker 数据面), 各是一个独立
+`ArrayQueue`. 单看任一个 ring 都是 FIFO, 但**跨 ring 没有顺序保证**: shard
+线程每轮固定先处理 requests 再处理 tasks, 于是一个先入队的 task 可能被后
+入队的 request 反超 (同一来源的消息跨 inbox 乱序).
+
+**修复**:
+1. 进程级单调入队序号 `ENQ_SEQ` (`inbox::next_enq_seq()`), 两个 inbox 的
+   push 路径都打戳 (含 `push_batch_spin` 批量路径);
+2. `ShardInbox::drain` / `TaskInbox::drain_up_to` 改为返回
+   `(序号, 消息)`; `deferred_tasks` 容器同步带序号;
+3. shard 线程每轮 drain 后用 `inbox::tasks_first(最老 task 序号, 最老
+   request 序号)` 决定处理顺序: 最老的 task 更老 → requests 整批延到下一轮
+   (它们的序号仍全局最老, 下轮必先处理), 否则按原顺序. 快/慢两条 drain
+   路径都接; `deferred_requests` 在最老位置拼回本轮批次.
+
+**效果**: 同一来源跨 inbox 的消息按发送顺序执行 (跨批次的细粒度交错仍按批
+边界切分 — 批内各自的 FIFO 由 ring 保证; 彻底合并需要把两个队列合成一个,
+属结构性改动, 记录为后续项).
+
+**测试**:
+
+| 用例 | 结果 |
+|---|---|
+| `enq_seq_is_monotonic_across_inboxes` | ✅ 序号全局单调递增 |
+| `tasks_first_follows_sequence_order` | ✅ 定序规则 (谁老谁先 / 空队列边界) |
+| `drain_reports_enqueue_sequence` | ✅ drain 带序号且 FIFO |
+| shard_manager + network 全量串行 | ✅ 65 + 247 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |
