@@ -1475,15 +1475,15 @@ impl ShardManager {
         Ok(())
     }
 
-    pub fn close(self) -> ShardResult<()> {
+    pub fn close(mut self) -> ShardResult<()> {
         // 1. 停机握手 (flush + Shutdown; 若调用方已 shutdown 过则为幂等 no-op)
         self.shutdown()?;
 
         // 2. drop senders (让 mpsc 关闭, shard loop 也会 break)
-        drop(self.shards);
+        drop(std::mem::take(&mut self.shards));
 
         // 3. join 所有线程
-        for (i, join) in self.threads.into_iter().enumerate() {
+        for (i, join) in std::mem::take(&mut self.threads).into_iter().enumerate() {
             join.join().map_err(|_| ShardError::JoinPanic(i))?;
         }
         Ok(())
@@ -1503,6 +1503,26 @@ impl ShardManager {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for ShardManager {
+    /// RAII 兜底: 忘记显式 `close()`/`shutdown()` 时 (典型: 测试只 `drop(mgr)`,
+    /// 或 panic unwind), 在此停 shard 线程并 join.
+    ///
+    /// 没有这层兜底时, 泄漏的 shard 线程会带着引擎无限空转 (idle 循环 10ms
+    /// poll 唤醒驱动持久化检查), 直到进程退出 — 测试套件里每个未 close 的
+    /// manager 泄漏 num_shards 个持续耗 CPU 的线程.
+    ///
+    /// 与显式路径幂等兼容: `close()` 已 take 空字段 + `shutdown()` 有
+    /// `shutdown_started` 标志, 本实现随后为 no-op.
+    fn drop(&mut self) {
+        // flush + Shutdown (尽力而为: 失败也继续停线程, 不让泄漏线程空转)
+        let _ = self.shutdown();
+        drop(std::mem::take(&mut self.shards));
+        for join in std::mem::take(&mut self.threads) {
+            let _ = join.join();
+        }
     }
 }
 
