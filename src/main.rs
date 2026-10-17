@@ -36,29 +36,33 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> i32 {
 #[cfg(target_os = "linux")]
 fn warn_if_insecure_defaults(cfg: &config::NexusConfig) {
     let s = &cfg.server;
-    // 空 host 与通配地址同样监听所有网卡
-    let is_wildcard = |addr: &str| {
+    // ⭐ 审计 P0-4 (2026-10-17): 旧实现只对通配地址 (0.0.0.0/::) 告警 —
+    // 绑定**具体外网 IP** (如 192.168.1.5) 同样对外暴露却一声不响.
+    // 现在: 只要不是回环地址就视为"对外可达".
+    let is_loopback = |addr: &str| {
         let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-        host.is_empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host == "127.0.0.1" || host == "::1" || host == "localhost"
     };
+    let exposed = |addr: &str| !addr.is_empty() && !is_loopback(addr);
 
     let mut open: Vec<&str> = Vec::new();
     let no_resp_auth = s.redis_password.is_empty();
-    if !s.listen_addr.is_empty() && no_resp_auth && is_wildcard(&s.listen_addr) {
+    if exposed(&s.listen_addr) && no_resp_auth {
         open.push("Binary(5433)");
     }
-    if !s.redis_addr.is_empty() && no_resp_auth && is_wildcard(&s.redis_addr) {
+    if exposed(&s.redis_addr) && no_resp_auth {
         open.push("RESP");
     }
     let sql_no_auth = s.sql_password.is_empty();
-    if !s.sql_addr.is_empty() && sql_no_auth && is_wildcard(&s.sql_addr) {
+    if exposed(&s.sql_addr) && sql_no_auth {
         open.push("MySQL(5434)");
     }
-    if !s.pg_addr.is_empty() && sql_no_auth && is_wildcard(&s.pg_addr) {
+    if exposed(&s.pg_addr) && sql_no_auth {
         open.push("PostgreSQL(5435)");
     }
     let http_no_auth = s.http_token.is_empty() && s.tls_key.is_empty();
-    if !s.http_addr.is_empty() && http_no_auth && is_wildcard(&s.http_addr) {
+    if exposed(&s.http_addr) && http_no_auth {
         open.push("HTTP/REST(6778)");
     }
     if open.is_empty() {
@@ -72,6 +76,12 @@ fn warn_if_insecure_defaults(cfg: &config::NexusConfig) {
     nlog::warn!(
         "main",
         "SECURITY: 建议绑定 127.0.0.1, 或配置 redis_password / sql_password / http_token 与 TLS"
+    );
+    // ⭐ 审计 P0-4③: Binary(5433) 是内部/基准协议, **不实现认证**
+    // (auth_password 恒 None) — 绝不绑到非回环地址.
+    nlog::warn!(
+        "main",
+        "SECURITY: Binary(5433) 协议无认证实现, 只应绑 127.0.0.1"
     );
 }
 

@@ -52,6 +52,8 @@ pub mod metrics {
     pub static KV_OPS: AtomicU64 = AtomicU64::new(0);
     /// ⭐ 审计 P3-11 (2026-10-17): Binary 协议解码错误次数 (旧实现静默重同步).
     pub static BINARY_DECODE_ERRORS: AtomicU64 = AtomicU64::new(0);
+    /// ⭐ 审计 P3-8 (2026-10-17): RESP 重排缓冲溢出 (某 seq 永未回复) 断连次数.
+    pub static RESP_REORDER_OVERFLOW: AtomicU64 = AtomicU64::new(0);
     /// ⭐ 方案 A (调优): JOIN EstimateRows 统计广播轮数 (合并行数后每批 +1).
     pub static SQL_JOIN_EST_ROUNDS: AtomicU64 = AtomicU64::new(0);
     /// ⭐ 方案 A (调优): 小表阈值跳过统计收集次数 (行数批收齐直接决策).

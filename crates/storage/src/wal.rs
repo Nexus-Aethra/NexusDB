@@ -394,9 +394,9 @@ mod tests {
     fn seal_and_segments() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = WalWriter::open(tmp.path(), 0, WalMode::Periodic, false).unwrap();
-        w.append_put("d", "t", b"k1", b"v1");
+        w.append_put("d", "t", b"k1", b"v1").unwrap();
         w.seal().unwrap(); // k1 落入段 1
-        w.append_put("d", "t", b"k2", b"v2");
+        w.append_put("d", "t", b"k2", b"v2").unwrap();
         // buf 未 flush 时 crash 模拟: 段 2 空, 段 1 含 k1
         let segs = WalWriter::existing_segments(tmp.path(), 0);
         assert_eq!(segs.len(), 2);

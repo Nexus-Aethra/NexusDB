@@ -6,6 +6,9 @@
 use super::*;
 use std::os::fd::AsRawFd;
 
+/// ⭐ 审计 P3-8 (2026-10-17): RESP 重排缓冲上限 (防"分片永不回复"时无限增长).
+pub(crate) const RESP_PENDING_MAX: usize = 4096;
+
 impl ConnState {
     // Construction receives all per-connection resources without a global runtime context.
     #[allow(clippy::too_many_arguments)]
@@ -481,6 +484,21 @@ impl ConnState {
             _ => {}
         }
         self.pending.insert(seq, bytes);
+        // ⭐ 审计 P3-8 (2026-10-17): 重排缓冲护栏 — 某个 seq 的分片回复永不到达
+        // 时, 后续回复会一直卡在 pending 里 (连接事实上已永久停摆), 旧实现无
+        // 上限无淘汰 → 内存随请求数无限增长. 超限即断连 (唯一合理恢复:
+        // 该连接的 in-flight 请求已不可能完成).
+        if self.pending.len() > RESP_PENDING_MAX {
+            crate::metrics::RESP_REORDER_OVERFLOW
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            nlog::warn!(
+                "worker",
+                "conn {} reorder buffer overflow ({} > {RESP_PENDING_MAX}), closing",
+                self.fd,
+                self.pending.len()
+            );
+            self.close_after_flush = true;
+        }
         self.resp_flush_ready();
     }
 
