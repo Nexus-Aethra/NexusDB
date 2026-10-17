@@ -84,7 +84,7 @@ impl StorageEngine {
         // ⭐ WAL (F60): 成功路径记录结果态 (重放幂等)
         let wal_start = trace_enabled.then(std::time::Instant::now);
         if let Some(w) = self.wal.as_mut() {
-            w.append_put(db, table, pkey, value);
+            w.append_put(db, table, pkey, value)?;
         }
         let wal_ns = wal_start
             .map(|start| start.elapsed().as_nanos() as u64)
@@ -171,7 +171,7 @@ impl StorageEngine {
         // ⭐ WAL (F60): 批量记录 (一次遍历, flush 时共享后续 fsync)
         if let Some(w) = self.wal.as_mut() {
             for (pkey, value) in pairs {
-                w.append_put(db, table, pkey, value);
+                w.append_put(db, table, pkey, value)?;
             }
         }
         if let Some(new_root) = new_root {
@@ -210,7 +210,7 @@ impl StorageEngine {
         }
         // ⭐ WAL (F60): 存在才记 (不存在的 delete 重放无意义)
         if existed && let Some(w) = self.wal.as_mut() {
-            w.append_del(db, table, pkey);
+            w.append_del(db, table, pkey)?;
         }
         Ok(existed)
     }

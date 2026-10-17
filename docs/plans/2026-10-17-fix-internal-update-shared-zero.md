@@ -718,3 +718,25 @@ TIME 与 NOW 同时分秒) / `mysql_uuid_default_on_non_uuid_column_errors`
 + 别名 / 与 FROM 查询混用不受影响); 同时修正 `mysql_auth_password_and_failures`
 里用 `SELECT 1` 当"非法语法"样例的旧断言 (改用残缺语句 `SELECT`).
 network 全量串行 250 passed / 0 failed; clippy 0; fmt 0.
+
+---
+
+## 附: 旧报告遗留项批次一 (C3 残留 / P1-3 / P3-9 / P3-14) — 同批次修复
+
+1. **C3 残留**: `InternalItemPtr::new` (ptr.rs) 仍只有 `debug_assert` 校验
+   shared=0 — 与已修的 `ItemPtr::new` / `LeafItemPtr::new` 不对称, release 下
+   internal 段首校验失效. 改为硬错误 `PageError::NotSegmentHead`.
+   (测试: `internal_item_ptr_rejects_non_segment_head`)
+2. **P1-3 CHECK 约束静默丢弃** (parser_ddl.rs 表级 + 列级): 表达式被括号深度
+   计数吞掉且无任何提示 — 用户以为约束生效. 现在仍吞 (保持既有迁移可跑) 但
+   每条 CHECK 打 WARN, 把"静默"变"显式".
+3. **P3-9 HTTP `find_head_end` 每次全量扫描 O(n²)**: `parse_request` 新增
+   `scanned` 进度参数 (caller 跨 recv 保留, 回退 3B 防边界漏检), 请求消费后
+   重置; `find_head_end` 改手写紧扫描. 同一请求分多次到达时 O(n²)→O(n).
+4. **P3-14 WAL 记录 `db.len() as u16` 无检查** (wal.rs): 超长名被静默截断
+   (重放写错表). `encode_record`/`append_put`/`append_del` 改为返回
+   `io::Result<()>` 并显式校验 (>65535 → InvalidInput).
+   (测试: `wal_append_rejects_overlong_names`)
+
+**测试**: page+storage+network 全量串行 **763 passed / 0 failed**;
+clippy -D warnings 0; fmt 0.

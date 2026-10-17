@@ -20,11 +20,13 @@ pub(crate) fn process_http_input(
     use crate::protocol::http as h;
     let cors = crate::http_config::cors_origin();
     let mut cursor = 0usize;
+    // ⭐ 审计 P3: 头部扫描进度 (跨 recv 增量到达时避免整片重扫 → O(n²)→O(n))
+    let mut head_scanned = 0usize;
     loop {
         if conn.close_after_flush {
             break;
         }
-        match h::parse_request(&conn.read_buf[cursor..]) {
+        match h::parse_request(&conn.read_buf[cursor..], &mut head_scanned) {
             Ok(None) => break,
             Err((code, msg)) => {
                 crate::metrics::HTTP_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -39,6 +41,7 @@ pub(crate) fn process_http_input(
             }
             Ok(Some((n, req))) => {
                 cursor += n;
+                head_scanned = 0; // 新请求从头扫描
                 crate::metrics::HTTP_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !req.keep_alive {
                     conn.close_after_flush = true;

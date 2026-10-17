@@ -185,3 +185,28 @@ fn wal_clean_close_leaves_no_segments() {
         "正常关闭后段应全部清除"
     );
 }
+
+/// ⭐ 审计 P3 (2026-10-17): WAL 记录编码对超长 db/table 名必须显式报错 —
+/// 旧实现 `db.len() as u16` 静默截断 (重放时写错表).
+#[test]
+fn wal_append_rejects_overlong_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut w =
+        storage::wal::WalWriter::open(tmp.path(), 0, WalMode::Periodic, false).expect("open wal");
+    let long = "x".repeat(u16::MAX as usize + 1);
+
+    // 超长 db 名 → 显式 Err (旧实现静默截断)
+    assert!(
+        w.append_put(&long, "t", b"k", b"v").is_err(),
+        "超长 db 名必须报错"
+    );
+    // 超长 table 名 → 显式 Err
+    assert!(
+        w.append_put("db", &long, b"k", b"v").is_err(),
+        "超长 table 名必须报错"
+    );
+    assert!(w.append_del(&long, "t", b"k").is_err(), "delete 同律");
+    // 正常名字不受影响
+    assert!(w.append_put("db", "t", b"k", b"v").is_ok());
+    assert!(w.append_del("db", "t", b"k").is_ok());
+}

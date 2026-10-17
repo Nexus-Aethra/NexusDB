@@ -33,14 +33,25 @@ pub type HttpParseError = (u16, &'static str);
 
 /// 增量解析: 完整请求 → Some((消耗字节, 请求)); 数据不足 → None.
 /// 头部超限/畸形 → Err (caller 回错误响应并断连).
-pub fn parse_request(buf: &[u8]) -> Result<Option<(usize, HttpRequest)>, HttpParseError> {
-    // 找头部终结 \r\n\r\n
-    let head_end = match find_head_end(buf) {
-        Some(e) => e,
+///
+/// ⭐ 审计 P3 (2026-10-17): `scanned` 是 caller 跨次调用保留的"已扫字节数"
+/// (同一请求的数据分多次 recv 到达时避免整片重扫 → O(n²) → O(n)).
+/// 语义: 只从 `scanned.saturating_sub(3)` 起找 `\r\n\r\n` (回退 3B 防
+/// 边界漏检); 请求消费/出错后 caller 应把它重置为 0.
+pub fn parse_request(
+    buf: &[u8],
+    scanned: &mut usize,
+) -> Result<Option<(usize, HttpRequest)>, HttpParseError> {
+    // 找头部终结 \r\n\r\n (从上轮已扫位置继续, 不整片重扫)
+    let from = scanned.saturating_sub(3);
+    let head_end = match find_head_end(&buf[from..]) {
+        Some(e) => e + from,
         None => {
             if buf.len() > MAX_HEAD_BYTES {
                 return Err((431, "request header too large"));
             }
+            // 记录已扫进度: 下次只扫新增字节
+            *scanned = buf.len();
             return Ok(None);
         }
     };
@@ -121,8 +132,20 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(usize, HttpRequest)>, HttpPar
     )))
 }
 
+/// 在 `buf` 中找 `\r\n\r\n` 的起始偏移 (手写紧扫描, 免 windows 切片构造).
 fn find_head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+    if buf.len() < 4 {
+        return None;
+    }
+    let last = buf.len() - 3;
+    let mut i = 0usize;
+    while i < last {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// query 串取参 (`db=x&y=z` → 首个匹配值, 未 percent-decode 的简单键值).
@@ -290,9 +313,12 @@ mod tests {
         let full = b"GET /v1/kv/t/k?db=app HTTP/1.1\r\nHost: x\r\nOrigin: http://a.b\r\n\r\n";
         // 不完整 → None
         for cut in [0, 5, full.len() - 1] {
-            assert!(parse_request(&full[..cut]).unwrap().is_none(), "cut={cut}");
+            assert!(
+                parse_request(&full[..cut], &mut 0).unwrap().is_none(),
+                "cut={cut}"
+            );
         }
-        let (n, req) = parse_request(full).unwrap().unwrap();
+        let (n, req) = parse_request(full, &mut 0).unwrap().unwrap();
         assert_eq!(n, full.len());
         assert_eq!(
             (req.method.as_str(), req.path.as_str()),
@@ -309,10 +335,14 @@ mod tests {
         let mut buf = r1.to_vec();
         buf.extend_from_slice(b"GET /v1/status HTTP/1.1\r\nConnection: close\r\n\r\n");
         // body 未到齐 → None
-        assert!(parse_request(&r1[..r1.len() - 1]).unwrap().is_none());
-        let (n1, req1) = parse_request(&buf).unwrap().unwrap();
+        assert!(
+            parse_request(&r1[..r1.len() - 1], &mut 0)
+                .unwrap()
+                .is_none()
+        );
+        let (n1, req1) = parse_request(&buf, &mut 0).unwrap().unwrap();
         assert_eq!(req1.body, b"hello");
-        let (_, req2) = parse_request(&buf[n1..]).unwrap().unwrap();
+        let (_, req2) = parse_request(&buf[n1..], &mut 0).unwrap().unwrap();
         assert_eq!(req2.path, "/v1/status");
         assert!(!req2.keep_alive);
     }
@@ -322,19 +352,24 @@ mod tests {
         // 头超限
         let mut huge = b"GET / HTTP/1.1\r\nX: ".to_vec();
         huge.extend(std::iter::repeat_n(b'a', MAX_HEAD_BYTES + 1));
-        assert_eq!(parse_request(&huge).unwrap_err().0, 431);
+        assert_eq!(parse_request(&huge, &mut 0).unwrap_err().0, 431);
         // body 超限
         let big = format!(
             "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY_BYTES + 1
         );
-        assert_eq!(parse_request(big.as_bytes()).unwrap_err().0, 413);
+        assert_eq!(parse_request(big.as_bytes(), &mut 0).unwrap_err().0, 413);
         // chunked 拒绝
         let ch = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert_eq!(parse_request(ch).unwrap_err().0, 501);
+        assert_eq!(parse_request(ch, &mut 0).unwrap_err().0, 501);
         // 畸形
-        assert_eq!(parse_request(b"BAD\r\n\r\n").unwrap_err().0, 400);
-        assert_eq!(parse_request(b"GET / HTTP/2.0\r\n\r\n").unwrap_err().0, 505);
+        assert_eq!(parse_request(b"BAD\r\n\r\n", &mut 0).unwrap_err().0, 400);
+        assert_eq!(
+            parse_request(b"GET / HTTP/2.0\r\n\r\n", &mut 0)
+                .unwrap_err()
+                .0,
+            505
+        );
     }
 
     #[test]

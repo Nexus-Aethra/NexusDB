@@ -182,11 +182,12 @@ pub struct InternalItemPtr<'a> {
 impl<'a> InternalItemPtr<'a> {
     pub fn new(page: &'a [u8], off: usize) -> Result<Self, PageError> {
         let (item, n) = decode_item(page, off, ItemKind::Internal)?;
-        debug_assert_eq!(
-            item.shared_prefix_len, 0,
-            "InternalItemPtr::new called on item with shared_prefix_len={}, must be shared=0",
-            item.shared_prefix_len
-        );
+        // ⭐ 审计 C3 残留 (2026-10-17): 与 ItemPtr::new / LeafItemPtr::new 对齐 —
+        // 段首/新游标必须 shared=0, 否则 cur_key 缺公共前缀且**无声出错**.
+        // 旧实现这里只有 debug_assert (release 失效), 是同一修复漏掉的第三处.
+        if item.shared_prefix_len != 0 {
+            return Err(PageError::NotSegmentHead(item.shared_prefix_len));
+        }
         Ok(Self {
             child_vpid: item.child_vpid,
             inner: ItemPtr {
@@ -287,5 +288,44 @@ mod tests {
                 assert!(ptr.is_none(), "next() should yield None at last i");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod c3_residual_tests {
+    use super::*;
+    use crate::header::PAGE_HEADER_SIZE;
+    use crate::internal::{internal_insert, internal_new};
+
+    /// ⭐ 审计 C3 残留 (2026-10-17): `InternalItemPtr::new` 对非段首
+    /// (shared != 0) 的 item 必须返回硬错误 — 旧实现只有 debug_assert,
+    /// release 下校验失效 (与 ItemPtr::new / LeafItemPtr::new 不对称).
+    #[test]
+    fn internal_item_ptr_rejects_non_segment_head() {
+        let mut page = internal_new();
+        internal_insert(&mut page, b"aaa", 10).unwrap();
+        internal_insert(&mut page, b"aab", 11).unwrap();
+        internal_insert(&mut page, b"aac", 12).unwrap();
+
+        // 段首 (shared=0) 正常
+        assert!(InternalItemPtr::new(&page, PAGE_HEADER_SIZE).is_ok());
+
+        // 找到第一个 shared > 0 的 item (与前一项有公共前缀) → 必须 Err
+        let free_off = crate::header::page_free_off(&page) as usize;
+        let mut off = PAGE_HEADER_SIZE;
+        let mut found = false;
+        while off < free_off {
+            let (it, n) = decode_item(&page, off, ItemKind::Internal).unwrap();
+            if it.shared_prefix_len > 0 {
+                match InternalItemPtr::new(&page, off) {
+                    Err(PageError::NotSegmentHead(_)) => {}
+                    other => panic!("非段首 (off={off}) 必须返回 NotSegmentHead, 实际 {other:?}"),
+                }
+                found = true;
+                break;
+            }
+            off += n;
+        }
+        assert!(found, "前置条件: 页中应存在 shared > 0 的 item");
     }
 }
