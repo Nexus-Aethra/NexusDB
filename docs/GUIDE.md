@@ -15,6 +15,8 @@
 8. [Measured Performance](#8-measured-performance)
 9. [Capability Boundaries](#9-capability-boundaries)
 
+> Complete SQL syntax support matrix: [`SQL-FEATURES.md`](./SQL-FEATURES.md)
+
 ---
 
 ## 1. What It Is
@@ -436,7 +438,7 @@ Delivered but with v1 limitations — keep in mind when evaluating/using:
 - **Permissions**: single `sql_password`, no per-user user/role/permission system yet.
 - **TLS**: opt-in; no client-cert mutual auth, no SCRAM channel binding.
 - **Transactions**: single-shard strictly atomic, cross-shard best-effort; DDL rejected inside a transaction.
-- **SQL**: LIKE prefix mode only; aggregates lack GROUP_CONCAT/window functions; remaining subquery gaps (correlated scalar, multi-correlated EXISTS, JOIN-side derived tables); ORDER BY full sort (no top-k).
+- **SQL**: LIKE prefix mode only; aggregates lack GROUP_CONCAT/window functions; remaining subquery gaps (correlated scalar, multi-correlated EXISTS, JOIN-side derived tables); ORDER BY full sort (no top-k). Full syntax support matrix (supported / explicitly rejected / documented trade-offs): [`SQL-FEATURES.md`](./SQL-FEATURES.md).
 - **Constraints**: plain UNIQUE is best-effort on the local shard; use explicit `GLOBAL UNIQUE` for cross-shard uniqueness.
 - **Backup / HA**: no built-in backup/PITR, replication/high-availability yet.
 - **JSON**: text storage, single row < 64KB, no JSON path index.
