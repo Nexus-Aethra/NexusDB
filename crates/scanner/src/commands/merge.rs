@@ -30,33 +30,35 @@ pub fn run<W: Write>(
     mut out: W,
 ) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard =
-        layout
-            .shards
-            .first()
-            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-                path: globals.dir.clone(),
-            })?;
-    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     // Phase 1: collect all key-value pairs from the page pool
+    // ⭐ 审计 P2-新: 遍历全部 shard — vpid 空间 per-shard, 同一 root 在各
+    // shard 各一棵树, 合起来才是全量数据; 相同 pkey 跨 shard 不应出现
+    // (hash 路由), 若出现按后写覆盖 (与 append-only 模型一致).
     let merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let merged_ref = RefCell::new(merged);
     let ok_ref = RefCell::new(0u64);
+    let bad_ref = RefCell::new(0u64);
+    let unread_ref = RefCell::new(0u64);
 
-    let summary = tree::walk_tree_in_order(
-        shard,
-        &locate,
-        tree_root,
-        globals.is_strict(),
-        |key, value| {
-            let mut m = merged_ref.borrow_mut();
-            m.insert(key.to_vec(), value.to_vec());
-            *ok_ref.borrow_mut() += 1;
-        },
-    );
+    for shard in &layout.shards {
+        let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
+        let summary = tree::walk_tree_in_order(
+            shard,
+            &locate,
+            tree_root,
+            globals.is_strict(),
+            |key, value| {
+                let mut m = merged_ref.borrow_mut();
+                m.insert(key.to_vec(), value.to_vec());
+                *ok_ref.borrow_mut() += 1;
+            },
+        );
+        *bad_ref.borrow_mut() += summary.bad;
+        *unread_ref.borrow_mut() += summary.unread;
+    }
 
-    let page_pool_bad = (summary.bad + summary.unread) as u64;
+    let page_pool_bad = bad_ref.into_inner() + unread_ref.into_inner();
     let page_pool_ok = ok_ref.into_inner();
     let mut merged = merged_ref.into_inner();
 
@@ -66,13 +68,15 @@ pub fn run<W: Write>(
     let mut wal_bad: u64 = 0;
 
     if include_wal {
-        // Collect all WAL segments (top-level + per-shard)
+        // Collect all WAL segments (top-level + per-shard, 全部 shard)
         let mut segments = Vec::new();
         for seg in &layout.top_level_wal {
             segments.push(seg);
         }
-        for seg in &shard.wal_segments {
-            segments.push(seg);
+        for shard in &layout.shards {
+            for seg in &shard.wal_segments {
+                segments.push(seg);
+            }
         }
         segments.sort_by_key(|s| (s.shard_id, s.seq));
 

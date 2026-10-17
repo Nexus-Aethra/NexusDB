@@ -18,48 +18,55 @@ use crate::pid::Locate;
 
 pub fn run<W: Write>(globals: &Globals, vpid: u64, neighbors: bool, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard =
-        layout
-            .shards
-            .first()
-            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-                path: globals.dir.clone(),
-            })?;
-    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
-    let coord = locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic)?;
-    let read = page_io::read_page(shard, coord);
+    // ⭐ 审计 P2-新: 遍历全部 shard — vpid 空间 per-shard, 同一 vpid 在各
+    // shard 是不同页; 逐 shard 解码输出 (带 shard 列), 任一 shard 有即有用.
+    // 全部 shard 都读不到才报 bad (与旧单 shard 行为一致的外推).
+    let mut any_ok = false;
+    for shard in &layout.shards {
+        let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
+        let coord = locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic)?;
+        let read = page_io::read_page(shard, coord);
 
-    match read {
-        page_io::PageRead::Ok(buf) => {
-            emit_row(&mut out, globals, vpid, &buf);
-            // ⭐ 审计 P2 (2026-10-17): strict 模式 — 坏页即非零退出 (CI 语义)
-            let r = crate::page_decode::PageReport::decode(&buf, vpid);
-            if let Some(b) = &r.bad {
-                globals.strict_gate(format!("vpid {vpid}: {:?}: {}", b.kind, b.detail))?;
+        match read {
+            page_io::PageRead::Ok(buf) => {
+                any_ok = true;
+                emit_row(&mut out, globals, shard.id, vpid, &buf);
+                // ⭐ 审计 P2 (2026-10-17): strict 模式 — 坏页即非零退出 (CI 语义)
+                let r = crate::page_decode::PageReport::decode(&buf, vpid);
+                if let Some(b) = &r.bad {
+                    globals.strict_gate(format!("vpid {vpid}: {:?}: {}", b.kind, b.detail))?;
+                }
+            }
+            other => {
+                emit_bad(&mut out, globals, shard.id, vpid, &other);
+                globals.strict_gate(format!("vpid {vpid}: unreadable page"))?;
             }
         }
-        other => {
-            emit_bad(&mut out, globals, vpid, &other);
-            globals.strict_gate(format!("vpid {vpid}: unreadable page"))?;
+
+        if neighbors {
+            let neighbor_vpids = compute_neighbor_vpids(vpid);
+            for nvpid in &neighbor_vpids {
+                let ncoord = match locate.resolve(*nvpid, crate::pid::Strategy::MateThenArithmetic)
+                {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let nread = page_io::read_page(shard, ncoord);
+                match nread {
+                    page_io::PageRead::Ok(buf) => {
+                        emit_neighbor_row(&mut out, globals, shard.id, *nvpid, &buf);
+                    }
+                    other => emit_bad(&mut out, globals, shard.id, *nvpid, &other),
+                }
+            }
         }
     }
 
-    if neighbors {
-        let neighbor_vpids = compute_neighbor_vpids(vpid);
-        for nvpid in &neighbor_vpids {
-            let ncoord = match locate.resolve(*nvpid, crate::pid::Strategy::MateThenArithmetic) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let nread = page_io::read_page(shard, ncoord);
-            match nread {
-                page_io::PageRead::Ok(buf) => {
-                    emit_neighbor_row(&mut out, globals, *nvpid, &buf);
-                }
-                other => emit_bad(&mut out, globals, *nvpid, &other),
-            }
-        }
+    if !any_ok && layout.shards.is_empty() {
+        return Err(crate::error::ScannerError::EmptyDirectory {
+            path: globals.dir.clone(),
+        });
     }
 
     Ok(0)
@@ -90,13 +97,14 @@ fn compute_neighbor_vpids(vpid: u64) -> Vec<u64> {
     out
 }
 
-fn emit_row<W: Write>(out: &mut W, globals: &Globals, vpid: u64, buf: &[u8; 16384]) {
+fn emit_row<W: Write>(out: &mut W, globals: &Globals, shard_id: u32, vpid: u64, buf: &[u8; 16384]) {
     let r = crate::page_decode::PageReport::decode(buf, vpid);
     let vpid_str = format_vpid(vpid, globals.hex_vpid);
 
     match globals.output_mode() {
         crate::output::OutputMode::Human => {
             let columns: &[ColumnName] = &[
+                "shard",
                 "vpid",
                 "page_type",
                 "header_vpid",
@@ -114,6 +122,7 @@ fn emit_row<W: Write>(out: &mut W, globals: &Globals, vpid: u64, buf: &[u8; 1638
                 None => "-".to_string(),
             };
             let row = HumanRow::new()
+                .field(shard_id.to_string())
                 .field(vpid_str)
                 .field(format!("{:?}", r.page_type))
                 .field(format!("{}", r.vpid))
@@ -128,6 +137,7 @@ fn emit_row<W: Write>(out: &mut W, globals: &Globals, vpid: u64, buf: &[u8; 1638
         }
         crate::output::OutputMode::Json => {
             let obj = JsonObject::new()
+                .field("shard", shard_id as u64)
                 .field("vpid", vpid)
                 .field("page_type", format!("{:?}", r.page_type))
                 .field("page_type_raw", r.page_type_raw as u64)
@@ -151,7 +161,13 @@ fn emit_row<W: Write>(out: &mut W, globals: &Globals, vpid: u64, buf: &[u8; 1638
     }
 }
 
-fn emit_neighbor_row<W: Write>(out: &mut W, globals: &Globals, vpid: u64, buf: &[u8; 16384]) {
+fn emit_neighbor_row<W: Write>(
+    out: &mut W,
+    globals: &Globals,
+    shard_id: u32,
+    vpid: u64,
+    buf: &[u8; 16384],
+) {
     let r = crate::page_decode::PageReport::decode(buf, vpid);
     let vpid_str = format_vpid(vpid, globals.hex_vpid);
 
@@ -162,6 +178,7 @@ fn emit_neighbor_row<W: Write>(out: &mut W, globals: &Globals, vpid: u64, buf: &
                 None => "-".to_string(),
             };
             let row = HumanRow::new()
+                .field(shard_id.to_string())
                 .field(format!("neighbor vpid={}", vpid_str))
                 .field(format!("{:?}", r.page_type))
                 .field(format!("{}", r.vpid))
@@ -177,6 +194,7 @@ fn emit_neighbor_row<W: Write>(out: &mut W, globals: &Globals, vpid: u64, buf: &
         crate::output::OutputMode::Json => {
             let obj = JsonObject::new()
                 .field("event", "neighbor")
+                .field("shard", shard_id as u64)
                 .field("vpid", vpid)
                 .field("page_type", format!("{:?}", r.page_type))
                 .field("magic_ok", r.magic_ok)
@@ -194,7 +212,13 @@ fn emit_neighbor_row<W: Write>(out: &mut W, globals: &Globals, vpid: u64, buf: &
     }
 }
 
-fn emit_bad<W: Write>(out: &mut W, globals: &Globals, vpid: u64, read: &page_io::PageRead) {
+fn emit_bad<W: Write>(
+    out: &mut W,
+    globals: &Globals,
+    shard_id: u32,
+    vpid: u64,
+    read: &page_io::PageRead,
+) {
     let vpid_str = format_vpid(vpid, globals.hex_vpid);
     let reason = match read {
         page_io::PageRead::BlockFileMissing { file_id } => {
@@ -209,12 +233,14 @@ fn emit_bad<W: Write>(out: &mut W, globals: &Globals, vpid: u64, read: &page_io:
     match globals.output_mode() {
         crate::output::OutputMode::Human => {
             let row = HumanRow::new()
+                .field(format!("shard={shard_id}"))
                 .field(format!("[BAD-PAGE] vpid={}", vpid_str))
                 .field(reason);
             human_row(out, &row).ok();
         }
         crate::output::OutputMode::Json => {
             let obj = JsonObject::new()
+                .field("shard", shard_id as u64)
                 .field("bad", true)
                 .field("kind", "page_read")
                 .field("vpid", vpid)

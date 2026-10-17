@@ -17,14 +17,6 @@ use crate::pid::{Locate, Strategy};
 
 pub fn run<W: Write>(globals: &Globals, tree_root: u64, key_hex: &str, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard =
-        layout
-            .shards
-            .first()
-            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-                path: globals.dir.clone(),
-            })?;
-    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let target_key = match hex::decode(key_hex) {
         Ok(k) => k,
@@ -34,13 +26,35 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, key_hex: &str, mut out: 
         }
     };
 
-    // Navigate from root to the leaf that should contain the key
-    match lookup_key(shard, &locate, tree_root, &target_key, &mut out, globals) {
-        Ok(_) => Ok(0),
-        Err(msg) => {
-            writeln!(&mut out, "{msg}").ok();
-            Ok(1)
+    // ⭐ 审计 P2-新: 遍历全部 shard — key 按 hash 路由只可能落在其中一个
+    // shard 的树里, 但 scanner 离线无从知道是哪个; 全部搜过以命中为准
+    // (正常 0 或 1 个命中; 多命中全部如实报告, 不静默取第一个).
+    let mut found = 0u32;
+    let mut last_err: Option<String> = None;
+    for shard in &layout.shards {
+        let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
+        match lookup_key(shard, &locate, tree_root, &target_key, &mut out, globals) {
+            Ok(()) => found += 1,
+            Err(msg) => last_err = Some(msg),
         }
+    }
+    if found > 0 {
+        Ok(0)
+    } else {
+        match last_err {
+            Some(msg) => {
+                writeln!(&mut out, "{msg}").ok();
+            }
+            None => {
+                writeln!(
+                    &mut out,
+                    "lookup: key {} not found in any shard",
+                    hex::encode(target_key)
+                )
+                .ok();
+            }
+        }
+        Ok(1)
     }
 }
 
@@ -140,6 +154,7 @@ fn lookup_key<W: Write>(
                                 match globals.output_mode() {
                                     output::OutputMode::Human => {
                                         let row = HumanRow::new()
+                                            .field(shard.id.to_string())
                                             .field(current_vpid.to_string())
                                             .field(item_idx.to_string())
                                             .field(&key_hex)
@@ -148,6 +163,7 @@ fn lookup_key<W: Write>(
                                     }
                                     output::OutputMode::Json => {
                                         let obj = JsonObject::new()
+                                            .field("shard", JsonValue::U64(shard.id as u64))
                                             .field("vpid", JsonValue::U64(current_vpid))
                                             .field("item_idx", JsonValue::U64(item_idx as u64))
                                             .field("key", JsonValue::Str(key_hex))

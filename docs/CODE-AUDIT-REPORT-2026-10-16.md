@@ -303,7 +303,7 @@
 | P0-4 | ⚠️ 部分修复（①②③） | ✅ 已修：外网 IP 告警补全 + Binary 协议 `auth_password: None` 不再硬编码绕过 | `c949ec7` |
 | P1-2 | ❌ 路由无 affinity | ⚪ **文档化**：DESIGN.md 改为"未实现"并说明留作性能项；功能正确性不依赖绑核 | `6616b45` |
 | P1-3 | ❌ CHECK 静默丢弃 | ✅ 已修：保留既有迁移兼容（仍吞表达式）但每条 CHECK 打 WARN，"静默"→"显式" | `d104723` |
-| P1-4 | ❌ FK 缓存 miss 静默跳过 | 🔴 **未修**（见 5.6） | — |
+| P1-4 | ❌ FK 缓存 miss 静默跳过 | ✅ 已修：父表 DELETE 前置 RESTRICT 预检 (sql_fk_restr.rs)；另修 cascade NoAction 永挂 | PR #12 (`4bb2127`) |
 | P1-6 | ❌ block_on_io 自旋 | ✅ 已修：核实为有界退避（64 轮 spin + yield），抽出 `BLOCK_ON_SPIN_ROUNDS` 常量并写明契约 | `be95b5e` |
 | P2-1 | ❌ 复合索引退化全表 | 🔴 **未修**（见 5.6） | — |
 | P2-4 | ⚠️ 协程 worker TLS 半修 | ✅ 已修：协程分支补齐 TLS 升级处理 | `5ee4496` |
@@ -380,24 +380,46 @@
 
 未修：协议分派 match 重复两处（P3-3，见 5.6）、错误分类靠字符串匹配（P3-5/P3-6，见 5.6）。
 
-### 5.6 🔴 仍未解决（6 项 + 文档化边界）
+### 5.6 🔴 仍未解决（5 项 + 文档化边界）
 
 | # | 问题 | 位置 | 为什么还没修 |
 |---|---|---|---|
-| **P1-4** | FK 对 DELETE/UPDATE 无 RESTRICT 检查 | `sql_fk.rs` 仅被 `sql_dml.rs:195`（INSERT 路径）调用 | 需新功能：父行删改前反查引用表，跨 shard 需父→子反向索引 |
 | **P2-1** | 复合索引退化全表 | `sql_dispatch.rs:1101` `if idx.cols.len() != 1 { continue; }` | 需扩展 ScanPred 支持多列前缀匹配 |
 | **P2-6** | `JoinInner` UnsafeCell + `unsafe impl<T: Send> Send` | `scheduler/src/task.rs:62-71` | 跨线程 poll 竞争；需设计改 Arc/Mutex 或显式 `!Send`，牵涉 JoinHandle 公共 API |
-| **P2-新** | **scanner 14 个命令全部 `shards.first()`，默认 6 shard 只救 1/6 数据** | `commands/{export,lookup,verify,map,dbs,rescue,header,range,blame,export_force,fix_mate,rescue_json,vpid,wal_*}.rs` | 需遍历全部 shard 合并结果；输出格式与 exit code 语义需重新设计 |
 | **P2** | flush_uring 忙轮询 | `logging/src/lib.rs:344` `drive_until_idle(256)` 自旋等写盘完成 | 仅在写盘期间自旋（非空闲期），影响有限，需引入完成通知机制 |
 | **P3-3** | 协议分派 match 在 worker_epoll / worker_coro 重复两处 | `worker_epoll.rs:231,318` vs `worker_coro.rs:343` | 两处生命周期/借用结构不同，抽取公共层需重构 |
 | **P3-5/6** | 错误分类 / SQLSTATE 靠字符串匹配 | `worker/protocol_io.rs:331-348`、`worker/sql_eval.rs:628-667` | 需引入结构化错误码类型，改动面覆盖全部错误产生点 |
+
+**已解决（2026-10-17 晚，PR #12 与本分支）**：
+
+| # | 问题 | 修复 | commit |
+|---|---|---|---|
+| P1-4 | FK 对 DELETE 无 RESTRICT 检查 | 新 `sql_fk_restr.rs` 预检状态机 (PkGet Redispatch / 两阶段 Phase2 双挂点); cascade_kickoff 只对 Cascade/SetNull 进延迟 (修 NoAction 永挂); 错误映射 1451/23503/409 | PR #12 (`4bb2127`) |
+| P2-新 | scanner 14 命令全部 `shards.first()` | 全命令遍历全部 shard 合并 (见 5.8); fix-mate 多 shard 必须 `--shard` | 本分支 |
+| (附带) | scanner `decode_meta_page` 格式漂移 | MetaPage item 区起点 40 → 1064 (引擎 T12.14 resolver 段 1KiB); 旧实现在现代引擎目录上把 resolver 段当 item 解, dbs/export/lookup/verify 全不可用 | 本分支 |
 
 **文档化边界**（已在 `SQL-FEATURES.md` / `DESIGN.md` / `AGENTS.md` 显式标注，非缺陷）：JOIN gather 读不入 OCC 读集、跨 shard COMMIT best-effort、不防幻读、Binary 协议无认证、CPU 亲和未实现。
 
 ### 5.7 建议修复顺序（更新）
 
-1. **P2-新 scanner 单 shard** —— 数据救援工具只救 1/6 数据，是"静默丢数据"家族在工具链的残留，且修复路径清晰（遍历 + 合并）。
-2. **P1-4 FK RESTRICT** —— 引用完整性缺口，直接影响数据正确性。
+1. ~~**P2-新 scanner 单 shard**~~ ✅ 已修 (本分支, 含附带 meta 解码漂移修复).
+2. ~~**P1-4 FK RESTRICT**~~ ✅ 已修 (PR #12).
+3. **P2-1 复合索引退化全表** — 正确性优先 (索引查不全 = 静默错数据); 需扩展 ScanPred 多列前缀匹配.
+4. **P2-6 JoinInner Send 安全** — 跨线程 poll 竞争, 需设计决策 (Arc/Mutex vs !Send).
+
+### 5.8 P2-新 修复明细 (scanner 多 shard, 2026-10-17)
+
+问题: 14 个命令全部取 `layout.shards.first()` — 多 shard 目录 (引擎默认 6 shard) 下其余 shard 的表与数据对 scanner 完全不可见, 救援只救 1/N 且无任何提示; `fix-mate` 更会静默修错 shard 的 `page.mate`.
+
+修复 (语义按命令类别):
+- **整库类** (dbs/verify/rescue/map/export/merge/lookup/blame): 遍历全部 shard — vpid 空间 per-shard, 同一 root_vpid 在各 shard 各是一棵树, 合起来才是全量; 诊断输出加 `shard` 列/字段, 坏页计数跨 shard 汇总, strict 门禁任一 shard 触发即非零退出.
+- **数据流类** (export/merge): 输出流保持既有可重导入格式 (key 跨 shard 不相交, 直接拼接); merge 跨 shard 合入同一 BTreeMap 后再放 WAL 重放.
+- **暴力扫类** (export-force/rescue-json): 跨 shard 合并去重 (相同 pkey 后写覆盖, 与 append-only 模型一致), 统计聚合.
+- **单页类** (header/vpid/range): 逐 shard 解码输出 (同一 vpid 在各 shard 是不同页); 全部 shard 读不到才报 bad.
+- **写盘类** (fix-mate): 多 shard 目录必须 `--shard <id>` 显式指定, 否则显式报错列出可用 shard — 消除"静默修错 shard"的修复工具写坏元数据路径.
+- wal-list/wal-dump 本就已遍历全部 shard 的 WAL 段, 无需改动.
+
+验证: `crates/scanner/tests/multishard_rescue.rs` — 真实引擎 3-shard 目录 (ShardManager 落盘 + close flush) 端到端跑 scanner 二进制: export-force/export 全 30 键、dbs/verify/header/map 三 shard 全覆盖、lookup 命中非 shard_0 的键、fix-mate 多 shard 拒猜、单 shard 目录行为不变; 反向验证 (stash src 后) 8/9 必败.
 3. **P2-1 复合索引** —— 影响面是性能，但复合 UNIQUE 建成却用不上属于功能失效。
 4. **P3-5/6 错误分类结构化** —— 收敛字符串匹配，为后续所有错误路径打基础。
 5. **P2-6 / P3-3 / flush_uring** —— 需设计权衡，排最后。

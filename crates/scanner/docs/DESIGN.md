@@ -456,9 +456,16 @@ figuring out *why* the engine refused to open it.
   expected to stop it first.
 - Performance work. Single-digit-millisecond responses on the 21 MB case
   study are the target; we explicitly do not need to hit those targets.
-- Per-shard routing. The 21 MB case study lives in `default\shard_0`. The
+- Per-shard routing. ~~The 21 MB case study lives in `default\shard_0`. The
   scanner assumes a single shard for v1; multi-shard is a future PR if and
-  when someone files an incident requiring it.
+  when someone files an incident requiring it.~~
+  **更新 (审计 P2-新, 2026-10-17)**: 全部命令已遍历所有 shard 并合并结果 —
+  旧实现只读 `shards.first()`, 多 shard 目录 (引擎默认 6 shard) 下 5/6 的
+  数据对 scanner 不可见 (静默降级). vpid 空间是 per-shard 的: 同一 root_vpid
+  在每个 shard 各是一棵树, 遍历全部 shard 才是全量; `fix-mate` (唯一写盘
+  命令) 改为多 shard 目录必须 `--shard <id>` 显式指定, 不再静默修 shard_0.
+  回归: `crates/scanner/tests/multishard_rescue.rs` (真实引擎 3-shard 目录
+  端到端, 修复前 8/9 必败).
 
 ---
 

@@ -137,15 +137,27 @@ fn read_varint_u32(buf: &[u8]) -> Option<(u32, usize)> {
 
 pub fn run<W: Write>(globals: &Globals, format: ExportForceFormat, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard =
-        layout
-            .shards
-            .first()
-            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-                path: globals.dir.clone(),
-            })?;
 
-    let (merged, stats) = scan_all_blocks(shard);
+    // ⭐ 审计 P2-新: 遍历全部 shard 暴力扫 (旧实现只扫 shards.first() —
+    // 默认 6 shard 只救 1/6 数据, 且无任何提示). 相同 pkey 跨 shard 不应
+    // 出现 (hash 路由); 若出现按后写覆盖, 与引擎 append-only 模型一致.
+    let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut stats = ScanStats {
+        scanned: 0,
+        bad: 0,
+        leaf: 0,
+        decoded: 0,
+    };
+    for shard in &layout.shards {
+        let (m, s) = scan_all_blocks(shard);
+        for (k, v) in m {
+            merged.insert(k, v);
+        }
+        stats.scanned += s.scanned;
+        stats.bad += s.bad;
+        stats.leaf += s.leaf;
+        stats.decoded += s.decoded;
+    }
     let row_count = merged.len() as u64;
 
     let mut emitted = 0u64;

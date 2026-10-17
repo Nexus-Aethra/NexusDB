@@ -23,40 +23,46 @@ pub fn run<W: Write>(
     mut out: W,
 ) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard =
-        layout
-            .shards
-            .first()
-            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-                path: globals.dir.clone(),
-            })?;
-    let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
-    if let Some(root) = tree_root {
-        blame_in_tree(&mut out, globals, shard, &locate, bad_vpid, root);
-    } else {
-        // Discover all trees via dbs, then search each one.
-        let meta_table_dir = read_meta_page(shard, &locate);
-        if let Some(dbs) = meta_table_dir {
-            for (db, table_dir_vpid) in &dbs {
-                let table_dir = read_table_dir(shard, &locate, *table_dir_vpid);
-                if let Some(tables) = table_dir {
-                    for (table, root_vpid) in &tables {
-                        let r = bfs_travel_path(shard, &locate, *root_vpid, |n| n.vpid == bad_vpid);
-                        if r.matched.is_some() {
-                            writeln!(
-                                &mut out,
-                                "Found bad vpid={} in db={} table={} root_vpid={}",
-                                bad_vpid, db, table, root_vpid
-                            )
-                            .ok();
-                            emit_blame_report(&mut out, globals, &r, bad_vpid, *root_vpid);
-                            return Ok(0);
+    // ⭐ 审计 P2-新: 遍历全部 shard — vpid 空间 per-shard, 同一 vpid 在各
+    // shard 是不同页; 每个 shard 独立定位/搜索, 命中全部报告 (带 shard).
+    let mut found_any = false;
+    for shard in &layout.shards {
+        let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
+        if let Some(root) = tree_root {
+            if blame_in_tree(&mut out, globals, shard, &locate, bad_vpid, root) {
+                found_any = true;
+            }
+        } else {
+            // Discover all trees via dbs, then search each one.
+            let meta_table_dir = read_meta_page(shard, &locate);
+            if let Some(dbs) = meta_table_dir {
+                for (db, table_dir_vpid) in &dbs {
+                    let table_dir = read_table_dir(shard, &locate, *table_dir_vpid);
+                    if let Some(tables) = table_dir {
+                        for (table, root_vpid) in &tables {
+                            let r =
+                                bfs_travel_path(shard, &locate, *root_vpid, |n| n.vpid == bad_vpid);
+                            if r.matched.is_some() {
+                                writeln!(
+                                    &mut out,
+                                    "Found bad vpid={} in shard={} db={} table={} root_vpid={}",
+                                    bad_vpid, shard.id, db, table, root_vpid
+                                )
+                                .ok();
+                                emit_blame_report(
+                                    &mut out, globals, shard.id, &r, bad_vpid, *root_vpid,
+                                );
+                                found_any = true;
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    if !found_any {
         writeln!(
             &mut out,
             "bad vpid={} was not found in any recognisable tree",
@@ -75,23 +81,19 @@ fn blame_in_tree<W: Write>(
     locate: &Locate,
     bad_vpid: u64,
     root_vpid: u64,
-) {
+) -> bool {
     let r = bfs_travel_path(shard, locate, root_vpid, |n| n.vpid == bad_vpid);
     if r.matched.is_none() {
-        writeln!(
-            out,
-            "bad vpid={} is not reachable from tree root_vpid={}",
-            bad_vpid, root_vpid
-        )
-        .ok();
-        return;
+        return false;
     }
-    emit_blame_report(out, globals, &r, bad_vpid, root_vpid);
+    emit_blame_report(out, globals, shard.id, &r, bad_vpid, root_vpid);
+    true
 }
 
 fn emit_blame_report<W: Write>(
     out: &mut W,
     globals: &Globals,
+    shard_id: u32,
     r: &BfsResult,
     bad_vpid: u64,
     root_vpid: u64,
@@ -102,6 +104,7 @@ fn emit_blame_report<W: Write>(
     match globals.output_mode() {
         crate::output::OutputMode::Human => {
             writeln!(out, "=== Blame report for vpid {} ===", vpid_str).ok();
+            writeln!(out, "  shard: {}", shard_id).ok();
             writeln!(out, "  root_vpid: {}", root_str).ok();
             writeln!(out, "  tree depth: {}", r.trail.len()).ok();
             writeln!(out, "  pages visited during search: {}", r.visited).ok();
@@ -133,6 +136,7 @@ fn emit_blame_report<W: Write>(
                 .collect();
             let obj = JsonObject::new()
                 .field("event", "blame_report")
+                .field("shard", shard_id as u64)
                 .field("bad_vpid", bad_vpid)
                 .field("root_vpid", root_vpid)
                 .field("tree_depth", r.trail.len() as u64)

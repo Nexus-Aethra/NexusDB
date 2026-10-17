@@ -72,6 +72,7 @@ pub fn run<W: Write>(
     freed: bool,
     auto: bool,
     apply: bool,
+    shard_sel: Option<u32>,
     mut out: W,
 ) -> Result<u8> {
     // Validate flag combination.
@@ -106,12 +107,34 @@ pub fn run<W: Write>(
     };
 
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    // ⭐ 审计 P2-新: page.mate 是 per-shard 的 — 旧实现固定 shards.first()
+    // (= shard_0), 多 shard 目录下会静默修错 shard 的 mate. 现在: 单 shard
+    // 目录沿用旧行为; 多 shard 必须 --shard 显式指定 (修错数据的代价 >> 多
+    // 打一个参数).
+    let shard = match shard_sel {
+        Some(id) => layout.shards.iter().find(|s| s.id == id).ok_or_else(|| {
+            ScannerError::InvalidFlags(format!(
+                "shard {} not found; available: {:?}",
+                id,
+                layout.shards.iter().map(|s| s.id).collect::<Vec<_>>()
+            ))
+        })?,
+        None => {
+            if layout.shards.len() > 1 {
+                return Err(ScannerError::InvalidFlags(format!(
+                    "data dir has {} shards; page.mate is per-shard — specify --shard <id> (available: {:?})",
+                    layout.shards.len(),
+                    layout.shards.iter().map(|s| s.id).collect::<Vec<_>>()
+                )));
+            }
+            layout
+                .shards
+                .first()
+                .ok_or_else(|| ScannerError::EmptyDirectory {
+                    path: globals.dir.clone(),
+                })?
+        }
+    };
     let mate_path = shard
         .page_mate
         .clone()
