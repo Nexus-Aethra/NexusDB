@@ -218,7 +218,10 @@ fn try_bulk_leaf_split(left: &mut [u8; PAGE_SIZE], right: &mut [u8; PAGE_SIZE]) 
             first_item.shared_prefix_len, first_item.key_unshared_len
         );
     }
-    let mut first_buf = [0u8; PAGE_SIZE];
+    // ⭐ 审计 P3 (2026-10-17): 16KB 栈缓冲改堆分配 — try_bulk_leaf_split 在
+    // 深层 async 调用链里, 每个 16KB 栈帧在深链上叠加曾把默认 8MB 栈打爆
+    // (SIGABRT). 堆分配 (vec) 后栈上只剩 Vec 头.
+    let mut first_buf = vec![0u8; PAGE_SIZE];
     let first_encoded_n =
         encode_leaf_item(&mut first_buf, &[], &split_key, first_item.value).ok()?;
     right[write_start..write_start + first_encoded_n]

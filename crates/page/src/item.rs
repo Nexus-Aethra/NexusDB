@@ -226,17 +226,21 @@ pub fn encode_internal_item(
     Ok(pos)
 }
 
-/// 计算 leaf item 编码所需字节数 (不含写入).
+// ⭐ 审计 P3: 以下 4 个尺寸 helper 显式标注 dead_code (取代 crate 级豁免) —
+// 属于对外 API 面 (调用方预估空间用), storage 当前走自身估算; 保留以便后续接线.
+#[allow(dead_code)]
 pub fn leaf_item_encoded_size(key_unique_len: usize, value_len: usize, vint_extra: usize) -> usize {
     4 + key_unique_len + vint_extra + value_len
 }
 
 /// leaf item 在编码后总字节数 (含 varint).
+#[allow(dead_code)]
 pub fn leaf_item_size(key_unique_len: usize, value_len: usize) -> usize {
     4 + key_unique_len + varint_len(value_len as u32) + value_len
 }
 
 /// internal item 编码字节数.
+#[allow(dead_code)]
 pub fn internal_item_size(key_unique_len: usize) -> usize {
     4 + key_unique_len + 8
 }
@@ -251,6 +255,7 @@ pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// varint(vint_len) 最大字节数 — 避免循环依赖.
+#[allow(dead_code)]
 pub fn vint_size(value_len: usize) -> usize {
     if value_len < VARINT_MAX_BYTES * 16 {
         1 // 实际多数场景

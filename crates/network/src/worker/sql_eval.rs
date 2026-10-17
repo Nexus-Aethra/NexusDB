@@ -369,6 +369,13 @@ pub(crate) fn sql_pk_bytes(ty: ColType, v: &ColValue) -> Result<Vec<u8>, String>
             Ok(storage::keyspace::encode_i128_ordered(*x).to_vec())
         }
         (_, ColValue::Null) => Err("PRIMARY KEY must not be NULL".into()),
+        // ⭐ 审计 P3 (2026-10-17): 空串主键给出明确原因 — 空 key 在 LCB-Tree
+        // 里保留给哨兵 item (leaf_insert 拒绝空 key), 不是"随便不支持".
+        (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b))
+            if b.is_empty() =>
+        {
+            Err("PRIMARY KEY must not be an empty string (empty keys are reserved for the btree sentinel)".into())
+        }
         _ => Err("bad PRIMARY KEY value".into()),
     }
 }

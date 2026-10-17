@@ -46,6 +46,10 @@ pub fn pre_merge_segment(idx: &mut PageIndex, seg_idx: usize) -> Result<bool, Pa
 /// 流程:
 /// 1. 检查 left < MIN, has_right_neighbor, right_count > need
 /// 2. left.item_count = MIN, right.item_count -= need
+// ⭐ 审计 P3: 显式标注 dead_code (取代 crate 级 #![allow(dead_code)] 豁免) —
+// steal (向邻居借项) 合并策略的逻辑版, 尚未接线到 storage; 与
+// `pre_merge_segment` 成对保留, 便于后续启用.
+#[allow(dead_code)]
 pub fn pre_merge_segment_steal(idx: &mut PageIndex, seg_idx: usize) -> Result<bool, PageError> {
     use crate::checkpoint::MIN_PER_CHECKPOINT;
 

@@ -309,7 +309,10 @@ pub(crate) struct PreSplitPlan {
 /// k+1 重写计划: shared 基准从"旧 mid 压缩表示"换成 `mid_full_key` 后的重编码.
 #[derive(Debug)]
 pub(crate) struct K1Plan {
-    /// k+1 在**原页** (mid 移位前) 中的偏移 — 解码与取旧长度用
+    // k+1 在**原页** (mid 移位前) 中的偏移 — 解码与取旧长度用
+    // (审计 P3: 显式标注 dead_code 取代 crate 级豁免; 计划结构为后续
+    //  pre_split 演进预留, 当前消费方只用 k1_off/k1_old_n/k1_buf/delta)
+    #[allow(dead_code)]
     pub k1_off_orig: usize,
     /// k+1 在 mid 落地后的新偏移 (写入目标)
     pub k1_off: usize,

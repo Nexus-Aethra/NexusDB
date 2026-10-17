@@ -608,3 +608,22 @@ mod tests {
         let _ = out;
     }
 }
+
+#[cfg(test)]
+mod dump_bounds {
+    use super::*;
+    use crate::header::{PAGE_SIZE, page_init_header, page_set_free_off, page_set_key_count};
+
+    /// ⭐ 审计 P3 (2026-10-17): free_off 越界 (大于页长) 时 dump 不得 panic
+    /// (scanner 对损坏页的 dump 路径; 旧实现有未收敛的切片风险).
+    #[test]
+    fn dump_tolerates_out_of_range_free_off() {
+        let mut page = [0u8; PAGE_SIZE];
+        page_init_header(&mut page, PageType::Leaf);
+        page_set_free_off(&mut page, u16::MAX); // 远超页长
+        page_set_key_count(&mut page, 3);
+        // 不得 panic; 产出文本即可 (内容允许是错误提示)
+        let text = dump_leaf_page(&page);
+        assert!(!text.is_empty(), "dump 应产出文本");
+    }
+}

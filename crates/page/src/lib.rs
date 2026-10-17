@@ -45,8 +45,6 @@
 //! | 分裂       | `leaf_split`, `internal_split` |
 //! | 校验       | `page_validate_checksum`, `page_set_checksum` |
 
-#![allow(dead_code)]
-
 mod checkpoint;
 pub mod debug;
 pub mod dump;
