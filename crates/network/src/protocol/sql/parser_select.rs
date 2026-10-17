@@ -608,6 +608,20 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 }
                 let alias = parse_col_alias(p);
                 items.push(SelectItem::Expr { expr, alias });
+            } else if matches!(
+                name.to_ascii_uppercase().as_str(),
+                "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP"
+            ) {
+                // ⭐ 审计 P3 (2026-10-17): PG 里 CURRENT_DATE/CURRENT_TIME/
+                // CURRENT_TIMESTAMP 是**关键字** (无括号), 旧实现只认带括号的
+                // 函数调用 → 这三个名字被当列名解析, 顶层 SELECT 直接报
+                // "unexpected end of statement" (连语法都不通), 且语义上也与
+                // NOW 混同. 这里按无括号标量函数处理 (别名仍消费掉:
+                // PG `SELECT CURRENT_DATE AS d`, 但 ScalarFn 无 alias 字段).
+                let _ = parse_col_alias(p);
+                items.push(SelectItem::ScalarFn {
+                    name: name.to_ascii_lowercase(),
+                });
             } else {
                 let alias = parse_col_alias(p);
                 items.push(SelectItem::Col { name, alias });

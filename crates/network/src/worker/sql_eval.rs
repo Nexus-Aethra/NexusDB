@@ -53,16 +53,28 @@ pub(crate) fn scalar_fn_const_row(items: &[sql::SelectItem]) -> Result<ScalarCon
     let mut row: Vec<ColValue> = Vec::with_capacity(items.len());
     for it in items {
         if let sql::SelectItem::ScalarFn { name } = it {
+            // ⭐ 审计 P3 (2026-10-17): CURRENT_DATE / CURRENT_TIME 语义修正.
+            // 旧实现四个名字一律返回"当前时刻微秒"且列名都叫 "now" — DATE 拿到
+            // 带时分秒的值, TIME 拿到带日期的值, 客户端按类型渲染出来全是错的.
+            // 现在: DATE = 当日零点 (UTC), TIME = 当日午夜以来的微秒, 列名与
+            // 函数名一致 (PG 行为). 存储仍是 i64 微秒 (Timestamp 承载).
+            const DAY_US: i64 = 86_400_000_000;
             match name.to_ascii_uppercase().as_str() {
-                "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" => {
+                "NOW" => {
                     cref.push(("now", ColType::Timestamp));
-                    // Timestamp 以 i64 微秒承载
-                    row.push(ColValue::I64(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as i64)
-                            .unwrap_or(0),
-                    ));
+                    row.push(ColValue::I64(now_micros()));
+                }
+                "CURRENT_TIMESTAMP" => {
+                    cref.push(("current_timestamp", ColType::Timestamp));
+                    row.push(ColValue::I64(now_micros()));
+                }
+                "CURRENT_DATE" => {
+                    cref.push(("current_date", ColType::Timestamp));
+                    row.push(ColValue::I64(now_micros().div_euclid(DAY_US) * DAY_US));
+                }
+                "CURRENT_TIME" => {
+                    cref.push(("current_time", ColType::Timestamp));
+                    row.push(ColValue::I64(now_micros().rem_euclid(DAY_US)));
                 }
                 other => return Err(format!("unknown scalar function '{other}'")),
             }
@@ -180,10 +192,16 @@ pub(crate) fn eval_col_default(
     Ok(match d {
         storage::schema::ColDefault::Lit(v) => v.clone(),
         storage::schema::ColDefault::Now => ColValue::I64(now_micros()),
+        // ⭐ 审计 P3 (2026-10-17): 非 UUID 列上的 uuid_generate_v4() 显式报错.
+        // 旧实现注释写"保守报错"却实际静默产 16B Bytes — 落进 Str/Int 列后
+        // 要么被当二进制垃圾存下来, 要么后续比较恒不等 (静默错数据).
         storage::schema::ColDefault::UuidGenV4 => match ty {
             ColType::Uuid => ColValue::Bytes(uuid_v4_bytes()),
-            // 非 UUID 列上的 uuid_generate_v4() → 也产 16B 文本? 保守报错
-            _ => ColValue::Bytes(uuid_v4_bytes()),
+            _ => {
+                return Err(format!(
+                    "uuid_generate_v4() default is only valid on UUID columns (got {ty:?})"
+                ));
+            }
         },
         // ⭐ PG 兼容 (portal): SERIAL/BIGSERIAL → 进程级单调递增
         storage::schema::ColDefault::Serial => ColValue::I64(next_auto_rowid()),

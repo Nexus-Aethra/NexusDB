@@ -386,7 +386,19 @@ fn sql_dispatch_stmt_inner(
                 .map(|v| {
                     let key = v.rsplit('.').next().unwrap_or(v).to_ascii_lowercase();
                     let val = match key.as_str() {
-                        "transaction_isolation" | "tx_isolation" => "READ-COMMITTED",
+                        // ⭐ 审计 P3 (2026-10-17): 按本连接**实际**隔离级别回答.
+                        // 旧实现恒返 "READ-COMMITTED" — 客户端 (ORM/驱动) 在
+                        // SERIALIZABLE 事务里读到错误等级, 可能据此做错误的重试/
+                        // 缓存决策. 无事务时按会话默认 (RC).
+                        "transaction_isolation" | "tx_isolation" => match conn.txn.as_ref() {
+                            // 四级 SQL 隔离级别在本实现归并为两档 (见 ast::TxnIso):
+                            // RU/RR 分别归并到 RC/Serializable, 故这里按实际档位回答.
+                            Some(t) => match t.iso {
+                                sql::TxnIso::Serializable => "SERIALIZABLE",
+                                sql::TxnIso::ReadCommitted => "READ-COMMITTED",
+                            },
+                            None => "READ-COMMITTED",
+                        },
                         "version" => "8.0.0-nexusdb",
                         "version_comment" => "NexusDB",
                         "sql_mode" => "",

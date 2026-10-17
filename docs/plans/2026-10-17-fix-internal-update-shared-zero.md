@@ -673,3 +673,29 @@ UB**, 而 `unsafe impl Send` 让编译器不再拦它. scheduler 的设计前提
 
 **测试**: workspace 全量串行 **1143 passed / 0 failed** (scheduler 66);
 clippy -D warnings 0; fmt 0.
+
+---
+
+## 附: P3 批次一 — 静默降级/语义失真类 (5 项) — 同批次修复
+
+1. **LIKE `_` 通配符被当字面量** (`parser_where.rs`): 无 `%` 但含 `_` 的模式
+   按字面量等值处理 → 静默空集 (用户以为"没数据"). 现在 `_` (含前缀模式里的
+   `_`) 一律显式报错, 只支持 `abc%` 前缀.
+2. **RETURNING 静默吞掉回 OK** (`parser.rs` INSERT / `parser_where.rs` UPDATE):
+   客户端以为拿到受影响行值, 实际什么都没返回. 现在显式报错.
+3. **`eval_col_default` 非 UUID 列 `uuid_generate_v4()`** (`sql_eval.rs`):
+   注释写"保守报错"实际静默产 16B Bytes (落进 Str/Int 列 = 垃圾数据). 现在
+   显式报错 (UUID 列不受影响).
+4. **CURRENT_DATE/CURRENT_TIME 语义偏差** (`parser_select.rs` + `sql_eval.rs`):
+   旧实现只认**带括号**的函数调用 → 无括号的 PG 关键字 `CURRENT_DATE` /
+   `CURRENT_TIME` 被当列名, 顶层 SELECT 直接语法错; 且四者同返"当前时刻微秒"
+   列名一律 `now`. 现在: 识别无括号关键字 + DATE=当日零点 / TIME=当日午夜以来
+   微秒 / 列名与函数名一致.
+5. **SysVarStub `transaction_isolation` 恒返 READ-COMMITTED** (`sql_dispatch.rs`):
+   客户端在 SERIALIZABLE 事务里读到错误等级. 现在按连接实际隔离级别回答.
+
+**测试**: `mysql_unsupported_syntax_errors_not_silent_ok` (LIKE `_` /
+RETURNING 报错且不污染数据) / `mysql_current_date_time_semantics` (DATE 零点、
+TIME 与 NOW 同时分秒) / `mysql_uuid_default_on_non_uuid_column_errors`
+(非 UUID 列报错, UUID 列可用); network+storage+page 全量串行 917 passed /
+0 failed; clippy 0; fmt 0.

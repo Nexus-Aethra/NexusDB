@@ -1094,11 +1094,10 @@ fn parse_insert(p: &mut P) -> Result<SqlStmt, String> {
             break;
         }
     }
-    // ⭐ compat: 吞 RETURNING ... (v1 不返回受影响行值)
+    // ⭐ 审计 P3 (2026-10-17): RETURNING 显式报错 — 旧实现静默吞掉后回 OK,
+    // 客户端以为拿到了受影响行的值 (实际什么都没返回), 属于"静默降级".
     if p.try_kw("RETURNING") {
-        while !p.peek().is_none() {
-            p.i += 1;
-        }
+        return Err("RETURNING is not supported (v1)".into());
     }
     p.done()?;
     Ok(SqlStmt::Insert { table, cols, rows })

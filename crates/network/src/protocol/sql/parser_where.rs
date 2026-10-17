@@ -266,6 +266,15 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
         let pct = pat.iter().position(|&b| b == b'%');
         match pct {
             None => {
+                // ⭐ 审计 P3 (2026-10-17): 含 `_` 通配符却无 `%` 时, 旧实现按
+                // **字面量等值**处理 → `a_c` 匹配不到任何行 (静默空集), 用户
+                // 以为"没有数据"而不是"这个模式不支持". v1 不支持 `_`, 显式报错.
+                if pat.contains(&b'_') {
+                    return Err(
+                        "LIKE '_' wildcard is not supported (v1: use 'abc%' prefix patterns)"
+                            .into(),
+                    );
+                }
                 conds.push(Cond {
                     col,
                     op: CmpOp::Eq,
@@ -275,6 +284,13 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             }
             Some(i) if i == pat.len() - 1 => {
                 let prefix = pat[..i].to_vec();
+                // 前缀里含 `_` 同样不支持 (字节区间法按字面量比较, 会漏匹配)
+                if prefix.contains(&b'_') {
+                    return Err(
+                        "LIKE '_' wildcard is not supported (v1: use 'abc%' prefix patterns)"
+                            .into(),
+                    );
+                }
                 if prefix.is_empty() {
                     // LIKE '%' = 恒真, 不产条件
                 } else {
@@ -506,11 +522,10 @@ pub(crate) fn parse_update(p: &mut P) -> Result<SqlStmt, String> {
         }
     }
     let conds = parse_where(p)?;
-    // ⭐ compat: 吞 RETURNING ... (v1 不返回受影响行值)
+    // ⭐ 审计 P3 (2026-10-17): RETURNING 显式报错 — 旧实现静默吞掉后回 OK,
+    // 客户端以为拿到了受影响行的值 (实际什么都没返回), 属于"静默降级".
     if p.try_kw("RETURNING") {
-        while !p.peek().is_none() {
-            p.i += 1;
-        }
+        return Err("RETURNING is not supported (v1)".into());
     }
     p.done()?;
     Ok(SqlStmt::Update { table, sets, conds })

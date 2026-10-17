@@ -4540,3 +4540,142 @@ fn mysql_or_on_decimal_indexed_column_stays_correct() {
     server.shutdown().unwrap();
     drop(mgr);
 }
+
+#[test]
+fn tmp_now_probe() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    let r = c.query("SELECT NOW()");
+    eprintln!("PROBE NOW -> {r:?}");
+    let r2 = c.query("SELECT CURRENT_DATE");
+    eprintln!("PROBE CURRENT_DATE -> {r2:?}");
+    let r3 = c.query("SELECT CURRENT_TIME");
+    eprintln!("PROBE CURRENT_TIME -> {r3:?}");
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P3 (2026-10-17): 未实现语法必须显式报错, 禁止静默吞掉回 OK.
+/// - LIKE `_` 通配符 (v1 只支持 `abc%` 前缀)
+/// - RETURNING (v1 不返回受影响行值)
+#[test]
+fn mysql_unsupported_syntax_errors_not_silent_ok() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE u3 (id INT PRIMARY KEY, name TEXT)");
+    c.query("INSERT INTO u3 VALUES (1, 'alice')");
+
+    // LIKE `_` 通配符: 旧实现按字面量等值 → 静默空集
+    let r = c.query("SELECT id FROM u3 WHERE name LIKE 'a_ice'");
+    assert!(
+        matches!(r, QueryResult::Err { .. }),
+        "LIKE '_' 必须显式报错, 实际 {r:?}"
+    );
+    // 前缀模式里的 `_` 同样报错 (字节区间法按字面量比较会漏匹配)
+    let r = c.query("SELECT id FROM u3 WHERE name LIKE 'a_%'");
+    assert!(
+        matches!(r, QueryResult::Err { .. }),
+        "前缀含 '_' 必须显式报错, 实际 {r:?}"
+    );
+    // 支持的前缀模式不受影响
+    assert_eq!(c.ids("SELECT id FROM u3 WHERE name LIKE 'ali%'"), vec!["1"]);
+
+    // RETURNING: 旧实现吞掉回 OK
+    let r = c.query("INSERT INTO u3 VALUES (2, 'bob') RETURNING id");
+    assert!(
+        matches!(r, QueryResult::Err { .. }),
+        "RETURNING 必须显式报错, 实际 {r:?}"
+    );
+    let r = c.query("UPDATE u3 SET name = 'carol' WHERE id = 1 RETURNING id");
+    assert!(
+        matches!(r, QueryResult::Err { .. }),
+        "UPDATE ... RETURNING 必须显式报错, 实际 {r:?}"
+    );
+    // 报错不得污染数据
+    assert_eq!(
+        c.ids("SELECT id FROM u3 ORDER BY id"),
+        vec!["1"],
+        "报错的 INSERT 不得写入"
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P3 (2026-10-17): CURRENT_DATE / CURRENT_TIME 语义修正
+/// (旧实现与 NOW 同值, 列名一律 "now").
+#[test]
+fn mysql_current_date_time_semantics() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+
+    // Timestamp 列按 datetime 文本渲染; 断言语义: DATE 是当天 00:00:00,
+    // TIME 是当天 00:00:00 以来的时刻, NOW 带时分秒.
+    let now = c.query("SELECT NOW()");
+    let QueryResult::Rows(now_rows) = &now else {
+        panic!("expect rows: {now:?}")
+    };
+    let now_s = now_rows[0][0].as_deref().unwrap().to_string();
+
+    let r = c.query("SELECT CURRENT_DATE");
+    let QueryResult::Rows(rows) = &r else {
+        panic!("expect rows: {r:?}")
+    };
+    let date_s = rows[0][0].as_deref().unwrap().to_string();
+    assert!(
+        date_s.ends_with("00:00:00"),
+        "CURRENT_DATE 必须是当天零点: {date_s}"
+    );
+    assert!(
+        now_s.starts_with(date_s.trim_end_matches("00:00:00").trim_end()),
+        "CURRENT_DATE 与 NOW 必须是同一天: {date_s} vs {now_s}"
+    );
+
+    let t = c.query("SELECT CURRENT_TIME");
+    let QueryResult::Rows(t_rows) = &t else {
+        panic!("expect rows: {t:?}")
+    };
+    let time_s = t_rows[0][0].as_deref().unwrap().to_string();
+    assert!(
+        time_s.ends_with(&now_s[now_s.len() - 8..]),
+        "CURRENT_TIME 应与 NOW 同时分秒: {time_s} vs {now_s}"
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P3 (2026-10-17): 非 UUID 列的 uuid_generate_v4() DEFAULT 必须报错
+/// (旧实现注释写"保守报错"实际静默产 16B Bytes).
+#[test]
+fn mysql_uuid_default_on_non_uuid_column_errors() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+    // DDL 本身可建 (默认值在 INSERT 时才求值)
+    assert_eq!(
+        c.query("CREATE TABLE bad (id INT PRIMARY KEY, v TEXT DEFAULT uuid_generate_v4())"),
+        QueryResult::Ok { affected: 0 }
+    );
+    let r = c.query("INSERT INTO bad (id) VALUES (1)");
+    assert!(
+        matches!(r, QueryResult::Err { .. }),
+        "非 UUID 列的 uuid_generate_v4() 求值必须报错, 实际 {r:?}"
+    );
+    // UUID 列上的默认值仍可用
+    assert_eq!(
+        c.query("CREATE TABLE ok (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), v TEXT)"),
+        QueryResult::Ok { affected: 0 }
+    );
+    assert_eq!(
+        c.query("INSERT INTO ok (v) VALUES ('x')"),
+        QueryResult::Ok { affected: 1 },
+        "UUID 列默认值应可用"
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
