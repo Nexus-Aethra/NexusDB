@@ -1510,12 +1510,19 @@ impl ShardManager {
 // shard 线程主函数
 // =====================================================================
 
+/// `block_on_io` 自旋轮数上界 (超过则 yield 让出 CPU).
+pub(crate) const BLOCK_ON_SPIN_ROUNDS: u32 = 64;
+
 /// ⭐ String RMW: INCR/DECR (shard 单线程内天然原子).
 ///
 /// ⭐ 数值原生存储 (N2): 按 tag 分派 —
 /// - TAG_I64: 直接 LE 读 + checked_add → 写回 TAG_I64 (8B 二进制)
 /// - TAG_RAW 十进制文本 (Redis 兼容/存量): parse i64 → **结果升级为 TAG_I64**
 /// - TAG_F64/F32: Redis 语义报 "not an integer"
+///
+/// ⭐ 审计 P1-6 (2026-10-17): 有界自旋 + yield 退避 — 前 BLOCK_ON_SPIN_ROUNDS
+/// 轮 spin_loop (等即将就绪的 io_uring CQE, 省一次线程让出), 之后 yield_now
+/// 让出 CPU (旧版无限自旋会烧满一个核; 现在长等待也只占调度份额, 不独占).
 pub(crate) fn block_on_io<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, Waker};
     let waker = Waker::noop();
@@ -1527,7 +1534,7 @@ pub(crate) fn block_on_io<F: std::future::Future>(fut: F) -> F::Output {
             return v;
         }
         spins += 1;
-        if spins < 64 {
+        if spins < BLOCK_ON_SPIN_ROUNDS {
             std::hint::spin_loop();
         } else {
             std::thread::yield_now();

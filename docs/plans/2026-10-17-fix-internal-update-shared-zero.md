@@ -740,3 +740,17 @@ network 全量串行 250 passed / 0 failed; clippy 0; fmt 0.
 
 **测试**: page+storage+network 全量串行 **763 passed / 0 failed**;
 clippy -D warnings 0; fmt 0.
+
+---
+
+## 附: 旧报告遗留项批次五 (P1-6 block_on_io 自旋) — 同批次修复
+
+**问题** (审计 P1-6): `block_on_io` 用 `Waker::noop` + 自旋等待 io_uring 完成 —
+旧版无限自旋会烧满一个核.
+
+**现状核实 + 收尾**: 代码已是"前 64 轮 `spin_loop` + 之后 `yield_now`"的**有界
+退避** (不会独占核), 但魔法数 64 无名字无说明. 本项抽出
+`BLOCK_ON_SPIN_ROUNDS` 常量并写明退避语义与审计结论 (该告警的"无限自旋"
+在后续改动中已消解, 留下文档化契约).
+
+**测试**: shard_manager 全量串行通过; clippy 0; fmt 0.
