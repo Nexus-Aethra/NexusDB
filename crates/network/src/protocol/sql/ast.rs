@@ -105,6 +105,12 @@ pub enum SelectItem {
     ScalarFn {
         name: String,
     },
+    /// ⭐ 审计 P3 (2026-10-17): 顶层字面量投影 (`SELECT 1` / `SELECT 'a', 2`)
+    /// — 存活探针/驱动初始化常用语句. 常量单行, 无 FROM.
+    Lit {
+        val: SqlValue,
+        alias: Option<String>,
+    },
     /// ⭐ compat: 表达式投影 (JSONB 取字段 j->'a' / j->>'a', v1 仅列+常量键).
     Expr {
         expr: ScalarExpr,
@@ -222,6 +228,7 @@ impl SelectItem {
     pub fn out_name(&self) -> String {
         match self {
             SelectItem::ScalarFn { name } => name.clone(),
+            SelectItem::Lit { val, alias } => alias.clone().unwrap_or_else(|| format!("{val:?}")),
             SelectItem::Col { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
             SelectItem::Agg {
                 func,

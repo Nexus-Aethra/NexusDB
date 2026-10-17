@@ -3,7 +3,8 @@
 
 use super::*;
 
-type ScalarConstRow = (Vec<(&'static str, ColType)>, Vec<ColValue>);
+/// ⭐ 审计 P3: 列名用 `String` (字面量投影的列名由字面量文本生成, 非 'static).
+type ScalarConstRow = (Vec<(String, ColType)>, Vec<ColValue>);
 
 /// ⭐ compat: 表达式投影输出行 — 按 (proj 列号, expr_proj 表达式) 构建单行
 /// 输出 (列定义 + 值). Some(expr) → 求值 (JSONB 取字段, 输出 Str);
@@ -49,9 +50,27 @@ pub(crate) fn project_output_row(
 /// ⭐ compat: 无 FROM 标量函数投影常量单行 (SELECT NOW() 等).
 /// 返回 (列定义, 常量行); 未知函数报错.
 pub(crate) fn scalar_fn_const_row(items: &[sql::SelectItem]) -> Result<ScalarConstRow, String> {
-    let mut cref: Vec<(&str, ColType)> = Vec::with_capacity(items.len());
+    let mut cref: Vec<(String, ColType)> = Vec::with_capacity(items.len());
     let mut row: Vec<ColValue> = Vec::with_capacity(items.len());
     for it in items {
+        if let sql::SelectItem::Lit { val, alias } = it {
+            // ⭐ 审计 P3: 顶层字面量投影 (SELECT 1 / SELECT 'a' AS x).
+            let (ty, cv) = match val {
+                sql::SqlValue::Int(i) => (ColType::I64, ColValue::I64(*i)),
+                sql::SqlValue::Float(f) => (ColType::F64, ColValue::F64(*f)),
+                sql::SqlValue::Str(s) => (ColType::Str, ColValue::Bytes(s.clone())),
+                sql::SqlValue::Null => (ColType::Str, ColValue::Null),
+                other => {
+                    return Err(format!(
+                        "unsupported literal in constant projection: {other:?}"
+                    ));
+                }
+            };
+            let name = alias.clone().unwrap_or_else(|| format!("{val:?}"));
+            cref.push((name, ty));
+            row.push(cv);
+            continue;
+        }
         if let sql::SelectItem::ScalarFn { name } = it {
             // ⭐ 审计 P3 (2026-10-17): CURRENT_DATE / CURRENT_TIME 语义修正.
             // 旧实现四个名字一律返回"当前时刻微秒"且列名都叫 "now" — DATE 拿到
@@ -61,19 +80,19 @@ pub(crate) fn scalar_fn_const_row(items: &[sql::SelectItem]) -> Result<ScalarCon
             const DAY_US: i64 = 86_400_000_000;
             match name.to_ascii_uppercase().as_str() {
                 "NOW" => {
-                    cref.push(("now", ColType::Timestamp));
+                    cref.push(("now".to_string(), ColType::Timestamp));
                     row.push(ColValue::I64(now_micros()));
                 }
                 "CURRENT_TIMESTAMP" => {
-                    cref.push(("current_timestamp", ColType::Timestamp));
+                    cref.push(("current_timestamp".to_string(), ColType::Timestamp));
                     row.push(ColValue::I64(now_micros()));
                 }
                 "CURRENT_DATE" => {
-                    cref.push(("current_date", ColType::Timestamp));
+                    cref.push(("current_date".to_string(), ColType::Timestamp));
                     row.push(ColValue::I64(now_micros().div_euclid(DAY_US) * DAY_US));
                 }
                 "CURRENT_TIME" => {
-                    cref.push(("current_time", ColType::Timestamp));
+                    cref.push(("current_time".to_string(), ColType::Timestamp));
                     row.push(ColValue::I64(now_micros().rem_euclid(DAY_US)));
                 }
                 other => return Err(format!("unknown scalar function '{other}'")),

@@ -125,6 +125,12 @@ pub(crate) fn sql_run_agg_select(
                     "scalar functions are not supported in aggregate queries (v1)".into(),
                 );
             }
+            sql::SelectItem::Lit { .. } => {
+                return fail(
+                    conn,
+                    "literal projections are not supported in aggregate queries (v1)".into(),
+                );
+            }
         }
     }
     // 组键列号

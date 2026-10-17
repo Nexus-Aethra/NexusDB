@@ -432,16 +432,19 @@ pub(crate) fn derived_render(
         );
     }
     // ⭐ compat: 标量函数投影 (SELECT NOW()/version()) — 常量单行
-    if items
-        .iter()
-        .all(|i| matches!(i, sql::SelectItem::ScalarFn { .. }))
-        && !items.is_empty()
+    if items.iter().all(|i| {
+        matches!(
+            i,
+            sql::SelectItem::ScalarFn { .. } | sql::SelectItem::Lit { .. }
+        )
+    }) && !items.is_empty()
     {
         let (cref, row) = match scalar_fn_const_row(items) {
             Ok(v) => v,
             Err(e) => return sql_err_bytes(proto, &e),
         };
-        return sql_rows_bytes(proto, binary, &cref, &[row]);
+        let cols: Vec<(&str, ColType)> = cref.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+        return sql_rows_bytes(proto, binary, &cols, &[row]);
     }
     // 投影: items 空 = 全列
     if items.is_empty() {
@@ -457,6 +460,7 @@ pub(crate) fn derived_render(
             },
             sql::SelectItem::Agg { .. } => unreachable!("孤 COUNT(*) 已在上方特判"),
             sql::SelectItem::ScalarFn { .. } => unreachable!("标量函数已在上方常量特判"),
+            sql::SelectItem::Lit { .. } => unreachable!("字面量投影已在上方常量特判"),
             sql::SelectItem::Expr { .. } => {
                 return sql_err_bytes(
                     proto,

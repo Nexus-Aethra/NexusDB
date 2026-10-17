@@ -373,7 +373,9 @@ fn sql_dispatch_stmt_inner(
             let bin = conn.mysql_binary.remove(&seq);
             match scalar_fn_const_row(&items) {
                 Ok((cref, row)) => {
-                    conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cref, &[row]))
+                    let cols: Vec<(&str, ColType)> =
+                        cref.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+                    conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cols, &[row]))
                 }
                 Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
             }

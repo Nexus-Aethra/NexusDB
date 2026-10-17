@@ -699,3 +699,22 @@ RETURNING 报错且不污染数据) / `mysql_current_date_time_semantics` (DATE 
 TIME 与 NOW 同时分秒) / `mysql_uuid_default_on_non_uuid_column_errors`
 (非 UUID 列报错, UUID 列可用); network+storage+page 全量串行 917 passed /
 0 failed; clippy 0; fmt 0.
+
+---
+
+## 附: P3 批次二 — `SELECT 1` 顶层字面量投影不支持 — 同批次修复
+
+**问题**: 顶层 `SELECT 1` / `SELECT 'a', 2` 直接语法错 (字面量投影只允许出现
+在子查询里, `parser_select.rs` 的 `!top` 分支) — 而这是存活探针 / 驱动初始化
+最常用的语句之一 (MySQL `SELECT 1`、PG `SELECT 1`).
+
+**修复**: `SelectItem` 新增 `Lit { val, alias }` 变体; 顶层遇到 Num/Str 字面量
+时解析成常量投影列表 → 复用 `ScalarSelect` (常量单行) 通道; `scalar_fn_const_row`
+增加 Lit 分支 (类型按字面量推断: Int→I64 / Float→F64 / Str→Str / Null→Str,
+列名 = alias 或字面量文本). ScalarConstRow 的列名从 `&'static str` 改为 `String`
+(字面量文本不是 'static), 两个消费点相应转换.
+
+**测试**: `mysql_top_level_literal_projection` (`SELECT 1` 常量单行 / 多字面量
++ 别名 / 与 FROM 查询混用不受影响); 同时修正 `mysql_auth_password_and_failures`
+里用 `SELECT 1` 当"非法语法"样例的旧断言 (改用残缺语句 `SELECT`).
+network 全量串行 250 passed / 0 failed; clippy 0; fmt 0.

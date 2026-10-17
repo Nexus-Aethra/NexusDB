@@ -394,6 +394,9 @@ pub(crate) fn parse_join_from(
             SelectItem::ScalarFn { .. } => {
                 Err("scalar functions are not supported in JOIN queries".to_string())
             }
+            SelectItem::Lit { .. } => {
+                Err("literal projections are not supported in JOIN queries".to_string())
+            }
             SelectItem::Expr { .. } => {
                 Err("expression projections are not supported in JOIN queries (v1)".to_string())
             }
@@ -496,6 +499,20 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     } else if !top && matches!(p.peek(), Some(Tok::Num(_))) {
         // ⭐ F71: 子查询中的字面量投影 (如 EXISTS 的 `SELECT 1`) — 值无关, 视为全列
         p.next()?;
+    } else if top && matches!(p.peek(), Some(Tok::Num(_)) | Some(Tok::Str(_))) {
+        // ⭐ 审计 P3 (2026-10-17): 顶层字面量投影 (`SELECT 1` / `SELECT 'a', 2`).
+        // 旧实现只允许子查询里出现字面量投影, 顶层直接语法错 — 而这是存活探针 /
+        // 驱动初始化最常用的语句之一. 解析成常量单行 (无 FROM).
+        loop {
+            let val = p.value()?;
+            let alias = parse_col_alias(p);
+            items.push(SelectItem::Lit { val, alias });
+            if p.peek() == Some(&Tok::Comma) {
+                p.next()?;
+            } else {
+                break;
+            }
+        }
     } else if top
         && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("VERSION"))
         && p.peek2_is_lparen()
@@ -637,7 +654,7 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
         // ⭐ compat: 无 FROM 的标量函数投影 (SELECT NOW()/CURRENT_TIMESTAMP) — 常量单行
         if items
             .iter()
-            .all(|i| matches!(i, SelectItem::ScalarFn { .. }))
+            .all(|i| matches!(i, SelectItem::ScalarFn { .. } | SelectItem::Lit { .. }))
             && !items.is_empty()
         {
             p.done()?;
@@ -688,6 +705,7 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 SelectItem::Col { name, .. } => Some(name.clone()),
                 SelectItem::Agg { .. } => None,
                 SelectItem::ScalarFn { .. } => None,
+                SelectItem::Lit { .. } => None,
                 SelectItem::Expr { .. } => None,
             })
             .collect();
@@ -744,6 +762,7 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 SelectItem::Col { name, .. } => Some(name.clone()),
                 SelectItem::Agg { .. } => None,
                 SelectItem::ScalarFn { .. } => None,
+                SelectItem::Lit { .. } => None,
                 SelectItem::Expr { .. } => None,
             })
             .collect();

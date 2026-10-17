@@ -227,10 +227,12 @@ fn mysql_auth_password_and_failures() {
 
     // 正确密码
     let mut c = MyConn::handshake_login(&server, "s3cret");
+    assert_eq!(c.query("SELECT").err_code(), Some(1064), "残缺语句非法语法");
+    // ⭐ 审计 P3 (2026-10-17): `SELECT 1` 顶层字面量投影已支持 (旧实现语法错)
     assert_eq!(
-        c.query("SELECT 1").err_code(),
-        Some(1064),
-        "SELECT 1 非法语法 (需 FROM)"
+        c.query("SELECT 1"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "SELECT 1 应返回常量单行"
     );
 
     // 密码错 → 1045
@@ -4673,6 +4675,41 @@ fn mysql_uuid_default_on_non_uuid_column_errors() {
         c.query("INSERT INTO ok (v) VALUES ('x')"),
         QueryResult::Ok { affected: 1 },
         "UUID 列默认值应可用"
+    );
+
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P3 (2026-10-17): 顶层字面量投影 (`SELECT 1`) — 旧实现只允许子查询里
+/// 出现字面量投影, 顶层直接语法错 (存活探针/驱动初始化最常用语句之一).
+#[test]
+fn mysql_top_level_literal_projection() {
+    let (server, mgr) = start_sql_server(None);
+    let mut c = MyConn::handshake_login(&server, "");
+
+    assert_eq!(
+        c.query("SELECT 1"),
+        QueryResult::Rows(vec![vec![Some("1".into())]]),
+        "SELECT 1 应返回常量单行"
+    );
+    // 多字面量 + 别名
+    let r = c.query("SELECT 1 AS a, 'x' AS b");
+    match &r {
+        QueryResult::Rows(rows) => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0].as_deref(), Some("1"));
+            assert_eq!(rows[0][1].as_deref(), Some("x"));
+        }
+        other => panic!("expect rows: {other:?}"),
+    }
+    // 与 FROM 查询混用不受影响
+    c.query("CREATE TABLE lp (id INT PRIMARY KEY, v INT)");
+    c.query("INSERT INTO lp VALUES (1, 7)");
+    assert_eq!(
+        c.query("SELECT v FROM lp WHERE id = 1"),
+        QueryResult::Rows(vec![vec![Some("7".into())]])
     );
 
     drop(c);

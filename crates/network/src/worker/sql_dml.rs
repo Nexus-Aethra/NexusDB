@@ -98,6 +98,7 @@ pub(crate) fn strip_qual_in_stmt(stmt: &mut SqlStmt) {
                     }
                     sql::SelectItem::Agg { .. } => {}
                     sql::SelectItem::ScalarFn { .. } => {}
+                    sql::SelectItem::Lit { .. } => {}
                     // ⭐ compat: 表达式投影内部列引用剥表限定前缀
                     sql::SelectItem::Expr { expr, .. } => {
                         expr.for_each_col_mut(&mut |c| strip_col_qual(c, &t));
