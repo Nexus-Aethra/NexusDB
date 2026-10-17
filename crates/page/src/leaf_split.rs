@@ -232,24 +232,51 @@ fn try_bulk_leaf_split(left: &mut [u8; PAGE_SIZE], right: &mut [u8; PAGE_SIZE]) 
     }
     let right_free = rest_dst + rest_len;
 
-    // === 重建 right cp array ===
+    // === 重建 right cp array: **保留源页的段边界** ===
+    // ⭐ 审计 P2 (2026-10-17): 旧实现把右半全部重建为**单个** cp 段
+    // (item_count = 1 + right_key_count) — bulk split 的左/右半各含若干源段,
+    // 单段 item_count 可远超 MAX_PER_CHECKPOINT (32), 违反"段 ≤ 32"不变量:
+    //   - 段内定位退化成线性扫描 (二分只发生在段间);
+    //   - free_space / checkpoint_area_size 估算失真 (按 1 段算, 实际要写多段).
+    // 源页的段边界在 bulk memcpy 后**依然有效**: 后续段的段首 item 是
+    // shared=0 的字节, 原样拷贝后仍满足段首不变量 (前缀引用的是物理前一项,
+    // 连续拷贝保持了这一点). 因此逐段搬运即可, 无需任何重编码.
+    let right_seg_count = idx.segments.len() - best_seg;
     write_checkpoint_header(
         right,
         CheckpointHeader {
-            checkpoint_count: 1,
+            checkpoint_count: right_seg_count as u16,
             ..Default::default()
         },
     );
+    // cp[0]: 右半第一段. 注意右页有**自己的哨兵** (PAGE_HEADER_SIZE 处), 段首
+    // 即哨兵, 因此 item_count = 1 (哨兵) + 源段 item 数 (与普通 leaf 页
+    // "cp[0] 含哨兵"的约定一致).
     write_checkpoint(
         right,
         0,
         Checkpoint {
-            item_count: 1 + right_key_count,
+            item_count: 1 + idx.segments[best_seg].item_count,
             first_item_off: PAGE_HEADER_SIZE as u16,
         },
     );
+    // cp[1..]: 源页后续段, 首项偏移按 bulk memcpy 平移
+    // (右半布局 = 哨兵 + 重编码首 item + 源页 [split_off+first_n ..] 原样拷贝)
+    let shift = (write_start + first_encoded_n) as isize - (split_off + first_n) as isize;
+    for (k, seg) in idx.segments[best_seg + 1..].iter().enumerate() {
+        write_checkpoint(
+            right,
+            k + 1,
+            Checkpoint {
+                item_count: seg.item_count,
+                first_item_off: (seg.first_item_off as isize + shift) as u16,
+            },
+        );
+    }
     page_set_free_off(right, right_free as u16);
     page_set_key_count(right, right_key_count);
+    // load + write_back: 借 PageIndex::load 的段首 shared=0 校验自建 cp array,
+    // 顺带把 header.key_count 写回 (内容与上面写入一致).
     let right_idx = PageIndex::load(right, ItemKind::Leaf).ok()?;
     right_idx.write_back(right).ok()?;
     crate::header::page_set_vpid(right, 0);
@@ -259,27 +286,27 @@ fn try_bulk_leaf_split(left: &mut [u8; PAGE_SIZE], right: &mut [u8; PAGE_SIZE]) 
     page_set_free_off(left, split_off as u16);
     page_set_key_count(left, left_key_count);
 
-    // 重建 left cp array (与原始 leaf_split 相同的防御性模式)
-    write_checkpoint_header(left, CheckpointHeader::default());
-    let left_idx = PageIndex::load(left, ItemKind::Leaf).ok()?;
-    if left_idx.segments.is_empty() && left_key_count > 0 {
+    // === 重建 left cp array: 同样保留源页段边界 ===
+    // 左半字节区间 [PAGE_HEADER_SIZE, split_off) 与源页逐字节一致 (只截断尾部),
+    // 因此源页 cp[0..best_seg] 的 (first_item_off, item_count) 原样有效.
+    // (旧实现在此先把 cp header 清零再 load → 恒走"单段"分支, else 的
+    //  write_back 是死代码.)
+    write_checkpoint_header(
+        left,
+        CheckpointHeader {
+            checkpoint_count: best_seg as u16,
+            ..Default::default()
+        },
+    );
+    for (k, seg) in idx.segments[..best_seg].iter().enumerate() {
         write_checkpoint(
             left,
-            0,
+            k,
             Checkpoint {
-                item_count: left_key_count + 1,
-                first_item_off: PAGE_HEADER_SIZE as u16,
+                item_count: seg.item_count,
+                first_item_off: seg.first_item_off,
             },
         );
-        write_checkpoint_header(
-            left,
-            CheckpointHeader {
-                checkpoint_count: 1,
-                ..Default::default()
-            },
-        );
-    } else {
-        left_idx.write_back(left).ok()?;
     }
 
     Some(split_key)

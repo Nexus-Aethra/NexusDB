@@ -539,3 +539,33 @@ acceptor 侧连接来源状态, 留作后续项.
 | `resp_auth_failures_are_rate_limited` | ✅ 单连接连续失败被断开; 两连接累计达阈值后新连接直接收 "too many authentication failures" (正确口令同样被拒) |
 | network 全量串行 | ✅ 244 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: bulk split 单段可超 32 (P2) — 同批次修复
+
+**问题**: `try_bulk_leaf_split` 把左/右半的 cp array 各重建为**单个**段
+(item_count = 该半全部 item 数). bulk split 的左/右半各含若干源段 (源页由
+insert 路径的 pre_split 维持每段 ≤32), 合并成单段后 item_count 轻易超过
+`MAX_PER_CHECKPOINT` (32) — 实测 100 key 的页 split 后左 48 / 右 54:
+- 段内定位退化为线性扫描 (二分只发生在段间);
+- `free_space` / `checkpoint_area_size` 估算失真 (按 1 段算, 实际要写多段);
+- 附带: left 侧重建前先把 cp header 清零再 load → 恒走"单段"分支, `else`
+  的 `write_back` 是死代码.
+
+**修复**: 保留源页段边界 (bulk memcpy 后依然有效 — 后续段段首 item 是
+shared=0 的字节, 原样拷贝后仍满足段首不变量, 前缀引用的是物理前一项):
+- left: cp[0..best_seg] 的 (first_item_off, item_count) 原样搬过去 (左半字节
+  区间与源页逐字节一致, 只截断尾部);
+- right: cp[0] = {PAGE_HEADER_SIZE, 1 + 源段 item 数} (右页有自己的哨兵, 段首
+  即哨兵 — 与普通 leaf 页"cp[0] 含哨兵"约定一致), cp[1..] 的偏移按 bulk
+  memcpy 平移 (首 item 重编码导致的长度差计入 shift);
+- 无任何重编码, 复用 `PageIndex::load` 的段首 shared=0 校验自建 cp array.
+
+**测试** (反向验证: stash 掉 leaf_split.rs 后 "段边界应被保留 (实际 1 段)" 失败):
+
+| 用例 | 结果 |
+|---|---|
+| `bulk_split_keeps_segments_within_max_per_checkpoint` | ✅ split 后两页均 ≥2 段且每段 ≤32; 段 item_count 之和 = key_count+1 (页自洽); 100 个 key 一个不丢 |
+| page + storage 全量串行 | ✅ 154 + 510 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |

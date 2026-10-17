@@ -9,9 +9,9 @@
 //! 6. 多轮 split 后 first_child 路由仍正确
 
 use page::{
-    ItemKind, PageIndex, internal_child, internal_delete, internal_insert, internal_new,
-    internal_split, leaf_delete, leaf_get, leaf_insert, leaf_new, leaf_split, page_free_off,
-    page_key_count, page_set_vpid,
+    ItemKind, MAX_PER_CHECKPOINT, PageIndex, internal_child, internal_delete, internal_insert,
+    internal_new, internal_split, leaf_delete, leaf_get, leaf_insert, leaf_new, leaf_split,
+    page_free_off, page_key_count, page_set_vpid,
 };
 
 // ============================================================================
@@ -408,4 +408,64 @@ fn internal_delete_separator_routing_adapts() {
     assert_eq!(internal_child(&page, b"k").unwrap(), 200); // "d" < "k" < "l"
     assert_eq!(internal_child(&page, b"l").unwrap(), 220);
     assert_eq!(internal_child(&page, b"z").unwrap(), 220);
+}
+
+/// ⭐ 审计 P2 (2026-10-17): bulk split 后两页的 cp 段必须继续满足
+/// "段 ≤ MAX_PER_CHECKPOINT" 不变量.
+///
+/// 旧实现把左/右半各重建为**单个** cp 段 (item_count = 该半全部 item 数) —
+/// bulk split 的左/右半各含若干源段, 单段 item_count 可远超 32:
+/// 段内定位退化为线性扫描 (二分只发生在段间), 且 free_space 估算失真
+/// (checkpoint_area_size 按 1 段算, 实际要写多段).
+#[test]
+fn bulk_split_keeps_segments_within_max_per_checkpoint() {
+    let mut left = leaf_new();
+    for i in 0..100u32 {
+        let k = format!("t_{i:04}");
+        leaf_insert(&mut left, k.as_bytes(), format!("v{i}").as_bytes()).unwrap();
+    }
+    // 源页自身满足不变量 (insert 路径的 pre_split 维持)
+    let src = PageIndex::load(&left, ItemKind::Leaf).unwrap();
+    assert!(
+        src.segments
+            .iter()
+            .all(|s| s.item_count <= MAX_PER_CHECKPOINT),
+        "源页应满足段 ≤ {MAX_PER_CHECKPOINT}"
+    );
+
+    let mut right = leaf_new();
+    leaf_split(&mut left, &mut right).unwrap();
+
+    for (name, page) in [("left", &left), ("right", &right)] {
+        let idx = PageIndex::load(page, ItemKind::Leaf).unwrap();
+        assert!(
+            idx.segments.len() >= 2,
+            "{name}: 段边界应被保留 (实际 {} 段)",
+            idx.segments.len()
+        );
+        for (i, s) in idx.segments.iter().enumerate() {
+            assert!(
+                s.item_count <= MAX_PER_CHECKPOINT,
+                "{name} cp[{i}] item_count={} 超过 {MAX_PER_CHECKPOINT}",
+                s.item_count
+            );
+        }
+        // 页自洽: 各段 item_count 之和 (含哨兵) = key_count + 1
+        let sum: u16 = idx.segments.iter().map(|s| s.item_count).sum();
+        assert_eq!(
+            sum as usize,
+            page_key_count(page) as usize + 1,
+            "{name}: cp 段计数与 key_count 不自洽"
+        );
+    }
+
+    // 数据不丢: key 数守恒且全部可查
+    assert_eq!(page_key_count(&left) + page_key_count(&right), 100);
+    for i in 0..100u32 {
+        let k = format!("t_{i:04}");
+        assert!(
+            leaf_get(&left, k.as_bytes()).is_some() || leaf_get(&right, k.as_bytes()).is_some(),
+            "key {k} 在 split 后丢失"
+        );
+    }
 }

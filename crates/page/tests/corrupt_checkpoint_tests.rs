@@ -4,7 +4,7 @@
 //! `hdr_off-(i+1)*4` usize 下溢 — debug/release 均 panic. 现在
 //! `PageIndex::load` 先校验容量上界并返回 Err.
 
-use page::{ItemKind, PAGE_SIZE, PageError, PageIndex, decode_item, leaf_insert, leaf_new};
+use page::{ItemKind, PAGE_SIZE, PageError, PageIndex, leaf_insert, leaf_new};
 
 #[test]
 fn corrupt_checkpoint_count_rejected_not_panicked() {
