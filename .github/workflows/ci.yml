@@ -22,6 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # TMPDIR 必须先于任何动作建好: dtolnay/rust-toolchain 的 curl 重试
+      # 包装内部用 mktemp, 目录不存在时整个 job 失败 (曾致 CI 三项全挂).
+      - name: 准备 TMPDIR
+        run: mkdir -p "$TMPDIR"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -33,10 +37,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: 准备 TMPDIR
         run: mkdir -p "$TMPDIR"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       # 禁止"仅 lib"式绿灯: 必须覆盖测试代码 (--all-targets),
       # 否则 src/lib.rs 里的单测代码不会被 lint 到 (P0-1 即由此漏网).
       # 用 -D warnings 把警告也当错误: 基线已清零 (0 warning / 0 error).
@@ -50,11 +54,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: 准备 TMPDIR
+        run: mkdir -p "$TMPDIR"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # 部分 e2e (socket / io_uring / shard 多线程) 需要 linux 原生能力.
-      - name: 准备 TMPDIR
-        run: mkdir -p "$TMPDIR"
       - name: 探测 io_uring 可用性
         run: |
           if [ -e /proc/sys/kernel/io_uring_disabled ] && [ "$(cat /proc/sys/kernel/io_uring_disabled)" = "2" ]; then
