@@ -9,7 +9,7 @@
 
 use std::io::Write;
 
-use page::{ItemKind, decode_item, page_free_off, page_type};
+use page::{decode_item, page_free_off, page_type, ItemKind};
 
 use crate::cli::Globals;
 use crate::dir;
@@ -26,12 +26,13 @@ pub fn run<W: Write>(
     mut out: W,
 ) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let start_key: Option<Vec<u8>> = match start_hex {
@@ -99,13 +100,15 @@ pub fn run<W: Write>(
     while off < free_off {
         match decode_item(page_bytes, off, ItemKind::Leaf) {
             Ok((item, n)) => {
-                let full = item.full_key(&prev_key);
+                // ⭐ 损坏 item (shared 越界): 停止遍历, 不静默错 key
+                let Ok(full) = item.full_key(&prev_key) else {
+                    break;
+                };
                 if item_idx > 0 {
                     // Check if key is within range
                     let in_range = match (&start_key, &end_key) {
                         (Some(start), Some(end)) => {
-                            full.as_slice() >= start.as_slice()
-                                && full.as_slice() <= end.as_slice()
+                            full.as_slice() >= start.as_slice() && full.as_slice() <= end.as_slice()
                         }
                         (Some(start), None) => full.as_slice() >= start.as_slice(),
                         (None, Some(end)) => full.as_slice() <= end.as_slice(),

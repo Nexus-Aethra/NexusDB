@@ -26,14 +26,14 @@ pub mod kv_to_shard;
 pub mod portable;
 pub mod protocol;
 pub mod reply_bus;
+#[cfg(target_os = "windows")]
+pub mod runtime_iocp;
 #[cfg(target_os = "linux")]
 pub mod server;
 pub mod tls;
 pub mod value_codec;
 #[cfg(target_os = "linux")]
 pub mod worker;
-#[cfg(target_os = "windows")]
-pub mod runtime_iocp;
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub use portable::{SqlSharedRoutes, new_sql_shared};
 #[cfg(target_os = "linux")]
@@ -50,6 +50,10 @@ pub mod metrics {
     pub static SQL_QUERIES: AtomicU64 = AtomicU64::new(0);
     /// RESP 命令计数.
     pub static KV_OPS: AtomicU64 = AtomicU64::new(0);
+    /// ⭐ 审计 P3-11 (2026-10-17): Binary 协议解码错误次数 (旧实现静默重同步).
+    pub static BINARY_DECODE_ERRORS: AtomicU64 = AtomicU64::new(0);
+    /// ⭐ 审计 P3-8 (2026-10-17): RESP 重排缓冲溢出 (某 seq 永未回复) 断连次数.
+    pub static RESP_REORDER_OVERFLOW: AtomicU64 = AtomicU64::new(0);
     /// ⭐ 方案 A (调优): JOIN EstimateRows 统计广播轮数 (合并行数后每批 +1).
     pub static SQL_JOIN_EST_ROUNDS: AtomicU64 = AtomicU64::new(0);
     /// ⭐ 方案 A (调优): 小表阈值跳过统计收集次数 (行数批收齐直接决策).
@@ -106,9 +110,9 @@ pub use protocol::{
     RespCommand, Response, validate_request,
 };
 pub use reply_bus::{ReplyBusReceiver, ReplyBusSender, ReplyEnvelope};
-#[cfg(target_os = "linux")]
-pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 #[cfg(target_os = "windows")]
 pub use runtime_iocp::{NetworkServer, NetworkServerConfig, ProtocolKind};
+#[cfg(target_os = "linux")]
+pub use server::{NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 #[cfg(target_os = "linux")]
 pub use worker::{WorkerConfig, WorkerPool};

@@ -1,23 +1,29 @@
 //! BinaryProtocol round-trip tests.
 
-use network::protocol::{DecodeOutcome, Protocol, Request, Response, ProtocolError};
 use network::BinaryProtocol;
+use network::protocol::{DecodeOutcome, Protocol, ProtocolError, Request, Response};
 
 #[test]
 fn put_roundtrip() {
     let p = BinaryProtocol;
-    let bytes = p.encode_request(42, &Request::Put {
-        key: b"hello".to_vec(),
-        value: b"world".to_vec(),
-    });
+    let bytes = p.encode_request(
+        42,
+        &Request::Put {
+            key: b"hello".to_vec(),
+            value: b"world".to_vec(),
+        },
+    );
     match p.decode_request(&bytes).unwrap() {
         DecodeOutcome::Complete { consumed, value } => {
             assert_eq!(consumed, bytes.len());
             // ⭐ decode 时 Put.value 预置 1B type tag (0x01 = TAG_RAW)
-            assert_eq!(value, Request::Put {
-                key: b"hello".to_vec(),
-                value: b"\x01world".to_vec(),
-            });
+            assert_eq!(
+                value,
+                Request::Put {
+                    key: b"hello".to_vec(),
+                    value: b"\x01world".to_vec(),
+                }
+            );
         }
         DecodeOutcome::NeedMore => panic!("should be complete"),
     }
@@ -50,14 +56,23 @@ fn delete_roundtrip() {
 #[test]
 fn empty_key_value() {
     let p = BinaryProtocol;
-    let bytes = p.encode_request(0, &Request::Put {
-        key: vec![],
-        value: vec![],
-    });
+    let bytes = p.encode_request(
+        0,
+        &Request::Put {
+            key: vec![],
+            value: vec![],
+        },
+    );
     match p.decode_request(&bytes).unwrap() {
         DecodeOutcome::Complete { value, .. } => {
             // ⭐ 空 payload decode 后 value = [TAG_RAW] (仅 1B tag)
-            assert_eq!(value, Request::Put { key: vec![], value: vec![0x01] });
+            assert_eq!(
+                value,
+                Request::Put {
+                    key: vec![],
+                    value: vec![0x01]
+                }
+            );
         }
         DecodeOutcome::NeedMore => panic!(),
     }
@@ -66,10 +81,13 @@ fn empty_key_value() {
 #[test]
 fn incomplete_returns_need_more() {
     let p = BinaryProtocol;
-    let full = p.encode_request(1, &Request::Put {
-        key: b"k".to_vec(),
-        value: b"v".to_vec(),
-    });
+    let full = p.encode_request(
+        1,
+        &Request::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        },
+    );
     for cut in 0..full.len() {
         match p.decode_request(&full[..cut]).unwrap() {
             DecodeOutcome::NeedMore => {}

@@ -33,7 +33,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     msg.extend_from_slice(&bitlen.to_be_bytes());
 
     let mut w = [0u32; 64];
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         for (i, wi) in w.iter_mut().enumerate().take(16) {
             *wi = u32::from_be_bytes([
                 chunk[i * 4],

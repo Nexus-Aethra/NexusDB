@@ -8,13 +8,11 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use network::protocol::mysql as my;
-use network::{
-    KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool,
-};
+use network::{KvLimits, NetworkServer, NetworkServerConfig, ProtocolKind, SharedWorkerPool};
 use shard_manager::{ShardManager, ShardManagerOptions};
 use storage::{IoBackend, IoBackendConfig};
 
@@ -83,7 +81,11 @@ fn resp_set_get(addr: SocketAddr, auth: Option<&str>) {
         // 无 AUTH 先操作应被拒
         s.write_all(&resp_cmd(&[b"SET", b"k0", b"x"])).unwrap();
         let n = s.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"-NOAUTH Authentication required.\r\n", "未认证应拒");
+        assert_eq!(
+            &buf[..n],
+            b"-NOAUTH Authentication required.\r\n",
+            "未认证应拒"
+        );
         // AUTH
         s.write_all(&resp_cmd(&[b"AUTH", pw.as_bytes()])).unwrap();
         let n = s.read(&mut buf).unwrap();
@@ -118,7 +120,9 @@ fn sql_ping(addr: SocketAddr) {
     // 发握手响应 (空密码, root)
     let p = &buf[..got];
     let mut pos = 1;
-    while p[pos] != 0 { pos += 1; }
+    while p[pos] != 0 {
+        pos += 1;
+    }
     pos += 1 + 4;
     let mut salt = [0u8; 20];
     salt[..8].copy_from_slice(&p[pos..pos + 8]);
@@ -145,7 +149,12 @@ fn sql_ping(addr: SocketAddr) {
             if got >= plen + 4 {
                 let seq = buf[3];
                 assert_eq!(seq, 2, "login resp seq should be 2, got {seq}");
-                assert_eq!(buf[4], 0x00, "login should succeed, payload={:?}", &buf[4..4 + plen]);
+                assert_eq!(
+                    buf[4],
+                    0x00,
+                    "login should succeed, payload={:?}",
+                    &buf[4..4 + plen]
+                );
                 return;
             }
         }
@@ -173,12 +182,61 @@ fn worker_thread_count() -> usize {
     count
 }
 
+// ===== 并行安全 =====
+
+/// 三个用例都断言进程级 worker 线程数, 并行执行会互相串数 (实测: 并行下
+/// `assert_eq!(workers, 2)` 看到 4 而 panic; 且 panic unwind 不走 shutdown,
+/// 泄漏的 acceptor 持着 channel sender → `SharedWorkerPool::drop` 的 join
+/// 永久死锁, 整个测试二进制挂死).
+/// 文件级互斥把三个用例串行化; 与其他测试文件天然隔离 (各自独立进程).
+static SHARED_POOL_TESTS: Mutex<()> = Mutex::new(());
+
+fn pool_test_lock() -> MutexGuard<'static, ()> {
+    // 忽略 poison: 前一个用例 panic 不应连带本用例
+    SHARED_POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// panic 安全的收尾: 顺序 = servers shutdown → pool drop → mgr drop.
+/// 该顺序即 `SharedWorkerPool::drop` 的契约 — 所有 server 停用 (sender 全部
+/// 释放) 之后才能 join workers, 否则 worker 的 inbox 永不断开, join 永久阻塞.
+struct PoolTestEnv {
+    servers: Vec<NetworkServer>,
+    pool: Option<Arc<SharedWorkerPool>>,
+    mgr: Option<Arc<ShardManager>>,
+}
+
+impl PoolTestEnv {
+    fn new(
+        servers: Vec<NetworkServer>,
+        pool: Arc<SharedWorkerPool>,
+        mgr: Arc<ShardManager>,
+    ) -> Self {
+        Self {
+            servers,
+            pool: Some(pool),
+            mgr: Some(mgr),
+        }
+    }
+}
+
+impl Drop for PoolTestEnv {
+    fn drop(&mut self) {
+        for s in self.servers.drain(..) {
+            let _ = s.shutdown();
+        }
+        // 最后引用归零: SharedWorkerPool::drop → sender 释放 → join workers
+        drop(self.pool.take());
+        // ShardManager::drop → flush + 停 shard 线程 (RAII 兜底)
+        drop(self.mgr.take());
+    }
+}
+
 #[test]
 fn shared_worker_pool_resp_and_sql() {
+    let _lock = pool_test_lock();
     let mgr = open_mgr();
-    let base = base_cfg(&mgr, ProtocolKind::Resp);
-    // 创建全局共享池 (2 workers, base_worker_id=0)
-    let shared = SharedWorkerPool::new(&base, 0).expect("shared pool");
+    let shared =
+        SharedWorkerPool::new(&base_cfg(&mgr, ProtocolKind::Resp), 0).expect("shared pool");
 
     // 两个 server 共享同一池 (不同协议)
     let mut cfg_a = base_cfg(&mgr, ProtocolKind::Resp);
@@ -187,31 +245,26 @@ fn shared_worker_pool_resp_and_sql() {
     cfg_b.shared_workers = Some(shared.clone());
     let server_a = NetworkServer::start(cfg_a).expect("start RESP");
     let server_b = NetworkServer::start(cfg_b).expect("start SQL");
+    let env = PoolTestEnv::new(vec![server_a, server_b], shared, mgr);
 
     // 线程数 = 池大小 (2), 而非 2 server × 2 = 4
     let workers = worker_thread_count();
     assert_eq!(workers, 2, "共享池应只有 2 个 worker 线程, 实际 {workers}");
 
     // 功能: RESP + SQL 在同一批 worker 上正常
-    resp_set_get(server_a.local_addr(), None);
-    sql_ping(server_b.local_addr());
-
-    // 关闭: 两个 server 先停 (各停 acceptor), 池最后 drop (join workers)
-    server_a.shutdown().unwrap();
-    server_b.shutdown().unwrap();
-    drop(shared);
-    drop(mgr);
-    // 等 worker 线程退出 (join 已由 SharedWorkerPool drop 完成)
-    std::thread::sleep(Duration::from_millis(50));
+    resp_set_get(env.servers[0].local_addr(), None);
+    sql_ping(env.servers[1].local_addr());
+    // env drop: shutdown servers → drop pool (join workers) → drop mgr
 }
 
 /// T3.3: 共享池中不同 server 用不同 auth_password — worker 按连接取 per-conn 配置.
 /// RESP server 需 AUTH (secret), SQL server 免认证. 同一批 worker 正确区分.
 #[test]
 fn shared_worker_pool_per_conn_auth() {
+    let _lock = pool_test_lock();
     let mgr = open_mgr();
-    let base = base_cfg(&mgr, ProtocolKind::Resp);
-    let shared = SharedWorkerPool::new(&base, 0).expect("shared pool");
+    let shared =
+        SharedWorkerPool::new(&base_cfg(&mgr, ProtocolKind::Resp), 0).expect("shared pool");
 
     let mut cfg_a = base_cfg_auth(&mgr, ProtocolKind::Resp, Some("secret".to_string()));
     cfg_a.shared_workers = Some(shared.clone());
@@ -219,26 +272,23 @@ fn shared_worker_pool_per_conn_auth() {
     cfg_b.shared_workers = Some(shared.clone());
     let server_a = NetworkServer::start(cfg_a).expect("start RESP (auth)");
     let server_b = NetworkServer::start(cfg_b).expect("start SQL (no auth)");
+    let env = PoolTestEnv::new(vec![server_a, server_b], shared, mgr);
 
     // 同一批 worker (2 个) 处理两个协议, 且 RESP 需 AUTH
     let workers = worker_thread_count();
     assert_eq!(workers, 2, "共享池应只有 2 个 worker, 实际 {workers}");
-    resp_set_get(server_a.local_addr(), Some("secret"));
-    sql_ping(server_b.local_addr());
-
-    server_a.shutdown().unwrap();
-    server_b.shutdown().unwrap();
-    drop(shared);
-    drop(mgr);
-    std::thread::sleep(Duration::from_millis(50));
+    resp_set_get(env.servers[0].local_addr(), Some("secret"));
+    sql_ping(env.servers[1].local_addr());
+    // env drop: panic 安全收尾
 }
 
 /// T3.4: 多协议混合压力 — 同一共享池同时处理 RESP + SQL 多连接并发, 无串扰.
 #[test]
 fn shared_worker_pool_mixed_load() {
+    let _lock = pool_test_lock();
     let mgr = open_mgr();
-    let base = base_cfg(&mgr, ProtocolKind::Resp);
-    let shared = SharedWorkerPool::new(&base, 0).expect("shared pool");
+    let shared =
+        SharedWorkerPool::new(&base_cfg(&mgr, ProtocolKind::Resp), 0).expect("shared pool");
 
     let mut cfg_a = base_cfg(&mgr, ProtocolKind::Resp);
     cfg_a.shared_workers = Some(shared.clone());
@@ -246,12 +296,13 @@ fn shared_worker_pool_mixed_load() {
     cfg_b.shared_workers = Some(shared.clone());
     let server_a = NetworkServer::start(cfg_a).expect("start RESP");
     let server_b = NetworkServer::start(cfg_b).expect("start SQL");
+    let env = PoolTestEnv::new(vec![server_a, server_b], shared, mgr);
 
     // 并发: 8 RESP 连接 + 8 SQL 连接, 每连接多次往返.
     let mut handles = Vec::new();
     for i in 0..8 {
-        let addr_a = server_a.local_addr();
-        let addr_b = server_b.local_addr();
+        let addr_a = env.servers[0].local_addr();
+        let addr_b = env.servers[1].local_addr();
         handles.push(std::thread::spawn(move || {
             // RESP: 每连接独立 key, SET+GET 往返多次
             for j in 0..10 {
@@ -266,7 +317,10 @@ fn shared_worker_pool_mixed_load() {
                 assert_eq!(&buf[..n], b"+OK\r\n");
                 s.write_all(&resp_cmd(&[b"GET", key.as_bytes()])).unwrap();
                 let n = s.read(&mut buf).unwrap();
-                assert_eq!(&buf[..n], format!("${}\r\n{}\r\n", val.len(), val).as_bytes());
+                assert_eq!(
+                    &buf[..n],
+                    format!("${}\r\n{}\r\n", val.len(), val).as_bytes()
+                );
             }
         }));
         handles.push(std::thread::spawn(move || {
@@ -280,9 +334,5 @@ fn shared_worker_pool_mixed_load() {
         h.join().expect("load thread panicked");
     }
 
-    server_a.shutdown().unwrap();
-    server_b.shutdown().unwrap();
-    drop(shared);
-    drop(mgr);
-    std::thread::sleep(Duration::from_millis(50));
+    // env drop: panic 安全收尾
 }

@@ -11,7 +11,7 @@
 
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use io_uring::{IoUring, opcode, types};
 
@@ -51,7 +51,10 @@ fn bench_one_by_one_submit() {
             }
         }
     }
-    eprintln!("[bench] 逐个 submit: 64 reads 用了 {} 次 enter", enter_count);
+    eprintln!(
+        "[bench] 逐个 submit: 64 reads 用了 {} 次 enter",
+        enter_count
+    );
 }
 
 /// N 个 socket 各自可读, 批量提交 (一次 push N + 一次 submit + submit_and_wait(N)).
@@ -85,7 +88,10 @@ fn bench_batch_submit() {
             got += 1;
         }
     }
-    eprintln!("[bench] 批量 submit: 64 reads 用了 {} 次 enter", enter_count);
+    eprintln!(
+        "[bench] 批量 submit: 64 reads 用了 {} 次 enter",
+        enter_count
+    );
 }
 
 /// 吞吐: 重复 N 次批量读, 测 ops/sec (模拟 drive 批量提交).
@@ -96,7 +102,9 @@ fn bench_batch_throughput() {
     let (mut ring, readers) = setup_ring_and_readers(BATCH);
     let (sub, mut sq, mut cq) = ring.split();
 
-    let mut bufs: Vec<Box<[u8]>> = (0..BATCH).map(|_| vec![0u8; 16].into_boxed_slice()).collect();
+    let mut bufs: Vec<Box<[u8]>> = (0..BATCH)
+        .map(|_| vec![0u8; 16].into_boxed_slice())
+        .collect();
 
     let t0 = Instant::now();
     let mut total_ops = 0usize;

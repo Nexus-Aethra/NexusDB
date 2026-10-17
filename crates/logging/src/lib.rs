@@ -102,6 +102,9 @@ pub struct LogQueue {
     pending: AtomicU64,
     /// 背压丢弃计数 (Debug/Trace 队列满时丢弃).
     dropped: AtomicU64,
+    /// ⭐ 2026-10-17 (审计新 P1-17): Error/Warn 满队兜底计数 (stderr 直写,
+    /// 替代旧实现的无限自旋).
+    overflowed: AtomicU64,
 }
 
 impl LogQueue {
@@ -116,19 +119,34 @@ impl LogQueue {
             eventfd: fd,
             pending: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            overflowed: AtomicU64::new(0),
         }
     }
 
-    /// 前端 push. 队列满时: Error/Warn 自旋重试 (不可丢), 其余丢弃计数.
+    /// 前端 push. 队列满时: Error/Warn 短自旋后 **stderr 兜底** (不丢但
+    /// 不挂死), 其余丢弃计数.
+    ///
+    /// ⭐ 2026-10-17 (审计新 P1-17): 旧实现对 Error/Warn **无限自旋** —
+    /// 后端 log 线程死亡/卡住 (fsync 挂死/panic) 时队列持续满, 每条
+    /// Error/Warn 都自旋, 拖死所有调用线程 (全局日志死锁连锁). 现在: 64 次
+    /// yield 后直写 stderr (不依赖后端, 日志不丢) 并计数.
     pub fn push(&self, level: Level, line: String) {
         let mut item = line;
+        let mut spins = 0u32;
         loop {
             match self.ring.push(item) {
                 Ok(()) => break,
                 Err(rejected) => {
                     if (level as u8) <= Level::Warn as u8 {
-                        item = rejected;
-                        std::thread::yield_now();
+                        spins += 1;
+                        if spins <= 64 {
+                            item = rejected;
+                            std::thread::yield_now();
+                        } else {
+                            self.overflowed.fetch_add(1, Ordering::Relaxed);
+                            eprint!("{rejected}"); // stderr 兜底: 不丢, 不挂死
+                            return;
+                        }
                     } else {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -169,6 +187,11 @@ impl LogQueue {
     }
 
     /// 累计丢弃条数 (背压).
+    /// ⭐ Error/Warn 满队 stderr 兜底的累计次数 (审计新 P1-17 观测).
+    pub fn overflowed(&self) -> u64 {
+        self.overflowed.load(Ordering::Relaxed)
+    }
+
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -653,6 +676,27 @@ mod tests {
         let content = std::fs::read_to_string(&file).unwrap();
         assert!(content.contains("time-trigger"), "got: {content:?}");
         backend.shutdown();
+    }
+
+    /// ⭐ 审计新 P1-17: 队列满时 Error/Warn 必须有界 (stderr 兜底) —
+    /// 旧实现无限自旋, 后端卡住即拖死所有调用方.
+    #[test]
+    fn urgent_log_overflow_is_bounded_not_infinite_spin() {
+        let q = LogQueue::with_capacity(2);
+        q.push(Level::Info, "a".into());
+        q.push(Level::Info, "b".into());
+        assert_eq!(q.dropped(), 0);
+        // 队列已满且无人 drain: Error push 必须快速返回 (stderr 兜底)
+        let start = std::time::Instant::now();
+        q.push(Level::Error, "urgent-line".into());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "Error/Warn 满队不得无界自旋 (旧实现全局死锁)"
+        );
+        assert!(q.overflowed() >= 1, "应计数 stderr 兜底");
+        // Debug 仍然直接丢弃 (既有语义)
+        q.push(Level::Debug, "noise".into());
+        assert_eq!(q.dropped(), 1);
     }
 
     #[test]

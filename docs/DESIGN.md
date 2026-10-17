@@ -71,7 +71,7 @@ struct Shard {
 
 线程模型：
 - **无锁**：线程间不共享任何状态，跨 shard 通信走 SPSC/MPMC 通道。
-- **CPU 亲和**：使用 `sched_setaffinity` 把每个 shard 线程绑到一个物理核，避免 cache 抖动。
+- **CPU 亲和**：~~使用 `sched_setaffinity` 把每个 shard 线程绑到一个物理核~~ **未实现**（审计 P1-2, 2026-10-17 核实：全代码库 0 处 `sched_setaffinity`）。当前由操作系统调度器自行放置 shard 线程；Share-Nothing 模型下功能正确性不依赖绑核，但 cache 局部性收益未获取。绑核留作后续性能项（需处理容器 cgroup 下的可见 CPU 集合）。
 - **无 GIL 等价**：Rust `Send`/`Sync` 边界天然保证 `Shard` 不跨线程。
 
 ### 3.3 协程 + io_uring 调度

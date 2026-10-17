@@ -47,15 +47,6 @@ pub fn sort_in_set(set: &mut Vec<SqlValue>) {
     }
 }
 
-/// ⭐ F76: 剥 db 限定前缀 — `db.tbl` / `db.tbl` (反引号已在 tokenizer 拼为单 Ident) → `tbl`.
-/// 表名不含 '.', 取最后一段即去 db 限定. v1 不支持真跨库 (归一为当前库同名表).
-pub(crate) fn strip_db_qual(name: String) -> String {
-    match name.rsplit_once('.') {
-        Some((_, tbl)) => tbl.to_string(),
-        None => name,
-    }
-}
-
 /// 比较算子 (WHERE 条件).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
@@ -113,6 +104,12 @@ pub enum SelectItem {
     /// ⭐ compat: 标量函数投影 (NOW()/version()) — worker 渲染常量.
     ScalarFn {
         name: String,
+    },
+    /// ⭐ 审计 P3 (2026-10-17): 顶层字面量投影 (`SELECT 1` / `SELECT 'a', 2`)
+    /// — 存活探针/驱动初始化常用语句. 常量单行, 无 FROM.
+    Lit {
+        val: SqlValue,
+        alias: Option<String>,
     },
     /// ⭐ compat: 表达式投影 (JSONB 取字段 j->'a' / j->>'a', v1 仅列+常量键).
     Expr {
@@ -231,6 +228,7 @@ impl SelectItem {
     pub fn out_name(&self) -> String {
         match self {
             SelectItem::ScalarFn { name } => name.clone(),
+            SelectItem::Lit { val, alias } => alias.clone().unwrap_or_else(|| format!("{val:?}")),
             SelectItem::Col { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
             SelectItem::Agg {
                 func,

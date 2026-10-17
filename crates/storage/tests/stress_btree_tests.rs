@@ -10,14 +10,31 @@ use common::run_async;
 fn demo_schema() -> TableSchema {
     TableSchema::new(
         vec![
-            Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
-            Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
-            Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
+            Column {
+                name: "id".into(),
+                ty: ColType::I64,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "name".into(),
+                ty: ColType::Str,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "score".into(),
+                ty: ColType::F64,
+                nullable: true,
+                default: None,
+            },
         ],
         0,
         &[1, 2],
         &[],
-        &[], &[], &[],
+        &[],
+        &[],
+        &[],
     )
     .unwrap()
 }
@@ -63,7 +80,10 @@ fn stress_10000_rows() {
             let n = e.estimate_row_count("default", "t1");
             assert_eq!(n, Some(10000), "round {round}: count {n:?}");
             // ⭐ 实际扫描校验 (e2e 的 COUNT 走扫描; estimate_row_count 是内存计数)
-            let scanned = e.index_scan_keys_local("default", "t1", 0, None, None, 0).await.unwrap();
+            let scanned = e
+                .index_scan_keys_local("default", "t1", 0, None, None, 0)
+                .await
+                .unwrap();
             assert_eq!(
                 scanned.len(),
                 10000,

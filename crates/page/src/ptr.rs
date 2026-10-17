@@ -34,11 +34,11 @@ impl<'a> ItemPtr<'a> {
         // 不知道 prev_key (调用方需要), 所以 cur_key 只能用 key_unshared.
         // 但通常我们是从 cp 段首 (shared=0) 或从 next() 来的, 都有 prev_key.
         // 这里 new() 直接从 key_unshared 推 full key — **仅适用于 shared=0 的 item**.
-        debug_assert_eq!(
-            item.shared_prefix_len, 0,
-            "ItemPtr::new called on item with shared_prefix_len={}, must be shared=0 (cp segment head or sentinel)",
-            item.shared_prefix_len
-        );
+        // 违反时 cur_key 缺失与 prev_key 的公共前缀, 后续所有比较都是错的, 而
+        // 且**无声**。故用硬错误挡住, 不只在 debug 下 panic (release 会静默错读).
+        if item.shared_prefix_len != 0 {
+            return Err(PageError::NotSegmentHead(item.shared_prefix_len));
+        }
         Ok(Self {
             page,
             off,
@@ -65,6 +65,20 @@ impl<'a> ItemPtr<'a> {
     /// 顺序前进到下一个 item. 内部用 cached cur_key 拼接下一个 key.
     /// 返回 None 表示已到 item 区末尾.
     pub fn next(&self, kind: ItemKind) -> Result<Option<ItemPtr<'a>>, PageError> {
+        Ok(self.next_decoded(kind)?.map(|(ptr, _item)| ptr))
+    }
+
+    /// ⭐ 审计 P2 (2026-10-17): `next()` + 解出下一 item 的附加字段
+    /// (value / child_vpid) 只需**一次** decode.
+    ///
+    /// 旧实现: `LeafItemPtr::next` / `InternalItemPtr::next` 先调
+    /// `inner.next()` (decode 一次), 再 `decode_item` 解第二遍拿 value_len /
+    /// child_vpid — 段内每次前进都双倍解码. 这里把解出的 `Item` (零拷贝借用
+    /// page) 一并返回, 调用方直接取字段.
+    pub fn next_decoded(
+        &self,
+        kind: ItemKind,
+    ) -> Result<Option<(ItemPtr<'a>, crate::item::Item<'a>)>, PageError> {
         let next_off = self.off + self.cur_n;
         let free_off = crate::header::page_free_off(self.page) as usize;
         if next_off >= free_off {
@@ -72,13 +86,16 @@ impl<'a> ItemPtr<'a> {
         }
         let (next_item, next_n) = decode_item(self.page, next_off, kind)?;
         // 用 self.cur_key 作为 prev_key
-        let full = next_item.full_key(&self.cur_key);
-        Ok(Some(ItemPtr {
-            page: self.page,
-            off: next_off,
-            cur_key: full,
-            cur_n: next_n,
-        }))
+        let full = next_item.full_key(&self.cur_key)?;
+        Ok(Some((
+            ItemPtr {
+                page: self.page,
+                off: next_off,
+                cur_key: full,
+                cur_n: next_n,
+            },
+            next_item,
+        )))
     }
 }
 
@@ -99,11 +116,10 @@ impl<'a> LeafItemPtr<'a> {
     /// 从指定字节偏移构造 ptr. decode 后缓存 value 指针.
     pub fn new(page: &'a [u8], off: usize) -> Result<Self, PageError> {
         let (item, n) = decode_item(page, off, ItemKind::Leaf)?;
-        debug_assert_eq!(
-            item.shared_prefix_len, 0,
-            "LeafItemPtr::new called on item with shared_prefix_len={}, must be shared=0",
-            item.shared_prefix_len
-        );
+        // 同 ItemPtr::new: 段首/哨兵之外的偏移会让 cur_key 缺前缀, 且无声出错.
+        if item.shared_prefix_len != 0 {
+            return Err(PageError::NotSegmentHead(item.shared_prefix_len));
+        }
         let value_ptr = item.value.as_ptr();
         Ok(Self {
             value_len: item.value_len,
@@ -144,17 +160,14 @@ impl<'a> LeafItemPtr<'a> {
 
     /// 顺序前进到下一个 item. 内部用 cached cur_key 拼接下一个 key.
     pub fn next(&self) -> Result<Option<LeafItemPtr<'a>>, PageError> {
-        let next_inner = self.inner.next(ItemKind::Leaf)?;
-        match next_inner {
+        // ⭐ 审计 P2 (2026-10-17): 单次 decode (旧实现 next + 再 decode 一遍)
+        match self.inner.next_decoded(ItemKind::Leaf)? {
             None => Ok(None),
-            Some(inner) => {
-                let (item, _) = decode_item(inner.page, inner.off, ItemKind::Leaf)?;
-                Ok(Some(LeafItemPtr {
-                    value_len: item.value_len,
-                    value_ptr: item.value.as_ptr(),
-                    inner,
-                }))
-            }
+            Some((inner, item)) => Ok(Some(LeafItemPtr {
+                value_len: item.value_len,
+                value_ptr: item.value.as_ptr(),
+                inner,
+            })),
         }
     }
 }
@@ -169,11 +182,12 @@ pub struct InternalItemPtr<'a> {
 impl<'a> InternalItemPtr<'a> {
     pub fn new(page: &'a [u8], off: usize) -> Result<Self, PageError> {
         let (item, n) = decode_item(page, off, ItemKind::Internal)?;
-        debug_assert_eq!(
-            item.shared_prefix_len, 0,
-            "InternalItemPtr::new called on item with shared_prefix_len={}, must be shared=0",
-            item.shared_prefix_len
-        );
+        // ⭐ 审计 C3 残留 (2026-10-17): 与 ItemPtr::new / LeafItemPtr::new 对齐 —
+        // 段首/新游标必须 shared=0, 否则 cur_key 缺公共前缀且**无声出错**.
+        // 旧实现这里只有 debug_assert (release 失效), 是同一修复漏掉的第三处.
+        if item.shared_prefix_len != 0 {
+            return Err(PageError::NotSegmentHead(item.shared_prefix_len));
+        }
         Ok(Self {
             child_vpid: item.child_vpid,
             inner: ItemPtr {
@@ -206,16 +220,13 @@ impl<'a> InternalItemPtr<'a> {
     }
 
     pub fn next(&self) -> Result<Option<InternalItemPtr<'a>>, PageError> {
-        let next_inner = self.inner.next(ItemKind::Internal)?;
-        match next_inner {
+        // ⭐ 审计 P2 (2026-10-17): 单次 decode (旧实现 next + 再 decode 一遍)
+        match self.inner.next_decoded(ItemKind::Internal)? {
             None => Ok(None),
-            Some(inner) => {
-                let (item, _) = decode_item(inner.page, inner.off, ItemKind::Internal)?;
-                Ok(Some(InternalItemPtr {
-                    child_vpid: item.child_vpid,
-                    inner,
-                }))
-            }
+            Some((inner, item)) => Ok(Some(InternalItemPtr {
+                child_vpid: item.child_vpid,
+                inner,
+            })),
         }
     }
 }
@@ -277,5 +288,44 @@ mod tests {
                 assert!(ptr.is_none(), "next() should yield None at last i");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod c3_residual_tests {
+    use super::*;
+    use crate::header::PAGE_HEADER_SIZE;
+    use crate::internal::{internal_insert, internal_new};
+
+    /// ⭐ 审计 C3 残留 (2026-10-17): `InternalItemPtr::new` 对非段首
+    /// (shared != 0) 的 item 必须返回硬错误 — 旧实现只有 debug_assert,
+    /// release 下校验失效 (与 ItemPtr::new / LeafItemPtr::new 不对称).
+    #[test]
+    fn internal_item_ptr_rejects_non_segment_head() {
+        let mut page = internal_new();
+        internal_insert(&mut page, b"aaa", 10).unwrap();
+        internal_insert(&mut page, b"aab", 11).unwrap();
+        internal_insert(&mut page, b"aac", 12).unwrap();
+
+        // 段首 (shared=0) 正常
+        assert!(InternalItemPtr::new(&page, PAGE_HEADER_SIZE).is_ok());
+
+        // 找到第一个 shared > 0 的 item (与前一项有公共前缀) → 必须 Err
+        let free_off = crate::header::page_free_off(&page) as usize;
+        let mut off = PAGE_HEADER_SIZE;
+        let mut found = false;
+        while off < free_off {
+            let (it, n) = decode_item(&page, off, ItemKind::Internal).unwrap();
+            if it.shared_prefix_len > 0 {
+                match InternalItemPtr::new(&page, off) {
+                    Err(PageError::NotSegmentHead(_)) => {}
+                    other => panic!("非段首 (off={off}) 必须返回 NotSegmentHead, 实际 {other:?}"),
+                }
+                found = true;
+                break;
+            }
+            off += n;
+        }
+        assert!(found, "前置条件: 页中应存在 shared > 0 的 item");
     }
 }

@@ -3,6 +3,11 @@
 
 use super::*;
 
+/// ⭐ 审计 P2 (2026-10-17): SELECT 结果集内存护栏 (对齐 JOIN_MAX_ROWS) —
+/// ORDER BY / 聚合需全量物化, 无 LIMIT 的大表查询会把 worker 内存吃穿 (OOM).
+/// 超限返回错误 (与 JOIN_MAX_ROWS 同款处理), 客户端可加 LIMIT / 收窄 WHERE 重试.
+pub(crate) const SELECT_MAX_ROWS: usize = 262_144;
+
 // Aggregation is invoked by the SQL dispatcher with explicit execution resources.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sql_run_agg_select(
@@ -84,7 +89,15 @@ pub(crate) fn sql_run_agg_select(
                 let out_ty = match func {
                     sql::AggFn::Count => ColType::I64,
                     sql::AggFn::Sum => src_ty.unwrap_or(ColType::I64),
-                    sql::AggFn::Avg => ColType::F64,
+                    // ⭐ 2026-10-17 (审计 P2): AVG(DECIMAL) 输出定标 Decimal
+                    // (scale+6 附加精度), 其余源列维持 F64.
+                    sql::AggFn::Avg => match src_ty {
+                        Some(ColType::Decimal { scale, .. }) => ColType::Decimal {
+                            precision: 38,
+                            scale: (scale + 6).min(38),
+                        },
+                        _ => ColType::F64,
+                    },
                     sql::AggFn::Min | sql::AggFn::Max => src_ty.unwrap_or(ColType::Bytes),
                 };
                 let inner = match arg {
@@ -110,6 +123,12 @@ pub(crate) fn sql_run_agg_select(
                 return fail(
                     conn,
                     "scalar functions are not supported in aggregate queries (v1)".into(),
+                );
+            }
+            sql::SelectItem::Lit { .. } => {
+                return fail(
+                    conn,
+                    "literal projections are not supported in aggregate queries (v1)".into(),
                 );
             }
         }
@@ -162,6 +181,7 @@ pub(crate) fn sql_run_agg_select(
     conn.sql_select_agg.insert(
         seq,
         SqlSelectAgg {
+            txn_read: txn_read_ctx(conn, db, &table),
             remaining: num_shards,
             error: None,
             rows: Vec::new(),
@@ -467,6 +487,14 @@ pub(crate) enum Accum {
         sum: f64,
         n: u64,
     },
+    /// ⭐ 2026-10-17 (审计 P2): AVG(DECIMAL) → i128 定标累加, 输出
+    /// scale+6 的 Decimal. 旧实现把 Decimal 转 f64 累加, 金额均值出现
+    /// 浮点误差 (且渲染成 DOUBLE 格式).
+    AvgDec {
+        acc: i128,
+        scale: u8,
+        n: u64,
+    },
     Min(Option<ColValue>),
     Max(Option<ColValue>),
 }
@@ -493,7 +521,16 @@ impl Accum {
                     seen: false,
                 },
             },
-            sql::AggFn::Avg => Accum::Avg { sum: 0.0, n: 0 },
+            sql::AggFn::Avg => match col_ty {
+                // ⚠️ 此处 col_ty 对 AVG 是**输出**类型 (scale+6 的 Decimal),
+                // 其 scale 不可信; 真实 scale 由首个入值推定 (见 feed).
+                Some(ColType::Decimal { .. }) => Accum::AvgDec {
+                    acc: 0,
+                    scale: 0,
+                    n: 0,
+                },
+                _ => Accum::Avg { sum: 0.0, n: 0 },
+            },
             sql::AggFn::Min => Accum::Min(None),
             sql::AggFn::Max => Accum::Max(None),
         }
@@ -559,6 +596,21 @@ impl Accum {
                 ColValue::Null => {}
                 _ => return Err("AVG requires a numeric column".into()),
             },
+            Accum::AvgDec { acc, scale, n } => match v {
+                ColValue::Decimal(x, sc) => {
+                    if *n == 0 {
+                        *scale = *sc; // 首个非 NULL 值推定 scale (列内一致)
+                    } else if *scale != *sc {
+                        return Err("AVG(DECIMAL): mixed scales in column".into());
+                    }
+                    *acc = acc
+                        .checked_add(*x)
+                        .ok_or_else(|| "AVG(DECIMAL) overflow".to_string())?;
+                    *n += 1;
+                }
+                ColValue::Null => {}
+                _ => return Err("AVG requires a numeric column".into()),
+            },
             Accum::Min(cur) => {
                 if !matches!(v, ColValue::Null)
                     && cur.as_ref().is_none_or(|c| cmp_colvalue(v, c).is_lt())
@@ -591,6 +643,20 @@ impl Accum {
             Accum::SumDec { acc, scale, .. } => ColValue::Decimal(acc, scale),
             Accum::Avg { n: 0, .. } => ColValue::Null,
             Accum::Avg { sum, n } => ColValue::F64(sum / n as f64),
+            // AVG(DECIMAL): 均值 = acc/n, 保留至多 6 位附加精度 (定标整数除法).
+            // 溢出兜底回退 f64 (理论边界: scale 38 的极端列).
+            Accum::AvgDec { n: 0, .. } => ColValue::Null,
+            Accum::AvgDec { acc, scale, n } => {
+                let extra = (38u8.saturating_sub(scale)).min(6);
+                let factor = 10i128.pow(extra as u32);
+                match acc
+                    .checked_mul(factor)
+                    .and_then(|v| v.checked_div(n as i128))
+                {
+                    Some(v) => ColValue::Decimal(v, scale + extra),
+                    None => ColValue::F64(acc as f64 / 10f64.powi(scale as i32) / n as f64),
+                }
+            }
             Accum::Min(v) | Accum::Max(v) => v.unwrap_or(ColValue::Null),
         }
     }
@@ -820,6 +886,11 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
     // 仅简单 SELECT 启用: order 空/无聚合/无 COUNT). 行展开回全列 (未下推列 = NULL,
     // down_proj 契约已含过滤/排序/投影所需列) 后走既有过滤/投影逻辑.
     let mut out_rows: Vec<Vec<ColValue>> = Vec::new();
+    // ⭐ 审计 P2 (2026-10-17): COUNT(*) 只需计数, 不必物化行 (原实现把全部
+    // 命中行堆进 out_rows 再取 len — 大表 COUNT 白白吃内存).
+    // agg_spec (GROUP BY/聚合) 优先, 与下方分支顺序一致.
+    let count_only = agg.count && agg.agg_spec.is_none();
+    let mut counted: usize = 0;
     if !agg.down_proj.is_empty() {
         let n = agg.schema.columns.len();
         let plain = std::mem::take(&mut agg.plain_rows);
@@ -841,6 +912,10 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
         let early_cut: Option<usize> = agg.limit.map(|l| (l + agg.offset) as usize);
         for values in &full {
             if eval_pred(&agg.schema, values, &agg.conds) {
+                if count_only {
+                    counted += 1;
+                    continue;
+                }
                 out_rows.push(values.clone());
                 if let Some(cut) = early_cut
                     && out_rows.len() >= cut
@@ -880,6 +955,10 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
             };
             let values = decoded?;
             if eval_pred(&agg.schema, &values, &agg.conds) {
+                if count_only {
+                    counted += 1;
+                    continue;
+                }
                 out_rows.push(values);
                 if let Some(cut) = early_cut
                     && out_rows.len() >= cut
@@ -889,15 +968,22 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
             }
         }
     }
+    // ⭐ 审计 P2 (2026-10-17): 结果集内存护栏 — 无 LIMIT 的大表 ORDER BY /
+    // 大结果集渲染会把 worker 内存吃穿 (OOM). 与 JOIN_MAX_ROWS 同款处理.
+    if out_rows.len() > SELECT_MAX_ROWS {
+        return Err(format!(
+            "result set too large (limit {SELECT_MAX_ROWS} rows); add LIMIT or narrow WHERE"
+        ));
+    }
     // ⭐ G2: 广义聚合
     if let Some(spec) = agg.agg_spec.take() {
         return materialize_agg_groups(&spec, out_rows, agg.offset, agg.limit);
     }
     // ⭐ S2: COUNT(*)
-    if agg.count {
+    if count_only {
         return Ok((
             vec![("COUNT(*)".to_string(), ColType::I64)],
-            vec![vec![ColValue::I64(out_rows.len() as i64)]],
+            vec![vec![ColValue::I64(counted as i64)]],
         ));
     }
     // ⭐ M2b: 排序消排 — sorted=true 时 out_rows 已按索引序 (= ORDER BY 序),
@@ -952,3 +1038,100 @@ pub(crate) fn materialize_select_agg(agg: &mut SqlSelectAgg) -> MatResult {
 // =====================================================================
 // ⭐ Z2 (MySQL wire 门面): 帧循环 — 握手/登录状态机 + COM_QUERY
 // =====================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_col_schema() -> std::sync::Arc<TableSchema> {
+        std::sync::Arc::new(
+            storage::schema::TableSchema::new(
+                vec![
+                    storage::schema::Column {
+                        name: "id".into(),
+                        ty: storage::schema::ColType::I64,
+                        nullable: false,
+                        default: None,
+                    },
+                    storage::schema::Column {
+                        name: "v".into(),
+                        ty: storage::schema::ColType::I64,
+                        nullable: true,
+                        default: None,
+                    },
+                ],
+                0,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn agg_with_plain_rows(
+        schema: std::sync::Arc<TableSchema>,
+        n: usize,
+        count: bool,
+    ) -> SqlSelectAgg {
+        // down_proj 路径: plain_rows 直接给 (免构造 row 字节); 空 And = 恒真谓词
+        let plain_rows: Vec<Vec<ColValue>> = (0..n)
+            .map(|i| vec![ColValue::I64(i as i64), ColValue::I64(0)])
+            .collect();
+        SqlSelectAgg {
+            remaining: 0,
+            error: None,
+            rows: Vec::new(),
+            txn_read: None,
+            schema,
+            conds: Pred::And(Vec::new()),
+            limit: None,
+            proj: vec![0, 1],
+            cover: None,
+            unique_early: false,
+            done: true,
+            dml: None,
+            dml_target: None,
+            order: vec![(0, false)],
+            sorted: false,
+            offset: 0,
+            count,
+            agg_spec: None,
+            out_names: Vec::new(),
+            expr_proj: Vec::new(),
+            down_proj: vec![0, 1],
+            plain_rows,
+        }
+    }
+
+    /// ⭐ 审计 P2 (2026-10-17): 无 LIMIT 的大结果集必须报错, 不得把 worker
+    /// 内存吃穿 (对齐 JOIN_MAX_ROWS).
+    #[test]
+    fn materialize_select_agg_caps_result_set() {
+        let n = SELECT_MAX_ROWS + 8;
+        let mut agg = agg_with_plain_rows(two_col_schema(), n, false);
+        let err = materialize_select_agg(&mut agg).unwrap_err();
+        assert!(err.contains("result set too large"), "超限应报错: {err}");
+    }
+
+    /// COUNT(*) 只计数不物化 → 不受护栏影响 (且不再白白堆内存).
+    #[test]
+    fn materialize_select_agg_count_does_not_materialize() {
+        let n = SELECT_MAX_ROWS + 8;
+        let mut agg = agg_with_plain_rows(two_col_schema(), n, true);
+        let (cols, rows) = materialize_select_agg(&mut agg).expect("count 不受护栏限制");
+        assert_eq!(cols[0].0, "COUNT(*)");
+        assert_eq!(rows, vec![vec![ColValue::I64(n as i64)]]);
+    }
+
+    /// LIMIT 早停的查询即使表很大也不触发护栏 (行数被 limit 截断).
+    #[test]
+    fn materialize_select_agg_limit_under_cap_ok() {
+        let mut agg = agg_with_plain_rows(two_col_schema(), SELECT_MAX_ROWS + 8, false);
+        agg.limit = Some(10);
+        let (_, rows) = materialize_select_agg(&mut agg).expect("limit 内应正常");
+        assert_eq!(rows.len(), 10);
+    }
+}

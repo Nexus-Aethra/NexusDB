@@ -29,13 +29,12 @@ fn setup() -> scheduler::SchedHandle {
     scheduler::SchedHandle::new(scheduler::Scheduler::new())
 }
 
+/// ⭐ 审计 P2 (2026-10-17): SchedHandle 不再 `Send` — 跨线程 clone/drive 是
+/// 真 UB (Rc 非原子引用计数 + 双线程 borrow_mut 同一 RefCell). 驱动必须在
+/// 创建 handle 的线程上进行, 因此这里改成当前线程直接推进.
 fn drive_thread(handle: scheduler::SchedHandle, max_iters: usize) -> bool {
-    std::thread::spawn(move || {
-        handle.set_current();
-        handle.drive_until_idle(max_iters)
-    })
-    .join()
-    .unwrap()
+    handle.set_current();
+    handle.drive_until_idle(max_iters)
 }
 
 #[test]
@@ -58,7 +57,10 @@ fn all_io_chain_scenarios() {
             let n = scheduler::io_ops::read(fd, &mut buf, 0).await.unwrap();
             (n, buf)
         });
-        assert!(drive_thread(sched, 10_000), "scheduler must drain to idle");
+        assert!(
+            drive_thread(sched.clone(), 10_000),
+            "scheduler must drain to idle"
+        );
         let (n, buf) = pollster::block_on(h).unwrap();
         assert_eq!(n, 5);
         assert_eq!(&buf, b"hello");
@@ -90,7 +92,10 @@ fn all_io_chain_scenarios() {
             assert_eq!(m, 5);
             buf
         });
-        assert!(drive_thread(sched, 10_000), "scheduler must drain to idle");
+        assert!(
+            drive_thread(sched.clone(), 10_000),
+            "scheduler must drain to idle"
+        );
         let buf = pollster::block_on(h).unwrap();
         assert_eq!(&buf, b"abcde");
     });
@@ -113,7 +118,10 @@ fn all_io_chain_scenarios() {
             scheduler::io_ops::fsync(fd).await.unwrap();
             scheduler::io_ops::close(fd).await.unwrap();
         });
-        assert!(drive_thread(sched, 10_000), "scheduler must drain to idle");
+        assert!(
+            drive_thread(sched.clone(), 10_000),
+            "scheduler must drain to idle"
+        );
         pollster::block_on(h).unwrap();
     });
 }

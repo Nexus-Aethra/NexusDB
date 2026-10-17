@@ -8,8 +8,7 @@ use crate::dir;
 use crate::error::Result;
 use crate::meta::list_table_dir_leaf;
 use crate::output::{
-    ColumnName, HumanRow, JsonObject, format_vpid, human_header, human_row, human_summary,
-    json_row,
+    format_vpid, human_header, human_row, human_summary, json_row, ColumnName, HumanRow, JsonObject,
 };
 use crate::page_decode::PageReport;
 use crate::page_io;
@@ -61,7 +60,8 @@ pub fn run<W: Write>(globals: &Globals, mut out: W) -> Result<u8> {
     // 2. For each db, read its table_dir root and list tables.
     let mut all_tables: Vec<(String, String, u64)> = Vec::new(); // (db, table, root_vpid)
     for (db, table_dir_vpid) in &dbs {
-        let coord = match locate.resolve(*table_dir_vpid, crate::pid::Strategy::MateThenArithmetic) {
+        let coord = match locate.resolve(*table_dir_vpid, crate::pid::Strategy::MateThenArithmetic)
+        {
             Ok(c) => c,
             Err(e) => {
                 write_bad_table_dir(&mut out, globals, db, *table_dir_vpid, &e.to_string())?;
@@ -97,8 +97,7 @@ pub fn run<W: Write>(globals: &Globals, mut out: W) -> Result<u8> {
     match globals.output_mode() {
         crate::output::OutputMode::Human => {
             human_summary(&mut out, &summary)?;
-            let columns: &[ColumnName] =
-                &["db_name", "table_name", "root_vpid", "root_type"];
+            let columns: &[ColumnName] = &["db_name", "table_name", "root_vpid", "root_type"];
             human_header(&mut out, columns)?;
             for (db, table, root_vpid) in &all_tables {
                 let coord = locate.resolve(*root_vpid, crate::pid::Strategy::MateThenArithmetic)?;
@@ -154,7 +153,10 @@ fn write_bad_meta_page<W: Write>(
     match globals.output_mode() {
         crate::output::OutputMode::Human => {
             let row = HumanRow::new()
-                .field(format!("[BAD-PAGE] vpid={}", format_vpid(vpid, globals.hex_vpid)))
+                .field(format!(
+                    "[BAD-PAGE] vpid={}",
+                    format_vpid(vpid, globals.hex_vpid)
+                ))
                 .field(reason);
             human_row(out, &row)?;
         }
@@ -180,7 +182,11 @@ fn write_bad_table_dir<W: Write>(
     match globals.output_mode() {
         crate::output::OutputMode::Human => {
             let row = HumanRow::new()
-                .field(format!("[BAD-PAGE] db={} vpid={}", db, format_vpid(vpid, globals.hex_vpid)))
+                .field(format!(
+                    "[BAD-PAGE] db={} vpid={}",
+                    db,
+                    format_vpid(vpid, globals.hex_vpid)
+                ))
                 .field(reason);
             human_row(out, &row)?;
         }
@@ -208,11 +214,7 @@ fn write_bad_table_dir_page<W: Write>(
         page_io::PageRead::BlockFileMissing { file_id } => {
             format!("block file {file_id}.block missing")
         }
-        page_io::PageRead::BlockFileTruncated {
-            file_id,
-            size,
-            ..
-        } => {
+        page_io::PageRead::BlockFileTruncated { file_id, size, .. } => {
             format!("block {file_id} truncated (size={size})")
         }
         page_io::PageRead::IoError { source, .. } => format!("io error: {source}"),

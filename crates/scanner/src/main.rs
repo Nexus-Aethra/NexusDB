@@ -47,33 +47,45 @@ fn main() -> ExitCode {
 
     let cmd_result: Result<u8> = match top.command {
         Command::Dbs => commands::dbs::run(globals, &mut out),
-        Command::Header { vpid, neighbors } => commands::header::run(globals, vpid, neighbors, &mut out),
+        Command::Header { vpid, neighbors } => {
+            commands::header::run(globals, vpid, neighbors, &mut out)
+        }
         Command::Vpid { vpid, raw } => commands::vpid::run(globals, vpid, raw, &mut out),
         Command::Verify { root } => commands::verify::run(globals, root, &mut out),
         Command::Blame { vpid, tree } => commands::blame::run(globals, vpid, tree, &mut out),
         Command::Rescue => commands::rescue::run(globals, &mut out),
-        Command::Export { root, format, skip_bad } => {
+        Command::Export {
+            root,
+            format,
+            skip_bad,
+        } => {
             let fmt = crate::commands::export::ExportFormat::from_str(&format)
                 .unwrap_or(crate::commands::export::ExportFormat::Kv);
             commands::export::run(globals, root, fmt, skip_bad, &mut out)
-        },
+        }
         Command::WalList => commands::wal_list::run(globals, &mut out),
         Command::WalDump { seq, to, limit } => {
             commands::wal_dump::run(globals, seq, to, limit, &mut out)
-        },
-        Command::Merge { root, format, include_wal } => {
+        }
+        Command::Merge {
+            root,
+            format,
+            include_wal,
+        } => {
             let fmt = crate::commands::merge::MergeFormat::from_str(&format)
                 .unwrap_or(crate::commands::merge::MergeFormat::Kv);
             commands::merge::run(globals, root, fmt, include_wal, &mut out)
-        },
+        }
         Command::Map { from_mate_only } => commands::map::run(globals, from_mate_only, &mut out),
         Command::Lookup { tree, key } => commands::lookup::run(globals, tree, &key, &mut out),
-        Command::Range { vpid, start, end } => commands::range::run(globals, vpid, start, end, &mut out),
+        Command::Range { vpid, start, end } => {
+            commands::range::run(globals, vpid, start, end, &mut out)
+        }
         Command::ExportForce { format } => {
             let fmt = crate::commands::export_force::ExportForceFormat::from_str(&format)
                 .unwrap_or(crate::commands::export_force::ExportForceFormat::Kv);
             commands::export_force::run(globals, fmt, &mut out)
-        },
+        }
         Command::FixMate {
             vpid,
             page_idx,
@@ -81,7 +93,9 @@ fn main() -> ExitCode {
             freed,
             auto,
             apply,
-        } => commands::fix_mate::run(globals, vpid, page_idx, file_id, freed, auto, apply, &mut out),
+        } => commands::fix_mate::run(
+            globals, vpid, page_idx, file_id, freed, auto, apply, &mut out,
+        ),
         Command::RescueJson { out_dir, ndjson } => {
             commands::rescue_json::run(globals, &out_dir, ndjson)
         }

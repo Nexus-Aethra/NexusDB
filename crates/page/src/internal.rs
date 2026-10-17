@@ -100,7 +100,7 @@ pub fn internal_child_with_bounds(
 /// 使用 PageIndex + push_back (与 leaf_insert 流程一致).
 pub fn internal_insert(page: &mut [u8], sep_key: &[u8], child_vpid: u64) -> Result<(), PageError> {
     use crate::checkpoint::MAX_PER_CHECKPOINT;
-    use crate::index::pre_split_segment;
+    use crate::index::{apply_pre_split, plan_pre_split, pre_split_fits};
     use crate::ptr::InternalItemPtr;
 
     if page_type(page) != PageType::Internal {
@@ -142,9 +142,27 @@ pub fn internal_insert(page: &mut [u8], sep_key: &[u8], child_vpid: u64) -> Resu
     let seg_idx = idx.locate_segment(sep_key);
     let mut cur_seg_idx = seg_idx;
 
-    // 2. pre_split
+    // 2. ⭐ 空间预检 + pre_split (2026-10-16 修复, 审计新 P0-1):
+    //
+    //    旧实现无任何预检直接执行 pre_split: 近满页上 mid item 的 full-key
+    //    重编码 (长共享前缀 key 可膨胀数百字节) 使 copy_within 越界 panic,
+    //    或使 free_off 写穿 checkpoint 区; 且随后 push_back 的 PageFull
+    //    错误路径上 write_back 不执行 — 调用方 (btree split 路径) 会把
+    //    污染页拆分后持久化 → 静默丢数据. 与 2026-08-02 leaf 冷启动事故
+    //    (docs/bug-cold-start-data-loss.md) 同根因, 当年只修了 leaf 侧.
+    //
+    //    修法 (对齐 leaf.rs 的 2026-08-02 模式, 但用精确值而非估算):
+    //    a. 只读演算 plan, 精确边界检查 — 放不下则 PageFull, 页数据未修改;
+    //    b. 快照兜底 — 万一 pre_split 之后 push_back 才失败, 恢复
+    //       "失败的插入不改变页"强不变量.
+    let mut snapshot: Option<Vec<u8>> = None;
     if idx.segments[cur_seg_idx].item_count >= MAX_PER_CHECKPOINT {
-        pre_split_segment(page, &mut idx, cur_seg_idx, ItemKind::Internal)?;
+        let plan = plan_pre_split(page, &idx, cur_seg_idx, ItemKind::Internal)?;
+        if !pre_split_fits(page, &idx, &plan) {
+            return Err(PageError::PageFull); // 页数据未修改, checkpoint 一致
+        }
+        snapshot = Some(page.to_vec());
+        apply_pre_split(page, &mut idx, cur_seg_idx, &plan)?;
         cur_seg_idx = idx.locate_segment(sep_key);
     }
 
@@ -198,7 +216,7 @@ pub fn internal_insert(page: &mut [u8], sep_key: &[u8], child_vpid: u64) -> Resu
     let seg_idx_for_push = idx.find_segment_by_offset(prev_ptr.byte_offset());
     drop(ptr);
     drop(prev_ptr);
-    internal_push_back(
+    if let Err(e) = internal_push_back(
         page,
         &mut idx,
         &prev_key,
@@ -206,7 +224,15 @@ pub fn internal_insert(page: &mut [u8], sep_key: &[u8], child_vpid: u64) -> Resu
         sep_key,
         child_vpid,
         seg_idx_for_push,
-    )?;
+    ) {
+        // ⭐ L2: pre_split 可能已改写页字节 (item 移位 + free_off 前进),
+        // 而 write_back 尚未执行 — 直接返回会把"污染页"交给调用方.
+        // 恢复快照, 保证失败的插入不改变页字节 (checkpoint 数组保持一致).
+        if let Some(snap) = &snapshot {
+            page.copy_from_slice(snap);
+        }
+        return Err(e);
+    }
     idx.write_back(page)?;
     Ok(())
 }
@@ -309,7 +335,7 @@ pub fn internal_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
         );
         // k+1 的 full key 用**原 prev** (target 的 full key) 还原, 不是 new_prev_key.
         // 因为 k1_item 编码时 shared_prefix_len 是基于 target (旧 prev) 的.
-        k1_full_key = k1_item.full_key(&target_full_key);
+        k1_full_key = k1_item.full_key(&target_full_key)?;
         dprintln!(
             internal,
             "[INTERNAL_DELETE] k1 full_key={:?} new_prev={:?} k1_is_seg_start={} target_was_seg_start={} target_seg_idx={} segments.len={}",
@@ -432,8 +458,12 @@ pub fn internal_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
             effective_seg_idx,
             idx.segments[effective_seg_idx].item_count
         );
-        let merged =
-            crate::index_merge::apply_pre_merge(page, &mut idx, effective_seg_idx, ItemKind::Internal)?;
+        let merged = crate::index_merge::apply_pre_merge(
+            page,
+            &mut idx,
+            effective_seg_idx,
+            ItemKind::Internal,
+        )?;
         dprintln!(internal, "[INTERNAL_DELETE] pre_merge result: {}", merged);
         if !merged {
             // total > MAX: 尝试 steal/borrow
@@ -505,7 +535,7 @@ pub fn internal_split(
         // Loop: i=0=sentinel, i=1..=mid=mid 真实 keys, i=mid+1=mid+1-th 真实 key (right 第一)
         for i in 0..(mid + 2) {
             let (item, n) = decode_item(left, off, ItemKind::Internal)?;
-            let full = item.full_key(&prev_key);
+            let full = item.full_key(&prev_key)?;
             dprintln!(
                 internal,
                 "[INTERNAL_SPLIT] i={} off={} n={} key={:?} child={}",
@@ -534,7 +564,7 @@ pub fn internal_split(
         // 循环跑到 i=mid+1, 这样能取到 i=mid 的 mid_n.
         for i in 0..(mid + 2) {
             let (item, n) = decode_item(left, off, ItemKind::Internal)?;
-            let full = item.full_key(&prev_key);
+            let full = item.full_key(&prev_key)?;
             dprintln!(
                 internal,
                 "[INTERNAL_SPLIT] [no-sentinel] i={} off={} n={} key={:?} child={}",
@@ -601,7 +631,7 @@ pub fn internal_split(
     let mut cur = mid_off + mid_n;
     while cur < left_orig_free {
         let (item, n) = decode_item(left, cur, ItemKind::Internal)?;
-        let full = item.full_key(&new_prev_key);
+        let full = item.full_key(&new_prev_key)?;
         let mut buf = [0u8; 4096];
         let enc_n = encode_internal_item(&mut buf, &new_prev_key, &full, item.child_vpid)?;
         right[write_off..write_off + enc_n].copy_from_slice(&buf[..enc_n]);
@@ -624,11 +654,21 @@ pub fn internal_split(
     let left_idx = PageIndex::load(left, ItemKind::Internal)?;
     if left_idx.segments.is_empty() && left_kc > 0 {
         // 防御性: 与 leaf_split 一致, load 返回 0 segments 时手动建 cp[0].
+        //
+        // ⚠️ 2026-10-16 修复 (新 P0-1 下游): item_count 必须按**本页有无哨兵**计算:
+        //   - 有哨兵页 (root 等): items = 哨兵 + left_kc 个真实 key → left_kc + 1
+        //   - 无哨兵页 (上一次 split 产生的 right 页再分裂时的左半):
+        //     items = left_kc 个真实 key → left_kc
+        // 旧实现硬编码 +1, 对无哨兵页多数一个**幽灵 item** — 段表声称的 item 数
+        // 超过实际数据, 后续 insert 的段内 walk 会越过 free_off 踩到零区/垃圾,
+        // 表现为 push_back copy_within 的 "slice index starts at X but ends at Y"
+        // panic 或静默错路由. (leaf_split 无此问题: leaf 页必有哨兵.)
+        let left_item_count = if has_sentinel { left_kc + 1 } else { left_kc };
         write_checkpoint(
             left,
             0,
             Checkpoint {
-                item_count: left_kc + 1, // +1 含哨兵
+                item_count: left_item_count,
                 first_item_off: PAGE_HEADER_SIZE as u16,
             },
         );
@@ -695,7 +735,7 @@ pub fn internal_push_back(
     if k1_off_orig < free_off_before {
         let (k1_item, k1_old_n) = decode_item(page, k1_off_orig, ItemKind::Internal)?;
         if k1_item.shared_prefix_len > 0 {
-            let k1_full_key = k1_item.full_key(prev_key);
+            let k1_full_key = k1_item.full_key(prev_key)?;
             k1_new_n =
                 encode_internal_item(&mut k1_buf, sep_key, &k1_full_key, k1_item.child_vpid)?;
             k1_delta = k1_new_n as isize - k1_old_n as isize;
@@ -829,7 +869,17 @@ pub fn internal_update(
 
     let old_off = ptr.byte_offset();
     let old_n = ptr.total_len();
-    let prev_key = prev_ptr.key().to_vec();
+    // ⭐ 2026-10-17 (审计 P2, 对齐 leaf.rs:932-936 的 2026-07-26 修复):
+    // target 恰好是段首 item 时 (seg_idx > 0, 扫描第一个就命中), prev_ptr 仍是
+    // target 自身 → prev_key == key → 重编码后 shared = key.len(), **破坏段首
+    // shared=0 自包含不变量** (PageIndex::load / InternalItemPtr::new 随后
+    // 对该段首的解析会错). 段首的编码语义 prev 必须视为空 (shared=0),
+    // 与原 encoding 一致.
+    let prev_key = if prev_ptr.byte_offset() == old_off {
+        Vec::new()
+    } else {
+        prev_ptr.key().to_vec()
+    };
 
     // 计算新 item 字节数. prev_key 不变, key 不变, child_vpid 字节固定 8B,
     // 所以 new_n 通常 == old_n (除非 shared/key_unshared 字节数变化, 极少见).

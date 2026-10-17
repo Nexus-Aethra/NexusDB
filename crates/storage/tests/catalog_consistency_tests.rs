@@ -17,9 +17,9 @@
 
 use std::collections::HashSet;
 
-use storage::{IoBackend, IoBackendConfig};
 use storage::OpenOptions;
 use storage::StorageEngine;
+use storage::{IoBackend, IoBackendConfig};
 
 mod common;
 

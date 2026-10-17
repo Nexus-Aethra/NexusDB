@@ -81,7 +81,8 @@ impl StorageEngine {
             }
             count += 1;
         }
-        self.put_list_meta(db, table, key, count, head, tail).await?;
+        self.put_list_meta(db, table, key, count, head, tail)
+            .await?;
         Ok(count as i64)
     }
 
@@ -149,7 +150,11 @@ impl StorageEngine {
         key: &[u8],
     ) -> Result<i64, RegistryError> {
         self.ensure_kind(db, table, key, ks::KIND_LIST).await?;
-        Ok(self.list_meta(db, table, key).await?.map(|(c, _, _)| c).unwrap_or(0) as i64)
+        Ok(self
+            .list_meta(db, table, key)
+            .await?
+            .map(|(c, _, _)| c)
+            .unwrap_or(0) as i64)
     }
 
     /// LRANGE start end (含负索引, end inclusive). 返回 stored 值 (caller 渲染).
@@ -181,9 +186,10 @@ impl StorageEngine {
             return Ok(vec![]);
         }
         // 扫描全部元素 (BTree 序 = 列表左到右), 取 [s..=e]
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let prefix = ks::data_prefix(ks::KIND_LIST, key);
         let mut pos = 0i64;
         let mut out = Vec::new();
@@ -222,9 +228,10 @@ impl StorageEngine {
         if pos < 0 || pos >= len {
             return Ok(None);
         }
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let prefix = ks::data_prefix(ks::KIND_LIST, key);
         let mut i = 0i64;
         let mut found: Option<Vec<u8>> = None;
@@ -266,9 +273,10 @@ impl StorageEngine {
         if pos < 0 || pos >= len {
             return Ok(false);
         }
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let prefix = ks::data_prefix(ks::KIND_LIST, key);
         let mut i = 0i64;
         let mut target: Option<i64> = None;
@@ -309,9 +317,10 @@ impl StorageEngine {
         table: &str,
         key: &[u8],
     ) -> Result<Vec<(i64, Vec<u8>)>, RegistryError> {
-        let root = self.open_table(db, table).await?.ok_or_else(|| {
-            RegistryError::TableNotFound(db.to_string(), table.to_string())
-        })?;
+        let root = self
+            .open_table(db, table)
+            .await?
+            .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
         let prefix = ks::data_prefix(ks::KIND_LIST, key);
         let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
         crate::registry::table_scan_prefix(self.pager_mut(), root, &prefix, &mut |k, v| {
@@ -388,8 +397,12 @@ impl StorageEngine {
             matched
         };
         for idx in &victims {
-            self.delete_physical(db, table, &ks::encode_data(ks::KIND_LIST, key, &ks::encode_idx(*idx)))
-                .await?;
+            self.delete_physical(
+                db,
+                table,
+                &ks::encode_data(ks::KIND_LIST, key, &ks::encode_idx(*idx)),
+            )
+            .await?;
         }
         if !victims.is_empty() {
             self.refresh_list_meta(db, table, key).await?;

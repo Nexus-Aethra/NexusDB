@@ -84,7 +84,26 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 /// 记录编码进 buf: [u32 len][u32 crc][payload], payload =
 /// [op][u16 db_len][db][u16 tbl_len][tbl][u32 key_len][key][u32 val_len][val].
-fn encode_record(buf: &mut Vec<u8>, db: &str, table: &str, pkey: &[u8], value: Option<&[u8]>) {
+fn encode_record(
+    buf: &mut Vec<u8>,
+    db: &str,
+    table: &str,
+    pkey: &[u8],
+    value: Option<&[u8]>,
+) -> io::Result<()> {
+    // ⭐ 审计 P3 (2026-10-17): db/table 名长度显式校验 — 旧实现直接
+    // `as u16`, 超长名被**静默截断** (WAL 重放时写错表). 64KB 的名字本就
+    // 不可信, 显式报错优于静默损坏.
+    if db.len() > u16::MAX as usize || table.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "WAL record name too long: db={}B table={}B (max 65535)",
+                db.len(),
+                table.len()
+            ),
+        ));
+    }
     let val = value.unwrap_or(&[]);
     let payload_len = 1 + 2 + db.len() + 2 + table.len() + 4 + pkey.len() + 4 + val.len();
     buf.reserve(8 + payload_len);
@@ -103,6 +122,7 @@ fn encode_record(buf: &mut Vec<u8>, db: &str, table: &str, pkey: &[u8], value: O
     buf.extend_from_slice(val);
     let crc = crc32(&buf[p0..]);
     buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
 }
 
 /// 从字节流解码全部完好记录 (torn tail 静默截断).
@@ -239,13 +259,19 @@ impl WalWriter {
     }
 
     /// 记录一次 put (结果态).
-    pub fn append_put(&mut self, db: &str, table: &str, pkey: &[u8], value: &[u8]) {
-        encode_record(&mut self.buf, db, table, pkey, Some(value));
+    pub fn append_put(
+        &mut self,
+        db: &str,
+        table: &str,
+        pkey: &[u8],
+        value: &[u8],
+    ) -> io::Result<()> {
+        encode_record(&mut self.buf, db, table, pkey, Some(value))
     }
 
     /// 记录一次 delete.
-    pub fn append_del(&mut self, db: &str, table: &str, pkey: &[u8]) {
-        encode_record(&mut self.buf, db, table, pkey, None);
+    pub fn append_del(&mut self, db: &str, table: &str, pkey: &[u8]) -> io::Result<()> {
+        encode_record(&mut self.buf, db, table, pkey, None)
     }
 
     /// 有未持久化内容 (buf 或已写未 sync).
@@ -334,8 +360,8 @@ mod tests {
     #[test]
     fn record_roundtrip() {
         let mut buf = Vec::new();
-        encode_record(&mut buf, "db1", "t1", b"key-a", Some(b"val-a"));
-        encode_record(&mut buf, "db2", "t2", b"key-b", None);
+        encode_record(&mut buf, "db1", "t1", b"key-a", Some(b"val-a")).unwrap();
+        encode_record(&mut buf, "db2", "t2", b"key-b", None).unwrap();
         let recs = decode_records(&buf);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].db, "db1");
@@ -347,9 +373,9 @@ mod tests {
     #[test]
     fn torn_tail_truncates() {
         let mut buf = Vec::new();
-        encode_record(&mut buf, "d", "t", b"k1", Some(b"v1"));
+        encode_record(&mut buf, "d", "t", b"k1", Some(b"v1")).unwrap();
         let good_len = buf.len();
-        encode_record(&mut buf, "d", "t", b"k2", Some(b"v2"));
+        encode_record(&mut buf, "d", "t", b"k2", Some(b"v2")).unwrap();
         // 尾部截一半 = torn write
         buf.truncate(good_len + 5);
         let recs = decode_records(&buf);
@@ -357,9 +383,9 @@ mod tests {
         assert_eq!(recs[0].pkey, b"k1");
         // crc 破坏第二条
         let mut buf2 = Vec::new();
-        encode_record(&mut buf2, "d", "t", b"k1", Some(b"v1"));
+        encode_record(&mut buf2, "d", "t", b"k1", Some(b"v1")).unwrap();
         let p = buf2.len();
-        encode_record(&mut buf2, "d", "t", b"k2", Some(b"v2"));
+        encode_record(&mut buf2, "d", "t", b"k2", Some(b"v2")).unwrap();
         buf2[p + 10] ^= 0xFF;
         assert_eq!(decode_records(&buf2).len(), 1);
     }
@@ -368,9 +394,9 @@ mod tests {
     fn seal_and_segments() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = WalWriter::open(tmp.path(), 0, WalMode::Periodic, false).unwrap();
-        w.append_put("d", "t", b"k1", b"v1");
+        w.append_put("d", "t", b"k1", b"v1").unwrap();
         w.seal().unwrap(); // k1 落入段 1
-        w.append_put("d", "t", b"k2", b"v2");
+        w.append_put("d", "t", b"k2", b"v2").unwrap();
         // buf 未 flush 时 crash 模拟: 段 2 空, 段 1 含 k1
         let segs = WalWriter::existing_segments(tmp.path(), 0);
         assert_eq!(segs.len(), 2);

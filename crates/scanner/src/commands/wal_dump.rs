@@ -77,8 +77,7 @@ pub fn run<W: Write>(
 
             let payload_len =
                 u32::from_le_bytes(seg_data[pos..pos + 4].try_into().unwrap()) as usize;
-            let crc_stored =
-                u32::from_le_bytes(seg_data[pos + 4..pos + 8].try_into().unwrap());
+            let crc_stored = u32::from_le_bytes(seg_data[pos + 4..pos + 8].try_into().unwrap());
             let Some(payload) = seg_data.get(pos + 8..pos + 8 + payload_len) else {
                 emit_torn_tail(&mut out, globals, seg.shard_id, seg.seq, path, pos)?;
                 total_bad += 1;
@@ -94,15 +93,7 @@ pub fn run<W: Write>(
             }
 
             if let Some(rec) = wal::decode_payload(payload) {
-                emit_record(
-                    &mut out,
-                    globals,
-                    seg.shard_id,
-                    seg.seq,
-                    &rec,
-                    crc_ok,
-                    path,
-                )?;
+                emit_record(&mut out, globals, seg.shard_id, seg.seq, &rec, crc_ok, path)?;
                 frame_count += 1;
             } else {
                 emit_torn_tail(&mut out, globals, seg.shard_id, seg.seq, path, pos)?;
@@ -115,7 +106,12 @@ pub fn run<W: Write>(
     }
 
     if total_bad > 0 && matches!(globals.output_mode(), output::OutputMode::Human) {
-        writeln!(&mut out, "[WAL-SUMMARY] {} frames, {} bad/torn", frame_count, total_bad).ok();
+        writeln!(
+            &mut out,
+            "[WAL-SUMMARY] {} frames, {} bad/torn",
+            frame_count, total_bad
+        )
+        .ok();
     }
 
     Ok(0)

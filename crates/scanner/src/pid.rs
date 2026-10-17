@@ -189,8 +189,7 @@ impl Locate {
                 .unwrap_or_else(|_| DiskCoord::from_vpid_arithmetic(vpid)),
         };
         if self.file_id_offset != 0 {
-            coord.file_id =
-                (coord.file_id as u64 + self.file_id_offset as u64) as u32;
+            coord.file_id = (coord.file_id as u64 + self.file_id_offset as u64) as u32;
         }
         Ok(coord)
     }

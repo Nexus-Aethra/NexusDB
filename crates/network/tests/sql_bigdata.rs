@@ -72,9 +72,14 @@ struct MyConn {
 impl MyConn {
     fn connect(server: &NetworkServer) -> Self {
         let stream = TcpStream::connect(server.local_addr()).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
         stream.set_nodelay(true).unwrap();
-        Self { stream, buf: Vec::new() }
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
     }
 
     fn read_frame(&mut self) -> (u8, Vec<u8>) {
@@ -180,13 +185,6 @@ impl MyConn {
             }
         }
     }
-
-    fn err_code(&self, r: &QueryResult) -> Option<u16> {
-        match r {
-            QueryResult::Err { code, .. } => Some(*code),
-            _ => None,
-        }
-    }
 }
 
 // ===== 大数据测试 =====
@@ -241,7 +239,11 @@ fn bigdata_count_and_filter() {
     match c.query("SELECT COUNT(*) FROM users") {
         QueryResult::Rows(rows) => {
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0][0].as_deref(), Some(N.to_string().as_str()), "COUNT(*) 全表");
+            assert_eq!(
+                rows[0][0].as_deref(),
+                Some(N.to_string().as_str()),
+                "COUNT(*) 全表"
+            );
         }
         other => panic!("expect rows, got {other:?}"),
     }
@@ -302,7 +304,11 @@ fn bigdata_aggregate_groupby() {
     match c.query("SELECT SUM(id) FROM users") {
         QueryResult::Rows(rows) => {
             let expect = (N * (N + 1)) / 2;
-            assert_eq!(rows[0][0].as_deref(), Some(expect.to_string().as_str()), "SUM(id)");
+            assert_eq!(
+                rows[0][0].as_deref(),
+                Some(expect.to_string().as_str()),
+                "SUM(id)"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -310,7 +316,11 @@ fn bigdata_aggregate_groupby() {
     match c.query("SELECT MIN(id), MAX(id) FROM users") {
         QueryResult::Rows(rows) => {
             assert_eq!(rows[0][0].as_deref(), Some("1"), "MIN(id)");
-            assert_eq!(rows[0][1].as_deref(), Some(N.to_string().as_str()), "MAX(id)");
+            assert_eq!(
+                rows[0][1].as_deref(),
+                Some(N.to_string().as_str()),
+                "MAX(id)"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -387,11 +397,10 @@ fn bigdata_order_paging() {
         other => panic!("{other:?}"),
     }
     // 倒序
-    match c.query(&format!("SELECT id FROM users ORDER BY id DESC LIMIT 5")) {
+    match c.query("SELECT id FROM users ORDER BY id DESC LIMIT 5") {
         QueryResult::Rows(rows) => {
-            let expect: Vec<Vec<Option<String>>> = (0..5)
-                .map(|i| vec![Some((N - i).to_string())])
-                .collect();
+            let expect: Vec<Vec<Option<String>>> =
+                (0..5).map(|i| vec![Some((N - i).to_string())]).collect();
             assert_eq!(rows, expect, "ORDER BY id DESC");
         }
         other => panic!("{other:?}"),
@@ -399,9 +408,8 @@ fn bigdata_order_paging() {
     // OFFSET 分页
     match c.query("SELECT id FROM users ORDER BY id LIMIT 5 OFFSET 100") {
         QueryResult::Rows(rows) => {
-            let expect: Vec<Vec<Option<String>>> = (101..=105)
-                .map(|i| vec![Some(i.to_string())])
-                .collect();
+            let expect: Vec<Vec<Option<String>>> =
+                (101..=105).map(|i| vec![Some(i.to_string())]).collect();
             assert_eq!(rows, expect, "OFFSET 分页");
         }
         other => panic!("{other:?}"),
@@ -461,7 +469,8 @@ fn bigdata_join() {
     // 注: 解析器明确不支持 JOIN 内聚合函数 (见 parser_select.rs:
     // "aggregate functions are not supported in JOIN queries"), 故 JOIN 校验走行集/单行.
     // JOIN 单行: uid=i 与 users.id=i 一一对应
-    match c.query("SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid WHERE u.id = 7") {
+    match c.query("SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid WHERE u.id = 7")
+    {
         QueryResult::Rows(rows) => {
             assert_eq!(
                 rows,
@@ -472,7 +481,9 @@ fn bigdata_join() {
         other => panic!("{other:?}"),
     }
     // JOIN 多行: 前 3 个订单对应 u1..u3
-    match c.query("SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid ORDER BY o.id LIMIT 3") {
+    match c.query(
+        "SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid ORDER BY o.id LIMIT 3",
+    ) {
         QueryResult::Rows(rows) => {
             assert_eq!(
                 rows,
@@ -516,7 +527,9 @@ fn bigdata_join() {
         other => panic!("{other:?}"),
     }
     // LEFT JOIN: 有订单用户右列非 NULL
-    match c.query("SELECT u.id, o.amt FROM users u LEFT JOIN orders o ON u.id = o.uid WHERE u.id = 42") {
+    match c
+        .query("SELECT u.id, o.amt FROM users u LEFT JOIN orders o ON u.id = o.uid WHERE u.id = 42")
+    {
         QueryResult::Rows(rows) => {
             assert_eq!(
                 rows,
@@ -573,7 +586,11 @@ fn bigdata_update_delete_consistency() {
     // score=0 计数 = N/2 (UPDATE 置 0) + 10 (原本 id>N/2 且 i%1000==0 的行: 11000..20000 步长 1000)
     match c.query("SELECT COUNT(*) FROM users WHERE score = 0") {
         QueryResult::Rows(rows) => {
-            assert_eq!(rows[0][0].as_deref(), Some((N / 2 + 10).to_string().as_str()), "score=0");
+            assert_eq!(
+                rows[0][0].as_deref(),
+                Some((N / 2 + 10).to_string().as_str()),
+                "score=0"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -587,14 +604,22 @@ fn bigdata_update_delete_consistency() {
     }
     match c.query("SELECT COUNT(*) FROM users") {
         QueryResult::Rows(rows) => {
-            assert_eq!(rows[0][0].as_deref(), Some((N / 2).to_string().as_str()), "删半后计数");
+            assert_eq!(
+                rows[0][0].as_deref(),
+                Some((N / 2).to_string().as_str()),
+                "删半后计数"
+            );
         }
         other => panic!("{other:?}"),
     }
     // 删除后剩前一半 (score 均已置 0)
     match c.query("SELECT COUNT(*) FROM users WHERE score = 0") {
         QueryResult::Rows(rows) => {
-            assert_eq!(rows[0][0].as_deref(), Some((N / 2).to_string().as_str()), "剩余 score 全 0");
+            assert_eq!(
+                rows[0][0].as_deref(),
+                Some((N / 2).to_string().as_str()),
+                "剩余 score 全 0"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -604,20 +629,32 @@ fn bigdata_update_delete_consistency() {
     let mut c2 = MyConn::handshake_login(&server);
     match c2.query("SELECT COUNT(*) FROM users") {
         QueryResult::Rows(rows) => {
-            assert_eq!(rows[0][0].as_deref(), Some((N / 2).to_string().as_str()), "重连后计数");
+            assert_eq!(
+                rows[0][0].as_deref(),
+                Some((N / 2).to_string().as_str()),
+                "重连后计数"
+            );
         }
         other => panic!("{other:?}"),
     }
     match c2.query("SELECT COUNT(*) FROM users WHERE score = 0") {
         QueryResult::Rows(rows) => {
-            assert_eq!(rows[0][0].as_deref(), Some((N / 2).to_string().as_str()), "重连后剩余全 score=0");
+            assert_eq!(
+                rows[0][0].as_deref(),
+                Some((N / 2).to_string().as_str()),
+                "重连后剩余全 score=0"
+            );
         }
         other => panic!("{other:?}"),
     }
     // 重连后最大 id 应为 N/2 (后一半已删)
     match c2.query("SELECT MAX(id) FROM users") {
         QueryResult::Rows(rows) => {
-            assert_eq!(rows[0][0].as_deref(), Some((N / 2).to_string().as_str()), "重连后 MAX(id)");
+            assert_eq!(
+                rows[0][0].as_deref(),
+                Some((N / 2).to_string().as_str()),
+                "重连后 MAX(id)"
+            );
         }
         other => panic!("{other:?}"),
     }

@@ -3,7 +3,8 @@
 
 use super::*;
 
-type ScalarConstRow = (Vec<(&'static str, ColType)>, Vec<ColValue>);
+/// ⭐ 审计 P3: 列名用 `String` (字面量投影的列名由字面量文本生成, 非 'static).
+type ScalarConstRow = (Vec<(String, ColType)>, Vec<ColValue>);
 
 /// ⭐ compat: 表达式投影输出行 — 按 (proj 列号, expr_proj 表达式) 构建单行
 /// 输出 (列定义 + 值). Some(expr) → 求值 (JSONB 取字段, 输出 Str);
@@ -49,20 +50,50 @@ pub(crate) fn project_output_row(
 /// ⭐ compat: 无 FROM 标量函数投影常量单行 (SELECT NOW() 等).
 /// 返回 (列定义, 常量行); 未知函数报错.
 pub(crate) fn scalar_fn_const_row(items: &[sql::SelectItem]) -> Result<ScalarConstRow, String> {
-    let mut cref: Vec<(&str, ColType)> = Vec::with_capacity(items.len());
+    let mut cref: Vec<(String, ColType)> = Vec::with_capacity(items.len());
     let mut row: Vec<ColValue> = Vec::with_capacity(items.len());
     for it in items {
-        if let sql::SelectItem::ScalarFn { name } = it {
-            match name.to_ascii_uppercase().as_str() {
-                "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" => {
-                    cref.push(("now", ColType::Timestamp));
-                    // Timestamp 以 i64 微秒承载
-                    row.push(ColValue::I64(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as i64)
-                            .unwrap_or(0),
+        if let sql::SelectItem::Lit { val, alias } = it {
+            // ⭐ 审计 P3: 顶层字面量投影 (SELECT 1 / SELECT 'a' AS x).
+            let (ty, cv) = match val {
+                sql::SqlValue::Int(i) => (ColType::I64, ColValue::I64(*i)),
+                sql::SqlValue::Float(f) => (ColType::F64, ColValue::F64(*f)),
+                sql::SqlValue::Str(s) => (ColType::Str, ColValue::Bytes(s.clone())),
+                sql::SqlValue::Null => (ColType::Str, ColValue::Null),
+                other => {
+                    return Err(format!(
+                        "unsupported literal in constant projection: {other:?}"
                     ));
+                }
+            };
+            let name = alias.clone().unwrap_or_else(|| format!("{val:?}"));
+            cref.push((name, ty));
+            row.push(cv);
+            continue;
+        }
+        if let sql::SelectItem::ScalarFn { name } = it {
+            // ⭐ 审计 P3 (2026-10-17): CURRENT_DATE / CURRENT_TIME 语义修正.
+            // 旧实现四个名字一律返回"当前时刻微秒"且列名都叫 "now" — DATE 拿到
+            // 带时分秒的值, TIME 拿到带日期的值, 客户端按类型渲染出来全是错的.
+            // 现在: DATE = 当日零点 (UTC), TIME = 当日午夜以来的微秒, 列名与
+            // 函数名一致 (PG 行为). 存储仍是 i64 微秒 (Timestamp 承载).
+            const DAY_US: i64 = 86_400_000_000;
+            match name.to_ascii_uppercase().as_str() {
+                "NOW" => {
+                    cref.push(("now".to_string(), ColType::Timestamp));
+                    row.push(ColValue::I64(now_micros()));
+                }
+                "CURRENT_TIMESTAMP" => {
+                    cref.push(("current_timestamp".to_string(), ColType::Timestamp));
+                    row.push(ColValue::I64(now_micros()));
+                }
+                "CURRENT_DATE" => {
+                    cref.push(("current_date".to_string(), ColType::Timestamp));
+                    row.push(ColValue::I64(now_micros().div_euclid(DAY_US) * DAY_US));
+                }
+                "CURRENT_TIME" => {
+                    cref.push(("current_time".to_string(), ColType::Timestamp));
+                    row.push(ColValue::I64(now_micros().rem_euclid(DAY_US)));
                 }
                 other => return Err(format!("unknown scalar function '{other}'")),
             }
@@ -180,10 +211,16 @@ pub(crate) fn eval_col_default(
     Ok(match d {
         storage::schema::ColDefault::Lit(v) => v.clone(),
         storage::schema::ColDefault::Now => ColValue::I64(now_micros()),
+        // ⭐ 审计 P3 (2026-10-17): 非 UUID 列上的 uuid_generate_v4() 显式报错.
+        // 旧实现注释写"保守报错"却实际静默产 16B Bytes — 落进 Str/Int 列后
+        // 要么被当二进制垃圾存下来, 要么后续比较恒不等 (静默错数据).
         storage::schema::ColDefault::UuidGenV4 => match ty {
             ColType::Uuid => ColValue::Bytes(uuid_v4_bytes()),
-            // 非 UUID 列上的 uuid_generate_v4() → 也产 16B 文本? 保守报错
-            _ => ColValue::Bytes(uuid_v4_bytes()),
+            _ => {
+                return Err(format!(
+                    "uuid_generate_v4() default is only valid on UUID columns (got {ty:?})"
+                ));
+            }
         },
         // ⭐ PG 兼容 (portal): SERIAL/BIGSERIAL → 进程级单调递增
         storage::schema::ColDefault::Serial => ColValue::I64(next_auto_rowid()),
@@ -332,6 +369,13 @@ pub(crate) fn sql_pk_bytes(ty: ColType, v: &ColValue) -> Result<Vec<u8>, String>
             Ok(storage::keyspace::encode_i128_ordered(*x).to_vec())
         }
         (_, ColValue::Null) => Err("PRIMARY KEY must not be NULL".into()),
+        // ⭐ 审计 P3 (2026-10-17): 空串主键给出明确原因 — 空 key 在 LCB-Tree
+        // 里保留给哨兵 item (leaf_insert 拒绝空 key), 不是"随便不支持".
+        (ColType::Str | ColType::Bytes | ColType::Json | ColType::Uuid, ColValue::Bytes(b))
+            if b.is_empty() =>
+        {
+            Err("PRIMARY KEY must not be an empty string (empty keys are reserved for the btree sentinel)".into())
+        }
         _ => Err("bad PRIMARY KEY value".into()),
     }
 }
@@ -361,13 +405,48 @@ pub(crate) fn eval_cond_leaf(schema: &TableSchema, values: &[ColValue], c: &Cond
                         .is_ok();
                 }
                 ColValue::Bytes(x) if c.set.iter().all(|v| matches!(v, SqlValue::Str(_))) => {
-                    return c
-                        .set
-                        .binary_search_by(|v| match v {
-                            SqlValue::Str(b) => b.as_slice().cmp(x.as_slice()),
-                            _ => std::cmp::Ordering::Less,
-                        })
-                        .is_ok();
+                    // ⭐ 2026-10-17 (审计 P2): UUID 列的集合元素是 36 字符
+                    // 文本而存储是 16B — 二分前必须逐元素 coercion. 旧实现
+                    // 直接拿文本与 16B 比较, >64 元素的 IN **恒空集**
+                    // (与 ≤64 的线性路径语义不一致).
+                    if colty == ColType::Uuid {
+                        let mut coerced: Vec<Vec<u8>> = Vec::with_capacity(c.set.len());
+                        let mut all_valid = true;
+                        for v in &c.set {
+                            match v {
+                                SqlValue::Str(t) => {
+                                    match std::str::from_utf8(t).ok().and_then(parse_uuid) {
+                                        Some(b) => coerced.push(b),
+                                        None => {
+                                            all_valid = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    all_valid = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_valid {
+                            // 文本序与二进制序在大小写混用等情形下可能不同,
+                            // 重排保证二分正确.
+                            coerced.sort_unstable();
+                            return coerced
+                                .binary_search_by(|b| b.as_slice().cmp(x.as_slice()))
+                                .is_ok();
+                        }
+                        // 含非法 UUID 文本 → 落到下方线性路径 (保守正确)
+                    } else {
+                        return c
+                            .set
+                            .binary_search_by(|v| match v {
+                                SqlValue::Str(b) => b.as_slice().cmp(x.as_slice()),
+                                _ => std::cmp::Ordering::Less,
+                            })
+                            .is_ok();
+                    }
                 }
                 _ => {}
             }
@@ -412,11 +491,51 @@ pub(crate) fn eval_pred(schema: &TableSchema, values: &[ColValue], pred: &Pred<C
 pub(crate) fn eval_pred_sysq(schema: &TableSchema, values: &[ColValue], pred: &Pred<Cond>) -> bool {
     match pred {
         Pred::Leaf(c) if c.col.starts_with("__") => true,
-        Pred::Leaf(c) => eval_cond_leaf(schema, values, c),
+        Pred::Leaf(c) => eval_cond_leaf_sysq(schema, values, c),
         Pred::And(v) => v.iter().all(|p| eval_pred_sysq(schema, values, p)),
         Pred::Or(v) => v.iter().any(|p| eval_pred_sysq(schema, values, p)),
         Pred::Not(b) => !eval_pred_sysq(schema, values, b),
     }
+}
+
+/// ⭐ 2026-10-17 (审计 P2): 系统表虚拟列**全为 Str schema** — 数值字面量
+/// 比较 (如 `ordinal_position > 5`) 会退化成字典序 ("10" < "5").
+/// 数值字面量 vs 可解析为数值的文本列值 → 按数值比较; 否则回退通用路径.
+fn eval_cond_leaf_sysq(schema: &TableSchema, values: &[ColValue], c: &Cond) -> bool {
+    use std::cmp::Ordering;
+    if !matches!(c.op, CmpOp::In | CmpOp::JsonExists)
+        && matches!(c.val, SqlValue::Int(_) | SqlValue::Float(_))
+        && let Some(i) = schema.col_by_name(&c.col)
+        && let Some((a, b)) = sysq_numeric_pair(&values[i as usize], &c.val)
+        && let Some(o) = a.partial_cmp(&b)
+    {
+        return match c.op {
+            CmpOp::Eq => o == Ordering::Equal,
+            CmpOp::Ne => o != Ordering::Equal,
+            CmpOp::Gt => o == Ordering::Greater,
+            CmpOp::Ge => o != Ordering::Less,
+            CmpOp::Lt => o == Ordering::Less,
+            CmpOp::Le => o != Ordering::Greater,
+            _ => unreachable!("上方已排除 In/JsonExists"),
+        };
+    }
+    eval_cond_leaf(schema, values, c)
+}
+
+/// 文本/数值列值 vs 数值字面量 → (f64, f64); 任一不可按数值解析 → None.
+fn sysq_numeric_pair(cv: &ColValue, lit: &SqlValue) -> Option<(f64, f64)> {
+    let a = match cv {
+        ColValue::Bytes(b) => std::str::from_utf8(b).ok()?.trim().parse::<f64>().ok()?,
+        ColValue::I64(v) => *v as f64,
+        ColValue::F64(v) => *v,
+        _ => return None,
+    };
+    let b = match lit {
+        SqlValue::Int(v) => *v as f64,
+        SqlValue::Float(v) => *v,
+        _ => return None,
+    };
+    Some((a, b))
 }
 
 /// ⭐ F80: WHERE/比较字面量按目标列类型强制转换 — DATE/TIME/TIMESTAMP 的
@@ -506,7 +625,7 @@ pub(crate) fn sql_cmp(cv: &ColValue, sv: &SqlValue) -> Option<std::cmp::Ordering
 /// ⭐ H3: HTTP 按消息映射 4xx/5xx JSON).
 pub(crate) fn sql_err_bytes(proto: ProtocolKind, msg: &str) -> Vec<u8> {
     if proto == ProtocolKind::Http {
-        let status = if msg.contains("duplicate key") {
+        let status = if msg.contains("duplicate key") || msg.contains("foreign key violation") {
             409
         } else if msg.contains("unknown column")
             || msg.contains("Unknown database")
@@ -533,6 +652,8 @@ pub(crate) fn sql_err_bytes(proto: ProtocolKind, msg: &str) -> Vec<u8> {
             "42703"
         } else if msg.contains("duplicate key") {
             "23505"
+        } else if msg.contains("foreign key violation") {
+            "23503" // foreign_key_violation — FK RESTRICT 拒删
         } else if msg.contains("serialization failure") {
             "40001"
         } else if msg.contains("read-only transaction") {
@@ -541,6 +662,8 @@ pub(crate) fn sql_err_bytes(proto: ProtocolKind, msg: &str) -> Vec<u8> {
             "25P02"
         } else if msg.contains("Unknown database") {
             "3D000"
+        } else if msg.contains("Cross-database access is not supported") {
+            "0A000"
         } else if msg.contains("expected")
             || msg.contains("unexpected")
             || msg.contains("unterminated")

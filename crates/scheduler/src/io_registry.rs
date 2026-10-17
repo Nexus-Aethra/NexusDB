@@ -54,6 +54,14 @@ impl IoRegistry {
         ud
     }
 
+    /// ⭐ 2026-10-17 (审计新 P1-16): 非破坏性地查询 CQE 是否已到达.
+    pub fn has_result(&self, user_data: u64) -> bool {
+        self.inner
+            .get(&user_data)
+            .map(|s| s.result.is_some())
+            .unwrap_or(false)
+    }
+
     /// 取出并移除. Future re-poll 时不再能找到.
     pub fn take(&mut self, user_data: u64) -> Option<IoOpState> {
         self.inner.remove(&user_data)

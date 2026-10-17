@@ -16,7 +16,6 @@ mod common;
 
 use common::run_async;
 
-
 /// 构造带合法 page header 的测试页 (magic "LCBP" + page_type=3;
 /// vpid 字段由 submit 自动覆盖). compact 判活依赖 header 自描述,
 /// 与生产 B+ 树页 (page crate 构造) 同约定.
@@ -84,7 +83,10 @@ fn compact_fill_dead_slots_roundtrip() {
         let _vpids = fill_and_sparsify(&mut pager, 192, &keep).await;
 
         assert!(
-            pager.liveness().live_pages(storage::PageKey { file_id: 0, chunk_idx: 1 }) > 0,
+            pager.liveness().live_pages(storage::PageKey {
+                file_id: 0,
+                chunk_idx: 1
+            }) > 0,
             "chunk1 应有残余活页"
         );
 
@@ -108,17 +110,16 @@ fn compact_fill_dead_slots_roundtrip() {
 
         // 阶段 2 IO: 写 dst 死槽
         let items: Vec<(u8, &[u8])> = wj.items.iter().map(|(p, d)| (*p, d.as_slice())).collect();
-        wj.io.write_pages_batch(&wj.dir, wj.dst, &items).await.unwrap();
+        wj.io
+            .write_pages_batch(&wj.dir, wj.dst, &items)
+            .await
+            .unwrap();
         drop(items);
 
         // 阶段 3: CAS 提交
         pager.complete_compact(wj.dst, wj.src, wj.moves, Ok(()));
         assert!(!pager.compact_inflight());
-        assert_eq!(
-            pager.liveness().live_pages(src),
-            0,
-            "src 活页全部迁走"
-        );
+        assert_eq!(pager.liveness().live_pages(src), 0, "src 活页全部迁走");
         assert_eq!(pager.liveness().pending_free_count(), 1, "src 入延迟释放");
 
         // 迁移后的页可读且内容正确 (走 disk: chunk_list 已 invalidate)
@@ -163,7 +164,10 @@ fn compact_cas_skips_concurrently_updated_page() {
 
         // 写盘 + 提交
         let items: Vec<(u8, &[u8])> = wj.items.iter().map(|(p, d)| (*p, d.as_slice())).collect();
-        wj.io.write_pages_batch(&wj.dir, wj.dst, &items).await.unwrap();
+        wj.io
+            .write_pages_batch(&wj.dir, wj.dst, &items)
+            .await
+            .unwrap();
         drop(items);
         pager.complete_compact(wj.dst, wj.src, wj.moves, Ok(()));
 
@@ -251,13 +255,19 @@ fn dead_block_is_unlinked_and_reopen_survives() {
 
         // 收割 dead chunk (start_compact 顺带; victims 可能 None 无所谓)
         let _ = pager.start_compact();
-        assert!(pager.liveness().pending_free_count() > 0, "dead chunk 入延迟释放");
+        assert!(
+            pager.liveness().pending_free_count() > 0,
+            "dead chunk 入延迟释放"
+        );
 
         // meta 确认链路 → promote → maybe_drop_free_blocks
         if let Some(mb) = pager.take_meta_flush_batch() {
             let witems: Vec<(u32, &[u8])> =
                 mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
-            mb.io.write_mate_windows(&mb.mate_path, &witems).await.unwrap();
+            mb.io
+                .write_mate_windows(&mb.mate_path, &witems)
+                .await
+                .unwrap();
             drop(witems);
             for (w, _) in &mb.windows {
                 pager.complete_meta_flush(*w, Ok(()));
@@ -273,7 +283,10 @@ fn dead_block_is_unlinked_and_reopen_survives() {
             if let Some(mb) = mb {
                 let witems: Vec<(u32, &[u8])> =
                     mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
-                mb.io.write_mate_windows(&mb.mate_path, &witems).await.unwrap();
+                mb.io
+                    .write_mate_windows(&mb.mate_path, &witems)
+                    .await
+                    .unwrap();
                 drop(witems);
                 for (w, _) in &mb.windows {
                     pager.complete_meta_flush(*w, Ok(()));
@@ -337,15 +350,24 @@ fn compact_freed_chunk_is_reused_and_survives_reopen() {
             .analyze_compact_read(dst, src, false, Ok((dst_bytes, src_bytes)))
             .expect("write job");
         let items: Vec<(u8, &[u8])> = wj.items.iter().map(|(p, d)| (*p, d.as_slice())).collect();
-        wj.io.write_pages_batch(&wj.dir, wj.dst, &items).await.unwrap();
+        wj.io
+            .write_pages_batch(&wj.dir, wj.dst, &items)
+            .await
+            .unwrap();
         drop(items);
         pager.complete_compact(wj.dst, wj.src, wj.moves, Ok(()));
         assert_eq!(pager.liveness().pending_free_count(), 1);
 
         // 模拟异步 meta 确认链路: 取 window 快照 → 写盘 → 逐 window 确认
-        let mb = pager.take_meta_flush_batch().expect("meta 批 (compact 后 due)");
-        let witems: Vec<(u32, &[u8])> = mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
-        mb.io.write_mate_windows(&mb.mate_path, &witems).await.unwrap();
+        let mb = pager
+            .take_meta_flush_batch()
+            .expect("meta 批 (compact 后 due)");
+        let witems: Vec<(u32, &[u8])> =
+            mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
+        mb.io
+            .write_mate_windows(&mb.mate_path, &witems)
+            .await
+            .unwrap();
         drop(witems);
         for (w, _) in &mb.windows {
             pager.complete_meta_flush(*w, Ok(()));
@@ -408,8 +430,14 @@ fn block_drain_evicts_mid_live_chunks_and_unlinks() {
         }
         pager.flush().await.unwrap();
 
-        let c3 = storage::PageKey { file_id: 1, chunk_idx: 3 };
-        let c7 = storage::PageKey { file_id: 1, chunk_idx: 7 };
+        let c3 = storage::PageKey {
+            file_id: 1,
+            chunk_idx: 3,
+        };
+        let c7 = storage::PageKey {
+            file_id: 1,
+            chunk_idx: 7,
+        };
         assert_eq!(pager.liveness().live_pages(c3), 40);
         assert_eq!(pager.liveness().live_pages(c7), 40);
         assert!(!pager.liveness().block_fully_free(1), "file1 半空非全死");
@@ -425,7 +453,12 @@ fn block_drain_evicts_mid_live_chunks_and_unlinks() {
             };
             if rj.src.file_id != 1 {
                 // drain 达成后落到普通 pick 的作业: 直接放弃本轮
-                pager.analyze_compact_read(rj.dst, rj.src, rj.dst_fresh, Err(std::io::Error::other("skip")));
+                pager.analyze_compact_read(
+                    rj.dst,
+                    rj.src,
+                    rj.dst_fresh,
+                    Err(std::io::Error::other("skip")),
+                );
                 break;
             }
             // 协程 IO 段 (fresh dst 传全零, 与 manager 分支一致)
@@ -435,25 +468,28 @@ fn block_drain_evicts_mid_live_chunks_and_unlinks() {
                 rj.io.read_page_chunk(&rj.dir, rj.dst).await.unwrap()
             };
             let src_bytes = rj.io.read_page_chunk(&rj.dir, rj.src).await.unwrap();
-            let Some(wj) =
-                pager.analyze_compact_read(rj.dst, rj.src, rj.dst_fresh, Ok((dst_bytes, src_bytes)))
-            else {
+            let Some(wj) = pager.analyze_compact_read(
+                rj.dst,
+                rj.src,
+                rj.dst_fresh,
+                Ok((dst_bytes, src_bytes)),
+            ) else {
                 continue; // src 全死分支 (已入延迟释放)
             };
             wj.execute().await.unwrap(); // fresh dst 整 chunk 写 / 常规死槽批写
             pager.complete_compact(wj.dst, wj.src, wj.moves, Ok(()));
         }
 
-        assert!(
-            pager.liveness().block_fully_free(1),
-            "排空后 file1 应全死"
-        );
+        assert!(pager.liveness().block_fully_free(1), "排空后 file1 应全死");
 
         // meta 确认 → promote → unlink file1
         if let Some(mb) = pager.take_meta_flush_batch() {
             let witems: Vec<(u32, &[u8])> =
                 mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
-            mb.io.write_mate_windows(&mb.mate_path, &witems).await.unwrap();
+            mb.io
+                .write_mate_windows(&mb.mate_path, &witems)
+                .await
+                .unwrap();
             drop(witems);
             for (w, _) in &mb.windows {
                 pager.complete_meta_flush(*w, Ok(()));

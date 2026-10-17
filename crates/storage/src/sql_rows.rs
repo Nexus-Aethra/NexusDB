@@ -704,7 +704,9 @@ impl StorageEngine {
             .await?
             .ok_or_else(|| se(format!("table {db}.{table} has no schema")))?;
         let Some(old) = self.row_get(db, table, pk).await? else {
-            return Err(se("SQL row does not exist; HSETNX adapter does not create partial rows"));
+            return Err(se(
+                "SQL row does not exist; HSETNX adapter does not create partial rows",
+            ));
         };
         let i = col as usize;
         if i >= schema.columns.len() || i == schema.pk_col as usize {

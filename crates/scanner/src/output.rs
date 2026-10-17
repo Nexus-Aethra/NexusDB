@@ -17,7 +17,6 @@ use std::io::Write;
 // `HumanRow::is_bad` is reserved for the human-mode sort-by-bad-first
 // formatter used by `export` (PR4) and `merge` (PR5).
 #[allow(dead_code)]
-
 /// Output mode picked from `--json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -189,10 +188,7 @@ mod tests {
     #[test]
     fn human_row_renders_tab_separated() {
         let mut buf = Vec::new();
-        let row = HumanRow::new()
-            .field("vpid")
-            .field("7")
-            .field("Leaf");
+        let row = HumanRow::new().field("vpid").field("7").field("Leaf");
         human_row(&mut buf, &row).unwrap();
         assert_eq!(buf, b"vpid\t7\tLeaf\n");
     }
@@ -200,16 +196,11 @@ mod tests {
     #[test]
     fn human_row_marks_bad_with_prefix() {
         let mut buf = Vec::new();
-        let row = HumanRow::new()
-            .field("[BAD-PAGE]")
-            .field("0")
-            .field("Meta");
+        let row = HumanRow::new().field("[BAD-PAGE]").field("0").field("Meta");
         let line = std::str::from_utf8(&buf).unwrap_or_default();
         assert!(!line.contains("[BAD-PAGE]")); // nothing flushed yet
         human_row(&mut buf, &row).unwrap();
-        assert!(std::str::from_utf8(&buf)
-            .unwrap()
-            .starts_with("[BAD-PAGE]"));
+        assert!(std::str::from_utf8(&buf).unwrap().starts_with("[BAD-PAGE]"));
     }
 
     #[test]

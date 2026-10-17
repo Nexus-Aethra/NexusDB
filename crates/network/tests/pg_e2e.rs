@@ -10,6 +10,13 @@ use std::sync::Arc;
 use storage::{IoBackend, IoBackendConfig};
 
 fn start_pg_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>) {
+    start_pg_server_with_limits(password, KvLimits::default())
+}
+
+fn start_pg_server_with_limits(
+    password: Option<&str>,
+    limits: KvLimits,
+) -> (NetworkServer, Arc<ShardManager>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let opts = ShardManagerOptions {
         num_shards: 3,
@@ -34,7 +41,7 @@ fn start_pg_server(password: Option<&str>) -> (NetworkServer, Arc<ShardManager>)
         default_table: "kv".to_string(),
         inbox_capacity: 64,
         protocol: ProtocolKind::Pg,
-        limits: KvLimits::default(),
+        limits,
         auth_password: password.map(|s| s.to_string()),
         worker_id_base: 0,
         sql_shared: network::new_sql_shared(),
@@ -71,7 +78,11 @@ impl PgConn {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
-        Self { stream, buf: Vec::new(), last_ready: 0 }
+        Self {
+            stream,
+            buf: Vec::new(),
+            last_ready: 0,
+        }
     }
 
     fn fill(&mut self) {
@@ -122,7 +133,11 @@ impl PgConn {
     }
 
     /// 完整登录 (可选 SSLRequest 前奏); 返回是否成功.
-    fn login(server: &NetworkServer, password: Option<&str>, ssl_probe: bool) -> Result<Self, (String, String)> {
+    fn login(
+        server: &NetworkServer,
+        password: Option<&str>,
+        ssl_probe: bool,
+    ) -> Result<Self, (String, String)> {
         let mut c = Self::connect(server);
         if ssl_probe {
             // SSLRequest → 'N'
@@ -195,8 +210,7 @@ impl PgConn {
                             let client_sig = cr::hmac_sha256(&stored_key, &auth_msg);
                             let proof: Vec<u8> =
                                 (0..32).map(|i| client_key[i] ^ client_sig[i]).collect();
-                            let client_final =
-                                format!("{cfwp},p={}", cr::base64_encode(&proof));
+                            let client_final = format!("{cfwp},p={}", cr::base64_encode(&proof));
                             c.send_frame(b'p', client_final.as_bytes());
                         }
                         12 => {} // AuthenticationSASLFinal (v=..) — 忽略验证
@@ -303,7 +317,10 @@ fn pg_full_flow() {
     );
     for i in 0..12 {
         assert_eq!(
-            c.query(&format!("INSERT INTO pgt VALUES ({i}, 't{}', {i}.5)", i % 3)),
+            c.query(&format!(
+                "INSERT INTO pgt VALUES ({i}, 't{}', {i}.5)",
+                i % 3
+            )),
             PgResult::Complete("OK 1".into()),
             "INSERT {i}"
         );
@@ -317,32 +334,55 @@ fn pg_full_flow() {
         )
     );
     // 索引等值 + ORDER BY DESC
-    assert_eq!(c.ids("SELECT id FROM pgt WHERE tag = 't1' ORDER BY id DESC"), vec!["10", "7", "4", "1"]);
+    assert_eq!(
+        c.ids("SELECT id FROM pgt WHERE tag = 't1' ORDER BY id DESC"),
+        vec!["10", "7", "4", "1"]
+    );
     // COUNT(*)
     assert_eq!(
         c.query("SELECT COUNT(*) FROM pgt WHERE tag = 't0'"),
         PgResult::Rows(vec!["COUNT(*)".into()], vec![vec![Some("4".into())]])
     );
     // UPDATE / DELETE affected tag
-    assert_eq!(c.query("UPDATE pgt SET score = 0 WHERE tag = 't2'"), PgResult::Complete("OK 4".into()));
-    assert_eq!(c.query("DELETE FROM pgt WHERE id = 0"), PgResult::Complete("OK 1".into()));
+    assert_eq!(
+        c.query("UPDATE pgt SET score = 0 WHERE tag = 't2'"),
+        PgResult::Complete("OK 4".into())
+    );
+    assert_eq!(
+        c.query("DELETE FROM pgt WHERE id = 0"),
+        PgResult::Complete("OK 1".into())
+    );
     // 错误面: SQLSTATE
-    let PgResult::Err(code, _) = c.query("SELECT nope FROM pgt WHERE id = 1") else { panic!() };
+    let PgResult::Err(code, _) = c.query("SELECT nope FROM pgt WHERE id = 1") else {
+        panic!()
+    };
     assert_eq!(code, "42703");
-    let PgResult::Err(code, _) = c.query("SELEKT 1") else { panic!() };
+    let PgResult::Err(code, _) = c.query("SELEKT 1") else {
+        panic!()
+    };
     assert_eq!(code, "42601");
     // 工具命令: SET / version / DESCRIBE / 空语句
-    assert_eq!(c.query("SET client_encoding TO 'UTF8'"), PgResult::Complete("OK 0".into()));
-    let PgResult::Rows(_, rows) = c.query("SELECT version()") else { panic!() };
+    assert_eq!(
+        c.query("SET client_encoding TO 'UTF8'"),
+        PgResult::Complete("OK 0".into())
+    );
+    let PgResult::Rows(_, rows) = c.query("SELECT version()") else {
+        panic!()
+    };
     assert!(rows[0][0].as_deref().unwrap().contains("PostgreSQL"));
-    let PgResult::Rows(cols, rows) = c.query("DESCRIBE pgt") else { panic!() };
+    let PgResult::Rows(cols, rows) = c.query("DESCRIBE pgt") else {
+        panic!()
+    };
     assert_eq!(cols, vec!["Field", "Type", "Null", "Key"]);
     assert_eq!(rows.len(), 3);
     assert_eq!(c.query(";"), PgResult::Complete("EMPTY".into()));
     // ⭐ compat (2026-08): multi-statement 支持 (portal 迁移), 逐条 CommandComplete
-    match c.query("SELECT 1; SELECT 2") {
-        PgResult::Complete(_) | PgResult::Rows(_, _) | PgResult::Err(_, _) => {}
-        _ => panic!("multi-statement should be accepted"),
+    // 必须显式排除 Err: 只 match Complete|Rows 的话, 服务端返回错误也会通过, 测试等于没断言.
+    // 注: 用带 FROM 的语句 —— 顶层 `SELECT <字面量>` (如 `SELECT 1`) 目前不被解析器支持,
+    // 那是独立于 multi-statement 的解析缺口, 不应混进本用例.
+    match c.query("SELECT id FROM pgt; SELECT id FROM pgt") {
+        PgResult::Err(code, msg) => panic!("multi-statement 不应报错, 实际 {code}: {msg}"),
+        PgResult::Complete(_) | PgResult::Rows(_, _) => {}
     }
 
     drop(c);
@@ -473,7 +513,12 @@ impl PgConn {
     #[allow(clippy::type_complexity)]
     fn drain_until_ready(
         &mut self,
-    ) -> (Vec<u8>, Vec<Vec<Option<String>>>, String, Option<(String, String)>) {
+    ) -> (
+        Vec<u8>,
+        Vec<Vec<Option<String>>>,
+        String,
+        Option<(String, String)>,
+    ) {
         let mut types = Vec::new();
         let mut rows = Vec::new();
         let mut tag = String::new();
@@ -487,16 +532,13 @@ impl PgConn {
                     let mut pos = 2;
                     let mut r = Vec::with_capacity(n);
                     for _ in 0..n {
-                        let len =
-                            i32::from_be_bytes([p[pos], p[pos + 1], p[pos + 2], p[pos + 3]]);
+                        let len = i32::from_be_bytes([p[pos], p[pos + 1], p[pos + 2], p[pos + 3]]);
                         pos += 4;
                         if len < 0 {
                             r.push(None);
                         } else {
                             let l = len as usize;
-                            r.push(Some(
-                                String::from_utf8_lossy(&p[pos..pos + l]).into_owned(),
-                            ));
+                            r.push(Some(String::from_utf8_lossy(&p[pos..pos + l]).into_owned()));
                             pos += l;
                         }
                     }
@@ -535,9 +577,9 @@ fn pg_extended_query() {
         c.send_bind(
             "ins",
             &[
-                (1, Some(i.to_be_bytes().to_vec())),                    // binary int8
-                (0, Some(format!("t{}", i % 2).into_bytes())),          // text
-                (1, Some((i as f64 * 1.5).to_be_bytes().to_vec())),     // binary float8
+                (1, Some(i.to_be_bytes().to_vec())),                // binary int8
+                (0, Some(format!("t{}", i % 2).into_bytes())),      // text
+                (1, Some((i as f64 * 1.5).to_be_bytes().to_vec())), // binary float8
             ],
         );
         c.send_simple(b'E', &[0, 0, 0, 0, 0]); // Execute (unnamed portal, no limit)
@@ -548,7 +590,11 @@ fn pg_extended_query() {
         assert_eq!(tag, "OK 1");
     }
     // unnamed 语句 SELECT (文本参数, 目标列弱类型转换) + Describe(statement)
-    c.send_parse("", "SELECT id, w FROM ext WHERE tag = $1 ORDER BY id DESC", &[]);
+    c.send_parse(
+        "",
+        "SELECT id, w FROM ext WHERE tag = $1 ORDER BY id DESC",
+        &[],
+    );
     c.send_simple(b'D', b"S\0");
     c.send_bind("", &[(0, Some(b"t1".to_vec()))]);
     c.send_simple(b'E', &[0, 0, 0, 0, 0]);
@@ -558,7 +604,9 @@ fn pg_extended_query() {
     assert!(types.contains(&b't'), "ParameterDescription");
     assert!(types.contains(&b'T'), "RowDescription 随结果流");
     assert_eq!(
-        rows.iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|r| r[0].clone().unwrap())
+            .collect::<Vec<_>>(),
         vec!["5", "3", "1"]
     );
     assert!(tag.starts_with("SELECT 3"), "{tag}");
@@ -611,7 +659,10 @@ fn pg_transactions() {
     assert_eq!(c1.last_ready, b'T', "事务中 T");
     c1.query("INSERT INTO ptx VALUES (1, 'a')");
     assert_eq!(c1.last_ready, b'T');
-    assert_eq!(c2.query("SELECT v FROM ptx WHERE id = 1"), PgResult::Rows(vec!["v".into()], vec![]));
+    assert_eq!(
+        c2.query("SELECT v FROM ptx WHERE id = 1"),
+        PgResult::Rows(vec!["v".into()], vec![])
+    );
     c1.query("COMMIT");
     assert_eq!(c1.last_ready, b'I', "提交后回 I");
     assert_eq!(
@@ -683,12 +734,18 @@ fn pg_serializable_conflict() {
     c2.query("UPDATE piso SET v = 100 WHERE id = 1");
     c1.query("UPDATE piso SET v = 12 WHERE id = 1");
     let r = c1.query("COMMIT");
-    assert!(matches!(r, PgResult::Err(ref code, _) if code == "40001"), "{r:?}");
+    assert!(
+        matches!(r, PgResult::Err(ref code, _) if code == "40001"),
+        "{r:?}"
+    );
 
     // READ ONLY → 25006
     c1.query("BEGIN READ ONLY");
     let r = c1.query("INSERT INTO piso VALUES (9, 9)");
-    assert!(matches!(r, PgResult::Err(ref code, _) if code == "25006"), "{r:?}");
+    assert!(
+        matches!(r, PgResult::Err(ref code, _) if code == "25006"),
+        "{r:?}"
+    );
     c1.query("ROLLBACK");
 
     // SAVEPOINT 经 PG 门面 + E 态 ROLLBACK TO 恢复 (SQLAlchemy 模式)
@@ -749,6 +806,145 @@ fn pg_group_by_aggregates() {
     drop(mgr);
 }
 
+/// ⭐ 审计 P2 (2026-10-17): PG 命名语句注册表上限 (同 MySQL COM_STMT_PREPARE).
+///
+/// 旧实现 `conn.pg_stmts` 无上限 — 单连接可无限 Parse, 注册表无界增长 →
+/// worker OOM (worker 单线程, 一个连接的泄漏会拖死同 worker 全部连接).
+#[test]
+fn pg_named_statement_registry_capped() {
+    let limits = KvLimits {
+        max_prepared_stmts: 3,
+        ..Default::default()
+    };
+    let (server, mgr) = start_pg_server_with_limits(None, limits);
+    let mut c = PgConn::login(&server, None, false).unwrap();
+    assert_eq!(
+        c.query("CREATE TABLE ps (id BIGINT PRIMARY KEY, v INT)"),
+        PgResult::Complete("OK 0".into())
+    );
+    assert_eq!(
+        c.query("INSERT INTO ps VALUES (1, 10)"),
+        PgResult::Complete("OK 1".into())
+    );
 
+    // 上限内正常注册
+    for i in 0..3 {
+        c.send_parse(&format!("s{i}"), "SELECT v FROM ps WHERE id = $1", &[20]);
+        c.send_simple(b'S', &[]);
+        let (types, _, _, err) = c.drain_until_ready();
+        assert!(err.is_none(), "{err:?}");
+        assert!(types.contains(&b'1'), "ParseComplete");
+    }
+    // 超限 → ErrorResponse (旧实现无上限, 静默吃内存)
+    c.send_parse("s3", "SELECT v FROM ps WHERE id = $1", &[20]);
+    c.send_simple(b'S', &[]);
+    let (_, _, _, err) = c.drain_until_ready();
+    let (code, msg) = err.expect("超过注册表上限必须报错");
+    assert!(
+        msg.contains("too many prepared statements"),
+        "错误信息应说明超限: {msg}"
+    );
+    assert!(!code.is_empty(), "{code}");
 
+    // 关闭一条命名语句 → 名额释放, 可继续 Parse 且能执行
+    c.send_simple(b'C', b"Ss0\0");
+    c.send_simple(b'S', &[]);
+    let (types, _, _, err) = c.drain_until_ready();
+    assert!(err.is_none(), "{err:?}");
+    assert!(types.contains(&b'3'), "CloseComplete");
+    c.send_parse("s4", "SELECT v FROM ps WHERE id = $1", &[20]);
+    c.send_bind("s4", &[(1, Some(1i64.to_be_bytes().to_vec()))]);
+    c.send_simple(b'E', &[0, 0, 0, 0, 0]);
+    c.send_simple(b'S', &[]);
+    let (_, rows, _, err) = c.drain_until_ready();
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(rows, vec![vec![Some("10".into())]], "注册表仍可用");
 
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P2 (2026-10-17): 范围/全表扫描的读必须进 OCC 读集 (PG 门面).
+///
+/// 旧实现只有 pk 点查登记读集 — 扫描读不参与提交验证, 并发事务改/删已读行
+/// 不被发现 (丢失更新). 本事务的写只覆盖 id=1, 从而单独暴露 SELECT 扫描
+/// 路径未登记的漏洞.
+#[test]
+fn pg_serializable_scan_reads_enter_read_set() {
+    let (server, mgr) = start_pg_server(None);
+    let mut c1 = PgConn::login(&server, None, false).expect("login");
+    let mut c2 = PgConn::login(&server, None, false).expect("login");
+    c1.query("CREATE TABLE isos (id BIGINT PRIMARY KEY, v INT)");
+    for i in 1..=5i64 {
+        c1.query(&format!("INSERT INTO isos VALUES ({i}, {})", i * 10));
+    }
+
+    // 范围扫描 (主键区间) 读过的行被并发改 → COMMIT 必须 40001
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(
+        c1.query("SELECT v FROM isos WHERE id >= 2 AND id <= 4"),
+        PgResult::Rows(
+            vec!["v".into()],
+            vec![
+                vec![Some("20".into())],
+                vec![Some("30".into())],
+                vec![Some("40".into())]
+            ]
+        )
+    );
+    c2.query("UPDATE isos SET v = 99 WHERE id = 3");
+    c1.query("UPDATE isos SET v = 11 WHERE id = 1");
+    let r = c1.query("COMMIT");
+    assert!(
+        matches!(r, PgResult::Err(ref code, _) if code == "40001"),
+        "扫描读应参与 OCC 验证: {r:?}"
+    );
+    assert_eq!(c1.last_ready, b'I', "commit 失败后事务已结束");
+    assert_eq!(
+        c2.query("SELECT v FROM isos WHERE id = 3"),
+        PgResult::Rows(vec!["v".into()], vec![vec![Some("99".into())]]),
+        "冲突事务未应用"
+    );
+
+    // 全表扫描同样登记
+    // 注: 上一个 COMMIT 虽整体回绝 (40001), 但跨 shard 是 best-effort —
+    // 持有 id=1 的 shard 本地无冲突已先行应用 (已知边界, 见 AGENTS.md),
+    // 故这里只断言行数, 不断言具体值.
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(
+        c1.query("SELECT v FROM isos"),
+        PgResult::Rows(
+            vec!["v".into()],
+            vec![
+                vec![Some("11".into())],
+                vec![Some("20".into())],
+                vec![Some("99".into())],
+                vec![Some("40".into())],
+                vec![Some("50".into())]
+            ]
+        ),
+        "全表扫读到 5 行 (id=1 已被上个 best-effort 提交应用)"
+    );
+    c2.query("UPDATE isos SET v = 77 WHERE id = 5");
+    c1.query("UPDATE isos SET v = 12 WHERE id = 1");
+    let r = c1.query("COMMIT");
+    assert!(
+        matches!(r, PgResult::Err(ref code, _) if code == "40001"),
+        "全表扫读应参与 OCC 验证: {r:?}"
+    );
+
+    // 无并发修改 → 不误报
+    c1.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    c1.query("SELECT v FROM isos WHERE id >= 2 AND id <= 4");
+    c1.query("UPDATE isos SET v = 13 WHERE id = 2");
+    assert!(
+        matches!(c1.query("COMMIT"), PgResult::Complete(_)),
+        "读到的行未变 → 正常提交"
+    );
+
+    drop(c1);
+    drop(c2);
+    server.shutdown().unwrap();
+    drop(mgr);
+}

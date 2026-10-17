@@ -16,6 +16,12 @@ pub enum PageError {
     #[error("item decode error: {0}")]
     ItemDecode(String),
 
+    /// 调用方违反了"该偏移必须是段首/哨兵 (shared_prefix_len == 0)"的前置条件.
+    /// 用硬错误而非 `debug_assert`: 违反时 cur_key 只能由 key_unshared 拼出,
+    /// 会**静默产出错误 key** —— debug 下 panic 尚可被看见, release 下无声错读更糟.
+    #[error("item at offset is not a segment head: shared_prefix_len={0} (expected 0)")]
+    NotSegmentHead(u16),
+
     #[error("invalid page type: expected {expected:?}, got {got:?}")]
     InvalidPageType {
         expected: crate::header::PageType,

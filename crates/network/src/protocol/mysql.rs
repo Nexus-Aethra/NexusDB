@@ -51,7 +51,7 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     msg.extend_from_slice(&ml.to_be_bytes());
 
     let mut w = [0u32; 80];
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         for (i, word) in w.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().expect("4B"));
         }
@@ -173,6 +173,10 @@ pub fn build_fast_auth_success(seq: u8) -> Vec<u8> {
 // 帧
 // =====================================================================
 
+/// MySQL 单包载荷上限: 长度字段只有 24 位 (0..=0xFFFFFF = 16,777,215).
+/// 载荷达到该值时必须拆成续包序列, 否则长度字段溢出。
+pub const MAX_PAYLOAD: usize = 0xFF_FFFF;
+
 /// 解一帧: Some((seq, payload_range_end_offset, payload)) / None = 半包.
 /// 返回 (seq, 整帧长度, payload owned).
 pub fn read_packet(buf: &[u8]) -> Option<(u8, usize, Vec<u8>)> {
@@ -186,13 +190,87 @@ pub fn read_packet(buf: &[u8]) -> Option<(u8, usize, Vec<u8>)> {
     Some((buf[3], 4 + len, buf[4..4 + len].to_vec()))
 }
 
-/// 封帧 (v1 不处理 16MB 分片 — 结果集单包上限内, 记录).
+/// ⭐ 2026-10-17 (审计新 P1-6): 单个**逻辑包** (含续包拼接) 的总大小上限.
+/// 取 MySQL 默认 max_allowed_packet (64MB): 覆盖合法大 bulk INSERT 的同时
+/// 把单连接内存封顶 (旧实现无限累积续包 → 远程 OOM).
+pub const MAX_PACKET_TOTAL: usize = 64 * 1024 * 1024;
+
+/// [`read_packet_full`] 的结果: 半包 (等更多数据) / 完成 / 超限.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketRead {
+    /// 半包: 续包未到齐, 等待更多数据 (旧 `None` 语义).
+    Incomplete,
+    /// 逻辑包超过 [`MAX_PACKET_TOTAL`] (客户端违反 max_allowed_packet 宣告).
+    TooLarge {
+        /// 首包 seq (供调用方回 ERR 包定位).
+        first_seq: u8,
+    },
+}
+
+/// 解一个**逻辑包**: 若长度字段为 0xFFFFFF 则继续拼接后续包 (MySQL 续包机制),
+/// 直到某个包长度 < 0xFFFFFF. 返回首包的 seq、消耗的总字节数、完整载荷.
+///
+/// ⚠️ 单用 [`read_packet`] 会把续包当成独立包处理 —— 服务端收到大请求时
+/// (如 20MB 的 COM_QUERY) 会只看到第一段, 载荷被截断.
+///
+/// ⚠️ 累积总量以 [`MAX_PACKET_TOTAL`] 为上限: 超限返回
+/// [`PacketRead::TooLarge`] (旧实现无限累积 → 远程 OOM).
+pub fn read_packet_full(buf: &[u8]) -> Result<(u8, usize, Vec<u8>), PacketRead> {
+    read_packet_full_impl(buf, MAX_PACKET_TOTAL, MAX_PAYLOAD)
+}
+
+/// 实现体 (cap/full 可注入 — 单测用小值验证累积/超限逻辑, 避免 64MB 分配).
+fn read_packet_full_impl(
+    buf: &[u8],
+    cap: usize,
+    full: usize,
+) -> Result<(u8, usize, Vec<u8>), PacketRead> {
+    let (first_seq, n, first) = read_packet(buf).ok_or(PacketRead::Incomplete)?;
+    if first.len() < full {
+        return Ok((first_seq, n, first));
+    }
+    let mut acc = first;
+    let mut consumed = n;
+    let mut cursor = n;
+    loop {
+        let Some((_, n2, next)) = read_packet(&buf[cursor..]) else {
+            return Err(PacketRead::Incomplete); // 半包: 等续包到齐
+        };
+        if acc.len() + next.len() > cap {
+            return Err(PacketRead::TooLarge { first_seq });
+        }
+        consumed += n2;
+        cursor += n2;
+        let done = next.len() < full;
+        acc.extend_from_slice(&next);
+        if done {
+            return Ok((first_seq, consumed, acc));
+        }
+    }
+}
+
+/// 封帧. 载荷 < 16MB 时单包; 达到上限则按 MySQL 协议拆成续包序列:
+/// 首包长度写满 `0xFFFFFF`, seq 逐包 +1, 末包放余量.
+///
+/// ⚠️ 旧实现只写 3 字节长度且从不拆分 —— 载荷 ≥ 16MB 时长度被静默截断而载荷
+/// 完整发出, 对端按截断长度解析, 结果集在线上直接非法 (大 SELECT 必中招).
 pub fn write_packet(seq: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + payload.len());
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes()[..3]);
-    out.push(seq);
-    out.extend_from_slice(payload);
-    out
+    let mut off = 0usize;
+    let mut s = seq;
+    loop {
+        let remaining = payload.len() - off;
+        let chunk = remaining.min(MAX_PAYLOAD);
+        // 长度字段是 3 字节; 满包必须写 0xFFFFFF 而不是被截断的剩余量.
+        out.extend_from_slice(&(chunk as u32).to_le_bytes()[..3]);
+        out.push(s);
+        out.extend_from_slice(&payload[off..off + chunk]);
+        off += chunk;
+        if chunk < MAX_PAYLOAD {
+            return out;
+        }
+        s = s.wrapping_add(1);
+    }
 }
 
 // ===== lenenc =====
@@ -903,5 +981,85 @@ mod tests {
         let (_, _, sw) = read_packet(&build_auth_switch(2, &[1u8; 20])).unwrap();
         assert_eq!(sw[0], 0xFE);
         assert!(sw[1..].starts_with(b"mysql_native_password\0"));
+    }
+
+    #[test]
+    fn payload_at_16mb_boundary_splits_into_continuation_packets() {
+        // 回归: 载荷长度达到 0xFFFFFF 时, 旧实现把长度截成 3 字节而载荷完整发出,
+        // 对端按截断长度解析 → 线上非法. 现在必须拆成"首包满 + 末包余量".
+        let payload: Vec<u8> = (0..MAX_PAYLOAD + 1000).map(|i| (i % 251) as u8).collect();
+        let wire = write_packet(1, &payload);
+
+        // 逐包拆回, 校验首包满、末包放余量、seq 连续
+        let mut off = 0usize;
+        let mut rebuilt: Vec<u8> = Vec::new();
+        let mut expect_seq = 1u8;
+        let mut packets = 0;
+        loop {
+            let (seq, n, part) = read_packet(&wire[off..]).expect("应能拆出完整包");
+            assert_eq!(seq, expect_seq, "续包 seq 必须连续");
+            rebuilt.extend_from_slice(&part);
+            off += n;
+            packets += 1;
+            expect_seq = expect_seq.wrapping_add(1);
+            if part.len() < MAX_PAYLOAD {
+                break;
+            }
+        }
+        assert_eq!(packets, 2, "17MB 载荷应拆成 2 包");
+        assert_eq!(rebuilt, payload, "拆分后重组必须逐字节一致");
+
+        // read_packet_full: 半包时应返回 Incomplete 而不是截断的假包
+        let partial = &wire[..4 + MAX_PAYLOAD];
+        assert_eq!(
+            read_packet_full(partial),
+            Err(PacketRead::Incomplete),
+            "续包未到齐时不能返回截断结果"
+        );
+        assert_eq!(read_packet_full(&wire).unwrap().2, payload);
+    }
+
+    /// 手工构造续包序列 (full=16, cap 可调) — 避免 write_packet 对恰好
+    /// full 的载荷追加尾部空包的伪影.
+    fn cont_wire(packets: &[usize], seq: u8) -> Vec<u8> {
+        let mut w = Vec::new();
+        for &len in packets {
+            w.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
+            w.push(seq);
+            w.extend_from_slice(&vec![0xABu8; len]);
+        }
+        w
+    }
+
+    #[test]
+    fn continuation_accumulation_within_cap_ok() {
+        // 3 个满包 (3*16=48B) + 终止短包 (4B) = 52B <= cap 64 → 完整重组
+        let wire = cont_wire(&[16, 16, 16, 4], 0);
+        let (seq, n, payload) = read_packet_full_impl(&wire, 64, 16).unwrap();
+        assert_eq!((seq, n, payload.len()), (0, 4 * 4 + 52, 52));
+    }
+
+    #[test]
+    fn oversized_continuation_rejected() {
+        // ⭐ 审计新 P1-6: 累积超过 cap 必须拒绝 (旧实现无限累积 → 远程 OOM).
+        // 5 个满包 = 80B > cap 64 → 第 5 包累积时拒绝
+        let wire = cont_wire(&[16, 16, 16, 16, 16], 0);
+        assert_eq!(
+            read_packet_full_impl(&wire, 64, 16),
+            Err(PacketRead::TooLarge { first_seq: 0 })
+        );
+        // 贴近 cap 但未超 (3 满包 + 12B 终止包 = 60B <= 64) → 放行
+        let wire_ok = cont_wire(&[16, 16, 16, 12], 0);
+        assert!(read_packet_full_impl(&wire_ok, 64, 16).is_ok());
+    }
+
+    #[test]
+    fn small_payload_stays_single_packet() {
+        let payload = b"hello".to_vec();
+        let wire = write_packet(7, &payload);
+        assert_eq!(wire.len(), 4 + payload.len(), "小包不该多出续包头");
+        let (seq, n, part) = read_packet_full(&wire).unwrap();
+        assert_eq!((seq, n), (7, 4 + payload.len()));
+        assert_eq!(part, payload);
     }
 }

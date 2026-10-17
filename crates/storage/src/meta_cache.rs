@@ -188,10 +188,17 @@ impl MetaCache {
     /// **前提**: 无 in-flight 快照 (caller 先 drain 异步 backlog);
     /// 否则协程稍后写入的旧快照会乱序覆盖这里的新数据.
     pub fn flush_dirty(&mut self) -> io::Result<()> {
-        debug_assert!(
-            !self.in_flight_windows.iter().any(|&b| b),
-            "flush_dirty 要求无 in-flight meta 快照 (先 drain 异步 backlog)"
-        );
+        // ⭐ 审计 P2 (2026-10-17): 前置条件从 debug_assert 升级为**运行时硬错误**.
+        // 旧实现只在 debug 下断言: release 里若真有 in-flight 快照 (异步刷盘
+        // 协程还握着旧快照), 这里写的"新数据"会被协程稍后写出的旧快照**乱序
+        // 覆盖** → page.mate 留下陈旧映射 (指向已释放/已复用的 chunk), 重启后
+        // 读到错页. 宁可让 flush 失败 (调用方可见), 也不静默损坏.
+        if self.in_flight_windows.iter().any(|&b| b) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flush_dirty requires no in-flight meta snapshots (drain the async backlog first)",
+            ));
+        }
         let mut wrote_any = false;
         for w in 0..self.dirty_windows.len() {
             if !self.dirty_windows[w] {

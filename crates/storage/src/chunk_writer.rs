@@ -134,6 +134,11 @@ impl ChunkBuf {
         if page_type_byte != PageType::Internal as u8 {
             self.data[off + 0x18..off + 0x20].copy_from_slice(&vpid.to_le_bytes());
         }
+        // ⭐ 审计 P2 (2026-10-17): 页校验和 — 所有字节定稿后 (含上面补的 vpid)
+        // 统一在此计算. 这是页字节进入 chunk 缓冲的唯一入口, 因此所有写路径
+        // (insert/update/split/COW/MetaPage) 都自动覆盖; 读路径在磁盘→内存
+        // 边界上验证 (见 pager::read).
+        page::page_set_checksum(&mut self.data[off..off + PAGE_SIZE]);
         self.mark_written(page_idx, vpid);
     }
 }

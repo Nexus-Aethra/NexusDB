@@ -84,7 +84,7 @@ impl StorageEngine {
         // ⭐ WAL (F60): 成功路径记录结果态 (重放幂等)
         let wal_start = trace_enabled.then(std::time::Instant::now);
         if let Some(w) = self.wal.as_mut() {
-            w.append_put(db, table, pkey, value);
+            w.append_put(db, table, pkey, value)?;
         }
         let wal_ns = wal_start
             .map(|start| start.elapsed().as_nanos() as u64)
@@ -171,7 +171,7 @@ impl StorageEngine {
         // ⭐ WAL (F60): 批量记录 (一次遍历, flush 时共享后续 fsync)
         if let Some(w) = self.wal.as_mut() {
             for (pkey, value) in pairs {
-                w.append_put(db, table, pkey, value);
+                w.append_put(db, table, pkey, value)?;
             }
         }
         if let Some(new_root) = new_root {
@@ -210,7 +210,7 @@ impl StorageEngine {
         }
         // ⭐ WAL (F60): 存在才记 (不存在的 delete 重放无意义)
         if existed && let Some(w) = self.wal.as_mut() {
-            w.append_del(db, table, pkey);
+            w.append_del(db, table, pkey)?;
         }
         Ok(existed)
     }
@@ -573,12 +573,17 @@ pub(crate) fn init_meta_page(block_dir: &std::path::Path, meta: &mut MetaCache) 
     let bytes = meta_page.flush();
 
     // 2. 写盘: block_dir/000001.block, offset 0 (chunk 0 page 0)
+    // ⭐ 2026-10-17 (审计新 P1-3): 必须 truncate(false) — 旧实现
+    // truncate(true): 当 recover 因故未识别 MetaPage 映射 (meta 判定失误)
+    // 而走到"全新库"分支时, 打开动作会把**含真实数据的整个文件清空** —
+    // 一次误判即全量数据毁灭. 只写 page 0, 文件其余字节原样保留
+    // (chunk_writer.rs:598 早有同样的教训与注释).
     let block_path = block_dir.join("000001.block");
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .open(&block_path)?;
     // use FileExt for write_all_at
     f.write_all_at(&*bytes, 0)?;
@@ -589,4 +594,49 @@ pub(crate) fn init_meta_page(block_dir: &std::path::Path, meta: &mut MetaCache) 
     meta.write(META_VPID, META_PID);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod p1_3_tests {
+    use super::init_meta_page;
+    use crate::meta_cache::MetaCache;
+
+    fn fresh_meta(dir: &std::path::Path) -> MetaCache {
+        MetaCache::open(&dir.join("page.mate")).unwrap()
+    }
+
+    /// ⭐ 审计新 P1-3: init_meta_page 不得清空已存在的数据文件.
+    /// (旧实现 truncate(true): recover 误判"全新库"时整个文件被清空.)
+    #[test]
+    fn init_meta_page_preserves_existing_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let block_path = tmp.path().join("000001.block");
+        // 预置一个 3 页大小的"数据"文件
+        let original: Vec<u8> = (0..3 * 16384u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&block_path, &original).unwrap();
+
+        let mut meta = fresh_meta(tmp.path());
+        init_meta_page(tmp.path(), &mut meta).unwrap();
+
+        // 文件必须未被截断 (3 页都在), page 0 被 MetaPage 覆盖, page 1+ 原样保留
+        let after = std::fs::read(&block_path).unwrap();
+        assert_eq!(after.len(), original.len(), "文件被截断了 — 数据毁灭!");
+        assert_eq!(
+            &after[16384..],
+            &original[16384..],
+            "page 1+ 的数据必须原样保留"
+        );
+        // MetaPage 登记生效
+        assert!(meta.read(0).is_some(), "vpid 0 应已登记");
+    }
+
+    /// 全新库 (文件不存在) 也能正常初始化.
+    #[test]
+    fn init_meta_page_creates_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut meta = fresh_meta(tmp.path());
+        init_meta_page(tmp.path(), &mut meta).unwrap();
+        assert!(tmp.path().join("000001.block").exists());
+        assert!(meta.read(0).is_some());
+    }
 }

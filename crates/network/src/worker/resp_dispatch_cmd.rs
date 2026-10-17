@@ -1737,20 +1737,36 @@ pub(crate) fn dispatch_resp_command(
             conn.resp_complete(seq, codec.encode_bulk(&m));
         }
         RespCommand::Auth { user, pass } => {
+            // ⭐ 审计 P2 (2026-10-17): 认证失败限速 — 旧实现失败无限次 (且不断
+            // 连接), 一次连接即可在线暴力破解. 现在: 全局锁定期直接拒; 单连接
+            // 连续失败 MAX_FAILS_PER_CONN 次即断开.
             let bytes = match auth_password {
                 None => codec.encode_error("ERR Client sent AUTH, but no password is set."),
                 Some(expected) => {
-                    let user_ok = match &user {
-                        None => true,
-                        Some(u) => u.as_slice() == b"default",
-                    };
-                    if user_ok && pass.as_slice() == expected.as_bytes() {
-                        conn.authenticated = true;
-                        codec.encode_ok()
+                    if let Err(remain) = conn.sql_shared.auth_throttle.check() {
+                        codec.encode_error(&format!(
+                            "ERR too many authentication failures, retry in {remain}s"
+                        ))
                     } else {
-                        codec.encode_error(
-                            "WRONGPASS invalid username-password pair or user is disabled.",
-                        )
+                        let user_ok = match &user {
+                            None => true,
+                            Some(u) => u.as_slice() == b"default",
+                        };
+                        if user_ok && pass.as_slice() == expected.as_bytes() {
+                            conn.auth_failures = 0;
+                            conn.sql_shared.auth_throttle.record_success();
+                            conn.authenticated = true;
+                            codec.encode_ok()
+                        } else {
+                            conn.auth_failures += 1;
+                            conn.sql_shared.auth_throttle.record_failure();
+                            if conn.auth_failures >= MAX_FAILS_PER_CONN {
+                                conn.close_after_flush = true;
+                            }
+                            codec.encode_error(
+                                "WRONGPASS invalid username-password pair or user is disabled.",
+                            )
+                        }
                     }
                 }
             };

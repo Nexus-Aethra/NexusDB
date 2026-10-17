@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use page::{ItemKind, decode_item, page_free_off, page_type};
+use page::{decode_item, page_free_off, page_type, page_vpid, ItemKind};
 
 use crate::cli::Globals;
 use crate::dir;
@@ -17,12 +17,13 @@ use crate::pid::{Locate, Strategy};
 
 pub fn run<W: Write>(globals: &Globals, tree_root: u64, key_hex: &str, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
     let target_key = match hex::decode(key_hex) {
@@ -34,7 +35,7 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, key_hex: &str, mut out: 
     };
 
     // Navigate from root to the leaf that should contain the key
-    match lookup_key(&shard, &locate, tree_root, &target_key, &mut out, globals) {
+    match lookup_key(shard, &locate, tree_root, &target_key, &mut out, globals) {
         Ok(_) => Ok(0),
         Err(msg) => {
             writeln!(&mut out, "{msg}").ok();
@@ -76,15 +77,21 @@ fn lookup_key<W: Write>(
                 let free_off = page_free_off(page_bytes) as usize;
                 let mut off = page::PAGE_HEADER_SIZE;
                 let mut prev_key: Vec<u8> = Vec::new();
-                let mut child_vpid = 0u64;
+                // ⭐ 2026-10-17 (审计新 P1-19): first_child 在**页头 vpid
+                // 字段**, 哨兵 item 的 child_vpid 恒为 0 (不可用). 旧实现从
+                // 哨兵取 first child (恒 0) → target < 首个 separator 时
+                // 误报 "dead end / not found" (左子树整个查不到).
+                let mut child_vpid = page_vpid(page_bytes);
 
                 while off < free_off {
                     match decode_item(page_bytes, off, ItemKind::Internal) {
                         Ok((item, n)) => {
-                            let full = item.full_key(&prev_key);
+                            let full = item
+                                .full_key(&prev_key)
+                                .map_err(|e| format!("corrupt item: {e}"))?;
                             if off == page::PAGE_HEADER_SIZE {
-                                // Sentinel: first child is the rightmost
-                                child_vpid = item.child_vpid;
+                                // Sentinel: child_vpid unused; first child
+                                // comes from the page header (see above).
                             }
                             // If separator <= target_key, the child after
                             // this separator is the right subtree
@@ -123,7 +130,9 @@ fn lookup_key<W: Write>(
                 while off < free_off {
                     match decode_item(page_bytes, off, ItemKind::Leaf) {
                         Ok((item, n)) => {
-                            let full = item.full_key(&prev_key);
+                            let full = item
+                                .full_key(&prev_key)
+                                .map_err(|e| format!("corrupt item: {e}"))?;
                             if item_idx > 0 && full == target_key {
                                 // Found it!
                                 let key_hex = hex::encode(&full);

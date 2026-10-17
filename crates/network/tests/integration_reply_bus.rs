@@ -9,7 +9,7 @@ use shard_manager::{ReplySink, ShardManager, ShardManagerOptions};
 use storage::{IoBackend, IoBackendConfig};
 
 use network::protocol::Response;
-use network::reply_bus::{reply_bus, ReplyEnvelope};
+use network::reply_bus::{ReplyEnvelope, reply_bus};
 
 /// 测试用 ReplySink: 收集所有 push_reply 调用.
 #[derive(Default)]
@@ -76,8 +76,14 @@ fn reply_bus_receives_get_and_delete() {
     assert_eq!(received.len(), 2);
     assert_eq!(received[0].0, 100);
     assert_eq!(received[1].0, 200);
-    assert!(matches!(received[0].2, Ok(shard_manager::ShardReply::GetValue(Some(_)))));
-    assert!(matches!(received[1].2, Ok(shard_manager::ShardReply::DeleteExisted(true))));
+    assert!(matches!(
+        received[0].2,
+        Ok(shard_manager::ShardReply::GetValue(Some(_)))
+    ));
+    assert!(matches!(
+        received[1].2,
+        Ok(shard_manager::ShardReply::DeleteExisted(true))
+    ));
 }
 
 #[test]

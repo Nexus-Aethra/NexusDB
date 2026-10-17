@@ -330,6 +330,16 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
 // parser (顺序读取器)
 // =====================================================================
 
+/// ⭐ 2026-10-17 (审计新 P1-10): 解析递归深度上限. WHERE 括号/子查询/
+/// NOT 前缀均为递归下降, 无限制时数万个 `(` 即可打爆线程栈 (网络 worker
+/// 栈可能仅 2MB) — 一条 SQL 的远程 DoS. 128 层对合法查询 (含 ORM 生成)
+/// 有大量余量, 最坏栈占用 ~几百 KB.
+pub(crate) const MAX_PARSE_DEPTH: u32 = 128;
+
+/// ⭐ 子查询嵌套上限 (比括号更严): 每层要跑完整 select 解析链, 帧代价高,
+/// 128 层即可超出 2MB 线程栈. 32 层对合法查询 (含 ORM) 仍极端宽松.
+pub(crate) const MAX_SUBQUERY_DEPTH: u32 = 32;
+
 pub(crate) struct P {
     pub(crate) toks: Vec<Tok>,
     pub(crate) i: usize,
@@ -338,9 +348,47 @@ pub(crate) struct P {
     /// ⭐ P1: 占位符风格混用检测 (?/$ 二选一).
     pub(crate) saw_question: bool,
     pub(crate) saw_dollar: bool,
+    /// ⭐ 2026-10-17 (审计新 P1-10): 当前递归深度 (见 MAX_PARSE_DEPTH).
+    pub(crate) depth: u32,
+    /// ⭐ 2026-10-17 (审计新 P1-10): 子查询嵌套深度 (见 MAX_SUBQUERY_DEPTH).
+    pub(crate) subq_depth: u32,
 }
 
 impl P {
+    /// ⭐ 2026-10-17 (审计新 P1-10): 进入一层递归解析. 超深返回错误
+    /// (调用方随之 abort 整条语句的解析 — 显式失败, 不是栈溢出崩溃).
+    pub(crate) fn enter_rec(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(format!(
+                "SQL expression nesting too deep (max {MAX_PARSE_DEPTH} levels)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// 退出一层递归解析 (错误路径上不调用亦可 — 整条语句随之 abort).
+    pub(crate) fn leave_rec(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// ⭐ 进入一层子查询解析 (EXISTS/派生表). 独立计数器 + 更严上限:
+    /// 每层跑完整 select 链, 帧代价远高于括号.
+    pub(crate) fn enter_subq(&mut self) -> Result<(), String> {
+        self.subq_depth += 1;
+        if self.subq_depth > MAX_SUBQUERY_DEPTH {
+            return Err(format!(
+                "SQL subquery nesting too deep (max {MAX_SUBQUERY_DEPTH} levels)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// 退出一层子查询解析.
+    pub(crate) fn leave_subq(&mut self) {
+        self.subq_depth = self.subq_depth.saturating_sub(1);
+    }
+
     pub(crate) fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.i)
     }
@@ -399,9 +447,14 @@ impl P {
         }
     }
 
-    /// ⭐ F76: 表位置标识符 — 读 ident 并剥 db 限定前缀 (`db.tbl` → `tbl`).
+    /// ⭐ F76: 表位置标识符 — 读 ident, **保留 `db.tbl` 限定名原样**.
+    ///
+    /// 2026-10-16 (审计新 P0-3): 旧实现在此静默剥离 db 限定前缀, 导致
+    /// `USE app; SELECT * FROM otherdb.users` 按当前库解析 — 读返回错误库
+    /// 的数据, 写污染当前库, 且无日志无指标. 现由 worker 侧
+    /// `sql_dbqual::normalize_stmt_tables` 统一校验 (同库剥离/跨库显式报错).
     pub(crate) fn table_ident(&mut self) -> Result<String, String> {
-        Ok(strip_db_qual(self.ident()?))
+        self.ident()
     }
 
     pub(crate) fn expect(&mut self, want: &Tok, what: &str) -> Result<(), String> {
@@ -690,6 +743,8 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
                 next_param: 0,
                 saw_question: false,
                 saw_dollar: false,
+                depth: 0,
+                subq_depth: 0,
             };
             let _ = p.try_kw("SESSION");
             p.kw("TRANSACTION")?;
@@ -718,6 +773,8 @@ pub fn parse_prepared(input: &[u8]) -> Result<(SqlStmt, u16), String> {
         next_param: 0,
         saw_question: false,
         saw_dollar: false,
+        depth: 0,
+        subq_depth: 0,
     };
     let stmt = match p.peek() {
         Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("CREATE") => parse_create(&mut p),
@@ -1037,11 +1094,10 @@ fn parse_insert(p: &mut P) -> Result<SqlStmt, String> {
             break;
         }
     }
-    // ⭐ compat: 吞 RETURNING ... (v1 不返回受影响行值)
+    // ⭐ 审计 P3 (2026-10-17): RETURNING 显式报错 — 旧实现静默吞掉后回 OK,
+    // 客户端以为拿到了受影响行的值 (实际什么都没返回), 属于"静默降级".
     if p.try_kw("RETURNING") {
-        while !p.peek().is_none() {
-            p.i += 1;
-        }
+        return Err("RETURNING is not supported (v1)".into());
     }
     p.done()?;
     Ok(SqlStmt::Insert { table, cols, rows })

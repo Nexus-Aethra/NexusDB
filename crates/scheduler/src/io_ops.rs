@@ -21,15 +21,25 @@ use std::task::{Context, Poll};
 use crate::scheduler::with_current;
 use crate::scheduler::with_current_slot;
 
-/// 取消被 future drop 遗留的内核请求。
+/// 取消被 future drop 遗留的内核请求.
 ///
-/// Drop 可能发生在 scheduler 已销毁之后；此时 io_uring 已随 scheduler 回收，无需再
-/// 提交 cancel。正常 task poll/drop 路径则必须取消，尤其是 `select_read` 的落选 PollFd。
+/// ⭐ 2026-10-17 (审计新 P1-16): 取消是**异步**的 — 内核在 cancel 生效前
+/// 可能仍在 DMA 读写调用方的 buffer. 旧实现只发 cancel 就返回: future 一
+/// drop, 调用方即可复用/释放 buffer, 与在途 DMA 构成数据竞争 (UB).
+/// 现在: 发 cancel 后**有界等待**该 ud 的 CQE (正常结果或 -ECANCELED
+/// 均可), 确保 DMA 结束后 buffer 才交还调用方.
+///
+/// Drop 可能发生在 scheduler 已销毁之后 (io_uring 已随 scheduler 回收,
+/// 无在途 DMA, 无需等待) 或 borrow 冲突时 — 两种情况 with_current 返回
+/// None, 直接返回 (尽力而为, 不退化为死锁).
 fn cancel_submitted(user_data: &Cell<Option<u64>>) {
     let Some(ud) = user_data.take() else {
         return;
     };
-    let _ = with_current(|s| s.cancel_submitted_io(ud));
+    let _ = with_current(|s| {
+        s.cancel_submitted_io(ud);
+        s.drain_cqe_until(ud, std::time::Duration::from_millis(50));
+    });
 }
 
 /// 公共逻辑: 已提交过 → 扫 CQE
@@ -40,6 +50,7 @@ macro_rules! poll_cqe {
             // ⭐ 批量提交: 扫描 CQ 前先提交攒下的 SQE, 否则 CQE 永不出现
             // (block_on_io 同步忙等路径不经过驱动循环, 靠这里保证正确性).
             s.flush_sq();
+            let mut cross_woke: Vec<usize> = Vec::new();
             let mut cq = s.ring.completion();
             cq.sync();
             // 也扫 CQ, 把任何还没 mark 的 CQE 都 mark 进 registry (drain_completions 可能还没跑).
@@ -48,9 +59,24 @@ macro_rules! poll_cqe {
                 let ud = cqe.user_data();
                 let result = cqe.result();
                 crate::trace!("io_ops CQE ud={} result={}", ud, result);
-                s.registry.mark_completed(ud, result);
+                // ⭐ 2026-10-17 (审计新 P1-15): 批量 CQ 扫描会 mark **其他**
+                // task 的 CQE (drive_once 先 poll 后 drain: 两轮之间到达的
+                // CQE 都会被下一个被 poll 任务的扫描消费). 旧实现只 mark 不
+                // 唤醒 — owner 永远 park 成 Pending, 且其 CQE 已被消耗、
+                // 后续 drain_completions 看到空 CQ → 永久死锁.
+                // 与 drain_completions 对齐: mark 后把 owner slot 入 ready
+                // (借用规则: cq 持有 s.ring 的借用, 先收集 slot_id,
+                //  drop(cq) 后统一入队).
+                if s.registry.mark_completed(ud, result)
+                    && let Some(st) = s.registry.inner_peek(ud)
+                {
+                    cross_woke.push(st.slot_id);
+                }
             }
             drop(cq);
+            for slot_id in cross_woke {
+                s.wake_slot(slot_id);
+            }
             if let Some(r) = s.registry.take_result($ud) {
                 crate::trace!("io_ops take_result(ud={}) → {:?}", $ud, r);
                 Some(r)
@@ -431,11 +457,9 @@ impl Future for PollFd {
 
         let slot_id = with_current_slot(|id| id).unwrap_or(0);
         // IORING_OP_POLL_ADD: 注册对 fd 的事件监听, 返回触发的事件 mask.
-        let entry = io_uring::opcode::PollAdd::new(
-            io_uring::types::Fd(this.fd),
-            this.events as u32,
-        )
-        .build();
+        let entry =
+            io_uring::opcode::PollAdd::new(io_uring::types::Fd(this.fd), this.events as u32)
+                .build();
         let ud = submit_sqe!(entry, slot_id, cx);
         this.user_data.set(Some(ud));
         Poll::Pending
@@ -515,8 +539,16 @@ pub struct SelectRead {
 impl SelectRead {
     pub(crate) fn new(fd1: RawFd, fd2: RawFd) -> Self {
         Self {
-            f1: Box::pin(PollFd { fd: fd1, events: libc::POLLIN, user_data: Cell::new(None) }),
-            f2: Box::pin(PollFd { fd: fd2, events: libc::POLLIN, user_data: Cell::new(None) }),
+            f1: Box::pin(PollFd {
+                fd: fd1,
+                events: libc::POLLIN,
+                user_data: Cell::new(None),
+            }),
+            f2: Box::pin(PollFd {
+                fd: fd2,
+                events: libc::POLLIN,
+                user_data: Cell::new(None),
+            }),
             done1: false,
             done2: false,
         }

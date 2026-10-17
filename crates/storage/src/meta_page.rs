@@ -173,7 +173,7 @@ impl MetaPage {
             for i in 0..key_count + 1 {
                 let (item, n) = decode_item(page, off, ItemKind::Leaf)
                     .map_err(|e| MetaError::PageDecode(format!("decode_item: {:?}", e)))?;
-                let full_key = item.full_key(&prev_key);
+                let full_key = item.full_key(&prev_key)?;
                 if i == 0 {
                     // 哨兵: shared=0, key_unshared_len=0
                     if !full_key.is_empty() {

@@ -39,6 +39,7 @@ type JoinRanges = Vec<HashMap<u32, JoinRange>>;
 type CascadePending = (std::sync::Arc<str>, String, Vec<Vec<u8>>);
 
 /// ⭐ 拆分 (2026-08): SQL 纯工具函数 (不依赖 ConnState 状态).
+mod sql_dbqual;
 mod sql_util;
 use sql_util::*;
 /// ⭐ 拆分 (2026-08): SQL 聚合执行 (GROUP BY/聚合函数/HAVING).
@@ -49,9 +50,15 @@ pub(crate) use sql_cascade::{CascadeJob, cascade_job_done, cascade_kickoff, is_c
 /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检.
 mod sql_fk;
 pub(crate) use sql_fk::{all_parents_cached, sql_fk_on_reply, sql_fk_start};
+/// ⭐ PG 兼容 (审计 P1-4): 父表 DELETE 前置 RESTRICT 预检.
+mod sql_fk_restr;
+pub(crate) use sql_fk_restr::{FkRestrSt, RestrResume, fk_restr_on_reply, fk_restr_start};
 /// ⭐ ORM-B2 (解耦 2026-08): 进程级共享路由缓存 (SqlSharedRoutes/FkIncoming).
+mod auth_throttle;
+pub(crate) use auth_throttle::MAX_FAILS_PER_CONN;
 mod sql_routes;
 pub use sql_routes::{FkIncoming, SqlSharedRoutes, new_sql_shared};
+pub(crate) use sql_routes::{rlock, wlock};
 /// ⭐ 解耦 2026-08: RESP 跨 shard 聚合状态结构体.
 mod resp_agg;
 pub(crate) use resp_agg::{
@@ -74,7 +81,7 @@ mod resp_dispatch_cmd;
 pub(crate) use resp_dispatch_cmd::dispatch_resp_command;
 /// ⭐ 解耦 2026-08: shard 回包处理主函数 (拆自 resp_dispatch).
 mod resp_shard;
-pub(crate) use resp_shard::handle_resp_shard_result;
+pub(crate) use resp_shard::{handle_resp_shard_result, run_dml_phase2};
 /// ⭐ 解耦 2026-08: 协议 wire 入口 (HTTP 处理).
 mod protocol_io;
 pub(crate) use protocol_io::{
@@ -86,7 +93,7 @@ pub(crate) use sql_state::{
     PendingRespSqlIncr, PendingSql, RespHQueryCtx, RespSqlHGetCtx, RespSqlHSetCtx,
     RespSqlIncrDelta, RespSqlReadMode, SUBQ_IN_MAX, SharedSqlCache, SqlDmlAgg, SqlFkIns, SqlPlan,
     SqlRowCtx, SqlTxnAgg, SqlUniqueIns, SqlWorkerCache, SubqCtx, TXN_MAX_BYTES, TXN_MAX_OPS,
-    TxnState, UniquePhase,
+    TXN_MAX_READ_SET, TxnState, UniquePhase,
 };
 /// ⭐ 拆分 (2026-08): SQL 语句分派/规划/执行核心.
 mod sql_dispatch;
@@ -254,6 +261,10 @@ pub(crate) struct SqlSelectAgg {
     remaining: usize,
     error: Option<String>,
     rows: Vec<storage::sql_rows::IndexEntry>,
+    /// ⭐ v2 (F62): 本语句若是事务内的读 → (db, table) 坐标; 回包到达时把
+    /// 每行 (pk, row 指纹) 登记进 conn.txn.read_set (OCC 验证用).
+    /// None = 非事务内读, 零开销.
+    txn_read: Option<(String, String)>,
     schema: std::sync::Arc<TableSchema>,
     conds: Pred<Cond>,
     limit: Option<u32>,
@@ -369,6 +380,9 @@ const JOIN_KEYSET_MAX: usize = 1024;
 pub(crate) struct ConnState {
     pub(crate) fd: RawFd,
     pub(crate) stream: TcpStream,
+    /// ⭐ 审计 P2 (2026-10-17): 最近一次从该连接读到数据的时刻 (idle 回收用).
+    /// worker 主循环按 `KvLimits::idle_timeout_secs` 周期性扫描.
+    pub(crate) last_activity: std::time::Instant,
     /// ⭐ F83: TLS 会话 (None = 明文; Some = 已 STARTTLS 升级, recv/send 走 rustls).
     pub(crate) tls: Option<Box<rustls::ServerConnection>>,
     pub(crate) read_buf: Vec<u8>,
@@ -377,6 +391,10 @@ pub(crate) struct ConnState {
     pub(crate) write_buf: Vec<u8>,
     pub(crate) write_pos: usize,
     pub(crate) epoll_write_buffering: bool,
+    /// ⭐ 2026-10-17 (审计新 P1-4): 本连接由**协程** worker 服务.
+    /// 协程的 recv_async 读路径无 TLS 解密分支 — TLS 升级后密文会被当
+    /// 明文解析 (握手挂死). 该标记让协议层在协程连接上显式拒绝 TLS 升级.
+    pub(crate) coro_worker: bool,
     /// 当前 epoll 是否已注册 EPOLLOUT；仅状态切换时 EPOLL_CTL_MOD，避免每条
     /// 回包额外 syscall。
     pub(crate) epoll_write_armed: bool,
@@ -392,6 +410,9 @@ pub(crate) struct ConnState {
     pub(crate) tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// RESP: 是否已通过 AUTH (无密码配置时恒 true).
     pub(crate) authenticated: bool,
+    /// ⭐ 审计 P2 (2026-10-17): 本连接连续认证失败次数 (达 `MAX_FAILS_PER_CONN`
+    /// 即断开, 防单连接内无限猜口令).
+    pub(crate) auth_failures: u32,
     /// RESP: 下一条命令分配的 seq (作为 ShardTask.req_id).
     pub(crate) next_seq: u64,
     /// RESP: 下一个应发送的 seq (FIFO 重排游标).
@@ -456,6 +477,10 @@ pub(crate) struct ConnState {
     pub(crate) cascade_seq_ctr: u64,
     /// ⭐ PG 兼容 (引用完整性, FMT_VER 8): 外键 INSERT 存在性预检 (seq → 状态).
     pub(crate) sql_fk_ins: HashMap<u64, SqlFkIns>,
+    /// ⭐ PG 兼容 (审计 P1-4): 父表 DELETE 前置 RESTRICT 预检 (seq → 状态).
+    pub(crate) fk_restr: HashMap<u64, FkRestrSt>,
+    /// ⭐ 审计 P1-4: 已补注全库 FK 反向索引的 db (CatalogDump 一次性, per-conn).
+    pub(crate) fk_catalog_done: std::collections::HashSet<String>,
     /// ⭐ PG 兼容 (multi-statement): 原 seq → 多语句顺序执行状态.
     pub(crate) multi_stmt: HashMap<u64, MultiStmt>,
     /// ⭐ PG 兼容 (multi-statement): 子 seq → 原 seq (DDL/DML 完成时回映射推进).
@@ -882,7 +907,7 @@ pub(crate) fn feed_route_bloom(
 ) {
     let sh = &conn.sql_shared;
     let ckey = (db.to_string(), table.to_string());
-    if !sh.created_here.read().unwrap().contains(&ckey) {
+    if !rlock(&sh.created_here).contains(&ckey) {
         return;
     }
     let BatchOp::RowPut { values, .. } = op else {
@@ -890,10 +915,7 @@ pub(crate) fn feed_route_bloom(
     };
     for idx in schema.indexes.iter() {
         if let Some(enc) = storage::sql_rows::index_vals_bytes(schema, idx, values) {
-            let entry = sh
-                .routes
-                .read()
-                .unwrap()
+            let entry = rlock(&sh.routes)
                 .get(&(ckey.0.clone(), ckey.1.clone(), idx.iid))
                 .cloned();
             if let Some(blooms) = entry {
@@ -990,6 +1012,23 @@ fn sql_read_key(
         .as_ref()
         .filter(|t| t.iso == sql::TxnIso::Serializable)
         .map(|_| (db.to_string(), table.to_string(), pk.to_vec()))
+}
+
+/// ⭐ 审计 P2 (2026-10-17): SERIALIZABLE 事务内的**扫描**读 → 读集坐标
+/// (db, table); RC/非事务回 None (零开销).
+///
+/// 旧实现只有 pk 点查 (`sql_read_key`) 登记读集, 范围/全表扫描的读完全不
+/// 参与提交验证 → 并发事务改/删已读行不被发现 (丢失更新). 这里给出扫描
+/// 聚合的坐标, 回包到达时逐行登记 (见 resp_shard 的 Rows 臂).
+pub(crate) fn txn_read_ctx(
+    conn: &ConnState,
+    db: &std::sync::Arc<str>,
+    table: &str,
+) -> Option<(String, String)> {
+    conn.txn
+        .as_ref()
+        .filter(|t| t.iso == sql::TxnIso::Serializable)
+        .map(|_| (db.to_string(), table.to_string()))
 }
 
 /// ⭐ 事务 v1 (F61): 写 op 进 write_set (上限护栏; 超限自动回滚).

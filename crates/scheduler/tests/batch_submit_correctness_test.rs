@@ -68,8 +68,16 @@ fn batch_submit_driven_by_scheduler() {
             sched.clone().drive_until_idle(256);
             iters += 1;
         }
-        eprintln!("[sched] completed={} iters={iters} elapsed={:?}", *done.lock().unwrap(), t0.elapsed());
-        assert_eq!(*done.lock().unwrap(), N, "所有读协程都应完成 (批量提交 flush)");
+        eprintln!(
+            "[sched] completed={} iters={iters} elapsed={:?}",
+            *done.lock().unwrap(),
+            t0.elapsed()
+        );
+        assert_eq!(
+            *done.lock().unwrap(),
+            N,
+            "所有读协程都应完成 (批量提交 flush)"
+        );
     });
 }
 
@@ -92,6 +100,10 @@ fn batch_submit_block_on_io_path() {
         {
             let read_fd = b.as_raw_fd();
             let buf_ref = buf.clone();
+            // 借用跨 .await 是本用例**刻意**复现的生产模式 (block_on_io 同步 poll):
+            // 单线程 + 同步轮询, 不存在并发重入, 因此不会触发 RefCell 的重复借用 panic.
+            // 若改为跨线程并发 poll, 这里会 panic —— 那正是该模式不可泛用的边界.
+            #[allow(clippy::await_holding_refcell_ref)]
             let fut = async move {
                 let mut b = buf_ref.borrow_mut();
                 scheduler::io_ops::read(read_fd, &mut b[..], 0)
@@ -100,7 +112,7 @@ fn batch_submit_block_on_io_path() {
             };
             let mut fut = std::pin::pin!(fut);
             let waker = std::task::Waker::noop();
-            let mut cx = std::task::Context::from_waker(&waker);
+            let mut cx = std::task::Context::from_waker(waker);
             let mut spins = 0u32;
             loop {
                 if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {

@@ -138,7 +138,11 @@ impl FdPool {
 
         // 3. open file (创建/打开, 不 truncate, 不删)
         let mut open_opts = OpenOptions::new();
-        open_opts.read(true).write(true).create(true).truncate(false);
+        open_opts
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false);
         if o_direct {
             open_opts.custom_flags(libc::O_DIRECT);
         }
@@ -288,7 +292,8 @@ mod tests {
         for i in 0..MAX_FD_PER_SHARD {
             let p = tmp.path().join(format!("f{i}.block"));
             std::fs::File::create(&p).unwrap();
-            pool.acquire(&mut ring, &p).expect("acquire ok within limit");
+            pool.acquire(&mut ring, &p)
+                .expect("acquire ok within limit");
         }
         // 第 MAX_FD_PER_SHARD + 1 个应失败
         let p_overflow = tmp.path().join(format!("f{MAX_FD_PER_SHARD}.block"));

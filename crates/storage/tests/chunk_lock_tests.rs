@@ -366,14 +366,20 @@ fn pager_read_miss_creates_chunk_lock_then_loads() {
             list.invalidate(&k.into());
         }
 
-        // 读: chunk_list miss, 走 load_fn. 但本次 read 自身会触发 chunk_lock acquire
-        // 实际上, 当前 Pager.read 还没集成 chunk_lock, 走原始 load_fn 路径
-        // 验证: chunk_list 重新加载, 数据仍正确
+        // 读: chunk_list miss, 走 load_fn. 注意 Pager.read 尚未集成 chunk_lock,
+        // 走原始 load_fn 路径.
+        // 验证: 数据正确, 且该页被回填进 chunk_list 的**页层** (pages).
+        // ⚠️ 不能断言 chunk_list().is_empty() —— 那是整块层 (map); 读路径按设计
+        // 只做 admit_page (见 chunk_lru::admit_page 注释: 不整块提升, 否则扫描会
+        // 退化成 16KiB×N 的分配). 页层与块层是两条独立的 LRU 链.
         let r = pager.read(v).await.unwrap();
         assert_eq!(r[0x28], 0);
+        let pk = pager.meta().read(v).expect("vpid 应已映射");
+        let page_key = key(pk.file_id(), pk.chunk_idx());
+        let page_idx = pk.page_idx() as u8;
         assert!(
-            !pager.chunk_list().is_empty(),
-            "read 后 chunk_list 重新加载"
+            pager.chunk_list().peek_page(page_key, page_idx).is_some(),
+            "读盘后该页应被回填进页层缓存"
         );
     });
 }

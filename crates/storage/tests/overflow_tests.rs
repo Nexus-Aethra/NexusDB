@@ -69,11 +69,19 @@ fn threshold_boundary_roundtrip() {
         engine.table_put("db1", "t1", b"lrg", &large).await.unwrap();
 
         assert_eq!(
-            engine.table_get("db1", "t1", b"sml").await.unwrap().as_deref(),
+            engine
+                .table_get("db1", "t1", b"sml")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(&small[..])
         );
         assert_eq!(
-            engine.table_get("db1", "t1", b"lrg").await.unwrap().as_deref(),
+            engine
+                .table_get("db1", "t1", b"lrg")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(&large[..])
         );
     });
@@ -88,7 +96,11 @@ fn one_megabyte_roundtrip() {
 
         let v = make_value(storage::MAX_OVERFLOW_VALUE, 0x5A); // 1MB
         engine.table_put("db1", "t1", b"big", &v).await.unwrap();
-        let got = engine.table_get("db1", "t1", b"big").await.unwrap().unwrap();
+        let got = engine
+            .table_get("db1", "t1", b"big")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.len(), v.len());
         assert_eq!(got, v, "1MB roundtrip 逐字节一致");
     });
@@ -146,7 +158,13 @@ fn delete_releases_chain() {
             after_delete <= before_put + 1, // +1 容忍 leaf 页自身
             "delete 后活页数 {after_delete} 未回落 (put 前 {before_put}) = 泄漏"
         );
-        assert!(engine.table_get("db1", "t1", b"gone").await.unwrap().is_none());
+        assert!(
+            engine
+                .table_get("db1", "t1", b"gone")
+                .await
+                .unwrap()
+                .is_none()
+        );
     });
 }
 

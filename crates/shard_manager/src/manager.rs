@@ -47,6 +47,9 @@ pub struct ShardManagerOptions {
     pub wal_mode: storage::wal::WalMode,
 }
 
+/// 扫描结果: (物理 key, value) 对的列表 —— 各 shard 归并后的全局结果.
+pub type ScanEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
 impl ShardManagerOptions {
     /// 构造默认配置.
     pub fn new(num_shards: usize, block_root: std::path::PathBuf) -> Self {
@@ -108,6 +111,9 @@ pub struct ShardManager {
     pub reply_bus_set: Arc<crate::task_reply_bus::ReplyBusSet>,
     /// ⭐ D2 (分库): KV 数字 id ↔ db name 双向翻译视图 (resolver 内存镜像).
     db_view: Arc<DbDirView>,
+    /// ⭐ 2026-10-17 (审计新 P1-18): shutdown 幂等标记 — close(self) 与
+    /// shutdown(&self) 共用同一套停机握手, 重复调用不得重复发指令.
+    shutdown_started: std::sync::atomic::AtomicBool,
 }
 
 /// ⭐ D2 (分库): KV 数字 id ↔ db name 双向翻译视图.
@@ -263,6 +269,7 @@ impl ShardManager {
             reply_sink: reply_sink_arc,
             reply_bus_set,
             db_view: Arc::new(DbDirView::default()),
+            shutdown_started: std::sync::atomic::AtomicBool::new(false),
         };
         // ⭐ D2 (分库): 从 shard 0 (resolver SoT 副本) 初始化 id↔name 视图
         mgr.refresh_db_view();
@@ -573,7 +580,7 @@ impl ShardManager {
         end: &[u8],
         prefix: &[u8],
         limit: u32,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+    ) -> Result<ScanEntries, String> {
         // 每 shard 单独一份 ScanKeys (各自 limit 下推, 归并后全局截断).
         let mut futures = Vec::with_capacity(self.num_shards);
         for shard in &self.shards {
@@ -946,7 +953,7 @@ impl ShardManager {
             match fut.await {
                 Ok(ShardReply::BatchResults(rs)) => {
                     // rs 顺序与 push 时的 ops 顺序一致, 也就是 group 顺序.
-                    for (slot, result) in orig_indices.iter().zip(rs.into_iter()) {
+                    for (slot, result) in orig_indices.iter().zip(rs) {
                         results[*slot] = result;
                     }
                 }
@@ -1025,6 +1032,10 @@ impl ShardManager {
 
         // 4. 决定 Commit 或 Abort
         if all_ok {
+            // ⭐ 2026-10-17 (审计新 P1-13): Commit 失败必须显式报错 —
+            // 旧实现 `if block_on_v2(fut).is_ok()` 吞掉失败后仍返回 Ok,
+            // 客户端以为建库成功, 实际可能只有部分 shard 提交 (不一致状态).
+            let mut commit_failed: Option<(usize, String)> = None;
             for i in 0..num_shards {
                 let (tx, fut) = PendingReply::new();
                 let req = ShardRequest::CommitCreateDb {
@@ -1033,13 +1044,29 @@ impl ShardManager {
                     reply: tx,
                 };
                 self.shards[i].inbox.push_spin(req);
-                if block_on_v2(fut).is_ok() {
-                    self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                match block_on_v2(fut) {
+                    Ok(_) => {
+                        self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                    }
+                    Err(kind) => {
+                        if commit_failed.is_none() {
+                            commit_failed = Some((i, format!("{kind:?}")));
+                        }
+                    }
                 }
             }
-            // ⭐ D2 (分库): 建库成功 → 刷新 id↔name 翻译视图
-            self.refresh_db_view();
-            Ok(())
+            match commit_failed {
+                // 全部提交成功 → 刷新视图 (失败时不刷: db 处于不一致状态)
+                None => {
+                    self.refresh_db_view();
+                    Ok(())
+                }
+                Some((shard_id, reason)) => Err(ShardError::CommitFailed {
+                    op: format!("create_db({db})"),
+                    shard_id,
+                    reason,
+                }),
+            }
         } else {
             let (err_shard, err_reason) = first_error.unwrap_or((0, "unknown".into()));
             for (i, result) in results.iter().enumerate() {
@@ -1115,6 +1142,7 @@ impl ShardManager {
         }
 
         if all_ok {
+            let mut commit_failed: Option<(usize, String)> = None;
             for i in 0..num_shards {
                 let (tx, fut) = PendingReply::new();
                 let req = ShardRequest::CommitCreateTable {
@@ -1124,11 +1152,26 @@ impl ShardManager {
                     reply: tx,
                 };
                 self.shards[i].inbox.push_spin(req);
-                if block_on_v2(fut).is_ok() {
-                    self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                // ⭐ 审计新 P1-13: commit 失败显式报错 (勿静默 Ok)
+                match block_on_v2(fut) {
+                    Ok(_) => {
+                        self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                    }
+                    Err(kind) => {
+                        if commit_failed.is_none() {
+                            commit_failed = Some((i, format!("{kind:?}")));
+                        }
+                    }
                 }
             }
-            Ok(0)
+            match commit_failed {
+                None => Ok(0),
+                Some((shard_id, reason)) => Err(ShardError::CommitFailed {
+                    op: format!("create_table({db}.{table})"),
+                    shard_id,
+                    reason,
+                }),
+            }
         } else {
             let (err_shard, err_reason) = first_error.unwrap_or((0, "unknown".into()));
             for (i, result) in results.iter().enumerate() {
@@ -1338,12 +1381,28 @@ impl ShardManager {
                 self.shards[i].inbox.push_spin(req);
                 commit_futs.push(Box::pin(fut));
             }
+            let mut commit_failed: Option<(usize, String)> = None;
             for (i, f) in commit_futs.into_iter().enumerate() {
-                if f.await.is_ok() {
-                    self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                // ⭐ 审计新 P1-13: commit 失败显式报错 (勿静默 Ok)
+                match f.await {
+                    Ok(_) => {
+                        self.coordinator.lock().unwrap().on_commit_ack(txn_id, i);
+                    }
+                    Err(kind) => {
+                        if commit_failed.is_none() {
+                            commit_failed = Some((i, format!("{kind:?}")));
+                        }
+                    }
                 }
             }
-            Ok(0)
+            match commit_failed {
+                None => Ok(0),
+                Some((shard_id, reason)) => Err(ShardError::CommitFailed {
+                    op: format!("create_table({db}.{table})"),
+                    shard_id,
+                    reason,
+                }),
+            }
         } else {
             let (err_shard, err_reason) = first_error.unwrap_or((0, "unknown".into()));
             let mut abort_futs: Vec<(usize, BoxedShardFuture)> = Vec::new();
@@ -1375,32 +1434,56 @@ impl ShardManager {
     }
 
     /// 路由: 用 db name + table + key hash.
+    /// ⭐ 审计 P2 (2026-10-17): 委托 `router::route_hash` (唯一实现, 防三处漂移).
     fn route_db_table_key(&self, db: &str, table: &str, key: &[u8]) -> ShardId {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        db.hash(&mut hasher);
-        table.hash(&mut hasher);
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) % self.num_shards
+        crate::router::route_hash(db, table, key, self.num_shards)
     }
 
     /// 关闭所有 shard 线程, 干净退出.
-    pub fn close(self) -> ShardResult<()> {
-        // 1. 发送 Shutdown 给所有 shard
+    /// ⭐ 优雅关闭 (经 `&self`, **不要求 Arc 独占**) — 审计新 P1-18.
+    ///
+    /// 旧退出路径 (main.rs) 用 `Arc::try_unwrap(mgr)` 拿独占引用再调
+    /// `close(self)`; 但 `sql_shared.cluster_ctl` 等处持有 Arc 克隆,
+    /// try_unwrap 必失败 → close 被跳过 → shard 线程被进程退出硬杀,
+    /// nowchunks 里的 dirty data **每次关机都丢** (最近写入窗口).
+    ///
+    /// 本方法两步: ① flush 全部 shard (dirty data 落盘, durability 关键);
+    /// ② 发 Shutdown 等各 shard 确认退出. 幂等 (重复调用直接返回).
+    pub fn shutdown(&self) -> ShardResult<()> {
+        if self
+            .shutdown_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        // 1. flush: 把各 shard nowchunks 的 dirty data 落盘
+        for shard in &self.shards {
+            let (tx, fut) = PendingReply::new();
+            shard.inbox.push_spin(ShardRequest::Flush { reply: tx });
+            if block_on_v2(fut).is_err() {
+                return Err(ShardError::ChannelClosed);
+            }
+        }
+        // 2. Shutdown: 等各 shard 确认 (它们随后自行退出循环)
         for shard in &self.shards {
             let (tx, fut) = PendingReply::new();
             // 忽略 send 错误 (shard 可能已死)
             shard.inbox.push_spin(ShardRequest::Shutdown { reply: tx });
-            // 等 reply (设 timeout, 避免死锁)
+            // 等 reply (block_on_v2 已有超时, 不会死锁)
             let _ = block_on_v2(fut);
         }
+        Ok(())
+    }
+
+    pub fn close(mut self) -> ShardResult<()> {
+        // 1. 停机握手 (flush + Shutdown; 若调用方已 shutdown 过则为幂等 no-op)
+        self.shutdown()?;
 
         // 2. drop senders (让 mpsc 关闭, shard loop 也会 break)
-        drop(self.shards);
+        drop(std::mem::take(&mut self.shards));
 
         // 3. join 所有线程
-        for (i, join) in self.threads.into_iter().enumerate() {
+        for (i, join) in std::mem::take(&mut self.threads).into_iter().enumerate() {
             join.join().map_err(|_| ShardError::JoinPanic(i))?;
         }
         Ok(())
@@ -1423,9 +1506,32 @@ impl ShardManager {
     }
 }
 
+impl Drop for ShardManager {
+    /// RAII 兜底: 忘记显式 `close()`/`shutdown()` 时 (典型: 测试只 `drop(mgr)`,
+    /// 或 panic unwind), 在此停 shard 线程并 join.
+    ///
+    /// 没有这层兜底时, 泄漏的 shard 线程会带着引擎无限空转 (idle 循环 10ms
+    /// poll 唤醒驱动持久化检查), 直到进程退出 — 测试套件里每个未 close 的
+    /// manager 泄漏 num_shards 个持续耗 CPU 的线程.
+    ///
+    /// 与显式路径幂等兼容: `close()` 已 take 空字段 + `shutdown()` 有
+    /// `shutdown_started` 标志, 本实现随后为 no-op.
+    fn drop(&mut self) {
+        // flush + Shutdown (尽力而为: 失败也继续停线程, 不让泄漏线程空转)
+        let _ = self.shutdown();
+        drop(std::mem::take(&mut self.shards));
+        for join in std::mem::take(&mut self.threads) {
+            let _ = join.join();
+        }
+    }
+}
+
 // =====================================================================
 // shard 线程主函数
 // =====================================================================
+
+/// `block_on_io` 自旋轮数上界 (超过则 yield 让出 CPU).
+pub(crate) const BLOCK_ON_SPIN_ROUNDS: u32 = 64;
 
 /// ⭐ String RMW: INCR/DECR (shard 单线程内天然原子).
 ///
@@ -1433,6 +1539,10 @@ impl ShardManager {
 /// - TAG_I64: 直接 LE 读 + checked_add → 写回 TAG_I64 (8B 二进制)
 /// - TAG_RAW 十进制文本 (Redis 兼容/存量): parse i64 → **结果升级为 TAG_I64**
 /// - TAG_F64/F32: Redis 语义报 "not an integer"
+///
+/// ⭐ 审计 P1-6 (2026-10-17): 有界自旋 + yield 退避 — 前 BLOCK_ON_SPIN_ROUNDS
+/// 轮 spin_loop (等即将就绪的 io_uring CQE, 省一次线程让出), 之后 yield_now
+/// 让出 CPU (旧版无限自旋会烧满一个核; 现在长等待也只占调度份额, 不独占).
 pub(crate) fn block_on_io<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, Waker};
     let waker = Waker::noop();
@@ -1444,7 +1554,7 @@ pub(crate) fn block_on_io<F: std::future::Future>(fut: F) -> F::Output {
             return v;
         }
         spins += 1;
-        if spins < 64 {
+        if spins < BLOCK_ON_SPIN_ROUNDS {
             std::hint::spin_loop();
         } else {
             std::thread::yield_now();

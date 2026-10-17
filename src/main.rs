@@ -31,6 +31,60 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> i32 {
     1
 }
 
+/// ⚠️ 安全告警: 监听非回环地址 且 对应门面未配置口令 = 对外裸奔.
+/// 启动时显式打印, 避免"开箱即用即无认证"被静默忽略.
+#[cfg(target_os = "linux")]
+fn warn_if_insecure_defaults(cfg: &config::NexusConfig) {
+    let s = &cfg.server;
+    // ⭐ 审计 P0-4 (2026-10-17): 旧实现只对通配地址 (0.0.0.0/::) 告警 —
+    // 绑定**具体外网 IP** (如 192.168.1.5) 同样对外暴露却一声不响.
+    // 现在: 只要不是回环地址就视为"对外可达".
+    let is_loopback = |addr: &str| {
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host == "127.0.0.1" || host == "::1" || host == "localhost"
+    };
+    let exposed = |addr: &str| !addr.is_empty() && !is_loopback(addr);
+
+    let mut open: Vec<&str> = Vec::new();
+    let no_resp_auth = s.redis_password.is_empty();
+    if exposed(&s.listen_addr) && no_resp_auth {
+        open.push("Binary(5433)");
+    }
+    if exposed(&s.redis_addr) && no_resp_auth {
+        open.push("RESP");
+    }
+    let sql_no_auth = s.sql_password.is_empty();
+    if exposed(&s.sql_addr) && sql_no_auth {
+        open.push("MySQL(5434)");
+    }
+    if exposed(&s.pg_addr) && sql_no_auth {
+        open.push("PostgreSQL(5435)");
+    }
+    let http_no_auth = s.http_token.is_empty() && s.tls_key.is_empty();
+    if exposed(&s.http_addr) && http_no_auth {
+        open.push("HTTP/REST(6778)");
+    }
+    if open.is_empty() {
+        return;
+    }
+    nlog::warn!(
+        "main",
+        "SECURITY: {} 监听所有网卡且未配置口令 — 当前对外免鉴权",
+        open.join(", ")
+    );
+    nlog::warn!(
+        "main",
+        "SECURITY: 建议绑定 127.0.0.1, 或配置 redis_password / sql_password / http_token 与 TLS"
+    );
+    // ⭐ 审计 P0-4③: Binary(5433) 是内部/基准协议, **不实现认证**
+    // (auth_password 恒 None) — 绝不绑到非回环地址.
+    nlog::warn!(
+        "main",
+        "SECURITY: Binary(5433) 协议无认证实现, 只应绑 127.0.0.1"
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn main() {
     // 默认查找: ./nexusdb.toml → 找不到则 ./config/nexusdb.toml (新结构)
@@ -110,6 +164,9 @@ fn main() {
         libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
     }
 
+    // 3.5 安全告警: 非回环监听 + 空口令
+    warn_if_insecure_defaults(&cfg);
+
     // 4. 启动 ShardManager
     let io_backend = cfg.storage.io_backend().expect("validated backend");
     // ⭐ 解耦 (Phase 3/T3): 全局共享 worker 池 — 多协议 server 共享同一批 worker,
@@ -153,6 +210,11 @@ fn main() {
     let limits = KvLimits {
         max_key_bytes: cfg.server.max_key_bytes,
         max_value_bytes: cfg.server.max_value_bytes,
+        // 单连接 prepared 语句注册表上限 (审计 P2: 防单连接 OOM 拖死 worker)
+        max_prepared_stmts: 1024,
+        // 单 worker 连接数上限 + 空闲连接回收 (审计 P2: 防连接无限堆积)
+        max_connections_per_worker: 4096,
+        idle_timeout_secs: 300,
     };
     // ⭐ ORM-B2: 进程级共享 SQL 路由缓存 (五门面同集群共用一个)
     let sql_shared = network::new_sql_shared();
@@ -429,13 +491,26 @@ fn main() {
     if let Err(e) = server.shutdown() {
         nlog::warn!("main", "network shutdown error: {e}");
     }
+    // ⭐ 2026-10-17 (审计新 P1-18): 先经 &self 关闭 — flush 全部 shard
+    // (nowchunks dirty data 落盘) + Shutdown 握手. 旧实现用
+    // Arc::try_unwrap(mgr) 拿独占引用再 close(): sql_shared.cluster_ctl
+    // 持有 Arc → try_unwrap 必失败 → close 被跳过 → shard 被进程退出硬杀,
+    // 每次关机都丢最近写入窗口的数据.
+    if let Err(e) = mgr.shutdown() {
+        nlog::warn!("main", "shard manager shutdown error: {e}");
+    }
+    // 线程 join 仅在确能独占所有权时进行 (进程退出前的清理;
+    // flush 已完成, join 失败不影响 durability).
     match Arc::try_unwrap(mgr) {
         Ok(m) => {
             if let Err(e) = m.close() {
                 nlog::warn!("main", "shard manager close error: {e}");
             }
         }
-        Err(_) => nlog::warn!("main", "shard manager still referenced, skip close"),
+        Err(_) => nlog::info!(
+            "main",
+            "shard manager still referenced; flush+shutdown done, skipping thread join"
+        ),
     }
     // ⭐ 探针 dump: NLOG_PROBE=1 时各阶段耗时直方图输出到 stderr.
     // 客户端可直接 `2>probe.log` 捕获, 用于长尾定位.
@@ -573,6 +648,11 @@ fn main() {
     let limits = KvLimits {
         max_key_bytes: cfg.server.max_key_bytes,
         max_value_bytes: cfg.server.max_value_bytes,
+        // 单连接 prepared 语句注册表上限 (审计 P2: 防单连接 OOM 拖死 worker)
+        max_prepared_stmts: 1024,
+        // 单 worker 连接数上限 + 空闲连接回收 (审计 P2: 防连接无限堆积)
+        max_connections_per_worker: 4096,
+        idle_timeout_secs: 300,
     };
     let listen_addr: std::net::SocketAddr = cfg.server.listen_addr.parse().expect("validated addr");
     let binary_server = match NetworkServer::start(NetworkServerConfig {

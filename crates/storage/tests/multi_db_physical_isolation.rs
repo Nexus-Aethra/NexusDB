@@ -15,9 +15,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use storage::{IoBackend, IoBackendConfig};
 use storage::OpenOptions;
 use storage::StorageEngine;
+use storage::{IoBackend, IoBackendConfig};
 
 mod common;
 
@@ -363,7 +363,7 @@ fn shard_id_different_is_physically_separated() {
             io_config: IoBackendConfig::default(),
             wal_mode: Default::default(),
         };
-        
+
         let _e0 = StorageEngine::open(opts_s0).await.expect("open shard 0");
         let _e1 = StorageEngine::open(opts_s1).await.expect("open shard 1");
 

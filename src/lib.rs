@@ -381,12 +381,7 @@ impl Table {
     /// // 或者用 prefix 拿 "user:1000xxx" 这种带前缀的 id
     /// let names = table.list_range(b"user:1000", b"user:2000", 0)?;
     /// ```
-    pub fn list_range(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        limit: u32,
-    ) -> EmbeddedResult<Vec<Vec<u8>>> {
+    pub fn list_range(&self, start: &[u8], end: &[u8], limit: u32) -> EmbeddedResult<Vec<Vec<u8>>> {
         self.manager
             .scan(&self.database, &self.name, start, end, &[], limit)
             .map_err(EmbeddedError::Scan)
@@ -430,7 +425,10 @@ impl Table {
             .manager
             .scan_with_values(&self.database, &self.name, &[], &[], &[], limit)
             .map_err(EmbeddedError::Scan)?;
-        Ok(pairs.into_iter().map(|(k, v)| (k, decode_typed(v))).collect())
+        Ok(pairs
+            .into_iter()
+            .map(|(k, v)| (k, decode_typed(v)))
+            .collect())
     }
 
     /// 范围 + 类型感知: `[start, end)` 闭开区间, 一次往返拿 (key, typed_value).
@@ -444,7 +442,10 @@ impl Table {
             .manager
             .scan_with_values(&self.database, &self.name, start, end, &[], limit)
             .map_err(EmbeddedError::Scan)?;
-        Ok(pairs.into_iter().map(|(k, v)| (k, decode_typed(v))).collect())
+        Ok(pairs
+            .into_iter()
+            .map(|(k, v)| (k, decode_typed(v)))
+            .collect())
     }
 
     /// 范围 + 前缀 + 类型感知 自由组合.
@@ -459,7 +460,10 @@ impl Table {
             .manager
             .scan_with_values(&self.database, &self.name, start, end, prefix, limit)
             .map_err(EmbeddedError::Scan)?;
-        Ok(pairs.into_iter().map(|(k, v)| (k, decode_typed(v))).collect())
+        Ok(pairs
+            .into_iter()
+            .map(|(k, v)| (k, decode_typed(v)))
+            .collect())
     }
 
     /// 单点类型感知 get: 与 `get` 行为相同, 但返回 `TypedValue` 而非 `Option<Vec<u8>>`.
@@ -479,18 +483,13 @@ impl Table {
     /// async 版 `get_typed`: 类型感知单点读.
     pub async fn get_typed_async(&self, key: &[u8]) -> EmbeddedResult<Option<TypedValue>> {
         // manager.get_async 返回 ShardResult<impl Future> — 先 `?` 剥外层, 再 await.
-        let fut = self
-            .manager
-            .get_async(&self.database, &self.name, key, 0)?;
+        let fut = self.manager.get_async(&self.database, &self.name, key, 0)?;
         Ok(fut.await?.map(decode_typed))
     }
 
     /// async 版 `set_many`: 批量写, 返回与输入同序的结果列表.
     /// 每条独立路由 + 并发 await, 跨 shard 自动 fan-out (由 `batch_ops_async` 内部处理).
-    pub async fn set_many_async(
-        &self,
-        entries: &[(&[u8], &[u8])],
-    ) -> Vec<EmbeddedResult<()>> {
+    pub async fn set_many_async(&self, entries: &[(&[u8], &[u8])]) -> Vec<EmbeddedResult<()>> {
         if entries.is_empty() {
             return Vec::new();
         }
@@ -631,16 +630,16 @@ impl Table {
     }
 
     /// async 版 `list_typed_limit`.
-    pub async fn list_typed_limit_async(
-        &self,
-        limit: u32,
-    ) -> EmbeddedResult<Vec<TypedEntry>> {
+    pub async fn list_typed_limit_async(&self, limit: u32) -> EmbeddedResult<Vec<TypedEntry>> {
         let pairs = self
             .manager
             .scan_with_values_async(&self.database, &self.name, &[], &[], &[], limit)
             .await
             .map_err(EmbeddedError::Scan)?;
-        Ok(pairs.into_iter().map(|(k, v)| (k, decode_typed(v))).collect())
+        Ok(pairs
+            .into_iter()
+            .map(|(k, v)| (k, decode_typed(v)))
+            .collect())
     }
 
     /// async 版 `list_typed_range`.
@@ -655,7 +654,10 @@ impl Table {
             .scan_with_values_async(&self.database, &self.name, start, end, &[], limit)
             .await
             .map_err(EmbeddedError::Scan)?;
-        Ok(pairs.into_iter().map(|(k, v)| (k, decode_typed(v))).collect())
+        Ok(pairs
+            .into_iter()
+            .map(|(k, v)| (k, decode_typed(v)))
+            .collect())
     }
 
     /// async 版 `list_typed_range_prefix`.
@@ -671,7 +673,10 @@ impl Table {
             .scan_with_values_async(&self.database, &self.name, start, end, prefix, limit)
             .await
             .map_err(EmbeddedError::Scan)?;
-        Ok(pairs.into_iter().map(|(k, v)| (k, decode_typed(v))).collect())
+        Ok(pairs
+            .into_iter()
+            .map(|(k, v)| (k, decode_typed(v)))
+            .collect())
     }
 }
 
@@ -873,13 +878,18 @@ mod tests {
         ));
         // ---- 写一个 float: 用 INCRBYFLOAT ----
         table.set(b"price", b"0").unwrap();
-        let float_results = table.manager.batch_ops(&[shard_manager::BatchOp::IncrFloat {
-            db: table.database.clone(),
-            table: table.name.clone(),
-            key: b"price".to_vec(),
-            delta: 9.5,
-        }]);
-        assert!(matches!(float_results[0], shard_manager::BatchResult::Double(_)));
+        let float_results = table
+            .manager
+            .batch_ops(&[shard_manager::BatchOp::IncrFloat {
+                db: table.database.clone(),
+                table: table.name.clone(),
+                key: b"price".to_vec(),
+                delta: 9.5,
+            }]);
+        assert!(matches!(
+            float_results[0],
+            shard_manager::BatchResult::Double(_)
+        ));
 
         // 1. list 仍能看到全部 4 个 key (3 raw + 1 int + 1 float? 实际: name_alice, name_bob, counter_x, price = 4)
         let all = table.list().unwrap();
@@ -986,7 +996,10 @@ mod tests {
 
         // 2. [b, e] 闭闭: 用 (b, "f") 模拟 (e 之后第一个 key 作为 exclusive)
         let r2 = table.list_range(b"b", b"f", 0).unwrap();
-        assert_eq!(r2, vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()]);
+        assert_eq!(
+            r2,
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()]
+        );
 
         // 3. 整个表: [空, 空)
         let r3 = table.list_range(b"", b"", 0).unwrap();
@@ -994,7 +1007,10 @@ mod tests {
 
         // 4. start 之后到表尾: [d, 空)
         let r4 = table.list_range(b"d", b"", 0).unwrap();
-        assert_eq!(r4, vec![b"d".to_vec(), b"e".to_vec(), b"f".to_vec(), b"g".to_vec()]);
+        assert_eq!(
+            r4,
+            vec![b"d".to_vec(), b"e".to_vec(), b"f".to_vec(), b"g".to_vec()]
+        );
 
         // 5. 从头到 end: [空, d)
         let r5 = table.list_range(b"", b"d", 0).unwrap();
@@ -1090,15 +1106,13 @@ mod tests {
         table.set(b"b:002", b"bob").unwrap();
         // int (走 INCR 触发 TAG_I64)
         table.set(b"c:003", b"0").unwrap();
-        table
-            .manager
-            .batch_ops(&[shard_manager::BatchOp::Incr {
-                db: table.database.clone(),
-                table: table.name.clone(),
-                key: b"c:003".to_vec(),
-                delta: 42,
-            }]);
-        // float (走 INCRBYFLOAT 触发 TAG_F64)
+        table.manager.batch_ops(&[shard_manager::BatchOp::Incr {
+            db: table.database.clone(),
+            table: table.name.clone(),
+            key: b"c:003".to_vec(),
+            delta: 42,
+        }]);
+        // float (走 INCRBYFLOAT 触发 TAG_F64; 取值任意, 只要非整数即可)
         table.set(b"d:004", b"0").unwrap();
         table
             .manager
@@ -1106,7 +1120,7 @@ mod tests {
                 db: table.database.clone(),
                 table: table.name.clone(),
                 key: b"d:004".to_vec(),
-                delta: 3.14,
+                delta: 2.5,
             }]);
 
         // 范围 [b, d) 闭开: b:002, c:003 (d:004 不含)
@@ -1173,9 +1187,11 @@ mod tests {
             Some(TypedValue::Raw(v)) => assert_eq!(v.as_slice(), b"2"),
             other => panic!("expected Raw(\"2\"), got {other:?}"),
         }
-        assert!(pollster::block_on(table.get_typed_async(b"missing"))
-            .unwrap()
-            .is_none());
+        assert!(
+            pollster::block_on(table.get_typed_async(b"missing"))
+                .unwrap()
+                .is_none()
+        );
 
         // 4. list_async: 全量
         let all = pollster::block_on(table.list_async()).unwrap();
@@ -1203,10 +1219,7 @@ mod tests {
         assert_eq!(range, vec![b"b".to_vec(), b"c".to_vec()]);
 
         // 8. list_range_prefix_async
-        let rp = pollster::block_on(table.list_range_prefix_async(
-            b"a", b"d", b"", 0,
-        ))
-        .unwrap();
+        let rp = pollster::block_on(table.list_range_prefix_async(b"a", b"d", b"", 0)).unwrap();
         assert_eq!(rp, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
 
         // 9. list_typed_async
@@ -1222,19 +1235,16 @@ mod tests {
         assert_eq!(typed_first2.len(), 2);
 
         // 11. list_typed_range_async
-        let typed_range =
-            pollster::block_on(table.list_typed_range_async(b"b", b"d", 0)).unwrap();
+        let typed_range = pollster::block_on(table.list_typed_range_async(b"b", b"d", 0)).unwrap();
         assert_eq!(typed_range.len(), 2);
 
         // 12. list_typed_range_prefix_async (与上同, prefix 空)
         let typed_rp =
-            pollster::block_on(table.list_typed_range_prefix_async(b"b", b"d", b"", 0))
-                .unwrap();
+            pollster::block_on(table.list_typed_range_prefix_async(b"b", b"d", b"", 0)).unwrap();
         assert_eq!(typed_rp.len(), 2);
 
         // 13. get_many_typed_async: 类型感知批量读
-        let typed_many =
-            pollster::block_on(table.get_many_typed_async(&[b"a", b"missing", b"c"]));
+        let typed_many = pollster::block_on(table.get_many_typed_async(&[b"a", b"missing", b"c"]));
         assert_eq!(typed_many.len(), 3);
         assert!(matches!(
             typed_many[0].as_ref().unwrap(),
@@ -1322,9 +1332,7 @@ mod tests {
         assert_eq!(all.len(), 20);
 
         // 升序排列 (BTree 序: k00 < k01 < ... < k19)
-        let expected: Vec<Vec<u8>> = (0..20)
-            .map(|i| format!("k{i:02}").into_bytes())
-            .collect();
+        let expected: Vec<Vec<u8>> = (0..20).map(|i| format!("k{i:02}").into_bytes()).collect();
         assert_eq!(all, expected);
 
         // 范围 [k05, k15) 闭开: 10 个

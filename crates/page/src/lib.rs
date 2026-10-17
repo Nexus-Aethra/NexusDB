@@ -45,8 +45,6 @@
 //! | 分裂       | `leaf_split`, `internal_split` |
 //! | 校验       | `page_validate_checksum`, `page_set_checksum` |
 
-#![allow(dead_code)]
-
 mod checkpoint;
 pub mod debug;
 pub mod dump;
@@ -62,27 +60,28 @@ mod ptr;
 mod varint;
 
 pub use checkpoint::{
-    Checkpoint, CheckpointHeader, MAX_PER_CHECKPOINT, MIN_PER_CHECKPOINT, checkpoint_area_size,
-    needed_checkpoint_count, read_checkpoint, read_checkpoint_header, write_checkpoint,
-    write_checkpoint_header,
+    CHECKPOINT_HEADER_SIZE, CHECKPOINT_SIZE, Checkpoint, CheckpointHeader, MAX_PER_CHECKPOINT,
+    MIN_PER_CHECKPOINT, checkpoint_area_size, needed_checkpoint_count, read_checkpoint,
+    read_checkpoint_header, write_checkpoint, write_checkpoint_header,
 };
 pub use error::PageError;
 pub use header::{
-    ITEM_AREA_SIZE, PAGE_FOOTER_SIZE, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, PageHeader,
-    PageType, page_check_magic, page_flags, page_free_off, page_free_space, page_init_header,
-    page_key_count, page_set_flags, page_set_free_off, page_set_key_count, page_set_version,
-    page_set_vpid, page_type, page_version, page_vpid,
+    CHECKPOINT_AREA_END, ITEM_AREA_SIZE, PAGE_FOOTER_SIZE, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE,
+    PageHeader, PageType, page_check_magic, page_checksum, page_flags, page_free_off,
+    page_free_space, page_init_header, page_key_count, page_set_checksum, page_set_flags,
+    page_set_free_off, page_set_key_count, page_set_version, page_set_vpid, page_type,
+    page_validate_checksum, page_version, page_vpid,
 };
 pub use index::{PageIndex, Segment, pre_split_segment};
 pub use index_merge::{apply_pre_merge, apply_pre_merge_steal, pre_merge_segment};
 pub use internal::{
-    internal_child, internal_child_with_bounds, internal_delete, internal_insert, internal_new, internal_push_back,
-    internal_split, internal_update,
+    internal_child, internal_child_with_bounds, internal_delete, internal_insert, internal_new,
+    internal_push_back, internal_split, internal_update,
 };
 pub use item::{Item, ItemKind, decode_item, encode_internal_item, encode_leaf_item};
 pub use leaf::{
-    leaf_delete, leaf_get, leaf_get_with, leaf_insert, leaf_new, leaf_push_back, leaf_scan_from, leaf_update,
-    leaf_update_with,
+    leaf_delete, leaf_get, leaf_get_with, leaf_insert, leaf_new, leaf_push_back, leaf_scan_from,
+    leaf_update, leaf_update_with,
 };
 pub use leaf_split::leaf_split;
 pub use ptr::{InternalItemPtr, ItemPtr, LeafItemPtr};

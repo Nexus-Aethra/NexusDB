@@ -36,9 +36,9 @@ pub mod db_name_resolver;
 pub mod engine;
 pub mod engine_io;
 pub mod file_at;
-pub mod keyspace;
 pub mod geo;
 pub mod index_bloom;
+pub mod keyspace;
 pub mod leaf_cache;
 pub mod meta_cache;
 pub mod meta_page;
@@ -70,14 +70,17 @@ pub use db_name_resolver::{DbNameResolver, RESOLVER_HEADER_SIZE, ResolverError};
 pub use engine::{OpenOptions, StorageEngine, StorageError};
 pub use meta_cache::{META_WINDOW_SIZE, MetaCache, SLOTS_PER_WINDOW};
 pub use meta_page::{MetaError, MetaPage};
-pub use overflow::{INLINE_LIMIT, MAX_OVERFLOW_VALUE, needs_overflow};
+pub use overflow::{
+    INLINE_LIMIT, MAX_INDEX_ENTRIES, MAX_OVERFLOW_VALUE, encode_descriptor, is_indirect,
+    needs_overflow,
+};
 pub use registry::RegistryError;
 pub use table_directory::{TableDirError, TableDirectory};
 pub use types::{
     BLOCK_SIZE, CHUNK_SIZE, CHUNKS_PER_BLOCK, DbId, INDEX_COUNT, INDEX_SIZE, IoBackend,
-    IoBackendConfig, MATE_CACHE_SIZE, META_PID, META_VPID, PAGE_SIZE, PAGES_PER_CHUNK,
-    PID_ALIVE, PID_DIRTY, PID_IN_TXN, PageKey, PidLocation, SLOTS_PER_INDEX, VpidLogEntry,
-    offset_to_pid, pid_to_chunk_offset, pid_to_offset,
+    IoBackendConfig, MATE_CACHE_SIZE, META_PID, META_VPID, PAGE_SIZE, PAGES_PER_CHUNK, PID_ALIVE,
+    PID_DIRTY, PID_IN_TXN, PageKey, PidLocation, SLOTS_PER_INDEX, VpidLogEntry, offset_to_pid,
+    pid_to_chunk_offset, pid_to_offset,
 };
 
 /// 🆕 test_support: 让 integration test 访问 crate 内部状态.

@@ -52,7 +52,8 @@ fn two_pc_create_table_visible_on_all_shards() {
     // 任意 shard put/get 都应成功
     for i in 0..20 {
         let key = format!("event_{i}");
-        mgr.put("app", "events", key.as_bytes(), b"v", 0).expect("put");
+        mgr.put("app", "events", key.as_bytes(), b"v", 0)
+            .expect("put");
         let v = mgr.get("app", "events", key.as_bytes(), 0).expect("get");
         assert_eq!(v, Some(b"v".to_vec()));
     }
@@ -79,7 +80,9 @@ fn two_pc_create_db_persists_across_reopen() {
     {
         let opts = ShardManagerOptions::new(4, tmp.path().to_path_buf());
         let mgr = ShardManager::open(opts).expect("open 2");
-        let v = mgr.get("app", "users", b"alice", 0).expect("get after reopen");
+        let v = mgr
+            .get("app", "users", b"alice", 0)
+            .expect("get after reopen");
         assert_eq!(v, Some(b"v1".to_vec()), "data persists after reopen");
         mgr.close().expect("close 2");
     }
@@ -105,7 +108,8 @@ fn two_pc_create_db_duplicate_triggers_abort() {
     );
 
     // 验证: db + table 仍存在 (第一次 Prepare 已 Commit, 第二次失败未影响)
-    mgr.put("app", "users", b"k", b"v", 0).expect("put after dup");
+    mgr.put("app", "users", b"k", b"v", 0)
+        .expect("put after dup");
 
     mgr.close().expect("close");
 }
@@ -219,7 +223,9 @@ fn two_pc_multiple_dbs_and_tables() {
             let val = format!("val_{db_idx}_{table_idx}");
             mgr.put(&db_name, &table_name, key.as_bytes(), val.as_bytes(), 0)
                 .expect("put");
-            let got = mgr.get(&db_name, &table_name, key.as_bytes(), 0).expect("get");
+            let got = mgr
+                .get(&db_name, &table_name, key.as_bytes(), 0)
+                .expect("get");
             assert_eq!(got, Some(val.into_bytes()));
         }
     }

@@ -64,7 +64,11 @@ fn btree_scan_cross_leaf_and_prefix_exact() {
         })
         .await
         .unwrap();
-        assert_eq!(collected.len(), 400, "应精确扫到 400 个 6 字节 key (decoy 排除)");
+        assert_eq!(
+            collected.len(),
+            400,
+            "应精确扫到 400 个 6 字节 key (decoy 排除)"
+        );
         // 物理 key 严格递增 (扫描有序保证)
         for w in collected.windows(2) {
             assert!(w[0] < w[1], "扫描结果必须有序递增");

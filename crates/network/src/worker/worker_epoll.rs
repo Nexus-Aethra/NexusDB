@@ -6,6 +6,120 @@
 
 use super::*;
 
+/// ⭐ 审计 P2 (2026-10-17): 连接数上限 — 超限时直接关闭新 fd (不建状态),
+/// 返回 true 表示已拒绝 (调用方 break/continue).
+fn reject_over_cap(
+    fd: RawFd,
+    conn_map: &HashMap<u64, ConnState>,
+    limits: &crate::protocol::KvLimits,
+    worker_id: u32,
+) -> bool {
+    if conn_map.len() < limits.max_connections_per_worker {
+        return false;
+    }
+    nlog::warn!(
+        "worker",
+        "worker-{worker_id} connection cap reached ({}), rejecting new conn",
+        limits.max_connections_per_worker
+    );
+    // 关 fd 即可 (TcpStream 由 worker 侧重建前 ownership 在 NewConn 里, 这里
+    // 只有 raw fd; close 后客户端看到连接被重置).
+    unsafe { libc::close(fd) };
+    true
+}
+
+/// ⭐ 审计 P2 (2026-10-17): idle 连接回收 — 关掉超过 `idle_timeout_secs`
+/// 没有任何读活动的连接 (客户端连上不关 / 半死连接).
+fn sweep_idle_conns(
+    epoll_fd: RawFd,
+    conn_map: &mut HashMap<u64, ConnState>,
+    limits: &crate::protocol::KvLimits,
+    worker_id: u32,
+) {
+    if limits.idle_timeout_secs == 0 {
+        return;
+    }
+    let timeout = std::time::Duration::from_secs(limits.idle_timeout_secs);
+    let now = std::time::Instant::now();
+    let idle: Vec<u64> = conn_map
+        .iter()
+        .filter(|(_, c)| now.duration_since(c.last_activity) >= timeout)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in idle {
+        nlog::debug!(
+            "worker",
+            "worker-{worker_id} conn {id} closed: idle > {}s",
+            limits.idle_timeout_secs
+        );
+        remove_conn(epoll_fd, conn_map, id, worker_id);
+    }
+}
+
+/// ⭐ 审计 P3-2 (2026-10-17): 连接建立逻辑唯一实现.
+///
+/// 旧实现在"循环顶部 drain"与"NEW_CONN_TOKEN 唤醒"两处**逐字重复**这段
+/// (ConnState 构建 + MySQL 握手 + epoll 注册) — 任一处改动漏同步另一处即
+/// 产生难查的行为分叉 (如只在一处加 idle 计时/连接上限).
+#[allow(clippy::too_many_arguments)]
+fn accept_one_conn(
+    epoll_fd: RawFd,
+    conn_map: &mut HashMap<u64, ConnState>,
+    new_conn: NewConn,
+    id: u64,
+    worker_id: u32,
+    num_shards: usize,
+    sql_cache: &SharedSqlCache,
+    sql_shared: &std::sync::Arc<SqlSharedRoutes>,
+    reply_bus: &SharedTaskReplyBus,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+) {
+    let proto = new_conn.protocol;
+    // ⭐ 解耦 (T3.3): per-conn 配置 (limits/auth/tls) 从 NewConn 取.
+    let mut state = ConnState::new(
+        new_conn.fd,
+        proto,
+        new_conn.auth_password.is_some(),
+        new_conn.default_db.clone(),
+        new_conn.default_table.clone(),
+        sql_cache.clone(),
+        sql_shared.clone(),
+        reply_bus.clone(),
+        db_view.clone(),
+        worker_id,
+        num_shards,
+        shard_inboxes.to_vec(),
+        new_conn.limits,
+        new_conn.auth_password.clone(),
+        new_conn.tls_config.clone(),
+    );
+    // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
+    if proto == ProtocolKind::Sql {
+        let salt = mysql_gen_salt(id, worker_id);
+        state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
+            &salt,
+            id as u32,
+            new_conn.tls_config.is_some(),
+        ));
+        state.mysql = Some(MysqlState {
+            salt,
+            phase: 0,
+            pending_db: None,
+        });
+    }
+    if std::env::var("NEXUS_EPOLL_WRITE_BUFFER").ok().as_deref() != Some("0") {
+        state.enable_epoll_write_buffering();
+    }
+    epoll_add(epoll_fd, state.fd, id);
+    conn_map.insert(id, state);
+    nlog::debug!(
+        "worker",
+        "worker-{worker_id} conn {id} from {}",
+        new_conn.peer
+    );
+}
+
 pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll_fd >= 0, "epoll_create1 failed");
@@ -32,13 +146,17 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
     let db_view = cfg.db_view;
     let inbox = cfg.inbox;
     let conn_eventfd = cfg.conn_eventfd;
-    let _limits = cfg.limits;
+    // ⭐ 审计 P2 (2026-10-17): 连接数上限 + idle 回收阈值 (旧实现 limits 在此
+    // 被丢弃, 连接可无限堆积且半死连接永不回收).
+    let limits = cfg.limits;
     let auth_password = cfg.auth_password;
     let _auth_required = auth_password.is_some();
     let _tls_config = cfg.tls_config; // ⭐ F83: None = 明文门面
     let num_shards = shard_inboxes.len();
 
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
+    // ⭐ 审计 P2 (2026-10-17): idle 扫描节流 (主循环 100ms 一轮, 没必要每轮扫)
+    let mut last_idle_sweep = std::time::Instant::now();
     // Reused reply buffer: TaskReplyBus can wake the worker many times per
     // second under pipelines, so allocating one Vec per wake is avoidable.
     let mut reply_results = Vec::with_capacity(256);
@@ -50,51 +168,24 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
         loop {
             match inbox.try_recv() {
                 Ok(new_conn) => {
+                    // ⭐ 审计 P2 (2026-10-17): 连接数上限 (超限直接关 fd)
+                    if reject_over_cap(new_conn.fd, &conn_map, &limits, worker_id) {
+                        continue;
+                    }
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    // ⭐ 解耦 (Phase 3): 协议随连接传递 (acceptor 按端口打标), worker 不再用固定 proto_kind.
-                    let proto = new_conn.protocol;
-                    // ⭐ 解耦 (T3.3): per-conn 配置 (limits/auth/tls) 从 NewConn 取.
-                    let mut state = ConnState::new(
-                        new_conn.fd,
-                        proto,
-                        new_conn.auth_password.is_some(),
-                        new_conn.default_db.clone(),
-                        new_conn.default_table.clone(),
-                        sql_cache.clone(),
-                        sql_shared.clone(),
-                        reply_bus.clone(),
-                        db_view.clone(),
+                    accept_one_conn(
+                        epoll_fd,
+                        &mut conn_map,
+                        new_conn,
+                        id,
                         worker_id,
                         num_shards,
-                        shard_inboxes.clone(),
-                        new_conn.limits,
-                        new_conn.auth_password.clone(),
-                        new_conn.tls_config.clone(),
-                    );
-                    // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
-                    if proto == ProtocolKind::Sql {
-                        let salt = mysql_gen_salt(id, worker_id);
-                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
-                            &salt,
-                            id as u32,
-                            new_conn.tls_config.is_some(),
-                        ));
-                        state.mysql = Some(MysqlState {
-                            salt,
-                            phase: 0,
-                            pending_db: None,
-                        });
-                    }
-                    if std::env::var("NEXUS_EPOLL_WRITE_BUFFER").ok().as_deref() != Some("0") {
-                        state.enable_epoll_write_buffering();
-                    }
-                    epoll_add(epoll_fd, state.fd, id);
-                    conn_map.insert(id, state);
-                    nlog::debug!(
-                        "worker",
-                        "worker-{worker_id} conn {id} from {}",
-                        new_conn.peer
+                        &sql_cache,
+                        &sql_shared,
+                        &reply_bus,
+                        &db_view,
+                        &shard_inboxes,
                     );
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -112,6 +203,12 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
 
         // 所有事件源 (conn readable / reply_bus / 新连接) 都有 eventfd/fd 精确唤醒,
         // 100ms timeout 仅兑底.
+        // ⭐ 审计 P2 (2026-10-17): idle 连接回收 (1s 节流; 主循环本就 ≤100ms 一轮)
+        if last_idle_sweep.elapsed() >= std::time::Duration::from_secs(1) {
+            sweep_idle_conns(epoll_fd, &mut conn_map, &limits, worker_id);
+            last_idle_sweep = std::time::Instant::now();
+        }
+
         let n =
             unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, 100) };
         if n < 0 {
@@ -173,50 +270,24 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                     libc::read(conn_eventfd, &mut v as *mut u64 as *mut libc::c_void, 8);
                 }
                 while let Ok(new_conn) = inbox.try_recv() {
+                    // ⭐ 审计 P2 (2026-10-17): 连接数上限 (超限直接关 fd)
+                    if reject_over_cap(new_conn.fd, &conn_map, &limits, worker_id) {
+                        continue;
+                    }
                     let id = next_conn_id;
                     next_conn_id += 1;
-                    let proto = new_conn.protocol;
-                    // ⭐ 解耦 (T3.3): per-conn 配置 (limits/auth/tls) 从 NewConn 取.
-                    let mut state = ConnState::new(
-                        new_conn.fd,
-                        proto,
-                        new_conn.auth_password.is_some(),
-                        new_conn.default_db.clone(),
-                        new_conn.default_table.clone(),
-                        sql_cache.clone(),
-                        sql_shared.clone(),
-                        reply_bus.clone(),
-                        db_view.clone(),
+                    accept_one_conn(
+                        epoll_fd,
+                        &mut conn_map,
+                        new_conn,
+                        id,
                         worker_id,
                         num_shards,
-                        shard_inboxes.clone(),
-                        new_conn.limits,
-                        new_conn.auth_password.clone(),
-                        new_conn.tls_config.clone(),
-                    );
-                    // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
-                    if proto == ProtocolKind::Sql {
-                        let salt = mysql_gen_salt(id, worker_id);
-                        state.send_bytes(&crate::protocol::mysql::build_handshake_v10_caps(
-                            &salt,
-                            id as u32,
-                            new_conn.tls_config.is_some(),
-                        ));
-                        state.mysql = Some(MysqlState {
-                            salt,
-                            phase: 0,
-                            pending_db: None,
-                        });
-                    }
-                    if std::env::var("NEXUS_EPOLL_WRITE_BUFFER").ok().as_deref() != Some("0") {
-                        state.enable_epoll_write_buffering();
-                    }
-                    epoll_add(epoll_fd, state.fd, id);
-                    conn_map.insert(id, state);
-                    nlog::debug!(
-                        "worker",
-                        "worker-{worker_id} conn {id} from {}",
-                        new_conn.peer
+                        &sql_cache,
+                        &sql_shared,
+                        &reply_bus,
+                        &db_view,
+                        &shard_inboxes,
                     );
                 }
             } else {
@@ -283,6 +354,7 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                                             &shard_inboxes,
                                             num_shards,
                                             &tls,
+                                            &lim,
                                         );
                                         should_remove = conn.resp_should_close();
                                     }
@@ -298,6 +370,7 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                                             &shard_inboxes,
                                             num_shards,
                                             &tls,
+                                            &lim,
                                         );
                                         should_remove = conn.resp_should_close();
                                     }
@@ -398,6 +471,19 @@ pub(crate) fn process_binary_input(
             }
             Ok(DecodeOutcome::NeedMore) => break,
             Err(_) => {
+                // ⭐ 审计 P3-11 (2026-10-17): 解码错误不再静默重同步 —
+                // 旧实现只跳 1 字节继续, 客户端收不到任何错误帧也无指标,
+                // 协议错乱会被当成"请求丢失". 现在: 计数 + 回一个错误帧,
+                // 再按原策略重同步 (二进制流无可靠边界, 跳 1 字节仍是唯一选择).
+                crate::metrics::BINARY_DECODE_ERRORS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let err_id = peek_req_id(
+                    &conn.read_buf[cursor..cursor + 4.min(conn.read_buf.len() - cursor)],
+                );
+                conn.send_binary_response(
+                    err_id,
+                    &crate::protocol::Response::Error("malformed binary frame".into()),
+                );
                 if cursor < conn.read_buf.len() {
                     cursor += 1; // 重同步: 跳过 1 字节
                 } else {

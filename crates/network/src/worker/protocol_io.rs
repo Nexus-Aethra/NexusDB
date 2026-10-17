@@ -20,11 +20,13 @@ pub(crate) fn process_http_input(
     use crate::protocol::http as h;
     let cors = crate::http_config::cors_origin();
     let mut cursor = 0usize;
+    // ⭐ 审计 P3: 头部扫描进度 (跨 recv 增量到达时避免整片重扫 → O(n²)→O(n))
+    let mut head_scanned = 0usize;
     loop {
         if conn.close_after_flush {
             break;
         }
-        match h::parse_request(&conn.read_buf[cursor..]) {
+        match h::parse_request(&conn.read_buf[cursor..], &mut head_scanned) {
             Ok(None) => break,
             Err((code, msg)) => {
                 crate::metrics::HTTP_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -39,6 +41,7 @@ pub(crate) fn process_http_input(
             }
             Ok(Some((n, req))) => {
                 cursor += n;
+                head_scanned = 0; // 新请求从头扫描
                 crate::metrics::HTTP_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !req.keep_alive {
                     conn.close_after_flush = true;
@@ -170,8 +173,8 @@ pub(crate) fn handle_http_request(
                 let sh = &conn.sql_shared;
                 serde_json::json!({
                     "worker_schemas": conn.sql_cache.borrow().schemas.len(),
-                    "routes": sh.routes.read().unwrap().len(),
-                    "created_here": sh.created_here.read().unwrap().len(),
+                    "routes": rlock(&sh.routes).len(),
+                    "created_here": rlock(&sh.created_here).len(),
                     "ddl_epoch": sh.ddl_epoch.load(Relaxed),
                     "route_pruned": sh.route_pruned.load(Relaxed),
                     "route_bypassed": sh.route_bypassed.load(Relaxed),
@@ -335,8 +338,12 @@ pub(crate) fn mysql_err_packet(msg: &str) -> Vec<u8> {
         1792
     } else if msg.contains("Unknown database") {
         1049
+    } else if msg.contains("Cross-database access is not supported") {
+        1235 // ER_NOT_SUPPORTED_YET — 跨库访问 v1 不支持 (显式报错, 非静默错数据)
     } else if msg.contains("has no schema") || msg.contains("doesn't exist") {
         1146 // ER_NO_SUCH_TABLE — ORM has_table 据此判表不存在后发 CREATE
+    } else if msg.contains("foreign key violation") {
+        1451 // ER_ROW_IS_REFERENCED_2 — FK RESTRICT 拒删 (ORM 据此识别 IntegrityError)
     } else if msg.contains("expected") || msg.contains("unexpected") || msg.contains("unterminated")
     {
         1064
@@ -360,10 +367,42 @@ pub(crate) fn process_sql_input(
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
     tls_config: &Option<std::sync::Arc<rustls::ServerConfig>>,
+    limits: &KvLimits,
 ) {
     use crate::protocol::mysql as my;
     let mut cursor = 0usize;
-    while let Some((pkt_seq, n, payload)) = my::read_packet(&conn.read_buf[cursor..]) {
+    // read_packet_full: 长度字段满 0xFFFFFF 时会继续拼接续包, 否则大请求
+    // (如 >16MB 的 COM_QUERY) 只会看到第一段.
+    loop {
+        let (pkt_seq, n, payload) = match my::read_packet_full(&conn.read_buf[cursor..]) {
+            Ok(t) => t,
+            Err(my::PacketRead::Incomplete) => {
+                // 半包: 等更多数据. 但若未消费缓冲区已超过单包上限, 该逻辑包
+                // 必然超限 (其续片永远到不齐 — recv 也已在上限处停止读入),
+                // 立即拒绝, 否则事件循环会在"读不进/解不出"之间空转.
+                if conn.read_buf.len() - cursor > my::MAX_PACKET_TOTAL {
+                    let seq = conn.read_buf.get(cursor + 3).copied().unwrap_or(0);
+                    conn.send_bytes(&my::build_err(
+                        seq.wrapping_add(1),
+                        1153,
+                        "got a packet bigger than 'max_allowed_packet' bytes",
+                    ));
+                    conn.close_after_flush = true;
+                }
+                break;
+            }
+            Err(my::PacketRead::TooLarge { first_seq }) => {
+                // ⭐ 审计新 P1-6: 续包累积超过 16MB (max_allowed_packet) —
+                // 显式 ERR + 断连. 旧实现无限累积 → 远程 OOM.
+                conn.send_bytes(&my::build_err(
+                    first_seq.wrapping_add(1),
+                    1153, // ER_NET_PACKET_TOO_LARGE
+                    "got a packet bigger than 'max_allowed_packet' bytes",
+                ));
+                conn.close_after_flush = true;
+                break;
+            }
+        };
         cursor += n;
         if conn.close_after_flush {
             break;
@@ -378,6 +417,18 @@ pub(crate) fn process_sql_input(
             let caps = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
             if caps & my::CLIENT_SSL != 0 && payload.len() <= 36 {
                 if let Some(cfg) = tls_config {
+                    if conn.coro_worker {
+                        // ⭐ 2026-10-17 (审计新 P1-4): 协程 worker 的
+                        // recv_async 无 TLS 解密分支 — 升级后密文被当明文
+                        // 解析, 握手挂死. 显式拒绝 (客户端可回落明文).
+                        conn.send_bytes(&my::build_err(
+                            pkt_seq.wrapping_add(1),
+                            1043,
+                            "TLS not supported on this connection",
+                        ));
+                        conn.close_after_flush = true;
+                        break;
+                    }
                     if !conn.start_tls(cfg.clone()) {
                         conn.close_after_flush = true;
                     }
@@ -418,9 +469,24 @@ pub(crate) fn process_sql_input(
                         .as_deref()
                         .is_none_or(|p| p == "mysql_native_password");
                     let is_caching = login.plugin.as_deref() == Some("caching_sha2_password");
+                    // ⭐ 审计 P2 (2026-10-17): 认证失败限速 — 锁定期内直接拒
+                    // (不比对口令), 失败计数进进程级滑动窗口.
+                    if let Err(remain) = conn.sql_shared.auth_throttle.check() {
+                        conn.send_bytes(&my::build_err(
+                            pkt_seq.wrapping_add(1),
+                            1045,
+                            &format!("Access denied (too many failures, retry in {remain}s)"),
+                        ));
+                        conn.close_after_flush = true;
+                    }
                     // ⭐ F82: caching_sha2 fast-auth — 服务端知明文口令直接验证 (免 RSA/TLS).
                     //   成功 → fast_auth_success(0x01 0x03)+OK; 失败/其他 → 走 AuthSwitch 兜底.
-                    if is_caching && my::caching_sha2_password_ok(&salt, &login.auth_resp, pwd) {
+                    else if is_caching
+                        && my::caching_sha2_password_ok(&salt, &login.auth_resp, pwd)
+                    {
+                        conn.sql_shared.auth_throttle.record_success();
+                        conn.auth_failures = 0;
+                        conn.send_bytes(&my::build_fast_auth_success(pkt_seq.wrapping_add(1)));
                         conn.send_bytes(&my::build_fast_auth_success(pkt_seq.wrapping_add(1)));
                         conn.send_bytes(&my::build_ok(pkt_seq.wrapping_add(2), 0));
                         if let Some(d) = want_db {
@@ -437,6 +503,8 @@ pub(crate) fn process_sql_input(
                             st.pending_db = want_db;
                         }
                     } else if my::native_password_ok(&salt, &login.auth_resp, pwd) {
+                        conn.sql_shared.auth_throttle.record_success();
+                        conn.auth_failures = 0;
                         conn.send_bytes(&my::build_ok(pkt_seq.wrapping_add(1), 0));
                         if let Some(d) = want_db {
                             conn.current_db = std::sync::Arc::from(d.as_str());
@@ -445,6 +513,9 @@ pub(crate) fn process_sql_input(
                             st.phase = 2;
                         }
                     } else {
+                        // ⭐ 审计 P2 (2026-10-17): 记一次认证失败 (进程级限速)
+                        conn.auth_failures += 1;
+                        conn.sql_shared.auth_throttle.record_failure();
                         conn.send_bytes(&my::build_err(
                             pkt_seq.wrapping_add(1),
                             1045,
@@ -461,6 +532,8 @@ pub(crate) fn process_sql_input(
             // ---- 等 AuthSwitch 响应 (payload = 裸 native token) ----
             1 => {
                 if my::native_password_ok(&salt, &payload, pwd) {
+                    conn.sql_shared.auth_throttle.record_success();
+                    conn.auth_failures = 0;
                     conn.send_bytes(&my::build_ok(pkt_seq.wrapping_add(1), 0));
                     // ⭐ S5: 二段认证通过 → 应用登录时的 database
                     let pending = conn.mysql.as_mut().and_then(|st| st.pending_db.take());
@@ -471,6 +544,9 @@ pub(crate) fn process_sql_input(
                         st.phase = 2;
                     }
                 } else {
+                    // ⭐ 审计 P2 (2026-10-17): 记一次认证失败 (进程级限速)
+                    conn.auth_failures += 1;
+                    conn.sql_shared.auth_throttle.record_failure();
                     conn.send_bytes(&my::build_err(
                         pkt_seq.wrapping_add(1),
                         1045,
@@ -533,6 +609,22 @@ pub(crate) fn process_sql_input(
                     conn.next_seq += 1;
                     match sql::parse_prepared(&payload[1..]) {
                         Ok((stmt, params)) => {
+                            // ⭐ 审计 P2 (2026-10-17): 注册表上限 — 旧实现无上限,
+                            // 单连接可无限 PREPARE → 无界增长 → worker OOM.
+                            if conn.mysql_stmts.len() >= limits.max_prepared_stmts {
+                                conn.resp_complete(
+                                    seq,
+                                    my::build_err(
+                                        pkt_seq.wrapping_add(1),
+                                        1461,
+                                        &format!(
+                                            "too many prepared statements (max {})",
+                                            limits.max_prepared_stmts
+                                        ),
+                                    ),
+                                );
+                                continue;
+                            }
                             let id = conn.next_stmt_id;
                             conn.next_stmt_id += 1;
                             conn.mysql_stmts.insert(
@@ -656,6 +748,7 @@ pub(crate) fn process_pg_input(
     shard_inboxes: &[SharedTaskInbox],
     num_shards: usize,
     tls_config: &Option<std::sync::Arc<rustls::ServerConfig>>,
+    limits: &KvLimits,
 ) {
     use crate::protocol::pg;
     let pwd = sql_password.as_deref().unwrap_or("");
@@ -667,83 +760,114 @@ pub(crate) fn process_pg_input(
         match conn.pg_phase {
             // ---- 等 StartupMessage (无 type 帧) ----
             0 => {
-                let Some((n, payload)) = pg::read_startup_frame(&conn.read_buf[cursor..]) else {
-                    break;
-                };
-                cursor += n;
-                if payload.len() == 4 {
-                    let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                    match code {
-                        // ⭐ F83: SSLRequest — 配置了 TLS → 回 'S' 并升级; 否则回 'N' 明文回落
-                        pg::SSL_REQUEST_CODE => {
-                            if let Some(cfg) = tls_config {
-                                conn.send_bytes(b"S"); // 明文 'S' (升级前最后一个明文字节)
-                                if !conn.start_tls(cfg.clone()) {
-                                    conn.close_after_flush = true;
-                                }
-                                // 后续 StartupMessage 走 TLS, 回到 epoll 等 ClientHello
-                                break;
-                            }
-                            conn.send_bytes(b"N");
-                            continue;
-                        }
-                        pg::GSSENC_REQUEST_CODE => {
-                            conn.send_bytes(b"N");
-                            continue;
-                        }
-                        pg::CANCEL_REQUEST_CODE => {
-                            conn.close_after_flush = true;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                match pg::parse_startup(payload) {
-                    Ok((_user, database)) => {
-                        // database 参数 → 切库 (不存在直接拒绝断连)
-                        // ⭐ PG 兼容: "postgres" admin 库别名 → 映射 default 库 (migrator 探测用)
-                        if let Some(dbn) = database
-                            && !dbn.is_empty()
-                            && dbn != default_db.as_ref()
-                        {
-                            let resolved = if dbn == "postgres" {
-                                default_db.clone()
-                            } else {
-                                std::sync::Arc::from(dbn.as_str())
-                            };
-                            if &*resolved == default_db.as_ref()
-                                || db_view.id_of(&resolved).is_some()
-                            {
-                                conn.current_db = resolved;
-                            } else {
-                                conn.send_bytes(&pg::build_error(
-                                    "3D000",
-                                    &format!("database \"{dbn}\" does not exist"),
-                                ));
-                                conn.close_after_flush = true;
-                                break;
-                            }
-                        }
-                        if pwd.is_empty() {
-                            conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
-                            conn.pg_phase = 2;
-                        } else {
-                            // ⭐ F82: 宣告 SCRAM-SHA-256 (取代明文口令), 进 SASL 交换
-                            conn.send_bytes(&pg::build_auth_sasl());
-                            conn.pg_scram = None;
-                            conn.pg_phase = 1;
-                        }
-                    }
-                    Err(e) => {
-                        conn.send_bytes(&pg::build_error("08P01", &e));
+                match pg::read_startup_frame(&conn.read_buf[cursor..]) {
+                    pg::FrameParse::NeedMore => break,
+                    pg::FrameParse::Invalid(why) => {
+                        // 长度字段非法: 回错误并断开. 绝不能退化成"继续等字节" ——
+                        // 字节永远凑不齐, 连接会静默挂起.
+                        conn.send_bytes(&pg::build_error("08P01", why));
                         conn.close_after_flush = true;
+                        break;
+                    }
+                    pg::FrameParse::Frame((n, payload)) => {
+                        cursor += n;
+                        if payload.len() == 4 {
+                            let code = u32::from_be_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]);
+                            match code {
+                                // ⭐ F83: SSLRequest — 配置了 TLS → 回 'S' 并升级; 否则回 'N' 明文回落
+                                pg::SSL_REQUEST_CODE => {
+                                    // ⭐ 2026-10-17 (审计新 P1-4): 协程 worker
+                                    // 无 TLS 解密分支, 升级即挂死 — 回落明文
+                                    // ('N' 与未配置 TLS 时行为一致).
+                                    if let Some(cfg) = tls_config
+                                        && !conn.coro_worker
+                                    {
+                                        conn.send_bytes(b"S"); // 明文 'S' (升级前最后一个明文字节)
+                                        if !conn.start_tls(cfg.clone()) {
+                                            conn.close_after_flush = true;
+                                        }
+                                        // 后续 StartupMessage 走 TLS, 回到 epoll 等 ClientHello
+                                        break;
+                                    }
+                                    conn.send_bytes(b"N");
+                                    continue;
+                                }
+                                pg::GSSENC_REQUEST_CODE => {
+                                    conn.send_bytes(b"N");
+                                    continue;
+                                }
+                                pg::CANCEL_REQUEST_CODE => {
+                                    conn.close_after_flush = true;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        match pg::parse_startup(payload) {
+                            Ok((_user, database)) => {
+                                // database 参数 → 切库 (不存在直接拒绝断连)
+                                // ⭐ PG 兼容: "postgres" admin 库别名 → 映射 default 库 (migrator 探测用)
+                                if let Some(dbn) = database
+                                    && !dbn.is_empty()
+                                    && dbn != default_db.as_ref()
+                                {
+                                    let resolved = if dbn == "postgres" {
+                                        default_db.clone()
+                                    } else {
+                                        std::sync::Arc::from(dbn.as_str())
+                                    };
+                                    if &*resolved == default_db.as_ref()
+                                        || db_view.id_of(&resolved).is_some()
+                                    {
+                                        conn.current_db = resolved;
+                                    } else {
+                                        conn.send_bytes(&pg::build_error(
+                                            "3D000",
+                                            &format!("database \"{dbn}\" does not exist"),
+                                        ));
+                                        conn.close_after_flush = true;
+                                        break;
+                                    }
+                                }
+                                if pwd.is_empty() {
+                                    conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
+                                    conn.pg_phase = 2;
+                                } else if let Err(remain) = conn.sql_shared.auth_throttle.check() {
+                                    // ⭐ 审计 P2 (2026-10-17): 锁定期内直接拒
+                                    conn.send_bytes(&pg::build_error(
+                                        "28P01",
+                                        &format!(
+                                            "too many authentication failures, retry in {remain}s"
+                                        ),
+                                    ));
+                                    conn.close_after_flush = true;
+                                } else {
+                                    // ⭐ F82: 宣告 SCRAM-SHA-256 (取代明文口令), 进 SASL 交换
+                                    conn.send_bytes(&pg::build_auth_sasl());
+                                    conn.pg_scram = None;
+                                    conn.pg_phase = 1;
+                                }
+                            }
+                            Err(e) => {
+                                conn.send_bytes(&pg::build_error("08P01", &e));
+                                conn.close_after_flush = true;
+                            }
+                        }
                     }
                 }
             }
             // ---- SASL 交换 (SCRAM-SHA-256): 首条 SASLInitialResponse, 次条 SASLResponse ----
             1 => {
-                let Some((n, ty, payload)) = pg::read_frame(&conn.read_buf[cursor..]) else {
-                    break;
+                let (n, ty, payload) = match pg::read_frame(&conn.read_buf[cursor..]) {
+                    pg::FrameParse::NeedMore => break,
+                    pg::FrameParse::Invalid(why) => {
+                        conn.send_bytes(&pg::build_error("08P01", why));
+                        conn.close_after_flush = true;
+                        break;
+                    }
+                    pg::FrameParse::Frame(f) => f,
                 };
                 cursor += n;
                 if ty != b'p' {
@@ -784,11 +908,17 @@ pub(crate) fn process_pg_input(
                     let state = conn.pg_scram.take().expect("scram state present");
                     match pg::scram_verify_final(&state, payload, pwd) {
                         Some(server_final) => {
+                            // ⭐ 审计 P2 (2026-10-17): 认证成功清零限速计数
+                            conn.sql_shared.auth_throttle.record_success();
+                            conn.auth_failures = 0;
                             conn.send_bytes(&pg::build_auth_sasl_final(&server_final));
                             conn.send_bytes(&pg::build_auth_ok_bundle(conn_id as u32));
                             conn.pg_phase = 2;
                         }
                         None => {
+                            // ⭐ 审计 P2 (2026-10-17): 记一次认证失败 (集群级限速)
+                            conn.auth_failures += 1;
+                            conn.sql_shared.auth_throttle.record_failure();
                             conn.send_bytes(&pg::build_error(
                                 "28P01",
                                 "password authentication failed",
@@ -800,8 +930,14 @@ pub(crate) fn process_pg_input(
             }
             // ---- 已认证: simple Query ----
             _ => {
-                let Some((n, ty, payload)) = pg::read_frame(&conn.read_buf[cursor..]) else {
-                    break;
+                let (n, ty, payload) = match pg::read_frame(&conn.read_buf[cursor..]) {
+                    pg::FrameParse::NeedMore => break,
+                    pg::FrameParse::Invalid(why) => {
+                        conn.send_bytes(&pg::build_error("08P01", why));
+                        conn.close_after_flush = true;
+                        break;
+                    }
+                    pg::FrameParse::Frame(f) => f,
                 };
                 cursor += n;
                 match ty {
@@ -907,11 +1043,23 @@ pub(crate) fn process_pg_input(
                                         oids[i] = *o;
                                     }
                                 }
+                                // ⭐ 审计 P2 (2026-10-17): 命名语句注册表上限
+                                // (同 MySQL COM_STMT_PREPARE; 旧实现无上限 → 单连接
+                                // 可注册至 OOM). 等 schema 的 pending 项也计入.
+                                if conn.pg_stmts.len() + conn.pg_pending_prepares.len()
+                                    >= limits.max_prepared_stmts
+                                {
+                                    if conn.pg_batch.error.is_none() {
+                                        conn.pg_batch.error = Some(format!(
+                                            "too many prepared statements (max {})",
+                                            limits.max_prepared_stmts
+                                        ));
+                                    }
                                 // ⭐ portal: INSERT 目标表 schema 未入缓存 → 挂起 Parse,
                                 // 发 GetSchemaOp 拉 schema, 续跑时再推断 OID 回 ParseComplete.
                                 // 期间同批的 Describe/Sync 一并挂起 (statement 不在 pg_stmts,
                                 // Sync 检测 pg_waiting_schema 不 flush).
-                                if let Some(table) = needs_schema {
+                                } else if let Some(table) = needs_schema {
                                     let seq = conn.next_seq;
                                     conn.next_seq += 1;
                                     conn.pg_pending_prepares.insert(

@@ -30,13 +30,12 @@ fn setup() -> scheduler::SchedHandle {
     scheduler::SchedHandle::new(scheduler::Scheduler::new())
 }
 
+/// ⭐ 审计 P2 (2026-10-17): SchedHandle 不再 `Send` — 跨线程 clone/drive 是
+/// 真 UB (Rc 非原子引用计数 + 双线程 borrow_mut 同一 RefCell). 驱动必须在
+/// 创建 handle 的线程上进行, 因此这里改成当前线程直接推进.
 fn drive_thread(handle: scheduler::SchedHandle, max_iters: usize) -> bool {
-    std::thread::spawn(move || {
-        handle.set_current();
-        handle.drive_until_idle(max_iters)
-    })
-    .join()
-    .unwrap()
+    handle.set_current();
+    handle.drive_until_idle(max_iters)
 }
 
 /// 所有 real_world 测试组合为一个串行测试.
@@ -109,7 +108,10 @@ fn read_disk_then_memory_transform_then_write_disk_inner() {
             buf
         });
 
-        assert!(drive_thread(sched, 10_000), "scheduler must drain to idle");
+        assert!(
+            drive_thread(sched.clone(), 10_000),
+            "scheduler must drain to idle"
+        );
         let result = pollster::block_on(h).unwrap();
         assert_eq!(&result, b"HELLO, SCHEDULER!");
 
@@ -151,7 +153,10 @@ fn concurrent_tasks_read_different_files_inner() {
             handles.push(h);
         }
 
-        assert!(drive_thread(sched, 10_000), "scheduler must drain to idle");
+        assert!(
+            drive_thread(sched.clone(), 10_000),
+            "scheduler must drain to idle"
+        );
         for h in handles {
             let buf = pollster::block_on(h).unwrap();
             // 校验每条记录内容
@@ -219,7 +224,10 @@ fn interleaved_disk_io_and_memory_compute_inner() {
             acc
         });
 
-        assert!(drive_thread(sched, 50_000), "scheduler must drain to idle");
+        assert!(
+            drive_thread(sched.clone(), 50_000),
+            "scheduler must drain to idle"
+        );
         let total = pollster::block_on(h_a).unwrap();
         let acc = pollster::block_on(h_b).unwrap();
 
@@ -262,7 +270,10 @@ fn detached_task_completes_on_drivers_inner() {
         });
         h.detach();
 
-        assert!(drive_thread(sched, 10_000), "scheduler must drain to idle");
+        assert!(
+            drive_thread(sched.clone(), 10_000),
+            "scheduler must drain to idle"
+        );
         // driver 跑完后 flag 应为 true (detached task 完成)
         assert!(flag.load(Ordering::SeqCst));
     });

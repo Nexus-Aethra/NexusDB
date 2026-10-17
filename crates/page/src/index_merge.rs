@@ -46,6 +46,10 @@ pub fn pre_merge_segment(idx: &mut PageIndex, seg_idx: usize) -> Result<bool, Pa
 /// 流程:
 /// 1. 检查 left < MIN, has_right_neighbor, right_count > need
 /// 2. left.item_count = MIN, right.item_count -= need
+// ⭐ 审计 P3: 显式标注 dead_code (取代 crate 级 #![allow(dead_code)] 豁免) —
+// steal (向邻居借项) 合并策略的逻辑版, 尚未接线到 storage; 与
+// `pre_merge_segment` 成对保留, 便于后续启用.
+#[allow(dead_code)]
 pub fn pre_merge_segment_steal(idx: &mut PageIndex, seg_idx: usize) -> Result<bool, PageError> {
     use crate::checkpoint::MIN_PER_CHECKPOINT;
 
@@ -129,7 +133,7 @@ pub fn apply_pre_merge(
     let mut left_last_key: Vec<u8> = Vec::new();
     while cur_off < right_first_off {
         let (item, n) = decode_item(page, cur_off, kind)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         prev_key = full.clone();
         left_last_key = full;
         cur_off += n;
@@ -141,7 +145,7 @@ pub fn apply_pre_merge(
     let mut cur = right_first_off;
     while cur < right_segment_end {
         let (item, n) = decode_item(page, cur, kind)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         right_items.push((full.clone(), item.value.to_vec(), item.child_vpid, n));
         prev_key = full;
         cur += n;
@@ -291,7 +295,7 @@ pub fn apply_pre_merge_steal(
     let mut prev_key: Vec<u8> = Vec::new();
     while cur < right_first_off {
         let (item, n) = decode_item(page, cur, kind)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         prev_key = full;
         cur += n;
     }
@@ -308,7 +312,7 @@ pub fn apply_pre_merge_steal(
     let mut stolen: usize = 0;
     while stolen < need && cur < right_segment_end {
         let (item, n) = decode_item(page, cur, kind)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         prev_key = full;
         cur += n;
         stolen += 1;
@@ -322,7 +326,7 @@ pub fn apply_pre_merge_steal(
 
     // 3. 解码 new_split_off 处的 item 并用 shared=0 重编码
     let (boundary_item, old_n_0) = decode_item(page, new_split_off, kind)?;
-    let boundary_full_key = boundary_item.full_key(&prev_key);
+    let boundary_full_key = boundary_item.full_key(&prev_key)?;
     let mut buf = [0u8; 4096];
     let new_n_0 = match kind {
         ItemKind::Leaf => encode_leaf_item(&mut buf, &[], &boundary_full_key, boundary_item.value)?,
@@ -377,7 +381,6 @@ pub fn apply_pre_merge_steal(
 
     Ok(true)
 }
-
 
 #[cfg(test)]
 mod tests {

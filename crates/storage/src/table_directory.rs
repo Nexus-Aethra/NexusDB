@@ -301,7 +301,7 @@ impl TableDirectory {
             while off < free {
                 let (item, n) = decode_item(&*page, off, ItemKind::Leaf)
                     .map_err(|e| TableDirError::PageDecode(format!("decode_item: {:?}", e)))?;
-                let full = item.full_key(&prev_key);
+                let full = item.full_key(&prev_key)?;
                 if i > 0 {
                     // 跳过哨兵
                     let name =

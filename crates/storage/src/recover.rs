@@ -68,6 +68,11 @@ pub struct RecoveredState {
     pub next_vpid: u64,
 
     /// 下一个要创建的 block file id (max(seen file_id) + 1).
+    ///
+    /// ⭐ 审计 P3-13 (2026-10-17): **观测字段** — 生产写入路径用的是
+    /// `pid_alloc.current().0` (当前活跃 block), 因为新页要追加进活跃 block
+    /// 而不是新开一个; 本字段是"恢复看到的高水位", 供测试/工具断言与人工
+    /// 核对 (recover_tests 大量断言), 不作为分配依据.
     pub next_file_id: u32,
 }
 
@@ -125,22 +130,35 @@ pub fn recover_for_shard(
     };
 
     let mate_path = block_dir.join("page.mate");
-    if !mate_path.exists() {
-        // 没有 page.mate → 全新库, 走默认 empty MetaCache
-        let tmp_mate = std::env::temp_dir().join("nexus_recover_empty.mate");
-        let _ = std::fs::File::create(&tmp_mate);
-        return Ok(RecoveredState {
-            meta: MetaCache::open(&tmp_mate)?,
-            vpid_alloc: VpidAllocator::new(0),
-            pid_alloc: PidAllocator::new(0, 0, 0),
-            next_vpid: 0,
-            next_file_id: 0,
-        });
-    }
+    // ⭐ 审计 P2 (2026-10-17): 旧实现在 page.mate 缺失时用**固定共享路径**
+    // `/tmp/nexus_recover_empty.mate` 兜底, 有两个严重后果:
+    //   1) `.block` 有数据但 page.mate 丢失 → 直接返回空 meta, 扫描被跳过:
+    //      存量页全部变孤儿, 且 pid/vpid 水位归零 → 新写入覆写 .block 里的
+    //      活页 (静默数据损坏);
+    //   2) 多实例 (多进程/多测试) 打开同一 /tmp 文件 → 同步 flush_dirty 互相
+    //      覆写, 且与异步刷盘路径 (block_dir/page.mate) 分家 → 重启丢元数据.
+    // 新实现: 直接在库目录开/建 page.mate (MetaCache::open 自带 create(true)),
+    // 元数据落点与异步刷盘一致; 只有库目录本身不存在 (调用方未
+    // create_if_missing 的全新路径, 无 .block 可扫) 时才回退到本实例唯一的
+    // 匿名临时文件 (见 `open_ephemeral_mate`).
+    let mut meta = match MetaCache::open(&mate_path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // 库目录都不存在 → 无 .block 可扫, 返回空状态 (保持旧契约).
+            return Ok(RecoveredState {
+                meta: open_ephemeral_mate()?,
+                vpid_alloc: VpidAllocator::new(0),
+                pid_alloc: PidAllocator::new(0, 0, 0),
+                next_vpid: 0,
+                next_file_id: 0,
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
-    // 1. 加载 page.mate 进 MetaCache (⭐ G3: mate 是主源 — meta 异步刷盘后
-    //    最多落后一轮, 且 free-chunk 延迟复用保证 mate 未确认前旧位置数据仍有效)
-    let mut meta = MetaCache::open(&mate_path)?;
+    // 1. page.mate 已加载进 MetaCache 作为初值 (⭐ G3: mate 是主源 — meta
+    //    异步刷盘后最多落后一轮, 且 free-chunk 延迟复用保证 mate 未确认前
+    //    旧位置数据仍有效).
 
     // 2. 收集 .block 文件, 按 file_id 升序 (G4 后可能有 file_id 空洞, 天然兼容)
     let block_files = collect_block_files(&block_dir)?;
@@ -187,7 +205,10 @@ pub fn recover_for_shard(
         let saved_tuple = (saved.file_id, saved.chunk_idx, saved.page_idx);
         let cur = pid_alloc.current();
         let scanned_tuple = (cur.0, cur.1, cur.2 as u16);
-        if saved_tuple > scanned_tuple && saved.page_idx <= u8::MAX as u16 {
+        // ⭐ 2026-10-17 (审计 P2): page_idx 的有效上界是 PAGES_PER_CHUNK (64)
+        // 而非 u8::MAX — 旧守卫 `<= u8::MAX` 放行 64..255 的损坏值,
+        // `as u8` 不截断但寻址到 chunk 外 (静默错页).
+        if saved_tuple > scanned_tuple && saved.page_idx < crate::types::PAGES_PER_CHUNK as u16 {
             pid_alloc = PidAllocator::new(saved.file_id, saved.chunk_idx, saved.page_idx as u8);
         }
     }
@@ -222,6 +243,27 @@ fn has_any_block(dir: &Path) -> bool {
 // =====================================================================
 // 内部 helper
 // =====================================================================
+
+/// 本实例唯一的匿名 meta 文件 (仅"库目录不存在"这一兜底路径使用).
+///
+/// 文件名带 pid + 纳秒时间戳 (多实例不撞名), 打开后立即 unlink: 文件仅由 fd
+/// 存活 → 无固定共享路径 (不会多实例互踩), 无文件系统残留 (关闭即回收),
+/// 内容随进程退出自然丢弃 (该路径本就无持久化语义).
+fn open_ephemeral_mate() -> io::Result<MetaCache> {
+    let unique = format!(
+        "nexus_recover_empty_{}_{}.mate",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let path = std::env::temp_dir().join(unique);
+    let meta = MetaCache::open(&path)?;
+    // POSIX: unlink 后已打开的 fd 继续有效, 仅名字从文件系统消失.
+    let _ = std::fs::remove_file(&path);
+    Ok(meta)
+}
 
 /// 收集 block_dir 内所有 `.block` 文件, 按 file_id 升序返回.
 ///

@@ -138,9 +138,13 @@ pub(crate) fn parse_show(p: &mut P) -> Result<SqlStmt, String> {
         if !(p.try_kw("FROM") || p.try_kw("IN")) {
             return Err("expected FROM after SHOW COLUMNS".into());
         }
-        let table = p.table_ident()?;
+        let mut table = p.table_ident()?;
         if p.try_kw("FROM") || p.try_kw("IN") {
-            let _ = p.ident()?;
+            // ⭐ 审计新 P0-3: `SHOW COLUMNS FROM t FROM db` 的库限定曾被
+            // `let _ = p.ident()` 静默丢弃 (恒查当前库). 拼成 `db.t` 交
+            // worker normalize_stmt_tables 统一校验.
+            let db = p.ident()?;
+            table = format!("{db}.{table}");
         }
         p.done()?;
         Ok(mk(
@@ -390,6 +394,9 @@ pub(crate) fn parse_join_from(
             SelectItem::ScalarFn { .. } => {
                 Err("scalar functions are not supported in JOIN queries".to_string())
             }
+            SelectItem::Lit { .. } => {
+                Err("literal projections are not supported in JOIN queries".to_string())
+            }
             SelectItem::Expr { .. } => {
                 Err("expression projections are not supported in JOIN queries (v1)".to_string())
             }
@@ -492,6 +499,20 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
     } else if !top && matches!(p.peek(), Some(Tok::Num(_))) {
         // ⭐ F71: 子查询中的字面量投影 (如 EXISTS 的 `SELECT 1`) — 值无关, 视为全列
         p.next()?;
+    } else if top && matches!(p.peek(), Some(Tok::Num(_)) | Some(Tok::Str(_))) {
+        // ⭐ 审计 P3 (2026-10-17): 顶层字面量投影 (`SELECT 1` / `SELECT 'a', 2`).
+        // 旧实现只允许子查询里出现字面量投影, 顶层直接语法错 — 而这是存活探针 /
+        // 驱动初始化最常用的语句之一. 解析成常量单行 (无 FROM).
+        loop {
+            let val = p.value()?;
+            let alias = parse_col_alias(p);
+            items.push(SelectItem::Lit { val, alias });
+            if p.peek() == Some(&Tok::Comma) {
+                p.next()?;
+            } else {
+                break;
+            }
+        }
     } else if top
         && matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("VERSION"))
         && p.peek2_is_lparen()
@@ -604,6 +625,20 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 }
                 let alias = parse_col_alias(p);
                 items.push(SelectItem::Expr { expr, alias });
+            } else if matches!(
+                name.to_ascii_uppercase().as_str(),
+                "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP"
+            ) {
+                // ⭐ 审计 P3 (2026-10-17): PG 里 CURRENT_DATE/CURRENT_TIME/
+                // CURRENT_TIMESTAMP 是**关键字** (无括号), 旧实现只认带括号的
+                // 函数调用 → 这三个名字被当列名解析, 顶层 SELECT 直接报
+                // "unexpected end of statement" (连语法都不通), 且语义上也与
+                // NOW 混同. 这里按无括号标量函数处理 (别名仍消费掉:
+                // PG `SELECT CURRENT_DATE AS d`, 但 ScalarFn 无 alias 字段).
+                let _ = parse_col_alias(p);
+                items.push(SelectItem::ScalarFn {
+                    name: name.to_ascii_lowercase(),
+                });
             } else {
                 let alias = parse_col_alias(p);
                 items.push(SelectItem::Col { name, alias });
@@ -619,7 +654,7 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
         // ⭐ compat: 无 FROM 的标量函数投影 (SELECT NOW()/CURRENT_TIMESTAMP) — 常量单行
         if items
             .iter()
-            .all(|i| matches!(i, SelectItem::ScalarFn { .. }))
+            .all(|i| matches!(i, SelectItem::ScalarFn { .. } | SelectItem::Lit { .. }))
             && !items.is_empty()
         {
             p.done()?;
@@ -670,6 +705,7 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 SelectItem::Col { name, .. } => Some(name.clone()),
                 SelectItem::Agg { .. } => None,
                 SelectItem::ScalarFn { .. } => None,
+                SelectItem::Lit { .. } => None,
                 SelectItem::Expr { .. } => None,
             })
             .collect();
@@ -685,8 +721,9 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
             offset_param,
         });
     }
-    // ⭐ F76: 非系统表 → 剥 db 限定前缀 (`default.t` → `t`); 系统表已在上方按全名分派
-    let table = strip_db_qual(table);
+    // ⭐ F76: 非系统表 — 保留 `db.tbl` 限定名原样 (系统表已在上方按全名分派).
+    // 2026-10-16 (审计新 P0-3): 限定名交 worker sql_dbqual::normalize_stmt_tables
+    // 统一校验: 同库剥离, 跨库显式报错 (旧实现在此静默剥离 → 跨库错数据).
     // ⭐ F67 (JOIN): 表名后 3 token 内出现 JOIN/INNER/LEFT → 转 JOIN 解析
     if is_join_ahead(p) {
         if distinct {
@@ -725,6 +762,7 @@ pub(crate) fn parse_select(p: &mut P, top: bool) -> Result<SqlStmt, String> {
                 SelectItem::Col { name, .. } => Some(name.clone()),
                 SelectItem::Agg { .. } => None,
                 SelectItem::ScalarFn { .. } => None,
+                SelectItem::Lit { .. } => None,
                 SelectItem::Expr { .. } => None,
             })
             .collect();

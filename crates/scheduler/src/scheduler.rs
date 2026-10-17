@@ -102,8 +102,7 @@ impl Scheduler {
                 .build(IO_URING_ENTRIES)
                 .expect("io_uring setup with SQPOLL failed")
         } else {
-            io_uring::IoUring::new(IO_URING_ENTRIES)
-                .expect("io_uring setup failed")
+            io_uring::IoUring::new(IO_URING_ENTRIES).expect("io_uring setup failed")
         };
         Self::from_ring(ring)
     }
@@ -454,7 +453,11 @@ impl Scheduler {
     pub fn run_until<F: FnMut() -> bool>(&mut self, predicate: F, max_iters: usize) -> bool {
         let mut pred = predicate;
         let mut iters = 0;
-        while !self.stop_flag.load(Ordering::Acquire) && !pred() && iters < max_iters && self.has_work() {
+        while !self.stop_flag.load(Ordering::Acquire)
+            && !pred()
+            && iters < max_iters
+            && self.has_work()
+        {
             self.drive_once();
             iters += 1;
         }
@@ -478,6 +481,58 @@ impl Scheduler {
                 "a Scheduler may only be driven from its original thread"
             ),
             None => self.driver_thread = Some(current),
+        }
+    }
+
+    /// ⭐ 把 slot  push 进 ready queue (审计新 P1-15: 供 io_ops 的 poll_cqe!
+    /// 在 mark **其他** task 的 CQE 后唤醒 owner — 与 drain_completions 的
+    /// 入队路径一致).
+    pub(crate) fn wake_slot(&mut self, slot_id: usize) {
+        crate::ready::push(&self.ready, slot_id);
+    }
+
+    /// ⭐ 2026-10-17 (审计新 P1-16): 有界等待指定 ud 的 CQE 到达.
+    ///
+    /// **用途**: Read/Write future 被 drop (取消) 时, 内核在 cancel 生效前
+    /// 可能仍在 DMA 读写调用方的 buffer. 必须等到该 op 的 CQE 到达
+    /// (正常结果或 -ECANCELED), DMA 确已结束, buffer 才能安全交还调用方
+    /// 复用 — 否则数据竞争 (UB).
+    ///
+    /// 扫描期间也会 mark/唤醒**其他** ud (与 drain_completions/poll_cqe!
+    /// 对齐). 超时 (正常情况 CQE 微秒级到达) 后放弃等待, 尽力而为.
+    pub(crate) fn drain_cqe_until(&mut self, ud: u64, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.flush_sq();
+            let mut found = false;
+            let mut cross_woke: Vec<usize> = Vec::new();
+            {
+                let mut cq = self.ring.completion();
+                cq.sync();
+                for cqe in cq {
+                    let u = cqe.user_data();
+                    let r = cqe.result();
+                    if u == ud {
+                        found = true;
+                        self.registry.mark_completed(u, r);
+                    } else if self.registry.mark_completed(u, r)
+                        && let Some(st) = self.registry.inner_peek(u)
+                    {
+                        cross_woke.push(st.slot_id);
+                    }
+                }
+            }
+            for slot_id in cross_woke {
+                self.wake_slot(slot_id);
+            }
+            // 已到达 (本轮或此前被其他扫描 mark) → 结束
+            if found || self.registry.has_result(ud) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
         }
     }
 
@@ -519,23 +574,33 @@ pub(crate) fn clear_current_scheduler() {
 pub fn with_current<R>(f: impl FnOnce(&mut Scheduler) -> R) -> Option<R> {
     // TLS 析构阶段 drop future 仍可能尝试清理已提交 IO；此时 scheduler/ring 已在
     // 同一析构链中释放，不能因访问已销毁的 CURRENT 再次 panic/abort。
-    CURRENT.try_with(|c| {
-        let rc = c.borrow();
-        let cell = rc.as_ref()?;
-        let mut s = cell.try_borrow_mut().ok()?;
-        Some(f(&mut s))
-    })
-    .ok()
-    .flatten()
+    CURRENT
+        .try_with(|c| {
+            let rc = c.borrow();
+            let cell = rc.as_ref()?;
+            let mut s = cell.try_borrow_mut().ok()?;
+            Some(f(&mut s))
+        })
+        .ok()
+        .flatten()
 }
 
 // SAFETY: handle 只能以唯一所有权 move 到 driver 线程；运行时会在首次 drive 后绑定
 // thread id。它不是 Sync，不能借用共享给多个线程并发驱动。
-pub struct SchedHandle(pub std::rc::Rc<std::cell::RefCell<Scheduler>>);
-// SAFETY: 见上.
-unsafe impl Send for SchedHandle {}
+/// ⭐ 审计 P2 (2026-10-17): **单线程所有权** — 内层 Rc 私有 + **不实现 Send**.
+///
+/// 旧实现 `pub struct SchedHandle(pub Rc<RefCell<Scheduler>>)` + `unsafe impl
+/// Send` + 手写 `Clone`: 调用方可以把 handle clone 后丢到另一个线程 drive —
+/// 两个线程同时持有同一 `Rc` (非原子引用计数) 且可能同时 `borrow_mut` 同一个
+/// `RefCell`, 这是**真正的 UB** (数据竞争 + 双重 borrow panic), 而 `unsafe
+/// impl Send` 让编译器不再拦它. scheduler 的设计前提就是"一个 driver 线程
+/// 独占", 现在把这个前提变成类型约束:
+/// - 字段私有 → 外部无法直接碰 Rc;
+/// - 无 `Send` → 跨线程移动/克隆在编译期即报错 (同线程 clone 仍允许:
+///   worker/shard 线程内 spawn 协程需要共享 handle).
+pub struct SchedHandle(std::rc::Rc<std::cell::RefCell<Scheduler>>);
 
-// ⭐ Manual Clone (既支持 Clone 也让我们能 clone Rc 共享 scheduler).
+// ⭐ Manual Clone (仅同线程共享 scheduler; 跨线程使用已被"无 Send"挡在编译期).
 impl Clone for SchedHandle {
     fn clone(&self) -> Self {
         Self(std::rc::Rc::clone(&self.0))
@@ -546,6 +611,11 @@ impl SchedHandle {
     pub fn new(s: Scheduler) -> Self {
         let rc = std::rc::Rc::new(std::cell::RefCell::new(s));
         Self(rc)
+    }
+
+    /// crate 内部访问底层 Rc (字段私有, 外部无法绕过所有权约束直接拿 Rc).
+    pub(crate) fn rc(&self) -> &std::rc::Rc<std::cell::RefCell<Scheduler>> {
+        &self.0
     }
     /// 设当前 scheduler Rc 到 thread-local. 必须在 driver 线程调.
     /// SAFETY: 需保证 self 不会被 drop, 直到 clear.
@@ -685,4 +755,158 @@ pub(crate) fn with_current_slot<R>(f: impl FnOnce(usize) -> R) -> Option<R> {
 /// 必须在调度线程上被 poll 的协程内调用 (即 spawn 出来的 task).
 pub fn current_task_id() -> usize {
     with_current_slot(|id| id).expect("current_task_id() called outside scheduler poll context")
+}
+
+#[cfg(test)]
+mod p1_15_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Context;
+    use std::time::Duration;
+
+    /// ⭐ 审计新 P1-15: `poll_cqe!` 的批量 CQ 扫描会消费**其他** task 的 CQE
+    /// (drive_once 先 poll 后 drain), 必须把 owner slot 入 ready — 否则 owner
+    /// 永远 park 且 CQE 已被消费, 后续 drain 看到空 CQ (永久死锁).
+    ///
+    /// 白盒构造: 只 poll B 的 future (A 不被 poll), 让 B 的扫描消费 A 的
+    /// CQE, 然后断言 A 的 slot 已入 ready.
+    #[test]
+    fn cross_task_cqe_mark_enqueues_ready() {
+        let mkpipe = || {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], fds[1])
+        };
+        let (r1, w1) = mkpipe();
+        let (r2, w2) = mkpipe();
+
+        let a_done = Arc::new(AtomicBool::new(false));
+        let a2 = a_done.clone();
+
+        let sched = SchedHandle::new(Scheduler::new());
+        sched.set_current();
+
+        // A (slot 0): poll(pipe1) — 提交 SQE 后 park
+        crate::spawn_on(&sched, async move {
+            let _ = crate::io_ops::poll(r1, libc::POLLIN).await;
+            a2.store(true, Ordering::Release);
+        });
+        sched.clone().drive_until_idle(4096);
+        assert!(!a_done.load(Ordering::Acquire), "pipe1 未写, A 不应完成");
+
+        // A 的 io 完成 → CQE 到达 (未被 drain)
+        let v: u64 = 1;
+        unsafe { libc::write(w1, &v as *const u64 as *mut libc::c_void, 8) };
+        std::thread::sleep(Duration::from_millis(100));
+
+        // B (slot 1): poll(pipe2) — 永不完成
+        crate::spawn_on(&sched, async move {
+            let _ = crate::io_ops::poll(r2, libc::POLLIN).await;
+        });
+
+        // 白盒第一步 (持 borrow): B 入 pool+ready, 取出 B 的 future
+        let (b_slot, mut b_fut, ready_rc) = {
+            let rc = CURRENT.with(|c| c.borrow().clone().expect("current"));
+            let mut s = rc.borrow_mut();
+            s.drain_task_queue_phase();
+            let mut work = s.extract_pending();
+            assert_eq!(work.len(), 1, "ready 里应只有 B (A 已 park)");
+            let (slot, fut) = work.remove(0);
+            (slot, fut, Rc::clone(&s.ready))
+        };
+        // 白盒第二步 (释放 borrow): 只 poll B — 其 CQ 扫描会消费 A 的 CQE
+        let waker = make_waker(b_slot, &ready_rc);
+        let mut cx = Context::from_waker(&waker);
+        set_current_slot(b_slot);
+        // 第一次 poll: 注册 + 提交 SQE (不扫 CQ); 第二次: poll_cqe! 扫 CQ —
+        // 此时会消费 A 的 CQE.
+        let p1 = b_fut.as_mut().poll(&mut cx);
+        let p2 = b_fut.as_mut().poll(&mut cx);
+        clear_current_slot();
+        assert!(
+            p1.is_pending() && p2.is_pending(),
+            "pipe2 无数据, B 应 Pending"
+        );
+
+        // 白盒第三步: B 放回 slot, 检查 ready (修复后 A 已被 B 的扫描入队)
+        let rc2 = CURRENT.with(|c| c.borrow().clone().expect("current"));
+        let mut s = rc2.borrow_mut();
+        s.pool.slot(b_slot).future = Some(b_fut);
+        let ready_len = crate::ready::len(&s.ready);
+        drop(s);
+
+        assert!(
+            ready_len >= 1,
+            "P1-15: B 的扫描消费了 A 的 CQE 但未把 A 入队 ready (修复前 A 永久挂起)"
+        );
+
+        // 端到端确认: 继续驱动, A 必须完成
+        let t0 = std::time::Instant::now();
+        while !a_done.load(Ordering::Acquire) {
+            sched.clone().drive_until_idle(4096);
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "A 未被唤醒 — P1-15 死锁"
+            );
+        }
+        unsafe {
+            libc::close(r1);
+            libc::close(w1);
+            libc::close(r2);
+            libc::close(w2);
+        }
+    }
+
+    /// ⭐ 审计新 P1-16: Read future 在 IO 在途时被 drop, 必须**有界**等待
+    /// CQE (内核 DMA 可能仍在写 buffer) 后交还 buffer — 旧实现只发异步
+    /// cancel 就返回, 调用方立即可复用 buffer → 数据竞争 (UB).
+    #[test]
+    fn dropped_inflight_read_waits_bounded_and_drains_registry() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+
+        let sched = SchedHandle::new(Scheduler::new());
+        sched.set_current();
+
+        let mut buf = [0u8; 64];
+        let mut fut = Box::pin(crate::io_ops::read(r, &mut buf, 0));
+        // 首次 poll: 提交 SQE (pipe 无数据 → 在途)
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        let before = CURRENT
+            .with(|c| c.borrow().clone().expect("current"))
+            .borrow()
+            .io_registry_stats();
+        // drop 在途 future: 必须快速返回 (有界等待), 不得挂死
+        let t0 = std::time::Instant::now();
+        drop(fut);
+        let drop_elapsed = t0.elapsed();
+        assert!(
+            drop_elapsed < Duration::from_secs(2),
+            "drop 在途 read future 耗时 {drop_elapsed:?} — 疑似无界等待"
+        );
+
+        // registry 应已排空 (CQE 被消费, 无残留 pending entry)
+        let after = CURRENT
+            .with(|c| c.borrow().clone().expect("current"))
+            .borrow()
+            .io_registry_stats();
+        assert_eq!(after.registered, before.registered, "drop 不应留新注册");
+        assert!(
+            after.completed > before.completed || after.cancelled > before.cancelled,
+            "在途 op 的 CQE 应已被 drain (completed/cancelled 增加)"
+        );
+
+        // buffer 交还后可安全复用 (无 sanitizer 报告即通过)
+        buf = [0xABu8; 64];
+        assert_eq!(buf[0], 0xAB);
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+    }
 }

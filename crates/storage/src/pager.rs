@@ -64,6 +64,8 @@ pub struct Pager {
     pub(crate) chunk_list: ChunkList,
     /// ⭐ 协程级 chunk 锁 (DESIGN §3.0). 同步版本下不会真触发 wait queue,
     /// 数据结构完整保留, T11 polish 接 async 时激活.
+    /// ⭐ 审计 P2-12 (2026-10-17): chunk_lock 尚未接入 Pager::read 热路径
+    /// (DESIGN §3.0 的 chunk 级租约; 目前仅测试可达), 保留结构待接线.
     pub(crate) chunk_lock: ChunkLockMap,
     /// 虚拟 page ID 分配
     pub(crate) vpid_alloc: VpidAllocator,
@@ -79,6 +81,8 @@ pub struct Pager {
     #[allow(dead_code)]
     pub(crate) writer: ChunkWriter,
     /// TravelTrees: task_id → TravelTree. 用于 B+Tree split 传播 (T8 polish)
+    /// ⭐ 审计 P2-12 (2026-10-17): TravelTree (travel_tree_tests 覆盖) 同样
+    /// 未接入读路径, 作为 per-task 路径追踪的实验结构保留.
     pub(crate) travel_trees: HashMap<TaskId, TravelTree>,
     /// ⭐ T16: IO 后端抽象 (StdFs / IoUring). Rc 共享: 异步落盘协程持有克隆
     /// (shard 单线程模型, Rc 安全).
@@ -538,7 +542,17 @@ impl Pager {
             file_id: pid.file_id(),
             chunk_idx: pid.chunk_idx(),
         };
-        let page_idx = pid.page_idx() as u8;
+        // ⭐ 2026-10-17 (审计 P2): checked 转换 — 损坏 pid (page_idx >= 64)
+        // 显式报错, 不静默截断寻址错误页 / 切片越界 panic.
+        let page_idx = crate::types::pid_page_idx_checked(&pid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt pid for vpid {vpid}: page_idx {} >= PAGES_PER_CHUNK",
+                    pid.page_idx()
+                ),
+            )
+        })?;
 
         // 2. nowchunks 优先 (有最新未 flush 数据)
         if let Some(chunk_bytes) = self.nowchunks.peek_chunk(key) {
@@ -630,6 +644,16 @@ impl Pager {
             if let Some(start) = disk_start {
                 self.path_trace.disk_read_ns += start.elapsed().as_nanos() as u64;
             }
+            // ⭐ 审计 P2 (2026-10-17): 页校验和 — 磁盘→内存边界上验证.
+            // 只在这一条路径上校验: nowchunks/write_queue/in_flight/LRU 的字节
+            // 都源自同一份已校验的写入, 内存里不会自发损坏; 成本 = 每页一次
+            // 16KB 哈希 (亚微秒级), 只在 cache miss (真正读盘) 时付.
+            page::page_validate_checksum(&bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("vpid {vpid} page checksum mismatch (corrupt on disk): {e}"),
+                )
+            })?;
             self.chunk_list.admit_page(key, page_idx, &bytes);
             self.chunk_list.note_page_miss(key, page_idx);
             let mut out = page_pool::alloc();
@@ -662,7 +686,16 @@ impl Pager {
             file_id: pid.file_id(),
             chunk_idx: pid.chunk_idx(),
         };
-        let page_idx = pid.page_idx() as u8;
+        // ⭐ 2026-10-17 (审计 P2): checked 转换 (同上)
+        let page_idx = crate::types::pid_page_idx_checked(&pid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt pid for vpid {vpid}: page_idx {} >= PAGES_PER_CHUNK",
+                    pid.page_idx()
+                ),
+            )
+        })?;
         let off = page_idx as usize * PAGE_SIZE;
 
         if let Some(chunk_bytes) = self.nowchunks.peek_chunk(key) {
@@ -793,10 +826,17 @@ impl Pager {
     pub async fn flush(&mut self) -> io::Result<()> {
         // ⭐ 异步落盘契约: caller (shard 主循环/close) 必须先排空 in-flight
         // 再调 flush, 否则同 key 新旧快照可能并发写同一磁盘 offset.
-        debug_assert!(
-            self.in_flight.is_empty(),
-            "flush() requires in-flight chunks drained first"
-        );
+        // 用硬错误而非 `debug_assert`: 违反时是**并发写同一 offset**, release 下
+        // 不 panic 而是把磁盘写坏 —— 必须在 release 也显式失败.
+        if !self.in_flight.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "flush() requires in-flight chunks drained first (pending={} chunk(s))",
+                    self.in_flight.len()
+                ),
+            ));
+        }
         // ⭐ 纯 COW (2026-07-26): 驻留即待刷, take 即移出不回插.
         // flush 后这些 chunk 内 vpid 的后续更新走 COW alloc 新 pid.
         let resident: Vec<PageKey> = self.nowchunks.resident_keys();
@@ -858,7 +898,9 @@ impl Pager {
     /// 避免写时队列无限膨胀, 且无等待+收割死锁风险.
     pub async fn swap_full_chunk_to_write_queue(&mut self, key: PageKey) -> io::Result<()> {
         // ⭐ DIAG: swap 前校验 chunk(0,0) 各页数据
-        if crate::chunk_writer::diag_enabled() && key.file_id == 0 && key.chunk_idx == 0
+        if crate::chunk_writer::diag_enabled()
+            && key.file_id == 0
+            && key.chunk_idx == 0
             && let Some(chunk) = self.nowchunks.peek_chunk(key)
         {
             for pidx in [0usize, 1, 30, 60, 63] {

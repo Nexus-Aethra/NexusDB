@@ -21,7 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. list() — pure keys, no value.
     let keys = users.list()?;
     println!("all keys: {:?}", keys);
-    assert_eq!(keys, vec![b"alice".to_vec(), b"bob".to_vec(), b"carol".to_vec()]);
+    assert_eq!(
+        keys,
+        vec![b"alice".to_vec(), b"bob".to_vec(), b"carol".to_vec()]
+    );
 
     // 3. list_prefix() — keys starting with a prefix.
     let b_pref = users.list_prefix(b"b")?;

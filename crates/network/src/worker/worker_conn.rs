@@ -6,6 +6,9 @@
 use super::*;
 use std::os::fd::AsRawFd;
 
+/// ⭐ 审计 P3-8 (2026-10-17): RESP 重排缓冲上限 (防"分片永不回复"时无限增长).
+pub(crate) const RESP_PENDING_MAX: usize = 4096;
+
 impl ConnState {
     // Construction receives all per-connection resources without a global runtime context.
     #[allow(clippy::too_many_arguments)]
@@ -33,6 +36,7 @@ impl ConnState {
         Self {
             fd,
             stream,
+            last_activity: std::time::Instant::now(),
             tls: None,
             default_table,
             limits,
@@ -46,6 +50,7 @@ impl ConnState {
             output_overflowed: false,
             proto,
             authenticated: !auth_required,
+            auth_failures: 0,
             next_seq: 0,
             next_to_send: 0,
             pending: BTreeMap::new(),
@@ -77,6 +82,8 @@ impl ConnState {
             cascade_roots: HashMap::new(),
             cascade_seq_ctr: 0,
             sql_fk_ins: HashMap::new(),
+            fk_restr: HashMap::new(),
+            fk_catalog_done: std::collections::HashSet::new(),
             multi_stmt: HashMap::new(),
             multi_sub_seq: HashMap::new(),
             reply_bus,
@@ -121,6 +128,7 @@ impl ConnState {
             pg_batch: PgBatch::default(),
             pg_ext: HashMap::new(),
             close_after_flush: false,
+            coro_worker: false,
         }
     }
 
@@ -232,7 +240,16 @@ impl ConnState {
             loop {
                 match tls.reader().read(&mut tmp) {
                     Ok(0) => break,
-                    Ok(n) => self.read_buf.extend_from_slice(&tmp[..n]),
+                    Ok(n) => {
+                        self.last_activity = std::time::Instant::now();
+                        self.read_buf.extend_from_slice(&tmp[..n]);
+                        // ⭐ 审计新 P1-6: 同明文路径的单轮 recv 上限.
+                        if self.read_buf.len()
+                            >= crate::protocol::mysql::MAX_PACKET_TOTAL + 64 * 1024
+                        {
+                            break;
+                        }
+                    }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
@@ -246,7 +263,15 @@ impl ConnState {
             match self.stream.read(&mut tmp) {
                 Ok(0) => return Ok(false), // EOF
                 Ok(n) => {
+                    self.last_activity = std::time::Instant::now();
                     self.read_buf.extend_from_slice(&tmp[..n]);
+                    // ⭐ 2026-10-17 (审计新 P1-6): 单轮 recv 上限 — 防客户端
+                    // 持续灌数据使 read_buf 在一轮事件内无界增长 (OOM).
+                    // 超出部分留给后续事件轮次 (process 会先消费);
+                    // 单逻辑包超限由 read_packet_full 拒绝并断连.
+                    if self.read_buf.len() >= crate::protocol::mysql::MAX_PACKET_TOTAL + 64 * 1024 {
+                        return Ok(true);
+                    }
                     if n < tmp.len() {
                         return Ok(true); // 读完了本次可用数据
                     }
@@ -276,6 +301,8 @@ impl ConnState {
             if n == 0 {
                 return Ok(false); // EOF
             }
+            // ⭐ 审计 P2 (2026-10-17): 读到数据 = 连接活跃 (idle 回收依据)
+            self.last_activity = std::time::Instant::now();
             self.read_buf.extend_from_slice(&tmp[..n]);
             if n < tmp.len() {
                 return Ok(true); // 读完了本次可用数据
@@ -303,16 +330,36 @@ impl ConnState {
             if tls.writer().write_all(bytes).is_err() {
                 return;
             }
+            // ⭐ 2026-10-17 (审计新 P1-5): **有界**泵送. 旧实现 WouldBlock
+            // 时无限 yield_now 自旋 — 慢客户端 (不读 socket) 会把 worker
+            // 线程 100% CPU 钉死在此, 同 worker 上所有连接一起停摆.
+            // 现在: 短自旋 → 100µs 退避 (CPU 归零) → 30s 总上限, 超限
+            // 断开该慢客户端, 其余连接恢复.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut spins = 0u32;
+            let mut timed_out = false;
             while tls.wants_write() {
                 match tls.write_tls(&mut self.stream) {
                     Ok(0) => break,
                     Ok(_) => {}
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::yield_now();
+                        spins += 1;
+                        if spins <= 64 {
+                            std::thread::yield_now();
+                        } else {
+                            if std::time::Instant::now() >= deadline {
+                                timed_out = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
+            }
+            if timed_out {
+                self.close_after_flush = true;
             }
             return;
         }
@@ -336,13 +383,26 @@ impl ConnState {
             }
             return;
         }
+        // ⭐ 2026-10-17 (审计新 P1-5): 同 TLS 路径的有界化 — 旧实现
+        // WouldBlock 无限自旋, 慢客户端拖死同 worker 全部连接.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut spins = 0u32;
         let mut written = 0usize;
         while written < bytes.len() {
             match self.stream.write(&bytes[written..]) {
                 Ok(0) => break, // 对端关闭
                 Ok(n) => written += n,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::yield_now();
+                    spins += 1;
+                    if spins <= 64 {
+                        std::thread::yield_now();
+                    } else {
+                        if std::time::Instant::now() >= deadline {
+                            self.close_after_flush = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
@@ -426,6 +486,21 @@ impl ConnState {
             _ => {}
         }
         self.pending.insert(seq, bytes);
+        // ⭐ 审计 P3-8 (2026-10-17): 重排缓冲护栏 — 某个 seq 的分片回复永不到达
+        // 时, 后续回复会一直卡在 pending 里 (连接事实上已永久停摆), 旧实现无
+        // 上限无淘汰 → 内存随请求数无限增长. 超限即断连 (唯一合理恢复:
+        // 该连接的 in-flight 请求已不可能完成).
+        if self.pending.len() > RESP_PENDING_MAX {
+            crate::metrics::RESP_REORDER_OVERFLOW
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            nlog::warn!(
+                "worker",
+                "conn {} reorder buffer overflow ({} > {RESP_PENDING_MAX}), closing",
+                self.fd,
+                self.pending.len()
+            );
+            self.close_after_flush = true;
+        }
         self.resp_flush_ready();
     }
 

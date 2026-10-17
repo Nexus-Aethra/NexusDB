@@ -38,6 +38,18 @@ use crate::output::{self, JsonObject, JsonValue};
 
 const PAGE_SIZE: u64 = 16 * 1024; // 16384 (engine PAGE_SIZE)
 const PAGES_PER_BLOCK: u64 = 640; // 10 MiB / 16 KiB
+const PAGES_PER_CHUNK: u64 = 64; // 1 MiB / 16 KiB
+
+/// ⭐ 2026-10-17 (审计新 P1-20): .block **文件内页序号** (0..640, 扫描用)
+/// → pid 的 (chunk_idx, page_idx). fix_mate 的存活扫描以文件内页序号寻址
+/// (偏移 = pidx × 16KiB), 写回 pid 时必须换算 — 旧实现硬编码 chunk_idx=0,
+/// chunk>=1 的孤儿页被修成"chunk 0 的不存在页号", **修复工具本身写坏元数据**.
+fn split_page_idx(file_page_idx: u64) -> (u8, u16) {
+    (
+        (file_page_idx / PAGES_PER_CHUNK) as u8,
+        (file_page_idx % PAGES_PER_CHUNK) as u16,
+    )
+}
 
 #[derive(Debug, Clone)]
 enum Mode {
@@ -50,6 +62,8 @@ enum Mode {
     Auto,
 }
 
+// flag 组合参数 (vpid/page_idx/--fix/--dry-run...) 与业务无关, 收成 struct 反而多一层映射.
+#[allow(clippy::too_many_arguments)]
 pub fn run<W: Write>(
     globals: &Globals,
     vpid: Option<u64>,
@@ -64,7 +78,8 @@ pub fn run<W: Write>(
     let mode = if auto {
         if vpid.is_some() || page_idx.is_some() || file_id.is_some() || freed {
             return Err(ScannerError::InvalidFlags(
-                "--auto is mutually exclusive with --vpid / --page-idx / --file-id / --freed".into(),
+                "--auto is mutually exclusive with --vpid / --page-idx / --file-id / --freed"
+                    .into(),
             ));
         }
         Mode::Auto
@@ -134,13 +149,15 @@ pub fn run<W: Write>(
     }
 
     // Locate the .block file we will read for stored_vpid auto-detection.
-    let block_path = shard
+    // ⭐ 审计新 P1-20: 记住它的真实 file_id (auto 修复写回 pid 用, 不再硬编码 1).
+    let block_file = shard
         .block_files
         .first()
-        .map(|b| b.path.clone())
         .ok_or_else(|| ScannerError::EmptyDirectory {
             path: globals.dir.clone(),
         })?;
+    let block_path = block_file.path.clone();
+    let block_file_id = block_file.file_id;
     let block_bytes = if matches!(mode, Mode::Auto) {
         Some(fs::read(&block_path).map_err(|e| ScannerError::ReadFailed {
             path: block_path.clone(),
@@ -152,7 +169,12 @@ pub fn run<W: Write>(
     };
 
     let planned: Vec<Edit> = match &mode {
-        Mode::Single { vpid, page_idx, file_id, freed } => {
+        Mode::Single {
+            vpid,
+            page_idx,
+            file_id,
+            freed,
+        } => {
             let slot = read_slot(&data, *vpid)?;
             let flags = if *freed { 0x08 } else { slot.flags() };
             vec![Edit {
@@ -164,10 +186,18 @@ pub fn run<W: Write>(
                     page_idx: *page_idx as u16,
                     flags,
                 },
-                reason: format!("explicit --vpid {} --page-idx {} --file-id {}", vpid, page_idx, file_id),
+                reason: format!(
+                    "explicit --vpid {} --page-idx {} --file-id {}",
+                    vpid, page_idx, file_id
+                ),
             }]
         }
-        Mode::Auto => plan_auto(&data, block_bytes.as_deref().unwrap(), &mut out)?,
+        Mode::Auto => plan_auto(
+            &data,
+            block_bytes.as_deref().unwrap(),
+            block_file_id,
+            &mut out,
+        )?,
     };
 
     if planned.is_empty() {
@@ -298,6 +328,7 @@ fn write_slot(data: &mut [u8], vpid: u64, slot: PidLocation) {
 fn plan_auto<W: Write>(
     data: &[u8],
     block: &[u8],
+    block_file_id: u32,
     out: &mut W,
 ) -> Result<Vec<Edit>> {
     let mut edits = Vec::new();
@@ -334,10 +365,13 @@ fn plan_auto<W: Write>(
         let old = slot;
         if matches.len() == 1 && !is_alive {
             // Exactly one orphan copy: repoint.
+            // ⭐ 审计新 P1-20: matches[0] 是文件内页序号 — 换算成 (chunk,page)
+            // 并用**真实** block file_id (非硬编码 1).
+            let (new_chunk, new_page) = split_page_idx(matches[0] as u64);
             let new = PidLocation {
-                file_id: 1,
-                chunk_idx: 0,
-                page_idx: matches[0],
+                file_id: block_file_id,
+                chunk_idx: new_chunk,
+                page_idx: new_page,
                 flags: 0x01,
             };
             edits.push(Edit {
@@ -345,29 +379,35 @@ fn plan_auto<W: Write>(
                 old,
                 new,
                 reason: format!(
-                    "auto: orphan copy at page_idx={} (current page_idx={} is zero)",
-                    matches[0], page_idx
+                    "auto: orphan copy at file_page_idx={} → (file {}, chunk {}, page {}); current slot points at dead page_idx={}",
+                    matches[0], block_file_id, new_chunk, new_page, page_idx
                 ),
             });
         } else if is_alive && file_id == 0 {
-            // Page is alive but file_id wrong.
+            // Page is alive but file_id wrong. 同样换算 chunk/page (page_idx
+            // 也是文件内序号) 并填真实 file_id.
+            let (new_chunk, new_page) = split_page_idx(page_idx);
             let new = PidLocation {
-                file_id: 1,
-                chunk_idx: 0,
-                page_idx: old.page_idx(),
+                file_id: block_file_id,
+                chunk_idx: new_chunk,
+                page_idx: new_page,
                 flags: old.flags(),
             };
             edits.push(Edit {
                 vpid,
                 old,
                 new,
-                reason: format!("auto: file_id 0->1 (page_idx={} valid)", page_idx),
+                reason: format!(
+                    "auto: file_id 0->{} (file_page_idx={} → chunk {} page {})",
+                    block_file_id, page_idx, new_chunk, new_page
+                ),
             });
         } else if matches.is_empty() && !is_alive {
-            // No recovery possible: mark FREED.
+            // No recovery possible: mark FREED. 保留原坐标 (freed slot 的
+            // 位置无语义, 但不应顺手改成硬编码的 (1,0)).
             let new = PidLocation {
-                file_id: 1,
-                chunk_idx: 0,
+                file_id: old.file_id(),
+                chunk_idx: old.chunk_idx(),
                 page_idx: old.page_idx(),
                 flags: 0x08,
             };
@@ -440,6 +480,72 @@ mod tests {
         block[0..4].copy_from_slice(b"LCBP");
         block[0x18..0x1c].copy_from_slice(&42u32.to_le_bytes());
         assert_eq!(read_stored_vpid(&block, 0), 42);
+    }
+
+    /// ⭐ 审计新 P1-20: auto 修复必须把文件内页序号换算成 (chunk, page),
+    /// 并使用真实 block file_id. 旧实现硬编码 file_id=1/chunk_idx=0 —
+    /// chunk>=1 的孤儿页被修成"chunk 0 的不存在页号", 修复工具本身写坏
+    /// 元数据; 非默认布局 (file_id≠1) 同样被写错.
+    #[test]
+    fn auto_repair_converts_file_page_idx_and_uses_real_file_id() {
+        // block: 128 页 (2 chunk). page 3 = 死 (全零); page 71 (chunk 1,
+        // page 7) = 活页且 stored_vpid = 5.
+        let mut block = vec![0u8; PAGE_SIZE as usize * 128];
+        let orphan_off = 71 * PAGE_SIZE as usize;
+        block[orphan_off..orphan_off + 4].copy_from_slice(b"LCBP");
+        block[orphan_off + 0x18..orphan_off + 0x1c].copy_from_slice(&5u32.to_le_bytes());
+
+        // mate: vpid 5 的 slot 指向已死的 page 3 (file 1, chunk 0).
+        let mut data = vec![0u8; 8 * 8];
+        write_slot(
+            &mut data,
+            5,
+            PidLocation {
+                file_id: 1,
+                chunk_idx: 0,
+                page_idx: 3,
+                flags: 0x01,
+            },
+        );
+
+        let mut out = Vec::new();
+        let edits = plan_auto(&data, &block, /* block_file_id */ 7, &mut out).unwrap();
+        let e = edits
+            .iter()
+            .find(|e| e.vpid == 5)
+            .expect("应有 vpid 5 的修复");
+        assert_eq!(
+            (e.new.file_id(), e.new.chunk_idx(), e.new.page_idx()),
+            (7, 1, 7),
+            "孤儿页在 chunk 1 page 7, file_id=7 — 旧实现会错写成 (1, 0, 71)"
+        );
+        assert_eq!(e.new.flags(), 0x01);
+    }
+
+    /// 找不到孤儿副本 → 标记 FREED, 且不得顺手把坐标改成硬编码 (1,0).
+    #[test]
+    fn auto_repair_marks_freed_without_rewriting_coordinates() {
+        let block = vec![0u8; PAGE_SIZE as usize]; // 全零: 没有活页
+        let mut data = vec![0u8; 8 * 16]; // 16 slots (vpid 9 需要)
+        write_slot(
+            &mut data,
+            9,
+            PidLocation {
+                file_id: 3,
+                chunk_idx: 2,
+                page_idx: 40,
+                flags: 0x01,
+            },
+        );
+        let mut out = Vec::new();
+        let edits = plan_auto(&data, &block, 3, &mut out).unwrap();
+        let e = edits.iter().find(|e| e.vpid == 9).unwrap();
+        assert_eq!(e.new.flags(), 0x08, "应标记 FREED");
+        assert_eq!(
+            (e.new.file_id(), e.new.chunk_idx(), e.new.page_idx()),
+            (3, 2, 40),
+            "FREED 应保留原坐标, 不得改写成硬编码值"
+        );
     }
 
     #[test]

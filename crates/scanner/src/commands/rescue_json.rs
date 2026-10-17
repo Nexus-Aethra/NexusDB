@@ -23,9 +23,12 @@ pub fn run(globals: &Globals, out_dir: &Path, ndjson: bool) -> Result<u8> {
     })?;
 
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout.shards.first().ok_or_else(|| ScannerError::EmptyDirectory {
-        path: globals.dir.clone(),
-    })?;
+    let shard = layout
+        .shards
+        .first()
+        .ok_or_else(|| ScannerError::EmptyDirectory {
+            path: globals.dir.clone(),
+        })?;
 
     let (merged, stats) = scan_all_blocks(shard);
 
@@ -87,7 +90,7 @@ pub fn run(globals: &Globals, out_dir: &Path, ndjson: bool) -> Result<u8> {
                     }
                     decoded.push(v);
                 }
-                Err(e) => {
+                Err(_e) => {
                     // Not JSON — record as raw bytes (hex) so we don't lose data
                     let hex_repr = hex::encode(value);
                     undecoded_kinds.push((kind.clone(), hex_repr));
@@ -97,11 +100,12 @@ pub fn run(globals: &Globals, out_dir: &Path, ndjson: bool) -> Result<u8> {
 
         if ndjson {
             for v in &decoded {
-                writeln!(f, "{}", serde_json::to_string(v).unwrap_or_default())
-                    .map_err(|e| ScannerError::IoError {
+                writeln!(f, "{}", serde_json::to_string(v).unwrap_or_default()).map_err(|e| {
+                    ScannerError::IoError {
                         path: path.clone(),
                         source: e,
-                    })?;
+                    }
+                })?;
             }
             for (kind, hex_repr) in &undecoded_kinds {
                 let obj = serde_json::json!({
@@ -118,10 +122,11 @@ pub fn run(globals: &Globals, out_dir: &Path, ndjson: bool) -> Result<u8> {
             // If there are no binary rows, simplify to a bare JSON array
             if undecoded_kinds.is_empty() {
                 let s = serde_json::to_string_pretty(&decoded).unwrap_or_else(|_| "[]".to_string());
-                f.write_all(s.as_bytes()).map_err(|e| ScannerError::IoError {
-                    path: path.clone(),
-                    source: e,
-                })?;
+                f.write_all(s.as_bytes())
+                    .map_err(|e| ScannerError::IoError {
+                        path: path.clone(),
+                        source: e,
+                    })?;
             } else {
                 let output = serde_json::json!({
                     "table": table,
@@ -131,10 +136,11 @@ pub fn run(globals: &Globals, out_dir: &Path, ndjson: bool) -> Result<u8> {
                     }).collect::<Vec<_>>(),
                 });
                 let s = serde_json::to_string_pretty(&output).unwrap_or_else(|_| "[]".to_string());
-                f.write_all(s.as_bytes()).map_err(|e| ScannerError::IoError {
-                    path: path.clone(),
-                    source: e,
-                })?;
+                f.write_all(s.as_bytes())
+                    .map_err(|e| ScannerError::IoError {
+                        path: path.clone(),
+                        source: e,
+                    })?;
             }
             f.write_all(b"\n").map_err(|e| ScannerError::IoError {
                 path: path.clone(),
@@ -156,11 +162,12 @@ pub fn run(globals: &Globals, out_dir: &Path, ndjson: bool) -> Result<u8> {
 
     writeln!(
         std::io::stderr(),
-        "[RESCUE-JSON] scanned={} leaf={} decoded={} dedup={} files_written={}",
+        "[RESCUE-JSON] scanned={} leaf={} decoded={} dedup={} unparsed={} files_written={}",
         stats.scanned,
         stats.leaf,
         stats.decoded,
         stats.decoded - merged.len() as u64,
+        skipped,
         written_files
     )
     .ok();

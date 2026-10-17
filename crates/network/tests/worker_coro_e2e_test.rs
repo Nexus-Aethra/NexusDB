@@ -51,8 +51,13 @@ struct Conn {
 impl Conn {
     fn new(s: &NetworkServer) -> Self {
         let stream = TcpStream::connect(s.local_addr()).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        Self { stream, buf: Vec::new() }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
     }
     fn frame(&mut self) -> Vec<u8> {
         loop {
@@ -66,22 +71,23 @@ impl Conn {
             self.buf.extend_from_slice(&t[..n]);
         }
     }
-    fn login(&mut self, s: &NetworkServer) {
+    fn login(&mut self, _s: &NetworkServer) {
         let p = self.frame();
         let mut pos = 1;
-        while p[pos] != 0 { pos += 1; }
+        while p[pos] != 0 {
+            pos += 1;
+        }
         pos += 1 + 4;
         let mut salt = [0u8; 20];
         salt[..8].copy_from_slice(&p[pos..pos + 8]);
         pos += 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10;
         salt[8..].copy_from_slice(&p[pos..pos + 12]);
         let tok = my::native_password_token(&salt, "");
-        let mut r = vec![
-            my::CLIENT_PROTOCOL_41 as u32 | my::CLIENT_SECURE_CONNECTION as u32 | my::CLIENT_PLUGIN_AUTH as u32,
-        ]
-        .into_iter()
-        .flat_map(|x| x.to_le_bytes())
-        .collect::<Vec<_>>();
+        let mut r =
+            vec![my::CLIENT_PROTOCOL_41 | my::CLIENT_SECURE_CONNECTION | my::CLIENT_PLUGIN_AUTH]
+                .into_iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<_>>();
         r.extend_from_slice(&0x0100_0000u32.to_le_bytes());
         r.push(45);
         r.extend_from_slice(&[0u8; 23]);

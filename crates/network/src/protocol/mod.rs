@@ -71,6 +71,19 @@ pub enum Response {
 pub struct KvLimits {
     pub max_key_bytes: usize,
     pub max_value_bytes: usize,
+    /// ⭐ 审计 P2 (2026-10-17): 单连接 prepared 语句注册表上限.
+    /// 旧实现无上限 — 单连接可无限 PREPARE, 注册表无限增长 → worker OOM
+    /// (worker 单线程, 一个连接的泄漏会拖死同 worker 上的全部连接).
+    /// MySQL `COM_STMT_PREPARE` 与 PG `Parse` (命名语句) 共用此上限.
+    pub max_prepared_stmts: usize,
+    /// ⭐ 审计 P2 (2026-10-17): 单 worker 连接数上限. 旧实现无上限 — 连接可
+    /// 无限堆积 (fd / ConnState 内存耗尽 = 拒绝服务). 超限的新连接在 worker
+    /// 侧直接关闭 (不建状态). 全局上限 ≈ 本值 × worker_count.
+    pub max_connections_per_worker: usize,
+    /// ⭐ 审计 P2 (2026-10-17): 空闲连接超时 (秒; 0 = 关闭该保护).
+    /// 旧实现无 idle 回收 — 客户端连上不关 (或半死连接) 会永久占用 worker
+    /// 槽位. epoll worker 主循环周期性扫 `ConnState::last_activity` 回收.
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for KvLimits {
@@ -78,6 +91,9 @@ impl Default for KvLimits {
         Self {
             max_key_bytes: 1024,
             max_value_bytes: 1024 * 1024,
+            max_prepared_stmts: 1024,
+            max_connections_per_worker: 4096,
+            idle_timeout_secs: 300,
         }
     }
 }

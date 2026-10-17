@@ -23,7 +23,10 @@ pub enum ColType {
     Uuid,
     /// ⭐ F81: 定点小数. precision=总位数(仅回显), scale=小数位.
     /// 值以 i128 承载 (变长区 16B LE); scale 随类型 → 转换/渲染/比较全程可得.
-    Decimal { precision: u8, scale: u8 },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
 }
 
 impl ColType {
@@ -277,11 +280,18 @@ impl TableSchema {
         }
         let mut next_iid = 0u32;
         let mut indexes: Vec<IndexDef> = Vec::with_capacity(
-            index_cols.len() + unique_cols.len() + global_unique_cols.len() + composite_unique_cols.len(),
+            index_cols.len()
+                + unique_cols.len()
+                + global_unique_cols.len()
+                + composite_unique_cols.len(),
         );
         let mut seen_cols = std::collections::HashSet::new();
         // (列集, unique, global); 单列索引逐列登记, 复合唯一整组登记
-        let mut push_index = |indexes: &mut Vec<IndexDef>, cols: Vec<u16>, unique: bool, global: bool| -> Result<(), SchemaError> {
+        let mut push_index = |indexes: &mut Vec<IndexDef>,
+                              cols: Vec<u16>,
+                              unique: bool,
+                              global: bool|
+         -> Result<(), SchemaError> {
             let col = cols[0];
             if col as usize >= columns.len() {
                 return Err(SchemaError::BadRef);
@@ -302,7 +312,13 @@ impl TableSchema {
             if dup {
                 return Ok(());
             }
-            indexes.push(IndexDef { iid: next_iid, col, cols, unique, global });
+            indexes.push(IndexDef {
+                iid: next_iid,
+                col,
+                cols,
+                unique,
+                global,
+            });
             next_iid += 1;
             seen_cols.insert(col);
             Ok(())
@@ -369,7 +385,12 @@ impl TableSchema {
             version_ncols: self.version_ncols.clone(),
             columns: self.columns.clone(),
             pk_col: self.pk_col,
-            indexes: self.indexes.iter().filter(|i| i.col != col_idx).cloned().collect(),
+            indexes: self
+                .indexes
+                .iter()
+                .filter(|i| i.col != col_idx)
+                .cloned()
+                .collect(),
             next_iid: self.next_iid,
             dropped,
             fks: self.fks.clone(),
@@ -528,7 +549,12 @@ impl TableSchema {
             } else {
                 None
             };
-            columns.push(Column { name, ty, nullable, default });
+            columns.push(Column {
+                name,
+                ty,
+                nullable,
+                default,
+            });
         }
         let n_idx = r.u16()? as usize;
         let mut indexes = Vec::with_capacity(n_idx);
@@ -554,7 +580,13 @@ impl TableSchema {
             }
             let unique = r.u8()? != 0; // ⭐ O3
             let global = if fmt >= 2 { r.u8()? != 0 } else { false }; // ⭐ F65 (v1 无此字段)
-            indexes.push(IndexDef { iid, col, cols, unique, global });
+            indexes.push(IndexDef {
+                iid,
+                col,
+                cols,
+                unique,
+                global,
+            });
         }
         let next_iid = r.u32()?;
         if pk_col as usize >= columns.len() {
@@ -567,7 +599,11 @@ impl TableSchema {
             for _ in 0..nv {
                 v.push(r.u16()?);
             }
-            if v.is_empty() { vec![columns.len() as u16] } else { v }
+            if v.is_empty() {
+                vec![columns.len() as u16]
+            } else {
+                v
+            }
         } else {
             vec![columns.len() as u16]
         };
@@ -597,7 +633,12 @@ impl TableSchema {
                     2 => FkAction::SetNull,
                     _ => FkAction::NoAction,
                 };
-                fs.push(FkDef { col, ref_table, ref_col, on_delete: action });
+                fs.push(FkDef {
+                    col,
+                    ref_table,
+                    ref_col,
+                    on_delete: action,
+                });
             }
             fs
         } else {
@@ -672,15 +713,37 @@ mod tests {
     fn demo_schema() -> TableSchema {
         TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
-                Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
-                Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
-                Column { name: "blob".into(), ty: ColType::Bytes, nullable: true, default: None },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "name".into(),
+                    ty: ColType::Str,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "score".into(),
+                    ty: ColType::F64,
+                    nullable: true,
+                    default: None,
+                },
+                Column {
+                    name: "blob".into(),
+                    ty: ColType::Bytes,
+                    nullable: true,
+                    default: None,
+                },
             ],
             0,
             &[1, 2], // name / score 建索引
             &[3],    // blob 唯一索引 (⭐ O3 roundtrip)
-            &[], &[], &[],
+            &[],
+            &[],
+            &[],
         )
         .unwrap()
     }
@@ -692,10 +755,37 @@ mod tests {
         let d = TableSchema::decode(&bytes).unwrap();
         assert_eq!(s, d);
         assert_eq!(d.indexes.len(), 3);
-        assert_eq!(d.indexes[0], IndexDef { iid: 0, col: 1, cols: vec![1], unique: false, global: false });
-        assert_eq!(d.indexes[1], IndexDef { iid: 1, col: 2, cols: vec![2], unique: false, global: false });
+        assert_eq!(
+            d.indexes[0],
+            IndexDef {
+                iid: 0,
+                col: 1,
+                cols: vec![1],
+                unique: false,
+                global: false
+            }
+        );
+        assert_eq!(
+            d.indexes[1],
+            IndexDef {
+                iid: 1,
+                col: 2,
+                cols: vec![2],
+                unique: false,
+                global: false
+            }
+        );
         // ⭐ O3: unique 位随序列化 roundtrip
-        assert_eq!(d.indexes[2], IndexDef { iid: 2, col: 3, cols: vec![3], unique: true, global: false });
+        assert_eq!(
+            d.indexes[2],
+            IndexDef {
+                iid: 2,
+                col: 3,
+                cols: vec![3],
+                unique: true,
+                global: false
+            }
+        );
         assert_eq!(d.next_iid, 3);
     }
 
@@ -725,18 +815,36 @@ mod tests {
         // 越界引用被拒
         assert_eq!(
             TableSchema::new(
-                vec![Column { name: "a".into(), ty: ColType::I64, nullable: false, default: None }],
+                vec![Column {
+                    name: "a".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None
+                }],
                 1,
                 &[],
-                &[], &[], &[], &[]),
+                &[],
+                &[],
+                &[],
+                &[]
+            ),
             Err(SchemaError::BadRef)
         );
         assert_eq!(
             TableSchema::new(
-                vec![Column { name: "a".into(), ty: ColType::I64, nullable: false, default: None }],
+                vec![Column {
+                    name: "a".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None
+                }],
                 0,
                 &[3],
-                &[], &[], &[], &[]),
+                &[],
+                &[],
+                &[],
+                &[]
+            ),
             Err(SchemaError::BadRef)
         );
     }
@@ -744,7 +852,10 @@ mod tests {
     #[test]
     fn decode_rejects_garbage() {
         assert_eq!(TableSchema::decode(&[]), Err(SchemaError::Truncated));
-        assert_eq!(TableSchema::decode(&[99, 1, 0, 0, 0, 0]), Err(SchemaError::BadFormat));
+        assert_eq!(
+            TableSchema::decode(&[99, 1, 0, 0, 0, 0]),
+            Err(SchemaError::BadFormat)
+        );
         // 截断的列区
         let mut bytes = demo_schema().encode();
         bytes.truncate(bytes.len() / 2);

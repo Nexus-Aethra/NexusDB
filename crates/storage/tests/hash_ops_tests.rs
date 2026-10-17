@@ -69,7 +69,12 @@ fn hash_large_cross_leaf() {
         e.create_table("db1", "t1").await.unwrap();
 
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..2000u32)
-            .map(|i| (format!("field{i:05}").into_bytes(), tagged(format!("v{i}").as_bytes())))
+            .map(|i| {
+                (
+                    format!("field{i:05}").into_bytes(),
+                    tagged(format!("v{i}").as_bytes()),
+                )
+            })
             .collect();
         assert_eq!(e.hash_set("db1", "t1", b"big", &pairs).await.unwrap(), 2000);
         assert_eq!(e.hash_len("db1", "t1", b"big").await.unwrap(), 2000);
@@ -104,7 +109,9 @@ fn hash_wrongtype_and_delete_any() {
         e.create_table("db1", "t1").await.unwrap();
 
         // String key 上 hash op → WrongType
-        e.table_put("db1", "t1", b"sk", &tagged(b"v")).await.unwrap();
+        e.table_put("db1", "t1", b"sk", &tagged(b"v"))
+            .await
+            .unwrap();
         let err = e
             .hash_set("db1", "t1", b"sk", &[(b"f".to_vec(), tagged(b"v"))])
             .await
@@ -143,7 +150,9 @@ fn set_over_composite_purges_old_rows() {
             (b"f2".to_vec(), tagged(b"v2")),
         ];
         e.hash_set("db1", "t1", b"k", &pairs).await.unwrap();
-        e.table_put("db1", "t1", b"k", &tagged(b"strval")).await.unwrap();
+        e.table_put("db1", "t1", b"k", &tagged(b"strval"))
+            .await
+            .unwrap();
 
         // key 现在是 string
         assert_eq!(
@@ -157,7 +166,9 @@ fn set_over_composite_purges_old_rows() {
         // DEL 后彻底干净, 再建 hash 正常 (无孤儿行干扰 count)
         assert!(e.key_delete_any("db1", "t1", b"k").await.unwrap());
         assert_eq!(e.table_get_typed("db1", "t1", b"k").await.unwrap(), None);
-        e.hash_set("db1", "t1", b"k", &[(b"nf".to_vec(), tagged(b"nv"))]).await.unwrap();
+        e.hash_set("db1", "t1", b"k", &[(b"nf".to_vec(), tagged(b"nv"))])
+            .await
+            .unwrap();
         assert_eq!(e.hash_len("db1", "t1", b"k").await.unwrap(), 1);
         // 全量 HGETALL 只有新 field (旧 f1/f2 无残留)
         let all = e.hash_get_all("db1", "t1", b"k").await.unwrap();
@@ -175,9 +186,15 @@ fn get_on_any_composite_is_wrongtype() {
         e.create_db("db1").await.unwrap();
         e.create_table("db1", "t1").await.unwrap();
 
-        e.set_add("db1", "t1", b"sk", &[b"m".to_vec()]).await.unwrap();
-        e.list_push("db1", "t1", b"lk", &[tagged(b"x")], false).await.unwrap();
-        e.zset_add("db1", "t1", b"zk", &[(1.0, b"m".to_vec())]).await.unwrap();
+        e.set_add("db1", "t1", b"sk", &[b"m".to_vec()])
+            .await
+            .unwrap();
+        e.list_push("db1", "t1", b"lk", &[tagged(b"x")], false)
+            .await
+            .unwrap();
+        e.zset_add("db1", "t1", b"zk", &[(1.0, b"m".to_vec())])
+            .await
+            .unwrap();
 
         for k in [&b"sk"[..], &b"lk"[..], &b"zk"[..]] {
             assert!(
@@ -186,11 +203,29 @@ fn get_on_any_composite_is_wrongtype() {
             );
         }
         // 反向: 各类型 op 在 String key 上 WRONGTYPE
-        e.table_put("db1", "t1", b"str", &tagged(b"v")).await.unwrap();
-        assert!(e.set_add("db1", "t1", b"str", &[b"m".to_vec()]).await.is_err());
-        assert!(e.list_push("db1", "t1", b"str", &[tagged(b"x")], false).await.is_err());
-        assert!(e.zset_add("db1", "t1", b"str", &[(1.0, b"m".to_vec())]).await.is_err());
+        e.table_put("db1", "t1", b"str", &tagged(b"v"))
+            .await
+            .unwrap();
+        assert!(
+            e.set_add("db1", "t1", b"str", &[b"m".to_vec()])
+                .await
+                .is_err()
+        );
+        assert!(
+            e.list_push("db1", "t1", b"str", &[tagged(b"x")], false)
+                .await
+                .is_err()
+        );
+        assert!(
+            e.zset_add("db1", "t1", b"str", &[(1.0, b"m".to_vec())])
+                .await
+                .is_err()
+        );
         // 异类复合互斥: set key 上 zadd
-        assert!(e.zset_add("db1", "t1", b"sk", &[(1.0, b"m".to_vec())]).await.is_err());
+        assert!(
+            e.zset_add("db1", "t1", b"sk", &[(1.0, b"m".to_vec())])
+                .await
+                .is_err()
+        );
     });
 }

@@ -78,7 +78,10 @@ fn take_batches_dedup_and_complete_ok() {
         let before = pager.chunk_cache_len();
         pager.complete_flush(key, Ok(())).unwrap();
         assert!(!pager.has_inflight());
-        assert!(pager.chunk_cache_len() > before, "chunk must enter chunk_list");
+        assert!(
+            pager.chunk_cache_len() > before,
+            "chunk must enter chunk_list"
+        );
     });
 }
 
@@ -108,9 +111,7 @@ fn complete_flush_error_requeues() {
         // 重试路径: 再取批能拿到同 key
         let retry = pager.take_flush_batches();
         assert!(
-            retry
-                .iter()
-                .any(|b| b.items.iter().any(|(k, _)| *k == key)),
+            retry.iter().any(|b| b.items.iter().any(|(k, _)| *k == key)),
             "retry batch for same key"
         );
     });

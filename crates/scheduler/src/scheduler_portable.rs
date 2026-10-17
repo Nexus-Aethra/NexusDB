@@ -170,8 +170,9 @@ pub fn current_task_id() -> usize {
     with_current_slot(|id| id).expect("current_task_id called outside scheduler task")
 }
 
-pub struct SchedHandle(pub Rc<RefCell<Scheduler>>);
-unsafe impl Send for SchedHandle {}
+/// ⭐ 审计 P2 (2026-10-17): 单线程所有权 — 内层 Rc 私有 + 不实现 Send
+/// (理由同 scheduler.rs 的 SchedHandle: 跨线程 clone/drive 是真 UB).
+pub struct SchedHandle(Rc<RefCell<Scheduler>>);
 
 impl Clone for SchedHandle {
     fn clone(&self) -> Self {
@@ -182,6 +183,11 @@ impl Clone for SchedHandle {
 impl SchedHandle {
     pub fn new(scheduler: Scheduler) -> Self {
         Self(Rc::new(RefCell::new(scheduler)))
+    }
+
+    /// crate 内部访问底层 Rc (字段私有, 外部无法绕过所有权约束直接拿 Rc).
+    pub(crate) fn rc(&self) -> &Rc<RefCell<Scheduler>> {
+        &self.0
     }
 
     pub fn set_current(&self) {

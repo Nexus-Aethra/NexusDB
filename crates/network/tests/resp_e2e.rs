@@ -292,8 +292,8 @@ fn resp_contiguous_set_pipeline_is_ordered_and_visible() {
     s.write_all(&batch).unwrap();
 
     let replies = read_replies(&mut s, 96);
-    for i in 0..48 {
-        assert_eq!(replies[i], b"+OK\r\n", "SET reply {i}");
+    for (i, reply) in replies.iter().take(48).enumerate() {
+        assert_eq!(reply, b"+OK\r\n", "SET reply {i}");
     }
     for i in 0..48 {
         let value = format!("batch-value-{i:02}");
@@ -1974,6 +1974,65 @@ fn resp_sql_removed_pure_redis_semantics() {
     assert_eq!(read_replies(&mut s, 1)[0], b"+OK\r\n");
 
     drop(s);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
+/// ⭐ 审计 P2 (2026-10-17): 认证失败限速 — 旧实现失败无限次 (RESP 甚至不断
+/// 连接), 一次连接即可在线暴力破解. 现在: 单连接连续失败
+/// `MAX_FAILS_PER_CONN` 次即断开; 集群级窗口内失败达阈值 → 锁定, 锁定期间
+/// 直接拒 (口令都不比对).
+#[test]
+fn resp_auth_failures_are_rate_limited() {
+    let (server, mgr) = start_server(Some("s3cret"));
+
+    /// 在一个连接上连续错口令, 返回 (失败次数, 是否被服务端断开).
+    /// 用裸 read 容忍 EOF/reset (read_replies 会把关闭当 panic).
+    fn hammer(mut s: TcpStream) -> (usize, bool) {
+        let mut wrong = 0usize;
+        for _ in 0..10 {
+            if s.write_all(&cmd(&[b"AUTH", b"wrong"])).is_err() {
+                return (wrong, true);
+            }
+            let mut tmp = [0u8; 256];
+            match s.read(&mut tmp) {
+                Ok(0) => return (wrong, true),
+                Ok(n) if tmp[..n].starts_with(b"-WRONGPASS") => wrong += 1,
+                Ok(_) => return (wrong, true),
+                Err(_) => return (wrong, true),
+            }
+        }
+        (wrong, false)
+    }
+
+    // 连接 1: 单连接连续失败达 MAX_FAILS_PER_CONN → 断开
+    let (w1, closed1) = hammer(connect(&server));
+    assert!(closed1, "单连接连续失败必须被断开");
+    assert!(w1 > 0, "断开前应允许若干次失败");
+
+    // 连接 2: 再猜若干次 → 集群级窗口失败总数达阈值 → 触发锁定
+    let (_, closed2) = hammer(connect(&server));
+    assert!(closed2, "第二个连接同样在单连接上限处断开");
+
+    // 连接 3: 锁定期内直接拒 (不再有 WRONGPASS, 而是限流提示)
+    let mut s3 = connect(&server);
+    s3.write_all(&cmd(&[b"AUTH", b"wrong"])).unwrap();
+    let r = read_replies(&mut s3, 1);
+    assert!(
+        r[0].starts_with(b"-ERR too many authentication failures"),
+        "锁定期内应直接拒: {:?}",
+        String::from_utf8_lossy(&r[0])
+    );
+    // 正确口令在锁定期内同样被拒 (锁定期不比对口令)
+    s3.write_all(&cmd(&[b"AUTH", b"s3cret"])).unwrap();
+    let r = read_replies(&mut s3, 1);
+    assert!(
+        r[0].starts_with(b"-ERR too many authentication failures"),
+        "锁定期内正确口令也应被拒: {:?}",
+        String::from_utf8_lossy(&r[0])
+    );
+
+    drop(s3);
     server.shutdown().unwrap();
     drop(mgr);
 }

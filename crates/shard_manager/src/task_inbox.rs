@@ -15,6 +15,8 @@ const TASK_INBOX_CAPACITY: usize = 8192;
 struct QueuedTask {
     task: ShardTask,
     enqueued_at: Option<std::time::Instant>,
+    /// ⭐ 审计 P2 (2026-10-17): 入队序号 (跨 inbox 定序用, 见 `ENQ_SEQ`).
+    seq: u64,
 }
 
 /// Task 专用 inbox: worker push, shard drain.
@@ -48,6 +50,7 @@ impl TaskInbox {
         let queued = QueuedTask {
             task,
             enqueued_at: crate::PROBE.is_enabled().then(std::time::Instant::now),
+            seq: crate::inbox::next_enq_seq(),
         };
         if let Err(rejected) = self.ring.push(queued) {
             return Err(rejected.task);
@@ -91,6 +94,7 @@ impl TaskInbox {
             let mut task = QueuedTask {
                 task,
                 enqueued_at: crate::PROBE.is_enabled().then(std::time::Instant::now),
+                seq: crate::inbox::next_enq_seq(),
             };
             loop {
                 match self.ring.push(task) {
@@ -121,7 +125,7 @@ impl TaskInbox {
     /// → shard 睡眠后无人唤醒 (丢唤醒). 先 store(0) 保证:
     /// - store 之前的 push 一定被本轮 pop 到 (Release/Acquire 序)
     /// - store 之后的 push 一定看到 pending=0 并写 eventfd
-    pub fn drain(&self) -> Vec<ShardTask> {
+    pub fn drain(&self) -> Vec<(u64, ShardTask)> {
         self.drain_up_to(usize::MAX)
     }
 
@@ -129,7 +133,8 @@ impl TaskInbox {
     ///
     /// 有界 drain 用于高负载前台时间片：保留 ring 内剩余任务不会丢失唤醒，
     /// 因为主循环在队列非空时会立即进行下一轮 drain，而不会进入 poll 睡眠。
-    pub fn drain_up_to(&self, limit: usize) -> Vec<ShardTask> {
+    /// 返回 `(入队序号, task)` — 序号用于跨 inbox 定序 (见 `ENQ_SEQ`).
+    pub fn drain_up_to(&self, limit: usize) -> Vec<(u64, ShardTask)> {
         self.pending.store(0, Ordering::Release);
         let mut batch = Vec::with_capacity(limit.min(128));
         while let Some(queued) = self.ring.pop() {
@@ -138,7 +143,7 @@ impl TaskInbox {
                     .task_queue_ns
                     .record(enqueued_at.elapsed().as_nanos() as u64);
             }
-            batch.push(queued.task);
+            batch.push((queued.seq, queued.task));
             if batch.len() == limit {
                 break;
             }
@@ -229,7 +234,10 @@ mod tests {
 
         let first = inbox.drain_up_to(2);
         assert_eq!(
-            first.iter().map(|task| task.req_id).collect::<Vec<_>>(),
+            first
+                .iter()
+                .map(|(_, task)| task.req_id)
+                .collect::<Vec<_>>(),
             [0, 1]
         );
         assert!(
@@ -239,7 +247,10 @@ mod tests {
 
         let second = inbox.drain_up_to(2);
         assert_eq!(
-            second.iter().map(|task| task.req_id).collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|(_, task)| task.req_id)
+                .collect::<Vec<_>>(),
             [2]
         );
         assert!(inbox.is_empty());

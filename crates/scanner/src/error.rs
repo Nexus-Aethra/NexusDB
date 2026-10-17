@@ -12,7 +12,7 @@ use thiserror::Error;
 // `InvalidFlags` is reserved for the strict-vs-tolerant validator and
 // `walk` flag checks; arrive with PR2+.
 #[allow(dead_code)]
-
+// ( BadPage 已由 --strict 落地使用, 见 cli::Globals::strict_gate )
 /// All errors that can be returned from scanner internals.
 #[derive(Debug, Error)]
 pub enum ScannerError {
@@ -28,6 +28,11 @@ pub enum ScannerError {
     /// with a command that always tolerates).
     #[error("invalid flag combination: {0}")]
     InvalidFlags(String),
+
+    /// ⭐ 审计 P2 (2026-10-17): `--strict` 模式遇到坏页/不可读页 → 硬失败.
+    /// tolerant (默认) 模式永远走不到这里 (坏页只记数不传播).
+    #[error("bad page in strict mode: {0}")]
+    BadPage(String),
 
     /// A required vpid could not be located on disk and we cannot proceed.
     #[error("vpid {vpid} cannot be located on disk: {reason}")]

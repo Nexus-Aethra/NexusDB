@@ -123,7 +123,7 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
     let reply_bus2 = reply_bus.clone();
     let _db2 = db.clone();
     let _table2 = table.clone();
-    let _limits2 = limits;
+    let limits2 = limits;
     let sql_cache2 = sql_cache.clone();
     let sql_shared2 = sql_shared.clone();
     let db_view2 = db_view.clone();
@@ -160,6 +160,19 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                 }
             }
             for nc in new_conns {
+                // ⭐ 审计 P2 (2026-10-17): 连接数上限 (超限直接关 fd, 不建协程).
+                // 协程 worker 无周期性 tick (阻塞在 conn_eventfd 的 poll 上), 故
+                // idle 回收仅在 epoll worker 落地 — 见模块文档.
+                let live = active2.load(std::sync::atomic::Ordering::Relaxed);
+                if live >= limits2.max_connections_per_worker {
+                    nlog::warn!(
+                        "worker",
+                        "worker-{worker_id} connection cap reached ({}), rejecting new conn",
+                        limits2.max_connections_per_worker
+                    );
+                    unsafe { libc::close(nc.fd) };
+                    continue;
+                }
                 let id = next_conn_id;
                 next_conn_id += 1;
                 // ⭐ 解耦 (Phase 3): 协议与 per-conn 配置随连接传递 (acceptor 按端口打标).
@@ -181,6 +194,8 @@ pub(crate) fn worker_main_coro(cfg: WorkerConfig) {
                     nc.auth_password.clone(),
                     nc.tls_config.clone(),
                 );
+                // ⭐ 审计新 P1-4: 标记协程 worker (协议层据此拒绝 TLS 升级)
+                state.coro_worker = true;
                 // ⭐ Z2 (MySQL wire): Sql conn 建立即主动发 HandshakeV10
                 if proto == ProtocolKind::Sql {
                     let salt = mysql_gen_salt(id, worker_id2);
@@ -337,6 +352,7 @@ async fn conn_coro(
                                 &shard_inboxes,
                                 num_shards,
                                 &tls_config,
+                                &limits,
                             );
                             conn.resp_should_close()
                         }
@@ -351,6 +367,7 @@ async fn conn_coro(
                                 &shard_inboxes,
                                 num_shards,
                                 &tls_config,
+                                &limits,
                             );
                             conn.resp_should_close()
                         }

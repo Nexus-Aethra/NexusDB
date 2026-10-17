@@ -35,23 +35,17 @@ fn main() {
         .get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_OPS_PHASE2);
-    let num_clients: usize = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(
-            args.get(3)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(NUM_SHARDS),
-        );
+    let num_clients: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(
+        args.get(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(NUM_SHARDS),
+    );
 
     println!("=== NexusDB 多 shard 多 client 并发压测 ===");
     println!("shards: {NUM_SHARDS}");
     println!("clients: {num_clients}");
     println!("ops/phase-2 (mixed): {ops_phase2}");
-    println!(
-        "phase 2 total ops: {}",
-        ops_phase2 * num_clients
-    );
+    println!("phase 2 total ops: {}", ops_phase2 * num_clients);
     println!();
 
     let tmp = tempfile::tempdir().expect("create tempdir");
@@ -157,7 +151,13 @@ fn main() {
 
                     for i in 0..ops_phase2 {
                         let r = (next() >> 32) % 100;
-                        let op = if r < 60 { 0 } else if r < 85 { 1 } else { 2 };
+                        let op = if r < 60 {
+                            0
+                        } else if r < 85 {
+                            1
+                        } else {
+                            2
+                        };
                         let key = format!("t{tid}_{i:08}");
 
                         let batch_op = if op == 0 {
@@ -221,9 +221,15 @@ fn main() {
                                     | BatchResult::KeysWithValues(_)
                                     | BatchResult::MultiPutOk => {
                                         match op_type {
-                                            0 => { total_put.fetch_add(1, Ordering::Relaxed); }
-                                            1 => { total_get.fetch_add(1, Ordering::Relaxed); }
-                                            _ => { total_delete.fetch_add(1, Ordering::Relaxed); }
+                                            0 => {
+                                                total_put.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            1 => {
+                                                total_get.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            _ => {
+                                                total_delete.fetch_add(1, Ordering::Relaxed);
+                                            }
                                         }
                                         total_ops.fetch_add(1, Ordering::Relaxed);
                                         local.push((op_type, per_op_d));
@@ -402,7 +408,11 @@ fn main() {
 
     println!();
     println!("[teardown] closing ShardManager...");
-    Arc::try_unwrap(mgr).ok().expect("Arc unique").close().expect("close");
+    Arc::try_unwrap(mgr)
+        .ok()
+        .expect("Arc unique")
+        .close()
+        .expect("close");
     println!("[done] data dir: {}", tmp.path().display());
 }
 

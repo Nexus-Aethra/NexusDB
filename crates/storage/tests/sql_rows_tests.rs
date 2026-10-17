@@ -29,14 +29,38 @@ fn opts_for(tmp: &tempfile::TempDir) -> OpenOptions {
 fn demo_schema() -> TableSchema {
     TableSchema::new(
         vec![
-            Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
-            Column { name: "name".into(), ty: ColType::Str, nullable: false, default: None },
-            Column { name: "score".into(), ty: ColType::F64, nullable: true, default: None },
-            Column { name: "note".into(), ty: ColType::Str, nullable: true, default: None },
+            Column {
+                name: "id".into(),
+                ty: ColType::I64,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "name".into(),
+                ty: ColType::Str,
+                nullable: false,
+                default: None,
+            },
+            Column {
+                name: "score".into(),
+                ty: ColType::F64,
+                nullable: true,
+                default: None,
+            },
+            Column {
+                name: "note".into(),
+                ty: ColType::Str,
+                nullable: true,
+                default: None,
+            },
         ],
         0,
         &[1, 2], // iid 0 = name, iid 1 = score
-        &[], &[], &[], &[])
+        &[],
+        &[],
+        &[],
+        &[],
+    )
     .unwrap()
 }
 
@@ -89,9 +113,14 @@ fn row_put_get_delete_with_index_consistency() {
         let s = setup(&mut e).await;
 
         for i in 0..10i64 {
-            e.row_put("db1", "t1", &pk(i), &vals(i, &format!("user{}", i % 3), Some(i as f64)))
-                .await
-                .unwrap();
+            e.row_put(
+                "db1",
+                "t1",
+                &pk(i),
+                &vals(i, &format!("user{}", i % 3), Some(i as f64)),
+            )
+            .await
+            .unwrap();
         }
         // row_get + decode
         let bytes = e.row_get("db1", "t1", &pk(7)).await.unwrap().unwrap();
@@ -112,12 +141,17 @@ fn row_put_get_delete_with_index_consistency() {
         );
 
         // update: id7 改名 user2, score 改 NULL → 旧索引行消失、score 行消失
-        e.row_put("db1", "t1", &pk(7), &vals(7, "user2", None)).await.unwrap();
+        e.row_put("db1", "t1", &pk(7), &vals(7, "user2", None))
+            .await
+            .unwrap();
         let hits = e
             .index_scan_local("db1", "t1", 0, Some(&eq), Some(&eq), 0)
             .await
             .unwrap();
-        assert_eq!(hits.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), vec![pk(1), pk(4)]);
+        assert_eq!(
+            hits.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            vec![pk(1), pk(4)]
+        );
         // score 索引 (iid 1) 只剩 9 条 (id7 NULL 不入索引)
         let all_scores = e
             .index_scan_keys_local("db1", "t1", 1, None, None, 0)
@@ -177,7 +211,10 @@ fn index_range_scan_and_limit() {
             .index_scan_local("db1", "t1", 1, None, Some(&ColValue::F64(-8.0)), 0)
             .await
             .unwrap();
-        assert_eq!(hits.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), vec![pk(0), pk(1), pk(2)]);
+        assert_eq!(
+            hits.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            vec![pk(0), pk(1), pk(2)]
+        );
     });
 }
 
@@ -244,12 +281,20 @@ fn row_table_type_isolation() {
             .await;
         assert!(err.is_err(), "row 表 HSET 应 WRONGTYPE");
         // 纯 KV 写过的 key 上 row_put → WRONGTYPE (非 TAG_ROW 旧值)
-        e.table_put("db1", "t1", b"\x00rawkey", &[0x01, b'v']).await.unwrap();
-        let err = e.row_put("db1", "t1", b"\x00rawkey", &vals(1, "n", None)).await;
+        e.table_put("db1", "t1", b"\x00rawkey", &[0x01, b'v'])
+            .await
+            .unwrap();
+        let err = e
+            .row_put("db1", "t1", b"\x00rawkey", &vals(1, "n", None))
+            .await;
         assert!(err.is_err(), "非 TAG_ROW 旧值上 row_put 应报错");
         // 无 schema 表上 row op → Schema 错误
         e.create_table("db1", "kv").await.unwrap();
-        assert!(e.row_put("db1", "kv", &pk(1), &vals(1, "n", None)).await.is_err());
+        assert!(
+            e.row_put("db1", "kv", &pk(1), &vals(1, "n", None))
+                .await
+                .is_err()
+        );
     });
 }
 
@@ -262,9 +307,14 @@ fn rows_and_indexes_survive_reopen() {
             setup(&mut e).await;
             for i in 0..300i64 {
                 // 300 行跨 leaf (索引行 + row 行 + [$] 行混居一棵树)
-                e.row_put("db1", "t1", &pk(i), &vals(i, &format!("u{}", i % 5), Some(i as f64)))
-                    .await
-                    .unwrap();
+                e.row_put(
+                    "db1",
+                    "t1",
+                    &pk(i),
+                    &vals(i, &format!("u{}", i % 5), Some(i as f64)),
+                )
+                .await
+                .unwrap();
             }
             e.flush().await.unwrap();
             e.close().await.unwrap();
@@ -294,16 +344,21 @@ fn rows_and_indexes_survive_reopen() {
 /// ⭐ Q6: crash 模拟 — flush 后不 close 直接 drop (无 close 簿记),
 /// reopen 走 recover 扫 .block 重建; index_scan 与全表逐 pk 点查一致.
 #[test]
-fn crash_reopen_index_consistent_with_rows()  {
+fn crash_reopen_index_consistent_with_rows() {
     run_async(async move {
         let tmp = tempfile::tempdir().unwrap();
         {
             let mut e = StorageEngine::open(opts_for(&tmp)).await.unwrap();
             setup(&mut e).await;
             for i in 0..50i64 {
-                e.row_put("db1", "t1", &pk(i), &vals(i, &format!("u{}", i % 4), Some(i as f64)))
-                    .await
-                    .unwrap();
+                e.row_put(
+                    "db1",
+                    "t1",
+                    &pk(i),
+                    &vals(i, &format!("u{}", i % 4), Some(i as f64)),
+                )
+                .await
+                .unwrap();
             }
             e.flush().await.unwrap();
             // 不 close: 模拟进程被杀 (drop 不做 close 簿记)
@@ -335,7 +390,11 @@ fn crash_reopen_index_consistent_with_rows()  {
             .index_scan_local("db1", "t1", 0, Some(&eq), Some(&eq), 0)
             .await
             .unwrap();
-        assert_eq!(hits.len(), 12, "u2: id 2,6,...,46 共 12 条 (0..50 步长 4 偏移 2)");
+        assert_eq!(
+            hits.len(),
+            12,
+            "u2: id 2,6,...,46 共 12 条 (0..50 步长 4 偏移 2)"
+        );
     });
 }
 
@@ -349,9 +408,14 @@ fn bloom_prunes_equality_miss_without_false_negative() {
             let mut e = StorageEngine::open(opts_for(&tmp)).await.unwrap();
             setup(&mut e).await;
             for i in 0..30i64 {
-                e.row_put("db1", "t1", &pk(i), &vals(i, &format!("u{}", i % 4), Some(i as f64)))
-                    .await
-                    .unwrap();
+                e.row_put(
+                    "db1",
+                    "t1",
+                    &pk(i),
+                    &vals(i, &format!("u{}", i % 4), Some(i as f64)),
+                )
+                .await
+                .unwrap();
             }
             // 命中: 全部已插入值可查 (无假阴性), skip 不增长
             let base_skip = e.bloom_skip_count;
@@ -426,30 +490,54 @@ fn unique_index_rejects_duplicates() {
         // email (col 1) 唯一索引
         let schema = TableSchema::new(
             vec![
-                Column { name: "id".into(), ty: ColType::I64, nullable: false, default: None },
-                Column { name: "email".into(), ty: ColType::Str, nullable: false, default: None },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "email".into(),
+                    ty: ColType::Str,
+                    nullable: false,
+                    default: None,
+                },
             ],
             0,
             &[],
-            &[1], &[], &[], &[])
+            &[1],
+            &[],
+            &[],
+            &[],
+        )
         .unwrap();
         e.set_schema("db1", "t1", &schema).await.unwrap();
-        let row = |id: i64, em: &str| {
-            vec![ColValue::I64(id), ColValue::Bytes(em.as_bytes().to_vec())]
-        };
-        e.row_put("db1", "t1", &pk(1), &row(1, "a@x")).await.unwrap();
-        e.row_put("db1", "t1", &pk(2), &row(2, "b@x")).await.unwrap();
+        let row =
+            |id: i64, em: &str| vec![ColValue::I64(id), ColValue::Bytes(em.as_bytes().to_vec())];
+        e.row_put("db1", "t1", &pk(1), &row(1, "a@x"))
+            .await
+            .unwrap();
+        e.row_put("db1", "t1", &pk(2), &row(2, "b@x"))
+            .await
+            .unwrap();
         // 不同 pk 撞已有值 → 拒绝
         let err = e.row_put("db1", "t1", &pk(3), &row(3, "a@x")).await;
         assert!(
-            err.as_ref().is_err_and(|e| e.to_string().contains("duplicate key")),
+            err.as_ref()
+                .is_err_and(|e| e.to_string().contains("duplicate key")),
             "重复 unique 值必须拒绝: {err:?}"
         );
         // 同 pk 同值覆盖 → 不误报
-        e.row_put("db1", "t1", &pk(1), &row(1, "a@x")).await.unwrap();
+        e.row_put("db1", "t1", &pk(1), &row(1, "a@x"))
+            .await
+            .unwrap();
         // 同 pk 换成空闲值 → ok; 旧值让位后他行可用
-        e.row_put("db1", "t1", &pk(1), &row(1, "c@x")).await.unwrap();
-        e.row_put("db1", "t1", &pk(3), &row(3, "a@x")).await.unwrap();
+        e.row_put("db1", "t1", &pk(1), &row(1, "c@x"))
+            .await
+            .unwrap();
+        e.row_put("db1", "t1", &pk(3), &row(3, "a@x"))
+            .await
+            .unwrap();
         // 换成已占值 → 拒绝
         let err = e.row_put("db1", "t1", &pk(2), &row(2, "c@x")).await;
         assert!(err.is_err(), "换值撞库应拒绝");

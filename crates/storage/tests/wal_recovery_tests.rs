@@ -39,7 +39,9 @@ fn wal_replay_after_crash() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     run_async(async move {
-        let mut e = StorageEngine::open(opts(&root, WalMode::Periodic)).await.unwrap();
+        let mut e = StorageEngine::open(opts(&root, WalMode::Periodic))
+            .await
+            .unwrap();
         e.create_db("default").await.unwrap();
         e.create_table("default", "t").await.unwrap();
         // 生产路径 DDL 后强制 flush (manager 层行为) — 这里对齐语义
@@ -47,7 +49,9 @@ fn wal_replay_after_crash() {
         for i in 0..50u32 {
             let k = format!("key-{i}");
             let v = format!("val-{i}");
-            e.table_put("default", "t", k.as_bytes(), v.as_bytes()).await.unwrap();
+            e.table_put("default", "t", k.as_bytes(), v.as_bytes())
+                .await
+                .unwrap();
         }
         // 建表元数据先持久化 (WAL 只覆盖 KV; 生产路径 DDL 后强制 flush 同语义)
         // 注: flush 放在写之后 — 同时验证"已刷数据 + WAL 增量"并存恢复
@@ -55,7 +59,9 @@ fn wal_replay_after_crash() {
         simulate_crash(e);
 
         // 重开: recover 只有空表 (chunk 未刷), WAL 重放补回 50 条
-        let mut e2 = StorageEngine::open(opts(&root, WalMode::Periodic)).await.unwrap();
+        let mut e2 = StorageEngine::open(opts(&root, WalMode::Periodic))
+            .await
+            .unwrap();
         for i in 0..50u32 {
             let k = format!("key-{i}");
             let got = e2.table_get("default", "t", k.as_bytes()).await.unwrap();
@@ -67,7 +73,9 @@ fn wal_replay_after_crash() {
         }
         // 重放后段已清空: 再次重开无重复重放 (幂等性由此隐式验证)
         e2.close().await.unwrap();
-        let e3 = StorageEngine::open(opts(&root, WalMode::Periodic)).await.unwrap();
+        let e3 = StorageEngine::open(opts(&root, WalMode::Periodic))
+            .await
+            .unwrap();
         drop(e3);
     });
 }
@@ -78,19 +86,30 @@ fn wal_replay_mixed_flushed_and_tail() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     run_async(async move {
-        let mut e = StorageEngine::open(opts(&root, WalMode::Periodic)).await.unwrap();
+        let mut e = StorageEngine::open(opts(&root, WalMode::Periodic))
+            .await
+            .unwrap();
         e.create_db("default").await.unwrap();
         e.create_table("default", "t").await.unwrap();
-        e.table_put("default", "t", b"old", b"flushed").await.unwrap();
+        e.table_put("default", "t", b"old", b"flushed")
+            .await
+            .unwrap();
         e.flush().await.unwrap(); // chunk+meta 持久化
-        e.table_put("default", "t", b"new", b"wal-only").await.unwrap();
+        e.table_put("default", "t", b"new", b"wal-only")
+            .await
+            .unwrap();
         e.table_delete("default", "t", b"old").await.unwrap(); // delete 也进 WAL
         e.wal_barrier().await.unwrap();
         simulate_crash(e);
 
-        let mut e2 = StorageEngine::open(opts(&root, WalMode::Periodic)).await.unwrap();
+        let mut e2 = StorageEngine::open(opts(&root, WalMode::Periodic))
+            .await
+            .unwrap();
         assert_eq!(
-            e2.table_get("default", "t", b"new").await.unwrap().as_deref(),
+            e2.table_get("default", "t", b"new")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(b"wal-only".as_ref()),
             "WAL 尾部增量恢复"
         );
@@ -110,14 +129,18 @@ fn wal_stale_records_after_drop_table() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     run_async(async move {
-        let mut e = StorageEngine::open(opts(&root, WalMode::Periodic)).await.unwrap();
+        let mut e = StorageEngine::open(opts(&root, WalMode::Periodic))
+            .await
+            .unwrap();
         e.create_db("default").await.unwrap();
         e.create_table("default", "t").await.unwrap();
         e.table_put("default", "t", b"k", b"v").await.unwrap();
         e.wal_barrier().await.unwrap();
         e.drop_table("default", "t").await.unwrap();
         simulate_crash(e);
-        let mut e2 = StorageEngine::open(opts(&root, WalMode::Periodic)).await.unwrap();
+        let mut e2 = StorageEngine::open(opts(&root, WalMode::Periodic))
+            .await
+            .unwrap();
         // 重放正常完成即通过 (表可能被重建 — drop 未持久化时属正确恢复)
         let _ = e2.table_get("default", "t", b"k").await;
     });
@@ -128,7 +151,9 @@ fn wal_off_no_files() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     run_async(async move {
-        let mut e = StorageEngine::open(opts(&root, WalMode::Off)).await.unwrap();
+        let mut e = StorageEngine::open(opts(&root, WalMode::Off))
+            .await
+            .unwrap();
         e.create_db("default").await.unwrap();
         e.create_table("default", "t").await.unwrap();
         e.table_put("default", "t", b"k", b"v").await.unwrap();
@@ -146,7 +171,9 @@ fn wal_clean_close_leaves_no_segments() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     run_async(async move {
-        let mut e = StorageEngine::open(opts(&root, WalMode::Strict)).await.unwrap();
+        let mut e = StorageEngine::open(opts(&root, WalMode::Strict))
+            .await
+            .unwrap();
         e.create_db("default").await.unwrap();
         e.create_table("default", "t").await.unwrap();
         e.table_put("default", "t", b"k", b"v").await.unwrap();
@@ -157,4 +184,29 @@ fn wal_clean_close_leaves_no_segments() {
         storage::wal::WalWriter::existing_segments(tmp.path(), 0).is_empty(),
         "正常关闭后段应全部清除"
     );
+}
+
+/// ⭐ 审计 P3 (2026-10-17): WAL 记录编码对超长 db/table 名必须显式报错 —
+/// 旧实现 `db.len() as u16` 静默截断 (重放时写错表).
+#[test]
+fn wal_append_rejects_overlong_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut w =
+        storage::wal::WalWriter::open(tmp.path(), 0, WalMode::Periodic, false).expect("open wal");
+    let long = "x".repeat(u16::MAX as usize + 1);
+
+    // 超长 db 名 → 显式 Err (旧实现静默截断)
+    assert!(
+        w.append_put(&long, "t", b"k", b"v").is_err(),
+        "超长 db 名必须报错"
+    );
+    // 超长 table 名 → 显式 Err
+    assert!(
+        w.append_put("db", &long, b"k", b"v").is_err(),
+        "超长 table 名必须报错"
+    );
+    assert!(w.append_del(&long, "t", b"k").is_err(), "delete 同律");
+    // 正常名字不受影响
+    assert!(w.append_put("db", "t", b"k", b"v").is_ok());
+    assert!(w.append_del("db", "t", b"k").is_ok());
 }

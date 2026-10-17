@@ -10,21 +10,24 @@ use std::io::Write;
 use crate::cli::Globals;
 use crate::dir;
 use crate::error::Result;
-use crate::output::{ColumnName, HumanRow, JsonObject, format_vpid, human_header, human_row, json_row};
+use crate::output::{
+    format_vpid, human_header, human_row, json_row, ColumnName, HumanRow, JsonObject,
+};
 use crate::pid::Locate;
-use crate::tree::{self, TreeNode, WalkSummary, bad_kind_name};
+use crate::tree::{self, bad_kind_name, TreeNode, WalkSummary};
 
 pub fn run<W: Write>(globals: &Globals, tree_root: u64, mut out: W) -> Result<u8> {
     let layout = dir::inspect(&globals.dir)?;
-    let shard = layout
-        .shards
-        .first()
-        .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
-            path: globals.dir.clone(),
-        })?;
+    let shard =
+        layout
+            .shards
+            .first()
+            .ok_or_else(|| crate::error::ScannerError::EmptyDirectory {
+                path: globals.dir.clone(),
+            })?;
     let locate = Locate::open_with_override(shard, globals.block_file_id_override)?;
 
-    match globals.output_mode() {
+    let summary = match globals.output_mode() {
         crate::output::OutputMode::Human => {
             let columns: &[ColumnName] = &[
                 "vpid",
@@ -36,20 +39,25 @@ pub fn run<W: Write>(globals: &Globals, tree_root: u64, mut out: W) -> Result<u8
                 "detail",
             ];
             human_header(&mut out, columns)?;
-            let summary = tree::walk_tree(shard, &locate, tree_root, |node| {
+            let summary = tree::walk_tree(shard, &locate, tree_root, globals.is_strict(), |node| {
                 emit_human_row(&mut out, globals, node);
             });
             emit_summary_human(&mut out, &summary);
             summary
         }
         crate::output::OutputMode::Json => {
-            let summary = tree::walk_tree(shard, &locate, tree_root, |node| {
+            let summary = tree::walk_tree(shard, &locate, tree_root, globals.is_strict(), |node| {
                 emit_json_row(&mut out, globals, node);
             });
             emit_summary_json(&mut out, &summary);
             summary
         }
     };
+
+    // ⭐ 审计 P2 (2026-10-17): strict 模式撞到坏页 → 非零退出 (CI 语义)
+    if let Some(hit) = &summary.strict_hit {
+        return Err(crate::error::ScannerError::BadPage(hit.clone()));
+    }
 
     Ok(0)
 }
@@ -106,12 +114,7 @@ fn emit_summary_human<W: Write>(out: &mut W, summary: &WalkSummary) {
     let _ = writeln!(
         out,
         "verify summary: visited={} ok={} bad={} unread={} max_depth={} cycle={}",
-        summary.visited,
-        summary.ok,
-        summary.bad,
-        summary.unread,
-        summary.max_depth,
-        summary.cycle,
+        summary.visited, summary.ok, summary.bad, summary.unread, summary.max_depth, summary.cycle,
     );
 }
 

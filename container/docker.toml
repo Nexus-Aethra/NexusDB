@@ -3,6 +3,8 @@
 
 [server]
 # 监听 0.0.0.0 以便容器外访问 (端口映射见 docker run -p)
+# ⚠️ 安全: 下面密码为空时, 服务启动会打印 SECURITY 告警 (对外免鉴权).
+#    生产部署务必挂载自己的配置并设 sql_password / redis_password / http_token.
 listen_addr = "0.0.0.0:5433"     # Binary 内部协议 (压测/工具)
 redis_addr  = "0.0.0.0:6379"     # RESP (Redis 兼容); 空 = 禁用
 sql_addr    = "0.0.0.0:5434"     # MySQL wire

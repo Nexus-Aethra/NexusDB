@@ -30,7 +30,9 @@ impl Default for IndexBloom {
 
 impl IndexBloom {
     pub fn new() -> Self {
-        Self { bits: (0..BLOOM_WORDS).map(|_| AtomicU64::new(0)).collect() }
+        Self {
+            bits: (0..BLOOM_WORDS).map(|_| AtomicU64::new(0)).collect(),
+        }
     }
 
     /// FNV-1a 双哈希: h1 正向, h2 反向字节流 (独立性足够, k=2).
@@ -43,7 +45,9 @@ impl IndexBloom {
         }
         let mut h2 = OFFSET;
         for &b in val.iter().rev() {
-            h2 = (h2 ^ b as u64).wrapping_mul(PRIME).wrapping_add(0x9e37_79b9);
+            h2 = (h2 ^ b as u64)
+                .wrapping_mul(PRIME)
+                .wrapping_add(0x9e37_79b9);
         }
         (h1 as usize % BLOOM_BITS, h2 as usize % BLOOM_BITS)
     }
@@ -72,7 +76,9 @@ mod tests {
         let mut vals = Vec::new();
         let mut x: u64 = 0x1234_5678_9abc_def0;
         for i in 0..5000u32 {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let mut v = x.to_be_bytes().to_vec();
             v.extend_from_slice(&i.to_le_bytes());
             b.insert(&v);

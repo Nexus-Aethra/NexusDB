@@ -20,11 +20,21 @@ pub fn encode_varint(buf: &mut [u8], value: u32) -> usize {
 }
 
 /// 从 varint 解码 u32, 返回 (value, 读取字节数).
+///
+/// ⭐ 审计 P3 (2026-10-17): 第 5 字节只容纳 4 个数据位 (前 4 字节已用 28 位).
+/// 旧实现无条件 `(b & 0x7F) << 28`: 非规范编码 (第 5 字节高位非零, 即值超出
+/// u32) 在 debug 下移位溢出 panic, release 下**静默截断**成错误的值. 现在
+/// 显式拒绝 → `None` (调用方按损坏数据处理).
 pub fn decode_varint(buf: &[u8]) -> Option<(u32, usize)> {
     let mut v: u32 = 0;
     let mut shift = 0u32;
     for (i, &b) in buf.iter().enumerate().take(VARINT_MAX_BYTES) {
-        v |= ((b & 0x7F) as u32) << shift;
+        let payload = b & 0x7F;
+        if i == VARINT_MAX_BYTES - 1 && payload & 0x70 != 0 {
+            // 第 5 字节高位非零 = 值超过 u32 可表示范围 (非规范编码)
+            return None;
+        }
+        v |= (payload as u32) << shift;
         if b & 0x80 == 0 {
             return Some((v, i + 1));
         }
@@ -51,6 +61,27 @@ pub fn varint_len(value: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ 审计 P3: 第 5 字节非规范编码必须报错, 不得静默截断.
+    #[test]
+    fn non_canonical_fifth_byte_rejected() {
+        // 5 字节且第 5 字节高位非零 (bit4..6) → 超出 u32, 必须 None
+        for &last in &[0x10u8, 0x20, 0x40, 0x70, 0x7F] {
+            let buf = [0x80u8, 0x80, 0x80, 0x80, last];
+            assert!(
+                decode_varint(&buf).is_none(),
+                "第 5 字节 {last:#x} 必须被拒绝"
+            );
+        }
+        // 第 5 字节只有低 4 位 → 合法 (28 位值)
+        let buf = [0x80u8, 0x80, 0x80, 0x80, 0x0F];
+        let (v, n) = decode_varint(&buf).expect("合法 5 字节");
+        assert_eq!(n, 5);
+        assert_eq!(v, 0x0F << 28);
+        // 6 字节 (第 5 字节仍带 continuation) → None
+        let buf = [0x80u8, 0x80, 0x80, 0x80, 0x8F];
+        assert!(decode_varint(&buf).is_none(), "超过 5 字节必须拒绝");
+    }
 
     #[test]
     fn round_trip_small() {

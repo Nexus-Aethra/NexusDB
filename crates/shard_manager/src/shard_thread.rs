@@ -28,56 +28,6 @@ struct PutReply {
     group: u32,
 }
 
-#[cfg(test)]
-mod adaptive_window_tests {
-    use super::AdaptiveTaskWindow;
-
-    fn window(current: usize) -> AdaptiveTaskWindow {
-        AdaptiveTaskWindow {
-            current,
-            calm_rounds: 0,
-            target_round_ns: AdaptiveTaskWindow::TARGET_FOREGROUND_ROUND_NS,
-            enabled: true,
-        }
-    }
-
-    #[test]
-    fn full_round_with_backlog_multiplicatively_reduces_window() {
-        let mut w = window(128);
-        assert!(w.observe(128, true, 1));
-        assert_eq!(w.limit(), 96);
-        assert_eq!(w.busy_drive_budget(), 24);
-    }
-
-    #[test]
-    fn calm_rounds_additively_recover_window() {
-        let mut w = window(64);
-        for _ in 0..7 {
-            assert!(!w.observe(8, false, 1));
-        }
-        assert!(w.observe(8, false, 1));
-        assert_eq!(w.limit(), 80);
-    }
-
-    #[test]
-    fn window_obeys_bounds_and_disable_switch() {
-        let mut w = window(AdaptiveTaskWindow::MIN);
-        assert!(!w.observe(AdaptiveTaskWindow::MIN, true, 1));
-        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
-
-        w.enabled = false;
-        assert!(!w.observe(usize::MAX, true, 1));
-        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
-    }
-
-    #[test]
-    fn slow_round_reduces_window_without_residual_backlog() {
-        let mut w = window(128);
-        assert!(w.observe(8, false, w.target_round_ns));
-        assert_eq!(w.limit(), 96);
-    }
-}
-
 /// Per-shard adaptive foreground quantum.  This is deliberately an AIMD
 /// controller rather than a global queue: a hot shard should yield sooner
 /// without reducing service capacity of unrelated shards.
@@ -443,6 +393,16 @@ pub(crate) fn drain_async_flush(
     rt: &scheduler::SchedHandle,
     flush_done: &FlushDoneSlot,
 ) {
+    // ⭐ 2026-10-17 (审计新 P1-14): **有界** drain.
+    // 旧实现无限循环: IO 持续故障时 backlog 永远排不空 (完成事件永不到达,
+    // 重试无上限无退避) — shard 线程卡死在此, 整个 shard 数据面停摆.
+    // 现在: 轮次/总时限双上限, 超限记 error 并返回 (backlog 留给下一轮
+    // drain, 事件循环继续服务该 shard; Flush handler 后续的同步 flush 仍
+    // 保证 durability).
+    const MAX_ROUNDS: u32 = 1024;
+    const MAX_TOTAL: std::time::Duration = std::time::Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    let mut rounds = 0u32;
     loop {
         drive_async_flush(engine, rt, flush_done, 256, usize::MAX, true);
         let drained = {
@@ -454,6 +414,16 @@ pub(crate) fn drain_async_flush(
             }
         };
         if drained && flush_done.borrow().is_empty() {
+            break;
+        }
+        rounds += 1;
+        if rounds >= MAX_ROUNDS || start.elapsed() >= MAX_TOTAL {
+            nlog::error!(
+                "shard",
+                "async flush backlog not draining after {} rounds / {:?} —                  leaving backlog for next cycle (possible persistent IO failure)",
+                rounds,
+                start.elapsed()
+            );
             break;
         }
         rt.clone().drive_until_idle(1000);
@@ -547,7 +517,10 @@ pub(crate) fn shard_thread_main(
     // later requests wait behind an unbounded drain.
     let mut task_window = AdaptiveTaskWindow::from_env();
     let turn_budget = ForegroundTurnBudget::from_env();
-    let mut deferred_tasks: VecDeque<crate::request::ShardTask> = VecDeque::new();
+    // ⭐ 审计 P2 (2026-10-17): 跨 inbox 定序 — deferred 容器也带入队序号.
+    let mut deferred_tasks: VecDeque<(u64, crate::request::ShardTask)> = VecDeque::new();
+    // 本轮先处理 tasks 时被延后的 requests (序号保证它们仍是全局最老的一批).
+    let mut deferred_requests: VecDeque<(u64, crate::request::ShardRequest)> = VecDeque::new();
     const FOREGROUND_DATA_ADMISSION: usize = 2;
     nlog::info!(
         "shard",
@@ -562,7 +535,7 @@ pub(crate) fn shard_thread_main(
         // spin poll 两个 inbox, 任一有数据就退出 spin
         let mut spins = 0u32;
         let (batch, tasks) = loop {
-            let b = inbox.drain();
+            let mut b = inbox.drain();
             let t = if deferred_tasks.is_empty() {
                 task_inbox.drain_up_to(task_window.limit())
             } else {
@@ -570,7 +543,18 @@ pub(crate) fn shard_thread_main(
                     .drain(..deferred_tasks.len().min(task_window.limit()))
                     .collect()
             };
-            if !b.is_empty() || !t.is_empty() {
+            // ⭐ 审计 P2 (2026-10-17): 跨 inbox 全序 — 两个 inbox 各是一个独立
+            // ring, 单看各自都是 FIFO, 但跨 ring 无顺序保证. 入队时打了全局单调
+            // 序号 (ENQ_SEQ), 这里按序号决定本轮处理顺序: 最老的 task 早于最老的
+            // request 时, requests 延到下一轮 (它们仍是全局最老, 下轮必先处理),
+            // 从而保证"同一来源跨 inbox 的消息按发送顺序执行".
+            let tasks_first =
+                crate::inbox::tasks_first(t.first().map(|(s, _)| *s), b.first().map(|(s, _)| *s));
+            if tasks_first {
+                deferred_requests.extend(b.drain(..));
+                b.clear();
+            }
+            if !b.is_empty() || !t.is_empty() || !deferred_requests.is_empty() {
                 break (b, t);
             }
             spins += 1;
@@ -616,7 +600,7 @@ pub(crate) fn shard_thread_main(
                 }
                 #[cfg(not(target_os = "linux"))]
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                let b = inbox.drain();
+                let mut b = inbox.drain();
                 let t = if deferred_tasks.is_empty() {
                     task_inbox.drain_up_to(task_window.limit())
                 } else {
@@ -624,7 +608,16 @@ pub(crate) fn shard_thread_main(
                         .drain(..deferred_tasks.len().min(task_window.limit()))
                         .collect()
                 };
-                if !b.is_empty() || !t.is_empty() {
+                // 同上的跨 inbox 定序 (慢路径)
+                let tasks_first = crate::inbox::tasks_first(
+                    t.first().map(|(s, _)| *s),
+                    b.first().map(|(s, _)| *s),
+                );
+                if tasks_first {
+                    deferred_requests.extend(b.drain(..));
+                    b.clear();
+                }
+                if !b.is_empty() || !t.is_empty() || !deferred_requests.is_empty() {
                     break (b, t);
                 }
                 // timeout 醒来无数据: 驱动异步落盘 + 周期刷盘后继续睡
@@ -647,7 +640,10 @@ pub(crate) fn shard_thread_main(
         rt.clone().drive_until_idle(0);
 
         let mut should_shutdown = false;
-        for req in batch {
+        // deferred requests 序号最老 → 排在本轮新 drain 的请求之前 (保持全序)
+        let batch: Vec<(u64, crate::request::ShardRequest)> =
+            deferred_requests.drain(..).chain(batch).collect();
+        for (_req_seq, req) in batch {
             match req {
                 ShardRequest::Shutdown { reply } => {
                     let _ = reply.send(Ok(ShardReply::ShutdownOk));
@@ -721,9 +717,16 @@ pub(crate) fn shard_thread_main(
                                     prefix,
                                     limit,
                                     with_values,
-                                } => {
-                                    exec_scan_keys(e, &db, &table, &start, &end, &prefix, limit, with_values)
-                                }
+                                } => exec_scan_keys(
+                                    e,
+                                    &db,
+                                    &table,
+                                    &start,
+                                    &end,
+                                    &prefix,
+                                    limit,
+                                    with_values,
+                                ),
                                 // ⭐ F65: 占坑 op (管理面兼容; 热路径走 ShardTask → exec_task_op)
                                 op @ (BatchOp::ReserveUnique { .. }
                                 | BatchOp::StealUnique { .. }
@@ -1389,19 +1392,28 @@ pub(crate) fn shard_thread_main(
                             results.push(r);
                         }
                         // ⭐ WAL (F60) strict: 回复前持久化屏障 (一个 Batch 多 op
-                        // 天然共享一次 fsync); reply 到达 ⇒ 已落盘
+                        // 天然共享一次 fsync); reply 到达 ⇒ 已落盘.
+                        // ⭐ 2026-10-17 (审计 P2): barrier 失败必须让客户端看到
+                        // 错误 — 旧实现只记日志后仍发成功回复, 客户端以为写已
+                        // 持久化, 违背 strict (crash 零丢失) 语义.
+                        let mut wal_err: Option<String> = None;
                         if e.wal_mode() == storage::wal::WalMode::Strict
                             && e.wal_needs_sync()
                             && let Err(err) = block_on_io(e.wal_barrier())
                         {
                             nlog::error!("shard", "WAL barrier failed: {err}");
+                            wal_err = Some(format!("WAL persist failed: {err}"));
                         }
-                        let _ = reply.send(Ok(ShardReply::BatchResults(results)));
+                        let reply_msg = match wal_err {
+                            Some(msg) => Err(crate::request::ShardErrorKind::StorageError(msg)),
+                            None => Ok(ShardReply::BatchResults(results)),
+                        };
+                        let _ = reply.send(reply_msg.clone());
                         // reply_bus 支持
                         if req_id > 0 {
                             let sink_opt = reply_sink.lock().expect("reply_sink lock").clone();
                             if let Some(sink) = sink_opt {
-                                sink.push_reply(req_id, shard_id as u32, Ok(ShardReply::PutOk));
+                                sink.push_reply(req_id, shard_id as u32, reply_msg);
                             }
                         }
                     } else {
@@ -1441,7 +1453,7 @@ pub(crate) fn shard_thread_main(
                         deferred_tasks.append(&mut pending_tasks);
                         break;
                     }
-                    let task = pending_tasks.pop_front().expect("checked non-empty");
+                    let (_task_seq, task) = pending_tasks.pop_front().expect("checked non-empty");
                     served_task_count += 1;
                     let task_start = (crate::PROBE.is_enabled() || turn_budget.enabled())
                         .then(std::time::Instant::now);
@@ -1474,15 +1486,18 @@ pub(crate) fn shard_thread_main(
                         while pairs.len() < PUT_RUN_MAX {
                             let same_table = matches!(
                                 pending_tasks.front(),
-                                Some(crate::request::ShardTask {
-                                    op: crate::request::BatchOp::Put { db: next_db, table: next_table, .. },
-                                    ..
-                                }) if next_db == &db && next_table == &table
+                                Some((
+                                    _,
+                                    crate::request::ShardTask {
+                                        op: crate::request::BatchOp::Put { db: next_db, table: next_table, .. },
+                                        ..
+                                    }
+                                )) if next_db == &db && next_table == &table
                             );
                             if !same_table {
                                 break;
                             }
-                            let next = pending_tasks.pop_front().expect("front checked above");
+                            let (_, next) = pending_tasks.pop_front().expect("front checked above");
                             let crate::request::ShardTask {
                                 conn_id,
                                 req_id,
@@ -1665,10 +1680,19 @@ pub(crate) fn shard_thread_main(
                     }
                 }
                 if !held.is_empty() {
-                    if let Err(err) = block_on_io(e.wal_barrier()) {
-                        nlog::error!("shard", "WAL group-commit barrier failed: {err}");
-                    }
-                    for (wid, tr) in held {
+                    // ⭐ 2026-10-17 (审计 P2): barrier 失败 → held 回复改发错误,
+                    // 不得把未持久化的写当成功回复 (strict 语义).
+                    let wal_err = match block_on_io(e.wal_barrier()) {
+                        Ok(()) => None,
+                        Err(err) => {
+                            nlog::error!("shard", "WAL group-commit barrier failed: {err}");
+                            Some(format!("WAL persist failed: {err}"))
+                        }
+                    };
+                    for (wid, mut tr) in held {
+                        if let Some(msg) = &wal_err {
+                            tr.result = crate::request::BatchResult::Error(msg.clone());
+                        }
                         reply_bus_set.get(wid).push(tr);
                     }
                 }
@@ -1816,14 +1840,21 @@ pub(crate) fn handle_request_blocking(
             ..
         } => {
             let r = block_on_io(e.table_put(&db, &table, &key, &val));
-            // ⭐ WAL (F60) strict: 同步慢路径也保证回复前持久化
-            if e.wal_mode() == storage::wal::WalMode::Strict && e.wal_needs_sync() {
-                let _ = block_on_io(e.wal_barrier());
+            // ⭐ WAL (F60) strict: 同步慢路径也保证回复前持久化;
+            // ⭐ 2026-10-17 (审计 P2): barrier 失败同样要回错误 (旧实现 `let _ =` 吞掉).
+            let mut wal_err: Option<String> = None;
+            if e.wal_mode() == storage::wal::WalMode::Strict
+                && e.wal_needs_sync()
+                && let Err(err) = block_on_io(e.wal_barrier())
+            {
+                nlog::error!("shard", "WAL barrier failed: {err}");
+                wal_err = Some(format!("WAL persist failed: {err}"));
             }
             send_reply(
-                match r {
-                    Ok(_) => Ok(ShardReply::PutOk),
-                    Err(err) => Err(ShardErrorKind::from_storage_display(&err)),
+                match (r, wal_err) {
+                    (_, Some(msg)) => Err(ShardErrorKind::StorageError(msg)),
+                    (Ok(_), None) => Ok(ShardReply::PutOk),
+                    (Err(err), None) => Err(ShardErrorKind::from_storage_display(&err)),
                 },
                 req_id,
             );
@@ -1852,13 +1883,20 @@ pub(crate) fn handle_request_blocking(
             ..
         } => {
             let r = block_on_io(e.table_delete(&db, &table, &key));
-            if e.wal_mode() == storage::wal::WalMode::Strict && e.wal_needs_sync() {
-                let _ = block_on_io(e.wal_barrier());
+            // ⭐ 2026-10-17 (审计 P2): barrier 失败回错误 (同 Put 路径).
+            let mut wal_err: Option<String> = None;
+            if e.wal_mode() == storage::wal::WalMode::Strict
+                && e.wal_needs_sync()
+                && let Err(err) = block_on_io(e.wal_barrier())
+            {
+                nlog::error!("shard", "WAL barrier failed: {err}");
+                wal_err = Some(format!("WAL persist failed: {err}"));
             }
             send_reply(
-                match r {
-                    Ok(b) => Ok(ShardReply::DeleteExisted(b)),
-                    Err(err) => Err(ShardErrorKind::from_storage_display(&err)),
+                match (r, wal_err) {
+                    (_, Some(msg)) => Err(ShardErrorKind::StorageError(msg)),
+                    (Ok(b), None) => Ok(ShardReply::DeleteExisted(b)),
+                    (Err(err), None) => Err(ShardErrorKind::from_storage_display(&err)),
                 },
                 req_id,
             );
@@ -1953,5 +1991,55 @@ pub(crate) fn handle_request_blocking(
                 "batch should be handled in main loop".into(),
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod adaptive_window_tests {
+    use super::AdaptiveTaskWindow;
+
+    fn window(current: usize) -> AdaptiveTaskWindow {
+        AdaptiveTaskWindow {
+            current,
+            calm_rounds: 0,
+            target_round_ns: AdaptiveTaskWindow::TARGET_FOREGROUND_ROUND_NS,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn full_round_with_backlog_multiplicatively_reduces_window() {
+        let mut w = window(128);
+        assert!(w.observe(128, true, 1));
+        assert_eq!(w.limit(), 96);
+        assert_eq!(w.busy_drive_budget(), 24);
+    }
+
+    #[test]
+    fn calm_rounds_additively_recover_window() {
+        let mut w = window(64);
+        for _ in 0..7 {
+            assert!(!w.observe(8, false, 1));
+        }
+        assert!(w.observe(8, false, 1));
+        assert_eq!(w.limit(), 80);
+    }
+
+    #[test]
+    fn window_obeys_bounds_and_disable_switch() {
+        let mut w = window(AdaptiveTaskWindow::MIN);
+        assert!(!w.observe(AdaptiveTaskWindow::MIN, true, 1));
+        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
+
+        w.enabled = false;
+        assert!(!w.observe(usize::MAX, true, 1));
+        assert_eq!(w.limit(), AdaptiveTaskWindow::MIN);
+    }
+
+    #[test]
+    fn slow_round_reduces_window_without_residual_backlog() {
+        let mut w = window(128);
+        assert!(w.observe(8, false, w.target_round_ns));
+        assert_eq!(w.limit(), 96);
     }
 }

@@ -789,8 +789,7 @@ pub async fn table_put_many(
             Err(_page_full) => {
                 // 退化: 提交累积 leaf 后走单 key 路径 (split 传播),
                 // root 可能变化; guide 已在 flush_cur 丢弃.
-                flush_cur(pager, &mut cur, &mut pending_free_old, &mut uncommitted_new)
-                    .await?;
+                flush_cur(pager, &mut cur, &mut pending_free_old, &mut uncommitted_new).await?;
                 // stored 若为新溢出链, 交给单 key路径? 单 key table_put 会重新
                 // write_overflow → 先回滚本次新链, 避免双写泄漏.
                 if overflow::is_indirect(stored) {

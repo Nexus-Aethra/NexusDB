@@ -7,8 +7,19 @@ use super::sql_join::*;
 use super::sql_sysquery::*;
 use super::*;
 
-// This is the protocol-to-SQL handoff; its inputs are distinct connection and routing resources.
-#[allow(clippy::too_many_arguments)]
+/// ⭐ 2026-10-17 (审计新 P1-9): 语句级 panic 隔离原语.
+///
+/// worker 是单线程事件循环: 任意一处 panic 会杀死线程, 拖死其上的**全部**
+/// 连接 (等效全服 DoS). 在语句边界捕获: panic → 回 ERR 并断连该连接
+/// (状态可能不完整, 不复用), 同 worker 的其他连接不受影响.
+///
+/// 这是防御性兜底 — sql_join.rs 等处的 unwrap 目前多被前置校验挡住, 但
+/// 任何遗漏/未来改动触发的 panic 都不再具备全局杀伤力.
+pub(crate) fn guard_stmt_panic<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)] // 既有豁免: 协议→SQL 交接需要连接/路由/分片等 distinct 资源
 pub(crate) fn sql_dispatch_stmt(
     conn: &mut ConnState,
     conn_id: u64,
@@ -21,7 +32,56 @@ pub(crate) fn sql_dispatch_stmt(
     num_shards: usize,
     stmt: SqlStmt,
 ) {
+    // ⭐ 审计新 P1-9: panic 隔离 — 见 guard_stmt_panic 文档.
+    if guard_stmt_panic(|| {
+        sql_dispatch_stmt_inner(
+            conn,
+            conn_id,
+            seq,
+            worker_id,
+            db,
+            default_db,
+            db_view,
+            shard_inboxes,
+            num_shards,
+            stmt,
+        )
+    })
+    .is_err()
+    {
+        conn.resp_complete(
+            seq,
+            sql_err_bytes(conn.proto, "internal error: statement execution failed"),
+        );
+        // 状态可能不完整 — 断连该连接, 不复用.
+        conn.close_after_flush = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // 同 sql_dispatch_stmt
+fn sql_dispatch_stmt_inner(
+    conn: &mut ConnState,
+    conn_id: u64,
+    seq: u64,
+    worker_id: u32,
+    db: &std::sync::Arc<str>,
+    default_db: &std::sync::Arc<str>,
+    db_view: &std::sync::Arc<shard_manager::DbDirView>,
+    shard_inboxes: &[SharedTaskInbox],
+    num_shards: usize,
+    mut stmt: SqlStmt,
+) {
     crate::metrics::SQL_QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // ⭐ 审计新 P0-3 (2026-10-16): 表限定名校验. 解析器保留 `db.tbl` 原样,
+    // 在此统一处理 — 同库剥离, 跨库显式报错. 修复前解析器静默剥离库名,
+    // `USE app; SELECT * FROM otherdb.users` 会按当前库解析: 读返回错误库
+    // 数据, 写污染当前库, 无日志无指标.
+    if let Err(e) = crate::worker::sql_dbqual::normalize_stmt_tables(&mut stmt, db.as_ref(), &|q| {
+        q == default_db.as_ref() || db_view.id_of(q).is_some()
+    }) {
+        conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+        return;
+    }
     // ⭐ ORM-B2: DDL epoch 检查 — DROP/重建后本 worker 陈旧 schema 缓存整体
     // 失效 (一次 relaxed load 热路径; DDL 低频, 全量清空重拉可接受)
     {
@@ -120,6 +180,21 @@ pub(crate) fn sql_dispatch_stmt(
                 // failed 事务的 COMMIT = 回滚 (PG 语义); 无事务/空事务 no-op
                 None => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0)),
                 Some(_) if failed => conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0)),
+                Some(txn) if txn.read_set_overflow => {
+                    // ⭐ 审计 P2 (2026-10-17): 读集超护栏 → 拒事务 (宁可拒也不放行
+                    // 一个验证不全的事务). 提示收窄范围 (更小的 WHERE / 更短的事务).
+                    conn.txn = None;
+                    conn.resp_complete(
+                        seq,
+                        sql_err_bytes(
+                            conn.proto,
+                            &format!(
+                                "transaction read set too large (> {TXN_MAX_READ_SET} rows); \
+                                 narrow the transaction scope"
+                            ),
+                        ),
+                    );
+                }
                 Some(txn) if txn.ops.is_empty() => {
                     // 纯读事务: 序列化点可取 BEGIN 时刻, 无需验证直接成功
                     conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
@@ -242,9 +317,18 @@ pub(crate) fn sql_dispatch_stmt(
                 sql_err_bytes(conn.proto, "DDL is not allowed inside a transaction"),
             );
         }
-        // ⭐ compat: 独立 CREATE INDEX — 表内联索引已在建表时支持, 这里 v1 吞掉返回 OK
+        // ⭐ 2026-10-17 (审计 P2): 独立 CREATE INDEX 显式报错.
+        // 旧实现吞掉返回 OK — 客户端以为索引已建, 实际查询计划毫无变化
+        // (静默降级). 表内联索引 (CREATE TABLE ... INDEX(col)) 本就支持,
+        // 这里明确指引, 绝不静默.
         SqlStmt::CreateIndex { .. } => {
-            conn.resp_complete(seq, sql_ok_bytes(conn.proto, 0));
+            conn.resp_complete(
+                seq,
+                sql_err_bytes(
+                    conn.proto,
+                    "standalone CREATE INDEX is not supported;                      declare indexes inline: CREATE TABLE t (..., INDEX(col))",
+                ),
+            );
         }
         // ⭐ compat: PG 专有 DDL 吞掉 (EXTENSION/FUNCTION/TRIGGER/SEQUENCE/DROP TRIGGER/INDEX)
         SqlStmt::DdlStub => {
@@ -289,7 +373,9 @@ pub(crate) fn sql_dispatch_stmt(
             let bin = conn.mysql_binary.remove(&seq);
             match scalar_fn_const_row(&items) {
                 Ok((cref, row)) => {
-                    conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cref, &[row]))
+                    let cols: Vec<(&str, ColType)> =
+                        cref.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+                    conn.resp_complete(seq, sql_rows_bytes(conn.proto, bin, &cols, &[row]))
                 }
                 Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
             }
@@ -302,7 +388,19 @@ pub(crate) fn sql_dispatch_stmt(
                 .map(|v| {
                     let key = v.rsplit('.').next().unwrap_or(v).to_ascii_lowercase();
                     let val = match key.as_str() {
-                        "transaction_isolation" | "tx_isolation" => "READ-COMMITTED",
+                        // ⭐ 审计 P3 (2026-10-17): 按本连接**实际**隔离级别回答.
+                        // 旧实现恒返 "READ-COMMITTED" — 客户端 (ORM/驱动) 在
+                        // SERIALIZABLE 事务里读到错误等级, 可能据此做错误的重试/
+                        // 缓存决策. 无事务时按会话默认 (RC).
+                        "transaction_isolation" | "tx_isolation" => match conn.txn.as_ref() {
+                            // 四级 SQL 隔离级别在本实现归并为两档 (见 ast::TxnIso):
+                            // RU/RR 分别归并到 RC/Serializable, 故这里按实际档位回答.
+                            Some(t) => match t.iso {
+                                sql::TxnIso::Serializable => "SERIALIZABLE",
+                                sql::TxnIso::ReadCommitted => "READ-COMMITTED",
+                            },
+                            None => "READ-COMMITTED",
+                        },
                         "version" => "8.0.0-nexusdb",
                         "version_comment" => "NexusDB",
                         "sql_mode" => "",
@@ -739,6 +837,39 @@ pub(crate) fn sql_dispatch_stmt(
     }
 }
 
+/// ⭐ 审计 P2 (2026-10-17): IN 集合元素与列类型跨型 → 显式报错.
+///
+/// 旧实现: `eval_cond_leaf` 的线性路径对每个集合元素调 `sql_cmp`, 跨型返回
+/// `None` 按 false 处理 → **静默空集**. 客户端无法区分"类型不匹配"和
+/// "确实没有匹配行" (IN 子查询折叠产物与字面量 IN 列表同一 Cond 结构,
+/// 两者都中招).
+///
+/// 修复: 计划期逐元素尝试转到列类型 (`sql_to_col`), 失败即报错 —
+/// PG 兼容语义 ("IN types ... cannot be matched"), 与 `>SUBQ_IN_MAX`
+/// 的超限报错同一层级.
+pub(crate) fn check_in_set_types(schema: &TableSchema, pred: &Pred<Cond>) -> Result<(), String> {
+    for c in pred.leaves() {
+        if c.op != CmpOp::In || c.set.is_empty() {
+            continue;
+        }
+        // 未知名由调用方的列名校验负责报错, 这里跳过
+        let Some(cidx) = schema.col_by_name(&c.col) else {
+            continue;
+        };
+        let ty = schema.columns[cidx as usize].ty;
+        for v in &c.set {
+            sql_to_col(ty, v).map_err(|e| {
+                format!(
+                    "IN types cannot be matched: column '{}' is {}, element {v:?}: {e}",
+                    c.col,
+                    coltype_sql_name(ty)
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// ⭐ F65: 提取 schema 的全局唯一列 (iid, col); 空 = 无全局唯一.
 pub(crate) fn conds_to_scan_preds(
     schema: &TableSchema,
@@ -813,6 +944,8 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
             return Err(format!("unknown column '{}'", c.col));
         }
     }
+    // ⭐ 审计 P2 (2026-10-17): IN 集合跨型 → 显式报错 (旧实现静默空集)
+    check_in_set_types(schema, pred)?;
     // ⭐ F69: 含 OR/NOT → 无单一区间, 回退全表扫 (正确性由完成点 eval_pred 兼底)
     let Some(conds) = pred.as_conjuncts() else {
         // ⭐ M2: OR → 索引并集 — 顶层 OR 的各单叶分支若均命中间一索引列的
@@ -835,6 +968,15 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                     break;
                 }
                 let col_idx = schema.col_by_name(&c.col).unwrap();
+                // ⭐ 审计 P2 (2026-10-17): DECIMAL 不走索引并集 — 与
+                // `conds_to_scan_preds` 保持一致 (那里显式跳过 Decimal):
+                // shard 端按 ordered-bytes 比较界, 与 worker 端 Decimal 定标
+                // 语义 (字面量转同 scale) 不一致, 混合 IN 界可能算出错误区间
+                // → 回退全表扫, 正确性由完成点残余过滤兜底.
+                if matches!(schema.columns[col_idx as usize].ty, ColType::Decimal { .. }) {
+                    ok = false;
+                    break;
+                }
                 // 仅支持索引列
                 let Some(ipos) = schema.indexes.iter().position(|i| i.col == col_idx) else {
                     ok = false;
@@ -1072,6 +1214,19 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
 }
 #[cfg(test)]
 mod tests {
+    /// ⭐ 审计新 P1-9: panic 隔离原语 — panic 必须被捕获为 Err (而非杀死
+    /// worker 线程), 正常路径不受影响.
+    #[test]
+    fn guard_stmt_panic_isolates_panic() {
+        // 正常路径
+        assert_eq!(super::guard_stmt_panic(|| 42), Ok(42));
+        // panic 路径: 静音默认 hook 避免测试输出刷屏, 随后恢复
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = super::guard_stmt_panic(|| -> u32 { panic!("boom") });
+        std::panic::set_hook(prev);
+        assert!(r.is_err(), "panic 必须被捕获为 Err");
+    }
     use super::*;
     use storage::schema::{ColType, Column};
 
@@ -1128,7 +1283,7 @@ mod tests {
             col: "score".into(),
             op: CmpOp::In,
             val: SqlValue::Null,
-            set: (1..=100).map(|i| SqlValue::Int(i)).collect(),
+            set: (1..=100).map(SqlValue::Int).collect(),
         });
         let (np, _) = sql::normalize_pred_cond(&p);
         let plan = sql_plan_select(&schema, &np).unwrap();

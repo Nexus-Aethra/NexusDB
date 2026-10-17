@@ -8,8 +8,10 @@ use super::parser_select::{
 
 pub(crate) fn parse_paren_subselect(p: &mut P) -> Result<Box<SqlStmt>, String> {
     p.expect(&Tok::LParen, "(")?;
+    p.enter_subq()?; // ⭐ 审计新 P1-10: 子查询嵌套递归防爆栈 (独立更严上限)
     let inner = parse_select(p, false)?;
     p.expect(&Tok::RParen, ")")?;
+    p.leave_subq();
     Ok(Box::new(inner))
 }
 
@@ -119,7 +121,10 @@ pub(crate) fn parse_and_expr(p: &mut P) -> Result<Pred<Cond>, String> {
 /// ⭐ F69: NOT 层.
 pub(crate) fn parse_not_expr(p: &mut P) -> Result<Pred<Cond>, String> {
     if p.try_kw("NOT") {
-        Ok(Pred::Not(Box::new(parse_not_expr(p)?)))
+        p.enter_rec()?; // ⭐ 审计新 P1-10: NOT 前缀递归防爆栈
+        let inner = parse_not_expr(p)?;
+        p.leave_rec();
+        Ok(Pred::Not(Box::new(inner)))
     } else {
         parse_primary(p)
     }
@@ -139,9 +144,11 @@ pub(crate) fn parse_primary(p: &mut P) -> Result<Pred<Cond>, String> {
         }));
     }
     if p.peek() == Some(&Tok::LParen) {
+        p.enter_rec()?; // ⭐ 审计新 P1-10: 括号嵌套递归防爆栈
         p.next()?;
         let inner = parse_or_expr(p)?;
         p.expect(&Tok::RParen, ")")?;
+        p.leave_rec();
         Ok(inner)
     } else {
         parse_where_atom(p)
@@ -259,6 +266,15 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
         let pct = pat.iter().position(|&b| b == b'%');
         match pct {
             None => {
+                // ⭐ 审计 P3 (2026-10-17): 含 `_` 通配符却无 `%` 时, 旧实现按
+                // **字面量等值**处理 → `a_c` 匹配不到任何行 (静默空集), 用户
+                // 以为"没有数据"而不是"这个模式不支持". v1 不支持 `_`, 显式报错.
+                if pat.contains(&b'_') {
+                    return Err(
+                        "LIKE '_' wildcard is not supported (v1: use 'abc%' prefix patterns)"
+                            .into(),
+                    );
+                }
                 conds.push(Cond {
                     col,
                     op: CmpOp::Eq,
@@ -268,6 +284,13 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
             }
             Some(i) if i == pat.len() - 1 => {
                 let prefix = pat[..i].to_vec();
+                // 前缀里含 `_` 同样不支持 (字节区间法按字面量比较, 会漏匹配)
+                if prefix.contains(&b'_') {
+                    return Err(
+                        "LIKE '_' wildcard is not supported (v1: use 'abc%' prefix patterns)"
+                            .into(),
+                    );
+                }
                 if prefix.is_empty() {
                     // LIKE '%' = 恒真, 不产条件
                 } else {
@@ -382,17 +405,33 @@ pub(crate) fn parse_where_atom(p: &mut P) -> Result<Pred<Cond>, String> {
 /// ⭐ P0-1: 折叠 cond 右值的字面量算术 (`a = 1+2` → `a = 3`). 仅数值;
 /// 含列引用/字符串遇算术符报错 (v1).
 pub(crate) fn fold_cond_arith(p: &mut P, first: SqlValue) -> Result<SqlValue, String> {
-    let mut acc = first;
+    // ⭐ 2026-10-17 (审计新 P1-8): 标准优先级, 与 UPDATE SET 侧统一:
+    // term 层先折 `*` `/`, expr 层再折 `+` `-`. 旧实现单层左结合,
+    // `a = 2 + 3 * 4` 会折成 20 而非 14.
+    fn fold_term(p: &mut P, first: SqlValue) -> Result<SqlValue, String> {
+        let mut acc = first;
+        loop {
+            let op = match p.peek() {
+                Some(Tok::Star) => ArithOp::Mul,
+                Some(Tok::Slash) => ArithOp::Div,
+                _ => break,
+            };
+            p.next()?;
+            let rhs = p.value()?;
+            acc = eval_const_bin(op, acc, rhs)?;
+        }
+        Ok(acc)
+    }
+    let mut acc = fold_term(p, first)?;
     loop {
         let op = match p.peek() {
             Some(Tok::Plus) => ArithOp::Add,
             Some(Tok::Minus) => ArithOp::Sub,
-            Some(Tok::Star) => ArithOp::Mul,
-            Some(Tok::Slash) => ArithOp::Div,
             _ => break,
         };
         p.next()?;
-        let rhs = p.value()?;
+        let first = p.value()?;
+        let rhs = fold_term(p, first)?;
         acc = eval_const_bin(op, acc, rhs)?;
     }
     Ok(acc)
@@ -483,11 +522,10 @@ pub(crate) fn parse_update(p: &mut P) -> Result<SqlStmt, String> {
         }
     }
     let conds = parse_where(p)?;
-    // ⭐ compat: 吞 RETURNING ... (v1 不返回受影响行值)
+    // ⭐ 审计 P3 (2026-10-17): RETURNING 显式报错 — 旧实现静默吞掉后回 OK,
+    // 客户端以为拿到了受影响行的值 (实际什么都没返回), 属于"静默降级".
     if p.try_kw("RETURNING") {
-        while !p.peek().is_none() {
-            p.i += 1;
-        }
+        return Err("RETURNING is not supported (v1)".into());
     }
     p.done()?;
     Ok(SqlStmt::Update { table, sets, conds })
@@ -516,18 +554,22 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
                         Ok(ScalarExpr::Lit(SqlValue::Int(0)))
                     }
                     "NOT" => {
+                        p.enter_rec()?; // ⭐ 审计新 P1-10: NOT 前缀递归防爆栈
                         p.next()?;
                         let e = atom(p)?;
+                        p.leave_rec();
                         Ok(ScalarExpr::Not(Box::new(e)))
                     }
                     _ => {
                         // ⭐ PG 兼容 (UPDATE SET): 函数调用 `NOW()` / `CURRENT_TIMESTAMP`
                         // 等 — 吞掉括号及参数, 解析为当前时间字面量 (时间列默认/更新).
-                        // 其他未知函数同样吞掉调用, 回退 Null (避免 `SET c = fn()` 报
-                        // "trailing tokens" 卡死后续多列 SET 解析).
-                        if p.peek() == Some(&Tok::LParen) {
+                        // ⚠️ 必须用 peek2_is_lparen: 此处当前 token 仍是 Ident 本身,
+                        // `p.peek() == LParen` 恒 false — 旧实现因此从未支持
+                        // `SET c = NOW()` (文档宣称支持), 函数分支整段是死代码.
+                        if p.peek2_is_lparen() {
                             let fname = s.to_ascii_lowercase();
-                            p.next()?; // (
+                            p.next()?; // 函数名 Ident
+                            p.next()?; // "("
                             let mut depth = 1;
                             while depth > 0 {
                                 match p.next()? {
@@ -540,7 +582,14 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
                                 "now" | "current_timestamp" | "current_date" | "current_time" => {
                                     Ok(ScalarExpr::Lit(SqlValue::Now))
                                 }
-                                _ => Ok(ScalarExpr::Lit(SqlValue::Null)),
+                                // ⭐ 2026-10-17 (审计新 P1-7): 未知函数**显式报错**.
+                                // 旧实现回退 Lit(Null): `UPDATE t SET c = SOMEFN(x)`
+                                // 把整列静默刷成 NULL — 不可逆数据破坏, 且用户以为
+                                // 执行了函数. 先吞掉平衡括号再报错, 避免 "trailing
+                                // tokens" 混淆信息 (旧注释的顾虑), 错误本身明确.
+                                _ => Err(format!(
+                                    "unknown function '{fname}' in UPDATE SET expression"
+                                )),
                             };
                         }
                         // 列引用
@@ -558,35 +607,51 @@ pub(crate) fn parse_update_set_value(p: &mut P) -> Result<SqlValue, String> {
                 let v = p.value()?;
                 Ok(ScalarExpr::Lit(v))
             }
-            _ => Ok(ScalarExpr::Lit(SqlValue::Null)),
+            // ⭐ 2026-10-17 (审计新 P1-7): 意外 token 显式报错. 旧实现兜底
+            // `Ok(Lit(Null))` — `SET c = ,` / `SET c = )` 之类会把列静默写 NULL.
+            other => Err(format!(
+                "unexpected token in UPDATE SET expression: {other:?}"
+            )),
         }
     }
-    let left = match atom(p) {
-        Ok(e) => e,
-        Err(_) => ScalarExpr::Lit(SqlValue::Null),
-    };
-    // 链式二元算术: 左结合, 支持 `a + b - c * d` (v1: 无优先级, 从左到右)
-    let mut acc = left;
-    let mut saw_op = false;
-    while let Some(op) = match p.peek() {
-        Some(Tok::Plus) => Some(ArithOp::Add),
-        Some(Tok::Minus) => Some(ArithOp::Sub),
-        Some(Tok::Star) => Some(ArithOp::Mul),
-        Some(Tok::Slash) => Some(ArithOp::Div),
-        _ => None,
-    } {
+    // ⭐ 2026-10-17 (审计新 P1-7): atom 的解析错误必须传播.
+    // 旧实现 `Err(_) => Lit(Null)` 把任何 SET 值解析失败静默变成 NULL 写入 —
+    // 不可逆数据破坏, 且用户以为执行了表达式.
+    // ⭐ 2026-10-17 (审计新 P1-8): 标准运算符优先级 — `*` `/` 紧于 `+` `-`.
+    // 旧实现单层左结合: `a + 2 * 3` 算成 (a+2)*3, 任何混合运算 UPDATE 都写坏
+    // 数据. 与 WHERE 侧 fold_cond_arith 统一为同一套两级结构.
+    // term 层: atom (('*'|'/') atom)*  — 左结合
+    fn term(p: &mut P) -> Result<ScalarExpr, String> {
+        let mut lhs = atom(p)?;
+        while matches!(p.peek(), Some(Tok::Star) | Some(Tok::Slash)) {
+            let op = match p.peek() {
+                Some(Tok::Star) => ArithOp::Mul,
+                _ => ArithOp::Div,
+            };
+            p.next()?;
+            let rhs = atom(p)?;
+            lhs = ScalarExpr::Bin {
+                op,
+                l: Box::new(lhs),
+                r: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+    // expr 层: term (('+'|'-') term)*  — 左结合
+    let mut acc = term(p)?;
+    while matches!(p.peek(), Some(Tok::Plus) | Some(Tok::Minus)) {
+        let op = match p.peek() {
+            Some(Tok::Plus) => ArithOp::Add,
+            _ => ArithOp::Sub,
+        };
         p.next()?;
-        let Ok(right) = atom(p) else { break };
+        let rhs = term(p)?;
         acc = ScalarExpr::Bin {
             op,
             l: Box::new(acc),
-            r: Box::new(right),
+            r: Box::new(rhs),
         };
-        saw_op = true;
-    }
-    // 有算术 → 表达式; 无算术 → 折叠为原 SqlValue (列引用 / 字面量 / NOT)
-    if saw_op {
-        return Ok(SqlValue::Expr(Box::new(acc)));
     }
     Ok(match acc {
         ScalarExpr::Col(c) => SqlValue::ColRef(c),

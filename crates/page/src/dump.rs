@@ -199,7 +199,15 @@ fn dump_items(ctx: &mut DumpCtx<'_>) {
     while off < free_off {
         match decode_item(ctx.page, off, ctx.kind) {
             Ok((item, n)) => {
-                let full = item.full_key(&prev_key);
+                let full = match item.full_key(&prev_key) {
+                    Ok(k) => k,
+                    Err(_) => {
+                        // ⭐ 损坏 item (shared 越界): 标记并停止 dump,
+                        // 不静默产出错 key.
+                        ctx.item_decode_failed = true;
+                        return;
+                    }
+                };
                 let shared_str = if item.shared_prefix_len > 0 {
                     format!("shared={}", item.shared_prefix_len)
                 } else {
@@ -598,5 +606,24 @@ mod tests {
         // 这里我们仅检查 WARN 的存在 — 因为这个 fixture 不严格反映现实.
         // 主要测试: 不 panic, dump 完整.
         let _ = out;
+    }
+}
+
+#[cfg(test)]
+mod dump_bounds {
+    use super::*;
+    use crate::header::{PAGE_SIZE, page_init_header, page_set_free_off, page_set_key_count};
+
+    /// ⭐ 审计 P3 (2026-10-17): free_off 越界 (大于页长) 时 dump 不得 panic
+    /// (scanner 对损坏页的 dump 路径; 旧实现有未收敛的切片风险).
+    #[test]
+    fn dump_tolerates_out_of_range_free_off() {
+        let mut page = [0u8; PAGE_SIZE];
+        page_init_header(&mut page, PageType::Leaf);
+        page_set_free_off(&mut page, u16::MAX); // 远超页长
+        page_set_key_count(&mut page, 3);
+        // 不得 panic; 产出文本即可 (内容允许是错误提示)
+        let text = dump_leaf_page(&page);
+        assert!(!text.is_empty(), "dump 应产出文本");
     }
 }

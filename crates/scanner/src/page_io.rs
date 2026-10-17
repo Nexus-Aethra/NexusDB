@@ -13,7 +13,6 @@
 // PR1 calls `read_page` only; `read_page_strict` lands alongside `--strict`
 // in PR2.
 #[allow(dead_code)]
-
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -34,7 +33,11 @@ pub enum PageRead {
     /// `.block` file for `DiskCoord::file_id` does not exist on disk.
     BlockFileMissing { file_id: u32 },
     /// The `.block` file is too short to contain this page.
-    BlockFileTruncated { file_id: u32, path: PathBuf, size: u64 },
+    BlockFileTruncated {
+        file_id: u32,
+        path: PathBuf,
+        size: u64,
+    },
     /// Underlying `std::io::Error` (permissions, IO error, etc.).
     IoError {
         file_id: u32,
@@ -49,7 +52,11 @@ pub enum PageRead {
 pub fn read_page(shard: &ShardDir, coord: DiskCoord) -> PageRead {
     // Find the .block file. Linear scan is fine: a single shard has at most
     // a few hundred .block files even for very large databases.
-    let block = match shard.block_files.iter().find(|b| b.file_id == coord.file_id) {
+    let block = match shard
+        .block_files
+        .iter()
+        .find(|b| b.file_id == coord.file_id)
+    {
         Some(b) => b,
         None => {
             return PageRead::BlockFileMissing {
@@ -206,11 +213,7 @@ mod tests {
         // PAGE_SIZE, which is exactly at the end -> truncated.
         let path = dir.path().join("000001.block");
         std::fs::write(&path, vec![0u8; PAGE_SIZE]).unwrap();
-        let shard = shard_with_block(
-            /* file_id = */ 0,
-            path.clone(),
-            PAGE_SIZE as u64,
-        );
+        let shard = shard_with_block(/* file_id = */ 0, path.clone(), PAGE_SIZE as u64);
         let r = read_page(&shard, DiskCoord::from_vpid_arithmetic(1));
         assert!(matches!(r, PageRead::BlockFileTruncated { .. }));
     }
@@ -227,18 +230,18 @@ mod tests {
         bytes[PAGE_SIZE..PAGE_SIZE + 8].copy_from_slice(b"LCBPMARK");
         std::fs::write(&path, &bytes).unwrap();
 
-        let shard = shard_with_block(
-            /* file_id = */ 0,
-            path,
-            (PAGE_SIZE * 2) as u64,
-        );
+        let shard = shard_with_block(/* file_id = */ 0, path, (PAGE_SIZE * 2) as u64);
 
         let r = read_page(&shard, DiskCoord::from_vpid_arithmetic(0));
-        let PageRead::Ok(buf) = r else { panic!("expected Ok") };
+        let PageRead::Ok(buf) = r else {
+            panic!("expected Ok")
+        };
         assert_eq!(&buf[0..8], b"\xA5\xA5\xA5\xA5\xA5\xA5\xA5\xA5");
 
         let r = read_page(&shard, DiskCoord::from_vpid_arithmetic(1));
-        let PageRead::Ok(buf) = r else { panic!("expected Ok") };
+        let PageRead::Ok(buf) = r else {
+            panic!("expected Ok")
+        };
         assert_eq!(&buf[0..8], b"LCBPMARK");
     }
 }

@@ -133,6 +133,71 @@ pub fn page_set_free_off(page: &mut [u8], off: u16) {
     page[0x08..0x0A].copy_from_slice(&off.to_le_bytes());
 }
 
+/// ⭐ 审计 P2 (2026-10-17): 页校验和字段偏移 (header 内 8B).
+const CHECKSUM_OFF: usize = 0x0C;
+const CHECKSUM_LEN: usize = 8;
+
+/// 计算页校验和: 覆盖除 checksum 字段本身 (`0x0C..0x14`) 外的全部页字节.
+///
+/// **非加密用途** (检测磁盘损坏/撕裂写), 8 字节一块 multiply-xor + 末轮混淆 —
+/// 对随机位翻转的检出率接近 1-2^-64, 对恶意构造无抵抗能力 (不需要).
+/// 不引第三方哈希依赖 (xxhash 等): 页校验和的成本必须在亚微秒级, 且算法要
+/// 能在本 crate 内自证正确 (单测锁定).
+pub fn page_checksum(page: &[u8]) -> u64 {
+    const M: u64 = 0x0000_0100_0000_01b3; // FNV-1a 64 素数
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0usize;
+    while i < page.len() {
+        if i == CHECKSUM_OFF {
+            // 跳过 checksum 字段本身 (否则自指)
+            i = CHECKSUM_OFF + CHECKSUM_LEN;
+            continue;
+        }
+        let end = (i + 8).min(page.len());
+        // 块跨越 checksum 字段时只吃到字段边界 (i < CHECKSUM_OFF 才可能跨越)
+        let take = if i < CHECKSUM_OFF && end > CHECKSUM_OFF {
+            CHECKSUM_OFF - i
+        } else {
+            end - i
+        };
+        let mut buf = [0u8; 8];
+        buf[..take].copy_from_slice(&page[i..i + take]);
+        let k = u64::from_le_bytes(buf);
+        h = (h ^ k).wrapping_mul(M);
+        i += take;
+    }
+    // 末轮混淆 (avalanching)
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h
+}
+
+/// 写入页校验和 (在所有页字节定稿后调用).
+pub fn page_set_checksum(page: &mut [u8]) {
+    let c = page_checksum(page);
+    page[CHECKSUM_OFF..CHECKSUM_OFF + CHECKSUM_LEN].copy_from_slice(&c.to_le_bytes());
+}
+
+/// 校验页校验和. 返回 `PageError::ChecksumMismatch` 表示页已损坏.
+///
+/// **兼容规则**: 字段为 0 视为"旧版写入的页" (本特性上线前落盘的页没有校验和),
+/// 跳过校验 — 否则存量数据会被误判为损坏. 这类页在下次被写入时自动补上校验和.
+pub fn page_validate_checksum(page: &[u8]) -> Result<(), PageError> {
+    let stored = u64::from_le_bytes(
+        page[CHECKSUM_OFF..CHECKSUM_OFF + CHECKSUM_LEN]
+            .try_into()
+            .expect("8B checksum"),
+    );
+    if stored == 0 {
+        return Ok(());
+    }
+    if stored != page_checksum(page) {
+        return Err(PageError::ChecksumMismatch);
+    }
+    Ok(())
+}
+
 /// 读取 page version (COW 版本号).
 pub fn page_version(page: &[u8]) -> u32 {
     u32::from_le_bytes(page[0x14..0x18].try_into().unwrap())
@@ -158,12 +223,19 @@ pub fn page_free_space(page: &[u8]) -> usize {
     let key_count = page_key_count(page) as usize;
     let free_off = page_free_off(page) as usize;
 
-    // checkpoint header (8) + key_count / 16 个 checkpoint (每 14B), 至少 1 个
-    let cp_count = (key_count / 16).max(1);
-    let cp_size = 8 + cp_count * crate::checkpoint::CHECKPOINT_SIZE;
+    // ⚠️ 段数取两个来源的**较大值**:
+    //   - 页头 checkpoint_count: 写入方记录的精确段数 (权威)
+    //   - needed_checkpoint_count(key_count) = ceil(k/32): 每段 ≤32 故这是段数下界
+    // 取大值保证: 页头尚未随扩段更新时不会**高估**可用空间。
+    // 旧实现在此处另写了一份 `key_count / 16` 的估算, 与权威算法差最多 2 倍
+    // (页越满偏得越多), 且 `.max(1)` 在空页上凭空多算一个 checkpoint。
+    let (hdr, _) = crate::checkpoint::read_checkpoint_header(page);
+    let seg_count =
+        (hdr.checkpoint_count as usize).max(crate::checkpoint::needed_checkpoint_count(key_count));
+    let cp_size = crate::checkpoint::checkpoint_area_size(seg_count);
 
-    // checkpoint array 起始 = PAGE_SIZE - PAGE_FOOTER_SIZE - cp_size
-    let cp_start = CHECKPOINT_AREA_END - cp_size;
+    // checkpoint array 起始 = CHECKPOINT_AREA_END - cp_size
+    let cp_start = CHECKPOINT_AREA_END.saturating_sub(cp_size);
 
     cp_start.saturating_sub(free_off)
 }
@@ -184,4 +256,74 @@ pub fn page_init_header(page: &mut [u8; PAGE_SIZE], pt: PageType) {
     page[4] = pt as u8;
     page_set_free_off(page, PAGE_HEADER_SIZE as u16);
     page_set_key_count(page, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⭐ 审计 P2 (2026-10-17): 校验和 round-trip + 单位翻转检出 + 旧版页兼容.
+    #[test]
+    fn page_checksum_detects_corruption_and_tolerates_legacy() {
+        let mut page = [0u8; PAGE_SIZE];
+        page_init_header(&mut page, PageType::Leaf);
+        page[0x100..0x10B].copy_from_slice(b"hello world");
+        // 未写校验和 (=0) → 视为旧版页, 放行
+        assert!(
+            page_validate_checksum(&page).is_ok(),
+            "旧版页 (校验和=0) 必须放行"
+        );
+
+        page_set_checksum(&mut page);
+        assert!(
+            page_validate_checksum(&page).is_ok(),
+            "刚写入的校验和必须通过"
+        );
+
+        // 任意单位置翻转 → 必须检出
+        for &off in &[0usize, 4, 0x0A, 0x14, 0x18, 0x100, PAGE_SIZE - 1] {
+            let mut corrupt = page;
+            corrupt[off] ^= 0x01;
+            assert!(
+                matches!(
+                    page_validate_checksum(&corrupt),
+                    Err(PageError::ChecksumMismatch)
+                ),
+                "offset {off} 的位翻转必须被检出"
+            );
+        }
+
+        // 校验和字段自身被破坏同样检出 (存的值 != 重算值)
+        let mut bad_sum = page;
+        bad_sum[0x0C] ^= 0xFF;
+        assert!(
+            page_validate_checksum(&bad_sum).is_err(),
+            "校验和字段损坏必须检出"
+        );
+
+        // 全零页 (未初始化) 不得误报
+        let zero = [0u8; PAGE_SIZE];
+        assert!(page_validate_checksum(&zero).is_ok(), "全零页 = 旧版页");
+    }
+
+    /// 校验和必须覆盖**除自身外**的全部字节 (改 vpid / key_count / item 区都算).
+    #[test]
+    fn page_checksum_covers_whole_page() {
+        let mut a = [0u8; PAGE_SIZE];
+        page_init_header(&mut a, PageType::Leaf);
+        page_set_checksum(&mut a);
+        let base = page_checksum(&a);
+
+        let mut b = a;
+        page_set_vpid(&mut b, 12345);
+        assert_ne!(page_checksum(&b), base, "vpid 变更必须改变校验和");
+
+        let mut c = a;
+        page_set_key_count(&mut c, 7);
+        assert_ne!(page_checksum(&c), base, "key_count 变更必须改变校验和");
+
+        let mut d = a;
+        d[PAGE_SIZE - 1] = 0xAB;
+        assert_ne!(page_checksum(&d), base, "item 区字节变更必须改变校验和");
+    }
 }

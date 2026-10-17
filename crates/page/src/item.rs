@@ -47,14 +47,25 @@ pub struct Item<'a> {
 }
 
 impl<'a> Item<'a> {
-    /// 仅对 LeafItem: 获取完整 key (用前缀 + 不重合部分).
+    /// 获取完整 key (用前缀 + 不重合部分).
     /// `prev_key` = 上一 item 的完整 key.
-    pub fn full_key(&self, prev_key: &[u8]) -> Vec<u8> {
-        let take = (self.shared_prefix_len as usize).min(prev_key.len());
+    ///
+    /// ⚠️ 2026-10-17 (审计 P2): `shared_prefix_len > prev_key.len()` 说明
+    /// 页数据损坏 (item 声明的共享前缀超过前一 key 的实际长度). 旧实现
+    /// `min()` 静默截断 → 产出**错误 key** 且无任何提示 (损坏页被静默
+    /// 错读). 现在返回 `Err(PageError::ItemDecode)`.
+    pub fn full_key(&self, prev_key: &[u8]) -> Result<Vec<u8>, PageError> {
+        let take = self.shared_prefix_len as usize;
+        if take > prev_key.len() {
+            return Err(PageError::ItemDecode(format!(
+                "corrupt item: shared_prefix_len={take} exceeds prev_key len {}",
+                prev_key.len()
+            )));
+        }
         let mut key = Vec::with_capacity(take + self.key_unshared_len as usize);
         key.extend_from_slice(&prev_key[..take]);
         key.extend_from_slice(self.key_unshared);
-        key
+        Ok(key)
     }
 }
 
@@ -142,6 +153,19 @@ pub fn encode_leaf_item(
         return Err(PageError::ItemDecode("key too long for u16 prefix".into()));
     }
     let key_unique = &key[shared..];
+    if key_unique.len() > u16::MAX as usize {
+        return Err(PageError::ItemDecode("key too long for u16".into()));
+    }
+    if value.len() > u32::MAX as usize {
+        return Err(PageError::ItemDecode("value too long for u32".into()));
+    }
+    // ⭐ 审计 P3 (2026-10-17): 一次性前置边界检查. 旧实现只校验 value 段,
+    // header/key/varint 直接下标写 → buf 给小了就是 slice panic (crate 级无
+    // 保护, 全靠调用方 KvLimits 约束). 现在统一返回 PageFull.
+    let need = 4 + key_unique.len() + varint_len(value.len() as u32) + value.len();
+    if need > buf.len() {
+        return Err(PageError::PageFull);
+    }
 
     // 2. 编码 header
     buf[0..2].copy_from_slice(&(shared as u16).to_le_bytes());
@@ -180,6 +204,13 @@ pub fn encode_internal_item(
         return Err(PageError::ItemDecode("key too long for u16 prefix".into()));
     }
     let key_unique = &key[shared..];
+    if key_unique.len() > u16::MAX as usize {
+        return Err(PageError::ItemDecode("key too long for u16".into()));
+    }
+    // ⭐ 审计 P3: 前置边界检查 (旧实现 header/key 段无检查, buf 给小了即 panic)
+    if 4 + key_unique.len() + 8 > buf.len() {
+        return Err(PageError::PageFull);
+    }
 
     buf[0..2].copy_from_slice(&(shared as u16).to_le_bytes());
     buf[2..4].copy_from_slice(&(key_unique.len() as u16).to_le_bytes());
@@ -189,26 +220,27 @@ pub fn encode_internal_item(
     pos += key_unique.len();
 
     // InternalItem 没有 value, 直接 child_vpid (8B)
-    if pos + 8 > buf.len() {
-        return Err(PageError::PageFull);
-    }
     buf[pos..pos + 8].copy_from_slice(&child_vpid.to_le_bytes());
     pos += 8;
 
     Ok(pos)
 }
 
-/// 计算 leaf item 编码所需字节数 (不含写入).
+// ⭐ 审计 P3: 以下 4 个尺寸 helper 显式标注 dead_code (取代 crate 级豁免) —
+// 属于对外 API 面 (调用方预估空间用), storage 当前走自身估算; 保留以便后续接线.
+#[allow(dead_code)]
 pub fn leaf_item_encoded_size(key_unique_len: usize, value_len: usize, vint_extra: usize) -> usize {
     4 + key_unique_len + vint_extra + value_len
 }
 
 /// leaf item 在编码后总字节数 (含 varint).
+#[allow(dead_code)]
 pub fn leaf_item_size(key_unique_len: usize, value_len: usize) -> usize {
     4 + key_unique_len + varint_len(value_len as u32) + value_len
 }
 
 /// internal item 编码字节数.
+#[allow(dead_code)]
 pub fn internal_item_size(key_unique_len: usize) -> usize {
     4 + key_unique_len + 8
 }
@@ -223,6 +255,7 @@ pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// varint(vint_len) 最大字节数 — 避免循环依赖.
+#[allow(dead_code)]
 pub fn vint_size(value_len: usize) -> usize {
     if value_len < VARINT_MAX_BYTES * 16 {
         1 // 实际多数场景
@@ -258,7 +291,7 @@ mod tests {
         assert_eq!(item.key_unshared_len, 5); // "there"
         assert_eq!(item.key_unshared, b"there");
         assert_eq!(item.value, value);
-        assert_eq!(item.full_key(prev), key.to_vec());
+        assert_eq!(item.full_key(prev).unwrap(), key.to_vec());
     }
 
     #[test]
@@ -272,6 +305,6 @@ mod tests {
         let (item, total) = decode_item(&buf, 0, ItemKind::Internal).unwrap();
         assert_eq!(total, n);
         assert_eq!(item.child_vpid, child);
-        assert_eq!(item.full_key(prev), key.to_vec());
+        assert_eq!(item.full_key(prev).unwrap(), key.to_vec());
     }
 }

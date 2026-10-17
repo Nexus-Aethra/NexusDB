@@ -57,6 +57,15 @@ pub fn tag_enabled(tag: &'static str) -> bool {
     }
 }
 
+/// 查询: 某 tag 的调试输出当前是否开启 (`dprintln!` 的同一判定).
+///
+/// 供"只为打印而算"的重劳动做惰性化: 调用方先问这句再决定要不要算,
+/// 避免 release 里白算 (见 leaf_delete 的 target_prev_key).
+/// `DEBUG_PAGE` 是 const false → 整个表达式编译期折叠, 零成本.
+pub fn debug_on(tag: &'static str) -> bool {
+    DEBUG_PAGE && tag_enabled(tag)
+}
+
 /// 统一调试输出宏: `dprintln!(<tag>, "<fmt>", args...)`.
 ///
 /// - 第一个参数 `tag` 是 ident (子系统名: leaf/index/internal/...).

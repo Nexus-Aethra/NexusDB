@@ -1,5 +1,5 @@
 // ⭐ 解耦 2026-08: DML 执行 (INSERT/UPDATE/DELETE 分布式执行) — 从 sql_dispatch.rs 拆出.
-use super::sql_dispatch::conds_to_scan_preds;
+use super::sql_dispatch::{check_in_set_types, conds_to_scan_preds};
 use super::*;
 
 /// ⭐ F76: 剥列名的表名限定前缀 (`表.列`/`别名.列` → `列`); 仅当前缀匹配时.
@@ -98,6 +98,7 @@ pub(crate) fn strip_qual_in_stmt(stmt: &mut SqlStmt) {
                     }
                     sql::SelectItem::Agg { .. } => {}
                     sql::SelectItem::ScalarFn { .. } => {}
+                    sql::SelectItem::Lit { .. } => {}
                     // ⭐ compat: 表达式投影内部列引用剥表限定前缀
                     sql::SelectItem::Expr { expr, .. } => {
                         expr.for_each_col_mut(&mut |c| strip_col_qual(c, &t));
@@ -143,6 +144,16 @@ pub(crate) fn sql_run_dml(
     // ⭐ F76: 单表限定列 `表.列` → 剥为 `列` (ORM 单表查询也带表名限定符)
     let mut stmt = stmt;
     strip_qual_in_stmt(&mut stmt);
+    // ⭐ 审计 P2 (2026-10-17): IN 集合与列类型跨型 → 显式报错 (旧实现由
+    // eval_cond_leaf 线性路径把 sql_cmp 的 None 当 false → 静默空集,
+    // 客户端无法区分"类型不匹配"与"没有匹配行"). SELECT 走 sql_plan_select
+    // 内同名校验, 这里覆盖 Delete/Update 两条 DML 路径.
+    if let Some(conds) = stmt_where_conds(&stmt)
+        && let Err(e) = check_in_set_types(&schema, conds)
+    {
+        conn.resp_complete(seq, sql_err_bytes(conn.proto, &e));
+        return;
+    }
     match stmt {
         // ⭐ compat: 无 FROM 标量函数投影在 sql_dispatch_stmt 已处理
         SqlStmt::ScalarSelect { .. } => unreachable!("ScalarSelect 在 sql_dispatch_stmt 处理"),
@@ -386,6 +397,28 @@ pub(crate) fn sql_run_dml(
             match sql_plan_select(&schema, &conds) {
                 Err(e) => conn.resp_complete(seq, sql_err_bytes(conn.proto, &e)),
                 Ok(SqlPlan::PkGet { pk }) => {
+                    // ⭐ 审计 P1-4: 父表 DELETE 前置 RESTRICT 预检 — 非 CASCADE
+                    // 引用 (默认 RESTRICT/NO ACTION) 有子行时拒删. 进入预检则
+                    // 延迟发写; 探针全净后以 cleared 重放本语句 (不会二次预检).
+                    if matches!(action, SqlDmlAction::Delete)
+                        && fk_restr_start(
+                            conn,
+                            conn_id,
+                            seq,
+                            worker_id,
+                            db,
+                            shard_inboxes,
+                            num_shards,
+                            &table,
+                            std::slice::from_ref(&pk),
+                            RestrResume::Redispatch(Box::new(SqlStmt::Delete {
+                                table: table.clone(),
+                                conds: conds.clone(),
+                            })),
+                        )
+                    {
+                        return;
+                    }
                     // ⭐ 事务 v1 (F61): pk 等值 UPDATE/DELETE 截流进 write_set
                     // (affected 乐观估 1, 真实效果 commit 时定 — 文档化)
                     if conn.txn.is_some() {
@@ -427,6 +460,7 @@ pub(crate) fn sql_run_dml(
                     conn.sql_select_agg.insert(
                         seq,
                         SqlSelectAgg {
+                            txn_read: txn_read_ctx(conn, db, &table),
                             remaining: num_shards,
                             error: None,
                             rows: Vec::new(),
@@ -498,6 +532,7 @@ pub(crate) fn sql_run_dml(
                     conn.sql_select_agg.insert(
                         seq,
                         SqlSelectAgg {
+                            txn_read: txn_read_ctx(conn, db, &table),
                             remaining: num_shards,
                             error: None,
                             rows: Vec::new(),
@@ -555,15 +590,11 @@ pub(crate) fn sql_run_dml(
             // ⭐ 优化器 M1 (2026-08): 谓词归一 (NOT 下推/恒真恒假短路) 后再规划
             let (ncond, cond_false) = sql::normalize_pred_cond(&conds);
             conds = ncond;
-            if cond_false {
-                // 恒假谓词 → 直接返回空结果 (短路广播)
-                let bin = conn.mysql_binary.remove(&seq);
-                conn.resp_complete(
-                    seq,
-                    sql_rows_bytes(conn.proto, bin, &[("", storage::schema::ColType::I64)], &[]),
-                );
-                return;
-            }
+            // ⭐ 2026-10-17 (审计 P2): 恒假谓词短路**移到投影解析之后** —
+            // 旧实现在此处硬编码单列 ("", I64) 返回空结果:
+            // `SELECT a, b FROM t WHERE 1=0` 会返回 1 列空名列的结果集,
+            // 列数/列名与真实投影不符, 破坏客户端结果集契约.
+            // cond_false 标记保留到投影解析后使用 (见下方 short-circuit).
             // ⭐ G1/G2 (F63): 投影分型 — 纯列 / COUNT(*) 特例 (旧路径) /
             // 广义聚合 (分桶完成点)
             let has_agg = items
@@ -661,6 +692,20 @@ pub(crate) fn sql_run_dml(
                         return;
                     }
                 }
+            }
+            // ⭐ 2026-10-17 (审计 P2): 恒假谓词 → 空结果, 但列定义必须是
+            // **真实投影** (proj/out_names 已解析), 而非硬编码单列.
+            if cond_false {
+                let bin = conn.mysql_binary.remove(&seq);
+                if count {
+                    conn.resp_complete(seq, render_sql_count(conn.proto, bin, 0));
+                } else {
+                    conn.resp_complete(
+                        seq,
+                        render_sql_rows(conn.proto, bin, &schema, &proj, &out_names, &[]),
+                    );
+                }
+                return;
             }
             let offset = offset.unwrap_or(0);
             match sql_plan_select(&schema, &conds) {
@@ -777,6 +822,7 @@ pub(crate) fn sql_run_dml(
                     conn.sql_select_agg.insert(
                         seq,
                         SqlSelectAgg {
+                            txn_read: txn_read_ctx(conn, db, &table),
                             remaining: rem,
                             error: None,
                             rows: Vec::new(),
@@ -858,7 +904,13 @@ pub(crate) fn sql_run_dml(
                             row_cols.push(schema.pk_col);
                         }
                     }
-                    let downable = !count && order_empty && row_cols.len() < schema.columns.len();
+                    // ⭐ 审计 P2 (2026-10-17): 事务内禁用投影下推 — 下推行只回
+                    // 投影列值 (无 pk / row 字节), OCC 读集无从登记. 事务内走完整
+                    // Rows 路径 (正确性优先于省带宽).
+                    let downable = !count
+                        && order_empty
+                        && row_cols.len() < schema.columns.len()
+                        && conn.txn.is_none();
                     // 下推 preds: 仅纯 AND 合取可转 ScanPred (值转换失败跳过该谓词)
                     let down_preds = if downable {
                         conds_to_scan_preds(&schema, &conds)
@@ -877,6 +929,7 @@ pub(crate) fn sql_run_dml(
                     conn.sql_select_agg.insert(
                         seq,
                         SqlSelectAgg {
+                            txn_read: txn_read_ctx(conn, db, &table),
                             remaining: num_shards,
                             error: None,
                             rows: Vec::new(),
@@ -946,7 +999,10 @@ pub(crate) fn sql_run_dml(
                     // (index_hint { pk: true } 走主键 B+Tree 区间). 无覆盖/路由剪枝
                     // (主键范围); 行经残余过滤 (preds 完整下推).
                     let pk_col = schema.pk_col;
+                    // ⭐ 审计 P2 (2026-10-17): 事务内禁用覆盖索引 — 免回表路径
+                    // 只有 (索引值, pk), 没有 row 字节, OCC 读集无法登记指纹.
                     let cover = (count || proj.iter().all(|&c| c == pk_col))
+                        && conn.txn.is_none()
                         && conds
                             .leaves()
                             .iter()
@@ -980,14 +1036,21 @@ pub(crate) fn sql_run_dml(
                         })
                         .collect();
                     // 投影: 覆盖时投影列; 否则全列 (worker 端再按 proj 取)
+                    // ⭐ 审计 P2 (2026-10-17): 事务内改用 ScanFilteredRows (回包带
+                    // pk + row 字节) 才能登记 OCC 读集; 此时清空 down_proj, 回包走
+                    // Rows 臂而非 ProjRows 臂.
+                    let txn_read = conn.txn.is_some();
                     let down_proj: Vec<u16> = if cover {
                         proj.clone()
+                    } else if txn_read {
+                        Vec::new()
                     } else {
                         (0..schema.columns.len() as u16).collect()
                     };
                     conn.sql_select_agg.insert(
                         seq,
                         SqlSelectAgg {
+                            txn_read: txn_read_ctx(conn, db, &table),
                             remaining: num_shards,
                             error: None,
                             rows: Vec::new(),
@@ -1013,19 +1076,35 @@ pub(crate) fn sql_run_dml(
                     );
                     let table_arc: std::sync::Arc<str> = std::sync::Arc::from(table.as_str());
                     for sid in 0..num_shards {
-                        let op = BatchOp::ScanFiltered {
-                            db: db.clone(),
-                            table: table_arc.clone(),
-                            preds: scan_preds.clone(),
-                            proj: down_proj.clone(),
-                            index_hint: Some(shard_manager::IndexHint {
-                                iid: 0,
-                                lo: lo.clone(),
-                                hi: hi.clone(),
-                                pk: true,
-                            }),
-                            key_set_hint: None,
-                            limit: shard_limit,
+                        // ⭐ 审计 P2 (2026-10-17): 事务内走 ScanFilteredRows
+                        // (返回 (索引值, pk, row 字节) — 读集登记需要; 见上).
+                        let op = if txn_read {
+                            BatchOp::ScanFilteredRows {
+                                db: db.clone(),
+                                table: table_arc.clone(),
+                                index_hint: Some(shard_manager::IndexHint {
+                                    iid: 0,
+                                    lo: lo.clone(),
+                                    hi: hi.clone(),
+                                    pk: true,
+                                }),
+                                limit: 0,
+                            }
+                        } else {
+                            BatchOp::ScanFiltered {
+                                db: db.clone(),
+                                table: table_arc.clone(),
+                                preds: scan_preds.clone(),
+                                proj: down_proj.clone(),
+                                index_hint: Some(shard_manager::IndexHint {
+                                    iid: 0,
+                                    lo: lo.clone(),
+                                    hi: hi.clone(),
+                                    pk: true,
+                                }),
+                                key_set_hint: None,
+                                limit: shard_limit,
+                            }
                         };
                         push_task_grouped(
                             conn_id,
@@ -1068,7 +1147,9 @@ pub(crate) fn sql_run_dml(
                     };
                     let pk_col = schema.pk_col;
                     let in_cover = |c: u16| c == idx_col || c == pk_col;
+                    // ⭐ 审计 P2 (2026-10-17): 事务内禁用覆盖索引 (同上: 无 row 字节)
                     let cover = (count || proj.iter().all(|&c| in_cover(c)))
+                        && conn.txn.is_none()
                         && order_cols.iter().all(|&(c, _)| in_cover(c))
                         && conds
                             .leaves()
@@ -1115,6 +1196,7 @@ pub(crate) fn sql_run_dml(
                     conn.sql_select_agg.insert(
                         seq,
                         SqlSelectAgg {
+                            txn_read: txn_read_ctx(conn, db, &table),
                             remaining: candidates.len(),
                             error: None,
                             rows: Vec::new(),

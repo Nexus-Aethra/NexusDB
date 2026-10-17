@@ -13,9 +13,9 @@ use std::collections::HashSet;
 use std::os::unix::fs::FileExt;
 
 use page::PAGE_HEADER_SIZE;
-use storage::{IoBackend, IoBackendConfig};
 use storage::db_name_resolver::{DbNameResolver, RESOLVER_HEADER_SIZE};
 use storage::meta_page::{MetaError, MetaPage};
+use storage::{IoBackend, IoBackendConfig};
 use storage::{OpenOptions, StorageEngine};
 
 mod common;

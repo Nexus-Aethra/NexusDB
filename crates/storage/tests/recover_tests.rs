@@ -18,7 +18,7 @@ use std::path::Path;
 use page::{PAGE_MAGIC, PageType};
 use storage::PAGE_SIZE;
 use storage::alloc::VpidAllocator;
-use storage::recover::recover;
+use storage::recover::{recover, recover_for_shard};
 
 mod common;
 
@@ -439,11 +439,7 @@ fn pid_state_fast_path_roundtrip() {
             e.flush().await.unwrap();
         }
         // pid.state 应已写入 (default db 的 shard 目录; app db 各自独立)
-        let ps = tmp
-            .path()
-            .join("default")
-            .join("shard_0")
-            .join("pid.state");
+        let ps = tmp.path().join("default").join("shard_0").join("pid.state");
         assert!(ps.exists(), "pid.state must be persisted on flush: {ps:?}");
         assert_eq!(std::fs::metadata(&ps).unwrap().len(), 8, "8B PidLocation");
 
@@ -454,13 +450,142 @@ fn pid_state_fast_path_roundtrip() {
         for i in 0..50u32 {
             let k = format!("k{i:04}");
             let got = e2.table_get("app", "kv", k.as_bytes()).await.unwrap();
-            assert_eq!(got.as_deref(), Some(b"v".as_slice()), "key {k} after reopen");
+            assert_eq!(
+                got.as_deref(),
+                Some(b"v".as_slice()),
+                "key {k} after reopen"
+            );
         }
         // 新写入不得覆盖旧数据 (pid 水位正确前进)
-        e2.table_put("app", "kv", b"new_key", b"new_v").await.unwrap();
+        e2.table_put("app", "kv", b"new_key", b"new_v")
+            .await
+            .unwrap();
         assert_eq!(
-            e2.table_get("app", "kv", b"k0000").await.unwrap().as_deref(),
+            e2.table_get("app", "kv", b"k0000")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(b"v".as_slice())
         );
     });
+}
+
+// =====================================================================
+// ⭐ 审计 P2 (2026-10-17): page.mate 缺失时的 recover 行为
+//
+// 旧实现: page.mate 不存在 → 用固定共享路径 /tmp/nexus_recover_empty.mate
+// 兜底并直接返回空状态, 造成两个严重后果:
+//   1) .block 有数据但 page.mate 丢失 → 扫描被跳过, 存量页全成孤儿,
+//      且 pid/vpid 水位归零 → 新写入覆写 .block 里的活页 (数据损坏);
+//   2) 多实例共用同一 /tmp 文件 → 同步 flush_dirty 互相覆写.
+// =====================================================================
+
+/// `.block` 有页但 `page.mate` 缺失: 必须走扫描重建, 不得返回空状态.
+#[test]
+fn recover_scans_blocks_when_mate_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let block_path = tmp.path().join("000001.block");
+    make_block(&block_path);
+    for i in 0..5u64 {
+        write_test_page(&block_path, 0, i, i, PageType::Leaf);
+    }
+    // 注意: 故意不创建 page.mate (模拟 mate 丢失/被误删)
+
+    let mut state = recover(tmp.path()).expect("recover ok");
+
+    for v in 0..5u64 {
+        assert!(
+            state.meta.read(v).is_some(),
+            "vpid {v} 应从 .block 扫描恢复 (mate 缺失不得丢弃存量页)"
+        );
+    }
+    assert_eq!(state.next_vpid, 5, "max vpid + 1");
+    assert_eq!(state.next_file_id, 1, "max file_id + 1");
+    let (fid, chunk, next_page) = state.pid_alloc.current();
+    assert_eq!(
+        (fid, chunk, next_page),
+        (0, 0, 5),
+        "pid 水位必须越过已写页, 否则新写入覆写活页"
+    );
+}
+
+/// mate 后端落点 (审计 P2 2026-10-17):
+/// - 全新 shard 目录 → meta 落在库目录 page.mate (与异步刷盘同路径), 重启可读回;
+/// - 库目录不存在 → 兜底用本实例唯一的匿名文件, 不碰固定共享 /tmp 路径.
+///
+/// 旧实现两种情况下都用固定共享路径 `/tmp/nexus_recover_empty.mate`:
+/// 多实例互踩 (同步 flush_dirty 互相覆写) + 与异步刷盘路径分家 (重启丢元数据).
+///
+/// 两个场景合并在一个用例: 它们都操作同一个固定共享路径, 分开会互相干扰.
+#[test]
+fn recover_mate_backend_is_db_local_not_shared_tmp() {
+    let shared = std::env::temp_dir().join("nexus_recover_empty.mate");
+    let _ = std::fs::remove_file(&shared);
+    let junk = storage::PidLocation {
+        file_id: 9,
+        chunk_idx: 9,
+        page_idx: 9,
+        flags: storage::PID_ALIVE,
+    };
+    std::fs::write(&shared, junk.to_bytes()).unwrap();
+    let junk_bytes = std::fs::read(&shared).unwrap();
+    let pid3 = storage::PidLocation {
+        file_id: 0,
+        chunk_idx: 0,
+        page_idx: 3,
+        flags: storage::PID_ALIVE,
+    };
+
+    // --- 场景 1: shard 目录存在但无 page.mate (全新库) ---
+    let tmp = tempfile::tempdir().unwrap();
+    let shard_dir = tmp.path().join("default").join("shard_0");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+
+    let mut state = recover_for_shard(tmp.path(), "default", 0).expect("recover ok");
+    assert!(
+        state.meta.read(0).is_none(),
+        "全新库不得继承共享 /tmp 文件里的陈旧映射"
+    );
+    state.meta.write(3, pid3);
+    state.meta.flush_dirty().expect("flush_dirty");
+    assert_eq!(
+        std::fs::read(&shared).unwrap(),
+        junk_bytes,
+        "同步刷盘不得写入固定共享 /tmp 路径"
+    );
+    let mut reopened =
+        storage::test_support::MetaCache::open(&shard_dir.join("page.mate")).unwrap();
+    assert_eq!(
+        reopened.read(3).map(|p| p.page_idx()),
+        Some(3),
+        "meta 必须持久化到库目录 page.mate (与异步刷盘同路径)"
+    );
+
+    // --- 场景 2: 库目录不存在 (调用方未 create_if_missing) ---
+    let missing = std::env::temp_dir().join("nexus_recover_missing_dir_xyz");
+    let _ = std::fs::remove_dir_all(&missing);
+    let mut state2 = recover(&missing).expect("recover missing dir ok");
+    assert_eq!(state2.next_vpid, 0);
+    assert_eq!(state2.next_file_id, 0);
+    assert!(
+        state2.meta.read(0).is_none(),
+        "全新库不得继承共享 /tmp 文件里的陈旧映射"
+    );
+    assert_eq!(
+        std::fs::read(&shared).unwrap(),
+        junk_bytes,
+        "兜底路径不得碰固定共享 /tmp 文件 (旧实现 File::create 会截断它)"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("nexus_recover_empty_"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "匿名 mate 应已 unlink, 不应残留: {leftovers:?}"
+    );
+
+    let _ = std::fs::remove_file(&shared);
 }

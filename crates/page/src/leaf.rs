@@ -131,7 +131,12 @@ pub fn leaf_get_with<R>(page: &[u8], key: &[u8], f: impl FnOnce(&[u8]) -> R) -> 
         ptr.byte_offset(),
         std::str::from_utf8(ptr.key()).unwrap_or("?")
     );
-    // cp[0] 段首是哨兵, 跳过
+    // ⭐ 审计 P2 (2026-10-17): 段内迭代次数按 `item_count` 界定, 不再用固定
+    // 1000 步上限 — bulk split / 索引重建可产出单段 >1000 item 的大段, 旧
+    // 实现在命中前就撞上限返回 None (假 miss → 静默丢数据). item_count 本身
+    // 不可信 (损坏页) 时由 ptr.next() 的解码失败 / 边界检查兜底终止.
+    let mut remaining = seg.item_count as usize;
+    // cp[0] 段首是哨兵, 跳过 (哨兵占 item_count 的一个名额)
     if seg_idx == 0 && ptr.key().is_empty() {
         let next_ptr = ptr.next().ok()??;
         dprintln!(
@@ -141,19 +146,19 @@ pub fn leaf_get_with<R>(page: &[u8], key: &[u8], f: impl FnOnce(&[u8]) -> R) -> 
             std::str::from_utf8(next_ptr.key()).unwrap_or("?")
         );
         ptr = next_ptr;
+        remaining = remaining.saturating_sub(1);
     }
-    let mut loop_count = 0;
     loop {
-        loop_count += 1;
-        if loop_count > 1000 {
-            dprintln!(leaf, "[LEAF_GET] LOOP LIMIT EXCEEDED");
+        if remaining == 0 {
+            // 段内已扫尽仍未命中 (key 不在本段 / 不存在)
+            dprintln!(leaf, "[LEAF_GET] segment exhausted, return None");
             return None;
         }
+        remaining -= 1;
         let cur_key = ptr.key();
         dprintln!(
             leaf,
-            "[LEAF_GET] loop #{} off={} key={:?} (looking for {:?})",
-            loop_count,
+            "[LEAF_GET] off={} key={:?} (looking for {:?})",
             ptr.byte_offset(),
             std::str::from_utf8(cur_key).unwrap_or("?"),
             std::str::from_utf8(key).unwrap_or("?")
@@ -163,6 +168,11 @@ pub fn leaf_get_with<R>(page: &[u8], key: &[u8], f: impl FnOnce(&[u8]) -> R) -> 
         }
         if cur_key > key {
             dprintln!(leaf, "[LEAF_GET] cur_key > key, return None");
+            return None;
+        }
+        if remaining == 0 {
+            // 段内最后一项已比对过, 无需再推进
+            dprintln!(leaf, "[LEAF_GET] last item in segment, return None");
             return None;
         }
         match ptr.next().ok()? {
@@ -279,14 +289,24 @@ pub fn leaf_insert(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), Page
         // 估算新 item 大小: key + value + 编码开销 (shared/varint/头)
         let est_item = key.len() + value.len() + 20;
         // pre_split 会多一个段 = 多一个 checkpoint entry (4B)
-        let cp_growth = if need_pre_split { crate::checkpoint::CHECKPOINT_SIZE } else { 0 };
+        let cp_growth = if need_pre_split {
+            crate::checkpoint::CHECKPOINT_SIZE
+        } else {
+            0
+        };
         let cp_size = crate::checkpoint::checkpoint_area_size(idx.segments.len()) + cp_growth;
         let free_off = page_free_off(page) as usize;
         if free_off + est_item + cp_size + PAGE_FOOTER_SIZE > PAGE_SIZE {
             return Err(PageError::PageFull);
         }
     }
+    // ⭐ 2026-10-16 (审计新 P0-1 同根因): 上面的 est 预检是启发式上界,
+    // 仍存在 "pre_split 成功改写页 → push_back 才失败" 的窗口. 存快照兜底,
+    // 恢复"失败的插入不改变页"强不变量 (pre_split_segment 内部已有精确
+    // 边界自检, 放不下时不会改字节; 快照覆盖的是其之后的 push_back 失败).
+    let mut snapshot: Option<Vec<u8>> = None;
     if need_pre_split {
+        snapshot = Some(page.to_vec());
         pre_split_segment(page, &mut idx, cur_seg_idx, ItemKind::Leaf)?;
         cur_seg_idx = idx.locate_segment(key);
     }
@@ -340,7 +360,7 @@ pub fn leaf_insert(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), Page
     // ptr 借用 page, 必须先 drop 再 mut borrow
     drop(ptr);
     drop(prev_ptr);
-    leaf_push_back(
+    if let Err(e) = leaf_push_back(
         page,
         &mut idx,
         &prev_key,
@@ -348,7 +368,13 @@ pub fn leaf_insert(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), Page
         key,
         value,
         seg_idx_for_push,
-    )?;
+    ) {
+        // ⭐ L2: pre_split 可能已改写页字节; 恢复快照, 失败的插入不得留下污染页
+        if let Some(snap) = &snapshot {
+            page.copy_from_slice(snap);
+        }
+        return Err(e);
+    }
 
     // 6. 写回 PageIndex (cp array + header.key_count)
     dprintln!(
@@ -445,13 +471,16 @@ pub fn leaf_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
             return Ok(false);
         }
         let (next_item, next_n) = decode_item(page, cur_off, ItemKind::Leaf)?;
-        prev_key = next_item.full_key(&prev_key);
+        prev_key = next_item.full_key(&prev_key)?;
         target_off = cur_off;
         target_n = next_n;
     }
     // target_full_key = prev_key (循环退出时 prev_key = target 的 full key)
     let target_full_key = prev_key.clone();
-    let target_prev_key = if target_off > PAGE_HEADER_SIZE {
+    // ⭐ 审计 P2 (2026-10-17): target_prev_key 只喂给下面的 dprintln! (调试
+    // 打印), 旧实现每次删除都白做一次全页扫描 (reconstruct_key_before 从页头
+    // 顺序 decode 到 target = O(N)). 与 dprintln! 同条件惰性化.
+    let target_prev_key = if crate::debug::debug_on("leaf") && target_off > PAGE_HEADER_SIZE {
         reconstruct_key_before(page, target_off, ItemKind::Leaf)?
     } else {
         Vec::new() // target 是哨兵, 但实际我们禁止空 key 删除, 所以不会到这里
@@ -514,7 +543,7 @@ pub fn leaf_delete(page: &mut [u8], key: &[u8]) -> Result<bool, PageError> {
         );
         // k+1 的 full key 用**原 prev** (target 的 full key) 还原, 不是 new_prev_key.
         // 因为 k1_item 编码时 shared_prefix_len 是基于 target (旧 prev) 的.
-        k1_full_key = k1_item.full_key(&target_full_key);
+        k1_full_key = k1_item.full_key(&target_full_key)?;
         dprintln!(
             leaf,
             "[LEAF_DELETE] k1 full_key={:?} new_prev={:?} k1_is_seg_start={} target_seg_idx={} segments.len={}",
@@ -697,7 +726,7 @@ pub(crate) fn reconstruct_key_before(
     let mut result = Vec::new();
     while cur_off < off {
         let (item, n) = decode_item(page, cur_off, kind)?;
-        result = item.full_key(&prev_key);
+        result = item.full_key(&prev_key)?;
         prev_key = result.clone();
         cur_off += n;
     }
@@ -739,7 +768,7 @@ pub fn leaf_push_back(
         );
         if k1_item.shared_prefix_len > 0 {
             // k+1 的 full key 用旧 prev_key 还原
-            let k1_full_key = k1_item.full_key(prev_key);
+            let k1_full_key = k1_item.full_key(prev_key)?;
             dprintln!(
                 leaf,
                 "[LEAF_PUSH_BACK]   k1_full_key={:?} (re-encoded with new prev={:?})",
@@ -958,6 +987,17 @@ pub fn leaf_update_with<R>(
     } else {
         // 慢路径: new_n != old_n, 需要 shift 后续 items
         let delta = new_n as isize - old_n as isize;
+        // ⭐ 2026-10-16 (审计新 P0-2): 移位前空间检查.
+        // 旧实现无检查: 近满页上 new_n > old_n 时 copy_within 目的端越过
+        // checkpoint 区 (静默覆盖, 页损坏) 或越过 PAGE_SIZE (panic
+        // "dest is out of bounds") — 合法输入 (KvLimits 内) 打崩服务,
+        // release 探针实证. 空间不足返回 PageFull, 与 btree_update 既定
+        // 契约一致 (其文档明示 caller 应改走 delete + insert).
+        let cp_size = crate::checkpoint::checkpoint_area_size(idx.segments.len());
+        let new_free = free_off_before as isize + delta;
+        if new_free < 0 || new_free as usize + cp_size + PAGE_FOOTER_SIZE > PAGE_SIZE {
+            return Err(PageError::PageFull);
+        }
         dprintln!(
             leaf,
             "[LEAF_UPDATE] shift at off={} old_n={} new_n={} delta={}",

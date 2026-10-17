@@ -117,5 +117,8 @@ fn engine_table_put_get_with_many_splits() {
             found += 1;
         }
     }
-    assert_eq!(found, 5000, "5000 split 后 read 应该 100% 命中, got {found}");
+    assert_eq!(
+        found, 5000,
+        "5000 split 后 read 应该 100% 命中, got {found}"
+    );
 }

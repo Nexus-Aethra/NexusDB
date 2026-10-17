@@ -264,7 +264,9 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                 });
             }
         } else if p.try_kw("CHECK") {
-            // ⭐ compat: 表级 CHECK (expr) — v1 吞 (不强制约束)
+            // ⭐ 审计 P1-3 (2026-10-17): CHECK 约束 v1 不强制, 但**不再静默** —
+            // 旧实现括号深度计数后直接丢弃, 用户以为约束生效 (实际从不校验).
+            // 现在: 表达式仍吞掉 (保持既有迁移可跑), 但每条 CHECK 打一条 WARN.
             if p.peek() == Some(&Tok::LParen) {
                 p.next()?;
                 let mut depth = 1;
@@ -275,6 +277,10 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                         _ => {}
                     }
                 }
+                nlog::warn!(
+                    "sql",
+                    "table CHECK constraint parsed but NOT enforced (v1 limitation)"
+                );
             }
         } else {
             let name = p.ident()?;
@@ -333,7 +339,7 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                         action,
                     });
                 } else if p.try_kw("CHECK") {
-                    // ⭐ compat: 列级 CHECK (expr) — v1 吞 (不强制约束)
+                    // ⭐ 审计 P1-3 (2026-10-17): 同表级 CHECK — 不强制但显式告警
                     if p.peek() == Some(&Tok::LParen) {
                         p.next()?;
                         let mut depth = 1;
@@ -344,6 +350,10 @@ pub(crate) fn parse_create(p: &mut P) -> Result<SqlStmt, String> {
                                 _ => {}
                             }
                         }
+                        nlog::warn!(
+                            "sql",
+                            "column CHECK constraint parsed but NOT enforced (v1 limitation)"
+                        );
                     }
                 } else {
                     break;

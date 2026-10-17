@@ -29,7 +29,10 @@ fn set_mismember_and_pop_n() {
         e.create_db("db1").await.unwrap();
         e.create_table("db1", "t1").await.unwrap();
 
-        let members: Vec<Vec<u8>> = [b"a", b"b", b"c", b"d"].iter().map(|m| m.to_vec()).collect();
+        let members: Vec<Vec<u8>> = [b"a", b"b", b"c", b"d"]
+            .iter()
+            .map(|m| m.to_vec())
+            .collect();
         assert_eq!(e.set_add("db1", "t1", b"s", &members).await.unwrap(), 4);
 
         // SMISMEMBER 保持输入序

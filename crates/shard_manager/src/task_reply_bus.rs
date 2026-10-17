@@ -30,19 +30,28 @@ pub struct TaskReplyBus {
     /// 首条 push (0→1) 才写 eventfd, 后续搭车 —— shard 一轮回 N 条
     /// 从 N 次 write syscall 降到 ~1 次.
     pending: AtomicU64,
+    /// ⭐ 2026-10-17 (审计新 P1-12): bus 满导致 push 等待的累计次数
+    /// (消费端阻塞/过慢的可观测信号).
+    full_waits: AtomicU64,
 }
 
 impl TaskReplyBus {
     pub fn new() -> Self {
+        Self::with_capacity(REPLY_BUS_CAPACITY)
+    }
+
+    /// 自定义容量 (测试用小 ring 验证背压路径).
+    pub fn with_capacity(capacity: usize) -> Self {
         #[cfg(target_os = "linux")]
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         #[cfg(target_os = "linux")]
         assert!(fd >= 0, "eventfd creation failed");
         Self {
-            ring: ArrayQueue::new(REPLY_BUS_CAPACITY),
+            ring: ArrayQueue::new(capacity.max(1)),
             #[cfg(target_os = "linux")]
             eventfd: fd,
             pending: AtomicU64::new(0),
+            full_waits: AtomicU64::new(0),
         }
     }
 
@@ -52,13 +61,24 @@ impl TaskReplyBus {
             result,
             enqueued_at: crate::PROBE.is_enabled().then(std::time::Instant::now),
         };
-        // 如果满了 spin retry (不太可能, 8192 容量)
+        // ⭐ 2026-10-17 (审计新 P1-12): bus 满时**有界自旋后退避 sleep**.
+        // 旧实现无限 yield_now 自旋: 消费端 (worker) 阻塞时 shard 线程
+        // 100% CPU 空转, 且整个 shard 数据面停摆. 退避后 CPU 归零, worker
+        // drain 出空间后自然恢复 (轮询语义, 无丢唤醒风险); 累计等待次数
+        // 计入 full_waits 供观测.
+        let mut spins = 0u32;
         loop {
             match self.ring.push(queued) {
                 Ok(()) => break,
                 Err(rejected) => {
                     queued = rejected;
-                    std::thread::yield_now();
+                    spins += 1;
+                    if spins <= 64 {
+                        std::thread::yield_now();
+                    } else {
+                        self.full_waits.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
                 }
             }
         }
@@ -131,6 +151,11 @@ impl TaskReplyBus {
         self.ring.len()
     }
 
+    /// ⭐ bus 满导致 push 退避等待的累计次数 (审计新 P1-12 观测).
+    pub fn full_waits(&self) -> u64 {
+        self.full_waits.load(Ordering::Relaxed)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ring.is_empty()
     }
@@ -185,5 +210,52 @@ impl ReplyBusSet {
     /// worker 数量.
     pub fn worker_count(&self) -> usize {
         self.buses.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request::BatchResult;
+
+    fn res(i: u64) -> TaskResult {
+        TaskResult {
+            conn_id: i,
+            req_id: i,
+            group: 0,
+            result: BatchResult::PutOk,
+        }
+    }
+
+    #[test]
+    fn push_non_full_no_wait() {
+        let bus = TaskReplyBus::with_capacity(4);
+        for i in 0..4 {
+            bus.push(res(i));
+        }
+        assert_eq!(bus.full_waits(), 0, "未满时不得计入等待");
+        assert_eq!(bus.len(), 4);
+    }
+
+    #[test]
+    fn push_full_backs_off_instead_of_spinning() {
+        // ⭐ 审计新 P1-12: bus 满时 push 必须退避 (旧实现无限自旋烧 CPU).
+        let bus = Arc::new(TaskReplyBus::with_capacity(2));
+        bus.push(res(0));
+        bus.push(res(1));
+        assert_eq!(bus.len(), 2);
+        let bus2 = bus.clone();
+        let h = std::thread::spawn(move || {
+            bus2.push(res(2)); // 满 → 退避等待
+        });
+        // 给退避路径足够的触发时间 (100µs sleep 粒度)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(bus.full_waits() > 0, "bus 满必须记录退避等待");
+        assert!(!h.is_finished(), "未 drain 前 push 不应完成");
+        // drain 出空间 → push 恢复
+        let drained = bus.drain();
+        assert_eq!(drained.len(), 2);
+        h.join().unwrap();
+        assert_eq!(bus.len(), 1, "drain 后 push 应成功入队");
     }
 }

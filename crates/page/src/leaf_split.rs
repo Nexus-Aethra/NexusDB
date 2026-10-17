@@ -35,14 +35,14 @@ fn force_split_segment_at_mid(
     let mut off = seg.first_item_off as usize;
     for _ in 0..mid_offset {
         let (item, n) = decode_item(page, off, kind)?;
-        prev_key = item.full_key(&prev_key);
+        prev_key = item.full_key(&prev_key)?;
         off += n;
     }
     let mid_item_off = off;
 
     // 解码 mid item 并重编码为 shared=0
     let (mid_item, mid_old_n) = decode_item(page, mid_item_off, kind)?;
-    let mid_full_key = mid_item.full_key(&prev_key);
+    let mid_full_key = mid_item.full_key(&prev_key)?;
     let mut buf = [0u8; 4096];
     let mid_new_n = encode_leaf_item(&mut buf, &[], &mid_full_key, mid_item.value)?;
     let delta_mid = mid_new_n as isize - mid_old_n as isize;
@@ -73,9 +73,10 @@ fn force_split_segment_at_mid(
         let free_off = page_free_off(page) as usize;
         if k1_off < free_off {
             let (k1_item, k1_old_n) = decode_item(page, k1_off, kind)?;
-            let k1_full_key = k1_item.full_key(&mid_full_key);
+            let k1_full_key = k1_item.full_key(&mid_full_key)?;
             let mut k1_buf = [0u8; 4096];
-            let k1_new_n = encode_leaf_item(&mut k1_buf, &mid_full_key, &k1_full_key, k1_item.value)?;
+            let k1_new_n =
+                encode_leaf_item(&mut k1_buf, &mid_full_key, &k1_full_key, k1_item.value)?;
             let k1_delta = k1_new_n as isize - k1_old_n as isize;
             if k1_delta != 0 {
                 let cur_free = page_free_off(page) as usize;
@@ -108,10 +109,7 @@ fn force_split_segment_at_mid(
 ///
 /// 返回 Some(split_key) 表示成功, None 表示条件不满足 (回退到原始逻辑).
 /// 安全性: 任何内部错误都返回 None (不 panic, 不破坏 page).
-fn try_bulk_leaf_split(
-    left: &mut [u8; PAGE_SIZE],
-    right: &mut [u8; PAGE_SIZE],
-) -> Option<Vec<u8>> {
+fn try_bulk_leaf_split(left: &mut [u8; PAGE_SIZE], right: &mut [u8; PAGE_SIZE]) -> Option<Vec<u8>> {
     let mut idx = PageIndex::load(left, ItemKind::Leaf).ok()?;
 
     // 如果只有 1 个段, 强制在段内创建段边界
@@ -160,8 +158,11 @@ fn try_bulk_leaf_split(
         while off < free {
             match decode_item(left, off, ItemKind::Leaf) {
                 Ok((item, n)) => {
-                    let _full = item.full_key(&prev_key);
-                    prev_key = _full;
+                    // ⭐ 损坏 item (shared 越界) → 放弃 bulk split (回退常规路径)
+                    let Ok(full) = item.full_key(&prev_key) else {
+                        return None;
+                    };
+                    prev_key = full;
                     actual_count += 1;
                     off += n;
                 }
@@ -181,8 +182,11 @@ fn try_bulk_leaf_split(
             for (si, seg) in idx.segments.iter().enumerate() {
                 eprintln!(
                     "  seg[{si}] item_count={} first_off={} first_key={:?}",
-                    seg.item_count, seg.first_item_off,
-                    String::from_utf8_lossy(&seg.first_full_key[..seg.first_full_key.len().min(20)])
+                    seg.item_count,
+                    seg.first_item_off,
+                    String::from_utf8_lossy(
+                        &seg.first_full_key[..seg.first_full_key.len().min(20)]
+                    )
                 );
             }
         }
@@ -214,7 +218,10 @@ fn try_bulk_leaf_split(
             first_item.shared_prefix_len, first_item.key_unshared_len
         );
     }
-    let mut first_buf = [0u8; PAGE_SIZE];
+    // ⭐ 审计 P3 (2026-10-17): 16KB 栈缓冲改堆分配 — try_bulk_leaf_split 在
+    // 深层 async 调用链里, 每个 16KB 栈帧在深链上叠加曾把默认 8MB 栈打爆
+    // (SIGABRT). 堆分配 (vec) 后栈上只剩 Vec 头.
+    let mut first_buf = vec![0u8; PAGE_SIZE];
     let first_encoded_n =
         encode_leaf_item(&mut first_buf, &[], &split_key, first_item.value).ok()?;
     right[write_start..write_start + first_encoded_n]
@@ -228,24 +235,51 @@ fn try_bulk_leaf_split(
     }
     let right_free = rest_dst + rest_len;
 
-    // === 重建 right cp array ===
+    // === 重建 right cp array: **保留源页的段边界** ===
+    // ⭐ 审计 P2 (2026-10-17): 旧实现把右半全部重建为**单个** cp 段
+    // (item_count = 1 + right_key_count) — bulk split 的左/右半各含若干源段,
+    // 单段 item_count 可远超 MAX_PER_CHECKPOINT (32), 违反"段 ≤ 32"不变量:
+    //   - 段内定位退化成线性扫描 (二分只发生在段间);
+    //   - free_space / checkpoint_area_size 估算失真 (按 1 段算, 实际要写多段).
+    // 源页的段边界在 bulk memcpy 后**依然有效**: 后续段的段首 item 是
+    // shared=0 的字节, 原样拷贝后仍满足段首不变量 (前缀引用的是物理前一项,
+    // 连续拷贝保持了这一点). 因此逐段搬运即可, 无需任何重编码.
+    let right_seg_count = idx.segments.len() - best_seg;
     write_checkpoint_header(
         right,
         CheckpointHeader {
-            checkpoint_count: 1,
+            checkpoint_count: right_seg_count as u16,
             ..Default::default()
         },
     );
+    // cp[0]: 右半第一段. 注意右页有**自己的哨兵** (PAGE_HEADER_SIZE 处), 段首
+    // 即哨兵, 因此 item_count = 1 (哨兵) + 源段 item 数 (与普通 leaf 页
+    // "cp[0] 含哨兵"的约定一致).
     write_checkpoint(
         right,
         0,
         Checkpoint {
-            item_count: 1 + right_key_count,
+            item_count: 1 + idx.segments[best_seg].item_count,
             first_item_off: PAGE_HEADER_SIZE as u16,
         },
     );
+    // cp[1..]: 源页后续段, 首项偏移按 bulk memcpy 平移
+    // (右半布局 = 哨兵 + 重编码首 item + 源页 [split_off+first_n ..] 原样拷贝)
+    let shift = (write_start + first_encoded_n) as isize - (split_off + first_n) as isize;
+    for (k, seg) in idx.segments[best_seg + 1..].iter().enumerate() {
+        write_checkpoint(
+            right,
+            k + 1,
+            Checkpoint {
+                item_count: seg.item_count,
+                first_item_off: (seg.first_item_off as isize + shift) as u16,
+            },
+        );
+    }
     page_set_free_off(right, right_free as u16);
     page_set_key_count(right, right_key_count);
+    // load + write_back: 借 PageIndex::load 的段首 shared=0 校验自建 cp array,
+    // 顺带把 header.key_count 写回 (内容与上面写入一致).
     let right_idx = PageIndex::load(right, ItemKind::Leaf).ok()?;
     right_idx.write_back(right).ok()?;
     crate::header::page_set_vpid(right, 0);
@@ -255,27 +289,27 @@ fn try_bulk_leaf_split(
     page_set_free_off(left, split_off as u16);
     page_set_key_count(left, left_key_count);
 
-    // 重建 left cp array (与原始 leaf_split 相同的防御性模式)
-    write_checkpoint_header(left, CheckpointHeader::default());
-    let left_idx = PageIndex::load(left, ItemKind::Leaf).ok()?;
-    if left_idx.segments.is_empty() && left_key_count > 0 {
+    // === 重建 left cp array: 同样保留源页段边界 ===
+    // 左半字节区间 [PAGE_HEADER_SIZE, split_off) 与源页逐字节一致 (只截断尾部),
+    // 因此源页 cp[0..best_seg] 的 (first_item_off, item_count) 原样有效.
+    // (旧实现在此先把 cp header 清零再 load → 恒走"单段"分支, else 的
+    //  write_back 是死代码.)
+    write_checkpoint_header(
+        left,
+        CheckpointHeader {
+            checkpoint_count: best_seg as u16,
+            ..Default::default()
+        },
+    );
+    for (k, seg) in idx.segments[..best_seg].iter().enumerate() {
         write_checkpoint(
             left,
-            0,
+            k,
             Checkpoint {
-                item_count: left_key_count + 1,
-                first_item_off: PAGE_HEADER_SIZE as u16,
+                item_count: seg.item_count,
+                first_item_off: seg.first_item_off,
             },
         );
-        write_checkpoint_header(
-            left,
-            CheckpointHeader {
-                checkpoint_count: 1,
-                ..Default::default()
-            },
-        );
-    } else {
-        left_idx.write_back(left).ok()?;
     }
 
     Some(split_key)
@@ -333,7 +367,7 @@ fn leaf_split_minimal(
     let mut mid_n: usize = 0;
     for i in 0..mid + 2 {
         let (item, n) = decode_item(left, off, ItemKind::Leaf)?;
-        let full = item.full_key(&prev_key);
+        let full = item.full_key(&prev_key)?;
         if i == mid {
             mid_off = off + n;
         }
@@ -369,7 +403,7 @@ fn leaf_split_minimal(
     let mut cur = mid_off + mid_n;
     while cur < left_orig_free {
         let (item, n) = decode_item(left, cur, ItemKind::Leaf)?;
-        let full = item.full_key(&new_prev_key);
+        let full = item.full_key(&new_prev_key)?;
         let mut buf = [0u8; 4096];
         let enc_n = encode_leaf_item(&mut buf, &new_prev_key, &full, item.value)?;
         right[write_off..write_off + enc_n].copy_from_slice(&buf[..enc_n]);
@@ -382,8 +416,21 @@ fn leaf_split_minimal(
     // right cp
     page_set_free_off(right, write_off as u16);
     page_set_key_count(right, new_key_count);
-    write_checkpoint_header(right, CheckpointHeader { checkpoint_count: 1, ..Default::default() });
-    write_checkpoint(right, 0, Checkpoint { item_count: 1 + new_key_count, first_item_off: PAGE_HEADER_SIZE as u16 });
+    write_checkpoint_header(
+        right,
+        CheckpointHeader {
+            checkpoint_count: 1,
+            ..Default::default()
+        },
+    );
+    write_checkpoint(
+        right,
+        0,
+        Checkpoint {
+            item_count: 1 + new_key_count,
+            first_item_off: PAGE_HEADER_SIZE as u16,
+        },
+    );
     let ri = PageIndex::load(right, ItemKind::Leaf)?;
     ri.write_back(right)?;
     crate::header::page_set_vpid(right, 0);
@@ -395,8 +442,21 @@ fn leaf_split_minimal(
     write_checkpoint_header(left, CheckpointHeader::default());
     let li = PageIndex::load(left, ItemKind::Leaf)?;
     if li.segments.is_empty() && mid > 0 {
-        write_checkpoint(left, 0, Checkpoint { item_count: mid as u16 + 1, first_item_off: PAGE_HEADER_SIZE as u16 });
-        write_checkpoint_header(left, CheckpointHeader { checkpoint_count: 1, ..Default::default() });
+        write_checkpoint(
+            left,
+            0,
+            Checkpoint {
+                item_count: mid as u16 + 1,
+                first_item_off: PAGE_HEADER_SIZE as u16,
+            },
+        );
+        write_checkpoint_header(
+            left,
+            CheckpointHeader {
+                checkpoint_count: 1,
+                ..Default::default()
+            },
+        );
     } else {
         li.write_back(left)?;
     }

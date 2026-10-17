@@ -85,9 +85,23 @@ pub fn write_checkpoint_header(page: &mut [u8], hdr: CheckpointHeader) {
 }
 
 /// 读第 i 个 cp index entry.
+///
+/// ⚠️ 磁盘数据不可信: `i` 过大时 `(i+1)*CHECKPOINT_SIZE > hdr_off` 会
+/// usize 下溢 (release 下回绕成巨大下标再越界 panic). 调用方
+/// (`PageIndex::load`) 已校验 cp_count 容量上界, 这里兜底返回空 entry
+/// 而非 panic.
 pub fn read_checkpoint(page: &[u8], i: usize) -> Checkpoint {
     let hdr_off = CHECKPOINT_AREA_END - CHECKPOINT_HEADER_SIZE;
-    let data_start = hdr_off - (i + 1) * CHECKPOINT_SIZE;
+    let over = (i + 1).checked_mul(CHECKPOINT_SIZE);
+    let data_start = match over.and_then(|o| hdr_off.checked_sub(o)) {
+        Some(d) => d,
+        None => {
+            return Checkpoint {
+                item_count: 0,
+                first_item_off: 0,
+            };
+        }
+    };
     Checkpoint {
         item_count: u16::from_le_bytes(page[data_start..data_start + 2].try_into().unwrap()),
         first_item_off: u16::from_le_bytes(

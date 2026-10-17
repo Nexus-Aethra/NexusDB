@@ -9,9 +9,9 @@
 //! - delete / update 走多层 BTree
 //! - TableDirectory 升级后能容纳大量 table (跨多层 BTree)
 
-use storage::{IoBackend, IoBackendConfig};
 use storage::OpenOptions;
 use storage::StorageEngine;
+use storage::{IoBackend, IoBackendConfig};
 
 mod common;
 

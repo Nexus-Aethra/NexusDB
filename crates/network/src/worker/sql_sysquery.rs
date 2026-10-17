@@ -80,7 +80,7 @@ pub(crate) fn sysq_finish(
     for (name, desc) in spec.order.iter().rev() {
         if let Some(ci) = all_cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
             rows.sort_by(|a, b| {
-                let o = cmp_colvalue(&a[ci], &b[ci]);
+                let o = sysq_cmp(&a[ci], &b[ci]);
                 if *desc { o.reverse() } else { o }
             });
         }
@@ -121,6 +121,26 @@ pub(crate) fn sysq_finish(
 
 pub(crate) fn sbytes(s: &str) -> ColValue {
     ColValue::Bytes(s.as_bytes().to_vec())
+}
+
+/// ⭐ 2026-10-17 (审计 P2): 系统表虚拟列全 Str — ORDER BY 数值列
+/// (如 ordinal_position) 按字典序会排出 "10" < "2". 双方均可解析为
+/// 数值时按数值排序, 否则回退字节序.
+fn sysq_cmp(a: &ColValue, b: &ColValue) -> std::cmp::Ordering {
+    let num = |v: &ColValue| -> Option<f64> {
+        match v {
+            ColValue::Bytes(s) => std::str::from_utf8(s)
+                .ok()
+                .and_then(|t| t.trim().parse().ok()),
+            ColValue::I64(x) => Some(*x as f64),
+            ColValue::F64(x) => Some(*x),
+            _ => None,
+        }
+    };
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => cmp_colvalue(a, b),
+    }
 }
 
 /// ⭐ F66: db 列表类虚拟表 (schemata / pg_namespace) — 零任务合成.

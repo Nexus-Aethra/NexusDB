@@ -32,7 +32,7 @@
 
 use std::collections::BTreeSet;
 
-use page::{PageType, decode_item};
+use page::{decode_item, page_vpid, PageType};
 
 use crate::dir::ShardDir;
 use crate::page_decode::BadKind;
@@ -91,6 +91,9 @@ pub struct WalkSummary {
     /// Traversal encountered a cycle (parent/child recursion): we cut it
     /// off. Almost always a sign of corruption.
     pub cycle: bool,
+    /// ⭐ 审计 P2 (2026-10-17): strict 模式下撞到的第一个坏页/不可读页描述
+    /// (遍历随即中止). tolerant 模式恒为 None.
+    pub strict_hit: Option<String>,
 }
 
 /// Walk the btree rooted at `root_vpid` and call `on_node` once per page
@@ -100,6 +103,7 @@ pub fn walk_tree<F>(
     shard: &ShardDir,
     locate: &Locate,
     root_vpid: u64,
+    strict: bool,
     mut on_node: F,
 ) -> WalkSummary
 where
@@ -123,10 +127,31 @@ where
         // Update summary BEFORE invoking the closure so callers see the
         // tally in real time if they want.
         summary.visited += 1;
-        match (&node.page_type, &node.bad) {
-            (Some(_), None) => summary.ok += 1,
-            (Some(_), Some(_)) => summary.bad += 1,
-            (None, _) => summary.unread += 1,
+        let node_bad = match (&node.page_type, &node.bad) {
+            (Some(_), None) => {
+                summary.ok += 1;
+                None
+            }
+            (Some(_), Some(b)) => {
+                summary.bad += 1;
+                Some(format!(
+                    "vpid {}: {} ({})",
+                    vpid,
+                    bad_kind_name(b.kind),
+                    b.reason
+                ))
+            }
+            (None, _) => {
+                summary.unread += 1;
+                Some(format!("vpid {vpid}: unreadable"))
+            }
+        };
+        // ⭐ 审计 P2 (2026-10-17): strict → 第一个坏页即中止 (设计文档 §3.1)
+        if strict {
+            if let Some(hit) = node_bad {
+                summary.strict_hit = Some(hit);
+                break;
+            }
         }
         on_node(&node);
 
@@ -158,13 +183,21 @@ pub fn walk_tree_in_order<F>(
     shard: &ShardDir,
     locate: &Locate,
     root_vpid: u64,
+    strict: bool,
     mut on_entry: F,
 ) -> WalkSummary
 where
     F: FnMut(&[u8], &[u8]),
 {
     let mut summary = WalkSummary::default();
-    do_in_order(shard, locate, root_vpid, &mut on_entry, &mut summary);
+    do_in_order(
+        shard,
+        locate,
+        root_vpid,
+        strict,
+        &mut on_entry,
+        &mut summary,
+    );
     summary
 }
 
@@ -172,6 +205,7 @@ fn do_in_order<F>(
     shard: &ShardDir,
     locate: &Locate,
     vpid: u64,
+    strict: bool,
     on_entry: &mut F,
     summary: &mut WalkSummary,
 ) where
@@ -182,6 +216,10 @@ fn do_in_order<F>(
         Ok(c) => c,
         Err(_) => {
             summary.unread += 1;
+            // ⭐ 审计 P2 (2026-10-17): strict → 记第一个坏点并整体中止
+            if strict && summary.strict_hit.is_none() {
+                summary.strict_hit = Some(format!("vpid {vpid}: cannot be located on disk"));
+            }
             return;
         }
     };
@@ -189,6 +227,9 @@ fn do_in_order<F>(
         page_io::PageRead::Ok(b) => b,
         _ => {
             summary.unread += 1;
+            if strict && summary.strict_hit.is_none() {
+                summary.strict_hit = Some(format!("vpid {vpid}: unreadable"));
+            }
             return;
         }
     };
@@ -204,7 +245,15 @@ fn do_in_order<F>(
             while off < free_off {
                 match page::decode_item(page_bytes, off, page::ItemKind::Leaf) {
                     Ok((item, n)) => {
-                        let full = item.full_key(&prev_key);
+                        // ⭐ 损坏 item (shared 越界): 记 bad 并停止, 不静默错 key
+                        let Ok(full) = item.full_key(&prev_key) else {
+                            summary.bad += 1;
+                            if strict && summary.strict_hit.is_none() {
+                                summary.strict_hit =
+                                    Some(format!("vpid {vpid}: corrupt leaf item (shared prefix)"));
+                            }
+                            break;
+                        };
                         if count > 0 && !full.is_empty() {
                             on_entry(&full, item.value);
                             summary.ok += 1;
@@ -215,12 +264,26 @@ fn do_in_order<F>(
                     }
                     Err(_) => {
                         summary.bad += 1;
+                        if strict && summary.strict_hit.is_none() {
+                            summary.strict_hit =
+                                Some(format!("vpid {vpid}: undecodable leaf item"));
+                        }
                         break;
                     }
                 }
             }
         }
         PageType::Internal => {
+            // ⭐ 2026-10-17 (审计新 P1-19): 先递归最左子树 — first_child
+            // 在页头 vpid, 旧实现漏掉它导致 export 丢失每个 internal 页
+            // 左子树的全部数据.
+            let first_child = page_vpid(page_bytes);
+            if first_child != 0 && first_child != vpid {
+                do_in_order(shard, locate, first_child, strict, on_entry, summary);
+                if summary.strict_hit.is_some() {
+                    return; // strict 中止: 不再继续本层
+                }
+            }
             // Enumerate all children in order, recurse.
             let free_off = page::page_free_off(page_bytes) as usize;
             let mut off = page::PAGE_HEADER_SIZE;
@@ -228,19 +291,35 @@ fn do_in_order<F>(
             while off < free_off {
                 match page::decode_item(page_bytes, off, page::ItemKind::Internal) {
                     Ok((item, n)) => {
-                        let full = item.full_key(&prev_key);
+                        // ⭐ 损坏 item (shared 越界): 记 bad 并停止
+                        let Ok(full) = item.full_key(&prev_key) else {
+                            summary.bad += 1;
+                            if strict && summary.strict_hit.is_none() {
+                                summary.strict_hit = Some(format!(
+                                    "vpid {vpid}: corrupt internal item (shared prefix)"
+                                ));
+                            }
+                            break;
+                        };
                         // The sentinel (item 0) has empty key, but its
                         // child_vpid is the first child. Every other item
                         // has a separator key and its child_vpid is the
                         // child for keys >= that separator.
                         if item.child_vpid != 0 && item.child_vpid != vpid {
-                            do_in_order(shard, locate, item.child_vpid, on_entry, summary);
+                            do_in_order(shard, locate, item.child_vpid, strict, on_entry, summary);
+                            if summary.strict_hit.is_some() {
+                                return; // strict 中止
+                            }
                         }
                         prev_key = full;
                         off += n;
                     }
                     Err(_) => {
                         summary.bad += 1;
+                        if strict && summary.strict_hit.is_none() {
+                            summary.strict_hit =
+                                Some(format!("vpid {vpid}: undecodable internal item"));
+                        }
                         break;
                     }
                 }
@@ -249,6 +328,9 @@ fn do_in_order<F>(
         other => {
             // Meta / Overflow / OverflowIndex: not a btree node, skip.
             summary.bad += 1;
+            if strict && summary.strict_hit.is_none() {
+                summary.strict_hit = Some(format!("vpid {vpid}: not a btree node ({other:?})"));
+            }
             let _ = other;
         }
     }
@@ -321,10 +403,9 @@ pub struct BfsResult {
 /// Read one page and turn it into a [`TreeNode`]; structural integrity
 /// is reported via `node.bad` rather than as an error.
 fn read_node(shard: &ShardDir, locate: &Locate, vpid: u64) -> TreeNode {
-    let coord = match locate.resolve(vpid, crate::pid::Strategy::MateThenArithmetic) {
-        Ok(c) => Some(c),
-        Err(_) => None,
-    };
+    let coord = locate
+        .resolve(vpid, crate::pid::Strategy::MateThenArithmetic)
+        .ok();
     let coord_for_read = match coord {
         Some(c) => c,
         None => DiskCoord::from_vpid_arithmetic(vpid),
@@ -369,11 +450,9 @@ fn page_read_reason(r: &page_io::PageRead) -> String {
         page_io::PageRead::BlockFileMissing { file_id } => {
             format!("block file {file_id}.block missing")
         }
-        page_io::PageRead::BlockFileTruncated {
-            file_id,
-            size,
-            ..
-        } => format!("block {file_id} truncated (size={size})"),
+        page_io::PageRead::BlockFileTruncated { file_id, size, .. } => {
+            format!("block {file_id} truncated (size={size})")
+        }
         page_io::PageRead::IoError { source, .. } => format!("io error: {source}"),
         page_io::PageRead::Ok(_) => "ok".into(),
     }
@@ -383,6 +462,14 @@ fn page_read_reason(r: &page_io::PageRead) -> String {
 /// skipping the sentinel at offset 0.
 fn iter_internal_children(buf: &[u8; PAGE_SIZE]) -> Vec<u64> {
     let mut out = Vec::new();
+    // ⭐ 2026-10-17 (审计新 P1-19): internal 页的最左子树 (keys < 首个
+    // separator) 的 child 存在**页头 vpid 字段**, 不在任何 item 里
+    // (哨兵 item 的 child_vpid 恒为 0). 旧实现只收集 item 的 child_vpid,
+    // 每个 internal 页漏掉整个左子树 — export/walk 数据不完整.
+    let first_child = page_vpid(buf);
+    if first_child != 0 {
+        out.push(first_child);
+    }
     let free_off = page::page_free_off(buf) as usize;
     let mut off = page::PAGE_HEADER_SIZE;
     let mut prev_key: Vec<u8> = Vec::new();
@@ -391,7 +478,10 @@ fn iter_internal_children(buf: &[u8; PAGE_SIZE]) -> Vec<u64> {
     while off < free_off {
         match decode_item(buf, off, page::ItemKind::Internal) {
             Ok((item, n)) => {
-                let full = item.full_key(&prev_key);
+                // ⭐ 损坏 item (shared 越界): 停止收集, 不静默错 key
+                let Ok(full) = item.full_key(&prev_key) else {
+                    break;
+                };
                 if count > 0 && !full.is_empty() {
                     out.push(item.child_vpid);
                 }
@@ -449,7 +539,7 @@ mod tests {
         let shard = synth_test_shard(&dir);
         let locate = Locate::open(&shard).unwrap();
         let mut seen = Vec::new();
-        let summary = walk_tree(&shard, &locate, 0, |node| {
+        let summary = walk_tree(&shard, &locate, 0, false, |node| {
             seen.push(node.vpid);
         });
         assert_eq!(seen, vec![0]);
@@ -466,7 +556,7 @@ mod tests {
         let shard = synth_test_shard(&dir);
         let locate = Locate::open(&shard).unwrap();
         let mut visited_vpids = Vec::new();
-        let summary = walk_tree(&shard, &locate, 0, |node| {
+        let summary = walk_tree(&shard, &locate, 0, false, |node| {
             visited_vpids.push(node.vpid);
         });
         // We have only one leaf at vpid=0 because the second page does
@@ -495,7 +585,7 @@ mod tests {
         // and return empty, so traversal does not descend and does not
         // panic.
         let mut count = 0;
-        let summary = walk_tree(&shard, &locate, 1, |_| count += 1);
+        let summary = walk_tree(&shard, &locate, 1, false, |_| count += 1);
         // We did not write `bad` into the .block file -- the on-disk
         // page at vpid 1 is the empty leaf. So count == 1 and summary
         // reflects a healthy single-page tree (page_type = Leaf on disk).
@@ -566,7 +656,7 @@ mod tests {
 
         // Walk vpid 0 (healthy leaf) — should find 1 page, ok=1
         let mut visited = Vec::new();
-        let summary = walk_tree(&shard, &locate, 0, |node| {
+        let summary = walk_tree(&shard, &locate, 0, false, |node| {
             visited.push(node.vpid);
         });
         assert_eq!(visited, vec![0]);
@@ -575,7 +665,7 @@ mod tests {
 
         // Walk vpid 1 (corrupt — bad type) — should detect the issue
         let mut visited2 = Vec::new();
-        let summary2 = walk_tree(&shard, &locate, 1, |node| {
+        let summary2 = walk_tree(&shard, &locate, 1, false, |node| {
             visited2.push(node.vpid);
         });
         assert_eq!(visited2, vec![1]);
@@ -587,7 +677,11 @@ mod tests {
         // At minimum, the page should be classified as visited and not
         // be "unread" (it was readable, just structurally bad).
         let was_unread_or_bad = summary2.bad > 0 || summary2.unread > 0;
-        assert!(was_unread_or_bad, "corrupt page must be classified as bad or unread, got ok={}", summary2.ok);
+        assert!(
+            was_unread_or_bad,
+            "corrupt page must be classified as bad or unread, got ok={}",
+            summary2.ok
+        );
     }
 
     /// Test that in-order traversal returns keys in sorted order.
@@ -625,12 +719,18 @@ mod tests {
         let locate = Locate::open(&shard).unwrap();
 
         let mut keys = Vec::new();
-        let summary = walk_tree_in_order(&shard, &locate, 0, |key, _value| {
+        let summary = walk_tree_in_order(&shard, &locate, 0, false, |key, _value| {
             keys.push(key.to_vec());
         });
 
         // Keys should be in BTree order: alpha, bravo, charlie, delta
-        assert_eq!(keys.len(), 4, "expected 4 keys, got {}: {:?}", keys.len(), keys);
+        assert_eq!(
+            keys.len(),
+            4,
+            "expected 4 keys, got {}: {:?}",
+            keys.len(),
+            keys
+        );
         assert_eq!(&keys[0], b"alpha");
         assert_eq!(&keys[1], b"bravo");
         assert_eq!(&keys[2], b"charlie");
@@ -645,4 +745,125 @@ mod tests {
     fn _placeholder_keeps_page_use() {
         let _ = page::leaf_new();
     }
+}
+
+/// ⭐ 审计新 P1-19 回归: internal 页的最左子树 (first_child 存于页头
+/// vpid) 必须被 in-order 遍历覆盖. 旧实现只跟 item child_vpid —
+/// 每个 internal 页漏掉整个左子树 (export 数据不完整).
+#[test]
+fn in_order_walk_includes_first_child_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard_dir = dir.path().join("shard_0");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+    let mut block = vec![0u8; PAGE_SIZE * 3];
+    // vpid 0: internal root — 页头 first_child=1, separator "m" → child 2
+    let mut root = page::internal_new();
+    page::page_set_vpid(&mut root, 1);
+    page::internal_insert(&mut root, b"m", 2).unwrap();
+    block[..PAGE_SIZE].copy_from_slice(&root);
+    // vpid 1: 左子树叶子 (修复前整个被漏)
+    let mut l = page::leaf_new();
+    page::page_set_vpid(&mut l, 1);
+    page::leaf_insert(&mut l, b"a", b"va").unwrap();
+    page::leaf_insert(&mut l, b"b", b"vb").unwrap();
+    block[PAGE_SIZE..2 * PAGE_SIZE].copy_from_slice(&l);
+    // vpid 2: 右子树叶子
+    let mut r = page::leaf_new();
+    page::page_set_vpid(&mut r, 2);
+    page::leaf_insert(&mut r, b"x", b"vx").unwrap();
+    page::leaf_insert(&mut r, b"y", b"vy").unwrap();
+    block[2 * PAGE_SIZE..3 * PAGE_SIZE].copy_from_slice(&r);
+    std::fs::write(shard_dir.join("000000.block"), &block).unwrap();
+    // page.mate: slot i = vpid i 的 pid (file 0, chunk 0, page i).
+    // 注意: 全零 mate 会被 lookup_mate 无校验地解码成 pid 0 — 所有 vpid
+    // 都指到 page 0 (scanner 既有行为), 测试必须写真值 slot.
+    let mut mate = vec![0u8; 8 * 4];
+    for (vpid, slot) in mate.chunks_exact_mut(8).enumerate().take(3) {
+        let pid = page::PidLocation {
+            file_id: 0,
+            chunk_idx: 0,
+            page_idx: vpid as u16,
+            flags: 0,
+        };
+        slot.copy_from_slice(&pid.to_bytes());
+    }
+    std::fs::write(shard_dir.join("page.mate"), &mate).unwrap();
+
+    let shard = ShardDir {
+        id: 0,
+        path: shard_dir.clone(),
+        block_files: vec![crate::dir::BlockFile {
+            file_id: 0,
+            path: shard_dir.join("000000.block"),
+            size_bytes: (PAGE_SIZE * 3) as u64,
+        }],
+        page_mate: Some(shard_dir.join("page.mate")),
+        pid_state: None,
+        wal_segments: Vec::new(),
+    };
+    let locate = Locate::open(&shard).unwrap();
+
+    // in-order 遍历必须含全部 4 个 key (修复前只有 x,y)
+    let mut keys = Vec::new();
+    walk_tree_in_order(&shard, &locate, 0, false, |k, _| keys.push(k.to_vec()));
+    assert_eq!(
+        keys,
+        vec![b"a".to_vec(), b"b".to_vec(), b"x".to_vec(), b"y".to_vec()],
+        "in-order 遍历漏掉了 first_child 子树"
+    );
+
+    // BFS walk 也必须覆盖左子树页
+    let mut seen = Vec::new();
+    let s2 = walk_tree(&shard, &locate, 0, false, |n| seen.push(n.vpid));
+    assert_eq!(s2.bad, 0, "合成树不应有坏页: {s2:?}");
+    assert!(seen.contains(&1), "walk_tree 漏掉 first_child 页 (vpid 1)");
+    assert!(seen.contains(&2), "walk_tree 漏掉 separator 页 (vpid 2)");
+}
+
+/// ⭐ 审计 P2 (2026-10-17): strict 模式必须**真的**生效 — 遇到坏页记录
+/// `strict_hit` 并中止遍历; tolerant (默认) 只记数继续.
+///
+/// 旧实现 `--strict`/`--tolerant` 解析后从不读取 (CLI flag 空操作).
+#[test]
+fn walk_strict_mode_halts_on_first_bad_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard_dir = dir.path().join("shard_0");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+
+    let mut block = vec![0u8; PAGE_SIZE * 2];
+    let mut root = page::leaf_new();
+    page::page_set_vpid(&mut root, 0);
+    block[..PAGE_SIZE].copy_from_slice(&root);
+    // vpid 1: 坏页 (LCBP + vpid 正确, 但 page_type=Meta 出现在 btree 位置)
+    let mut corrupt = [0u8; PAGE_SIZE];
+    corrupt[..4].copy_from_slice(b"LCBP");
+    corrupt[4] = 1u8;
+    page::page_set_vpid(&mut corrupt, 1);
+    block[PAGE_SIZE..].copy_from_slice(&corrupt);
+    std::fs::write(shard_dir.join("000000.block"), &block).unwrap();
+    std::fs::write(shard_dir.join("page.mate"), vec![0u8; 1024 * 1024]).unwrap();
+
+    let shard = ShardDir {
+        id: 0,
+        path: shard_dir.clone(),
+        block_files: vec![crate::dir::BlockFile {
+            file_id: 0,
+            path: shard_dir.join("000000.block"),
+            size_bytes: (PAGE_SIZE * 2) as u64,
+        }],
+        page_mate: Some(shard_dir.join("page.mate")),
+        pid_state: None,
+        wal_segments: Vec::new(),
+    };
+    let locate = Locate::open(&shard).unwrap();
+
+    // tolerant (默认): 坏页只记数, 不置 strict_hit
+    let s = walk_tree(&shard, &locate, 1, false, |_| {});
+    assert!(s.strict_hit.is_none(), "tolerant 不得置 strict_hit");
+    assert!(s.bad + s.unread > 0, "坏页应被记数");
+
+    // strict: 记 strict_hit (命令层据此返回 Err → main 退出码 2)
+    let s = walk_tree(&shard, &locate, 1, true, |_| {});
+    let hit = s.strict_hit.expect("strict 必须记录第一个坏页");
+    assert!(hit.contains("vpid 1"), "hit 应带 vpid: {hit}");
 }

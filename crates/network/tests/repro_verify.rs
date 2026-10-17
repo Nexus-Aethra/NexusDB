@@ -11,7 +11,10 @@ const NUM_CLIENTS: usize = 6;
 const PHASE2_OPS_PER_CLIENT: usize = 10_000;
 const VALUE_LEN: usize = 32;
 
-fn make_mgr() -> (tempfile::TempDir, std::sync::Arc<shard_manager::ShardManager>) {
+fn make_mgr() -> (
+    tempfile::TempDir,
+    std::sync::Arc<shard_manager::ShardManager>,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let opts = ShardManagerOptions {
         num_shards: NUM_SHARDS,
@@ -55,9 +58,9 @@ fn just_phase1_then_phase3() {
         }
     }
     // Phase 3 verify keys
-    let verify_keys = std::sync::Arc::new(std::sync::Mutex::new(
-        Vec::<Vec<u8>>::with_capacity(NUM_CLIENTS * 100),
-    ));
+    let verify_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::with_capacity(
+        NUM_CLIENTS * 100,
+    )));
     {
         use std::sync::{Arc, Barrier};
         let barrier = Arc::new(Barrier::new(NUM_CLIENTS));
@@ -240,9 +243,9 @@ fn phase1_then_phase2_then_phase3() {
         }
     }
     // Phase 3 verify
-    let verify_keys = std::sync::Arc::new(std::sync::Mutex::new(
-        Vec::<Vec<u8>>::with_capacity(NUM_CLIENTS * 100),
-    ));
+    let verify_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::with_capacity(
+        NUM_CLIENTS * 100,
+    )));
     {
         use std::sync::{Arc, Barrier};
         let barrier = Arc::new(Barrier::new(NUM_CLIENTS));
@@ -296,8 +299,8 @@ fn phase1_sequential_then_phase2_then_phase3() {
     }
     // Phase 2 顺序
     for tid in 0..NUM_CLIENTS as u64 {
-        let mut rng: u64 = 0x12345678_9ABCDEF0u64
-            .wrapping_add(tid.wrapping_mul(0x9E3779B97F4A7C15u64));
+        let mut rng: u64 =
+            0x12345678_9ABCDEF0u64.wrapping_add(tid.wrapping_mul(0x9E3779B97F4A7C15u64));
         let mut next = || {
             rng = rng
                 .wrapping_mul(6364136223846793005)
@@ -392,9 +395,9 @@ fn phase1_then_concurrent_puts_only_then_phase3() {
         }
     }
     // Phase 3
-    let verify_keys = std::sync::Arc::new(std::sync::Mutex::new(
-        Vec::<Vec<u8>>::with_capacity(NUM_CLIENTS * 100),
-    ));
+    let verify_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::with_capacity(
+        NUM_CLIENTS * 100,
+    )));
     {
         use std::sync::{Arc, Barrier};
         let barrier = Arc::new(Barrier::new(NUM_CLIENTS));
@@ -482,10 +485,11 @@ fn minimal_two_clients_two_shards() {
         let barrier = barrier.clone();
         handles.push(std::thread::spawn(move || {
             barrier.wait();
-            let mut rng: u64 = 0x12345678_9ABCDEF0u64
-                .wrapping_add(tid * 0x9E3779B97F4A7C15u64);
+            let mut rng: u64 = 0x12345678_9ABCDEF0u64.wrapping_add(tid * 0x9E3779B97F4A7C15u64);
             let mut next = || {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 rng
             };
             for i in 0..5_000u64 {
@@ -545,7 +549,9 @@ fn single_threaded_phase2_then_phase3() {
     // Phase 2: 60K mixed single thread
     let mut rng: u64 = 0x12345678_9ABCDEF0u64;
     let mut next = || {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rng
     };
     for i in 0..60_000u64 {
@@ -639,9 +645,9 @@ fn phase1_then_concurrent_puts_then_gets_then_phase3() {
         }
     }
     // Phase 3
-    let verify_keys = std::sync::Arc::new(std::sync::Mutex::new(
-        Vec::<Vec<u8>>::with_capacity(NUM_CLIENTS * 100),
-    ));
+    let verify_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::with_capacity(
+        NUM_CLIENTS * 100,
+    )));
     {
         use std::sync::{Arc, Barrier};
         let barrier = Arc::new(Barrier::new(NUM_CLIENTS));
