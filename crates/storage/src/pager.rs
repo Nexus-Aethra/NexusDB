@@ -640,6 +640,16 @@ impl Pager {
             if let Some(start) = disk_start {
                 self.path_trace.disk_read_ns += start.elapsed().as_nanos() as u64;
             }
+            // ⭐ 审计 P2 (2026-10-17): 页校验和 — 磁盘→内存边界上验证.
+            // 只在这一条路径上校验: nowchunks/write_queue/in_flight/LRU 的字节
+            // 都源自同一份已校验的写入, 内存里不会自发损坏; 成本 = 每页一次
+            // 16KB 哈希 (亚微秒级), 只在 cache miss (真正读盘) 时付.
+            page::page_validate_checksum(&bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("vpid {vpid} page checksum mismatch (corrupt on disk): {e}"),
+                )
+            })?;
             self.chunk_list.admit_page(key, page_idx, &bytes);
             self.chunk_list.note_page_miss(key, page_idx);
             let mut out = page_pool::alloc();

@@ -69,9 +69,10 @@ pub use checkpoint::{
 pub use error::PageError;
 pub use header::{
     CHECKPOINT_AREA_END, ITEM_AREA_SIZE, PAGE_FOOTER_SIZE, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE,
-    PageHeader, PageType, page_check_magic, page_flags, page_free_off, page_free_space,
-    page_init_header, page_key_count, page_set_flags, page_set_free_off, page_set_key_count,
-    page_set_version, page_set_vpid, page_type, page_version, page_vpid,
+    PageHeader, PageType, page_check_magic, page_checksum, page_flags, page_free_off,
+    page_free_space, page_init_header, page_key_count, page_set_checksum, page_set_flags,
+    page_set_free_off, page_set_key_count, page_set_version, page_set_vpid, page_type,
+    page_validate_checksum, page_version, page_vpid,
 };
 pub use index::{PageIndex, Segment, pre_split_segment};
 pub use index_merge::{apply_pre_merge, apply_pre_merge_steal, pre_merge_segment};

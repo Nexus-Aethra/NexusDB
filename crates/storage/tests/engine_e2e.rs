@@ -657,3 +657,62 @@ fn ensure_table_and_db_id_view() {
         );
     });
 }
+
+/// ⭐ 审计 P2 (2026-10-17): 页校验和 — 磁盘上的页被损坏后必须**检出**
+/// (旧实现只有字段定义, `PageError::ChecksumMismatch` 无人返回: 损坏页被当
+/// 正常数据静默读取).
+#[test]
+fn engine_detects_corrupt_page_via_checksum() {
+    run_async(async move {
+        let (tmp, mut opts) = setup();
+        opts.chunk_cache_size = 1; // 逼近期最小缓存, 保证读走磁盘路径
+
+        let (v1, v2, v3) = {
+            let mut e = StorageEngine::open(opts.clone()).await.expect("open ok");
+            let v1 = e.put(make_data(0x11)).await.expect("put 1");
+            let v2 = e.put(make_data(0x22)).await.expect("put 2");
+            let v3 = e.put(make_data(0x33)).await.expect("put 3");
+            e.flush().await.expect("flush");
+            e.close().await.expect("close");
+            (v1, v2, v3)
+        };
+        let _ = (v1, v3);
+
+        // 损坏 v2 所在页的一个字节 (block 文件 = {tmp}/default/shard_0/000001.block)
+        let block = tmp
+            .path()
+            .join("default")
+            .join("shard_0")
+            .join("000001.block");
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&block)
+            .expect("open block for corrupt");
+        // v2 = MetaPage 之后的第 2 个数据页 → page_idx 2; 翻转 item 区一个字节
+        let off = (2 * PAGE_SIZE + 0x100) as u64;
+        let mut b = [0u8; 1];
+        f.read_exact_at(&mut b, off).expect("read byte");
+        b[0] ^= 0xFF;
+        f.write_all_at(&b, off).expect("corrupt byte");
+        f.sync_all().expect("sync");
+
+        // 重开: 读到坏页必须报 checksum 错 (而不是静默返回损坏数据)
+        let mut e2 = StorageEngine::open(opts.clone())
+            .await
+            .expect("reopen ok (catalog 页未损坏)");
+        let r = e2.get(v2).await;
+        match r {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("checksum"),
+                    "损坏页必须报 checksum 错, 实际: {msg}"
+                );
+            }
+            Ok(bytes) => panic!("损坏页必须被拒绝, 实际读回了数据 (首字节 {:02X})", bytes[0]),
+        }
+        drop(e2);
+    });
+}

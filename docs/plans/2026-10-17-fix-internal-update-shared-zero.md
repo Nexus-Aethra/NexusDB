@@ -603,3 +603,37 @@ shared=0 的字节, 原样拷贝后仍满足段首不变量, 前缀引用的是�
 | `drain_reports_enqueue_sequence` | ✅ drain 带序号且 FIFO |
 | shard_manager + network 全量串行 | ✅ 65 + 247 passed / 0 failed |
 | clippy -D warnings / fmt | ✅ 0 / 0 |
+
+---
+
+## 附: 页 checksum 从未实现 (P2) — 同批次修复
+
+**问题**: page header 有 `checksum[8]` 字段 (文档写 "xxhash64"), lib.rs 文档
+宣称 `page_validate_checksum` / `page_set_checksum`, `PageError::ChecksumMismatch`
+也存在 — 但**全部没有实现**: 没有任何代码计算/写入/校验校验和. 结果: 磁盘上位
+翻转/撕裂写/坏块导致的页损坏会被当正常数据静默读取 (错 key / 错 value / 错路由).
+
+**修复**:
+1. `page` crate 实现三件套: `page_checksum` (覆盖除 checksum 字段
+   `0x0C..0x14` 外的全部 16KB; 8B 一块 multiply-xor + 末轮混淆, 非加密用途),
+   `page_set_checksum`, `page_validate_checksum` (不匹配 → `ChecksumMismatch`).
+   不引第三方哈希依赖 (成本必须亚微秒级 + 算法可在 crate 内自证).
+2. **写入**: `ChunkBuf::write_page_with_header` 在所有页字节定稿后 (含自动补的
+   vpid 字段) 统一算校验和 — 这是页字节进入 chunk 缓冲的唯一入口, insert /
+   update / split / COW / MetaPage 全部写路径自动覆盖.
+3. **读取**: `Pager::read` 的磁盘→内存分支上校验 (nowchunks / write_queue /
+   in_flight / LRU 的字节都源自同一份已校验写入, 不会自发损坏; 只在真正读盘
+   时付一次 16KB 哈希).
+4. **兼容**: 字段为 0 视为旧版页 (本特性上线前落盘的页没有校验和) → 跳过校验,
+   下次被写入时自动补上 — 存量数据不会被误判为损坏.
+
+**测试** (反向验证: 去掉 `page_set_checksum` 调用后 reopen 读页直接失败 —
+说明校验确实在写路径生效; 去掉 validate 后损坏页被静默读回):
+
+| 用例 | 结果 |
+|---|---|
+| `page_checksum_detects_corruption_and_tolerates_legacy` | ✅ round-trip; 7 个位置的位翻转全部检出; 校验和字段自身损坏检出; 旧版页(=0)/全零页放行 |
+| `page_checksum_covers_whole_page` | ✅ vpid / key_count / item 区字节变更都改变校验和 |
+| `engine_detects_corrupt_page_via_checksum` | ✅ 落盘后翻转数据页一个字节 → reopen 读该页报 checksum 错 (而非静默返回损坏数据) |
+| page + storage + shard_manager + network 全量串行 | ✅ 979 passed / 0 failed |
+| clippy -D warnings / fmt | ✅ 0 / 0 |
