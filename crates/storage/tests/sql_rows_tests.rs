@@ -547,3 +547,116 @@ fn unique_index_rejects_duplicates() {
         assert_eq!(cols[1], ColValue::Bytes(b"b@x".to_vec()));
     });
 }
+
+/// ⭐ P2-1 (审计 2026-10-16): 复合索引 (a,b) 首列等值 → 前缀扫.
+/// 修复前: index_scan_raw 按首列单列编码做界, 复合 enc_val 头字节 0x04
+/// (IVAL_COMPOSITE) 恒大于单列界头 (0x01/0x02/0x03) → memcmp 立即 Break
+/// → 等值扫静默返空 (索引查不全 = 静默错数据).
+#[test]
+fn composite_index_first_col_eq_prefix_scan() {
+    run_async(async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = StorageEngine::open(opts_for(&tmp)).await.unwrap();
+        let schema = TableSchema::new(
+            vec![
+                Column {
+                    name: "id".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "a".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "b".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+            ],
+            0,
+            &[],
+            &[],
+            &[],
+            &[vec![1, 2]], // iid 0 = 复合 UNIQUE(a, b)
+            &[],
+        )
+        .unwrap();
+        e.create_db("db1").await.unwrap();
+        e.create_table("db1", "t1").await.unwrap();
+        e.set_schema("db1", "t1", &schema).await.unwrap();
+        for (id, a, b) in [(1i64, 1i64, 1i64), (2, 1, 2), (3, 2, 1), (4, 3, 9)] {
+            e.row_put(
+                "db1",
+                "t1",
+                &pk(id),
+                &[ColValue::I64(id), ColValue::I64(a), ColValue::I64(b)],
+            )
+            .await
+            .unwrap();
+        }
+        let ids_of = |hit: Vec<(Vec<u8>, Vec<u8>)>| -> Vec<i64> {
+            let mut v: Vec<i64> = hit
+                .into_iter()
+                .map(|(k, _)| i64::from_be_bytes(k.as_slice().try_into().unwrap()))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        // 首列等值: a=1 → 恰好 2 行 (id 1,2)
+        let eq = ColValue::I64(1);
+        let hit = e
+            .index_scan_local("db1", "t1", 0, Some(&eq), Some(&eq), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(hit),
+            vec![1, 2],
+            "复合索引首列等值前缀扫必须命中全部 a=1 行"
+        );
+        // 单边范围 (仅 lo) → 超集扫 (全部 4 行; 精确性由残余过滤兜底)
+        let lo = ColValue::I64(1);
+        let hit = e
+            .index_scan_local("db1", "t1", 0, Some(&lo), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(hit),
+            vec![1, 2, 3, 4],
+            "复合索引单边范围应为超集扫 (不漏行)"
+        );
+        // 双边范围 → 同样超集 (不漏行)
+        let hi = ColValue::I64(2);
+        let hit = e
+            .index_scan_local("db1", "t1", 0, Some(&lo), Some(&hi), 0)
+            .await
+            .unwrap();
+        assert_eq!(ids_of(hit).len(), 4, "复合索引双边范围应为超集扫");
+        // 不存在的首列值 → 空 (前缀断裂, 非全返)
+        let miss = ColValue::I64(99);
+        let hit = e
+            .index_scan_local("db1", "t1", 0, Some(&miss), Some(&miss), 0)
+            .await
+            .unwrap();
+        assert!(hit.is_empty(), "首列等值 miss 必须返空: {hit:?}");
+        e.flush().await.unwrap();
+        e.close().await.unwrap();
+
+        // 重开: bloom 重建只喂完整复合编码 — 前缀扫必须绕开 bloom 短路
+        // (bloom 无前缀项, 若走短路会假阴性返空).
+        let mut e = StorageEngine::open(opts_for(&tmp)).await.unwrap();
+        let hit = e
+            .index_scan_local("db1", "t1", 0, Some(&eq), Some(&eq), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(hit),
+            vec![1, 2],
+            "重开后前缀扫仍须命中 (绕 bloom 短路)"
+        );
+    });
+}

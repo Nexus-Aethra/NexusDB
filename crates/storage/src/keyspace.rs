@@ -397,6 +397,8 @@ pub fn split_index_val(rest: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 /// 解码值段 (enc_val 含型别字节) → 原值字节 (数值 = 8B 保序编码, 字节串 = 还原体).
+/// ⭐ PG 兼容 (FMT_VER 7): 复合段无单一"原值" — 原样返回拼接字节
+/// (字节序 = 索引序; 调用方按列取值需自行 split, 覆盖索引路径已禁复合).
 pub fn decode_index_val(enc_val: &[u8]) -> Option<Vec<u8>> {
     match *enc_val.first()? {
         IVAL_NUM => (enc_val.len() == 9).then(|| enc_val[1..9].to_vec()),
@@ -412,6 +414,7 @@ pub fn decode_index_val(enc_val: &[u8]) -> Option<Vec<u8>> {
             }
             Some(val)
         }
+        IVAL_COMPOSITE => Some(enc_val.to_vec()),
         _ => None,
     }
 }

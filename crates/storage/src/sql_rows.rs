@@ -1217,6 +1217,57 @@ impl StorageEngine {
             b.map(|v| index_val_bytes(ty, v).ok_or_else(|| se("bad index bound type")))
                 .transpose()
         };
+        // ⭐ PG 兼容 (FMT_VER 7): 复合索引 — 键 = `[IVAL_COMPOSITE][nseg][u16 len][enc]...`,
+        // enc_val 段头字节 0x04 恒大于单列界编码的头 (0x01/0x02/0x03) → 旧实现
+        // 一带上界 memcmp 即 Break, 等值/范围扫**静默返空** (索引查不全).
+        // 复合只支持**首列等值前缀扫** (界安全): 起点 = `[I][iid][复合前缀]`,
+        //  enc_val 不再以该前缀开头即断裂; 段含变长 (Str/Bytes) 时 (len,enc)
+        // 字典序≠值序, 范围界不可构造 → 范围/单边界退整 iid 超集扫
+        // (精确性由调用方残余过滤兜底).
+        // bloom 只存完整复合编码 (row_put 喂 index_vals_bytes 全值), 前缀不可查
+        // → 复合路径不走 bloom 短路 (查不到 = 假阴性返空).
+        if idx.cols.len() > 1 {
+            let lo_enc = enc_bound(lo)?;
+            let hi_enc = enc_bound(hi)?;
+            let prefix = ks::index_prefix(iid);
+            let (start, want) = match (&lo_enc, &hi_enc) {
+                (Some(l), Some(h)) if l == h => {
+                    let mut p = Vec::with_capacity(4 + l.len());
+                    p.push(crate::keyspace::IVAL_COMPOSITE);
+                    p.push(idx.cols.len() as u8);
+                    p.extend_from_slice(&(l.len() as u16).to_le_bytes());
+                    p.extend_from_slice(l);
+                    (ks::index_value_prefix(iid, &p), Some(p))
+                }
+                _ => (prefix.clone(), None),
+            };
+            let root = self
+                .open_table(db, table)
+                .await?
+                .ok_or_else(|| RegistryError::TableNotFound(db.to_string(), table.to_string()))?;
+            let mut n = 0usize;
+            return crate::registry::table_scan_range(
+                self.pager_mut(),
+                root,
+                &start,
+                &prefix,
+                &mut |k, _v| {
+                    if let Some(want) = &want {
+                        match ks::split_index_val(&k[5..]) {
+                            Some((ev, _)) if ev.starts_with(want.as_slice()) => {}
+                            _ => return ControlFlow::Break(()),
+                        }
+                    }
+                    on_entry(k);
+                    n += 1;
+                    if limit > 0 && n >= limit {
+                        return ControlFlow::Break(());
+                    }
+                    ControlFlow::Continue(())
+                },
+            )
+            .await;
+        }
         let lo_enc = enc_bound(lo)?;
         let hi_enc = enc_bound(hi)?;
 
