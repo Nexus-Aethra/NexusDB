@@ -182,6 +182,21 @@ fn worker_thread_count() -> usize {
     count
 }
 
+/// 等 worker 线程名可见再返回计数. `thread::spawn` 返回时新线程可能还没被
+/// 调度 (pthread_setname_np 未执行, comm 仍是进程名) — CI 高负载下实测
+/// 直接数会数到 0 (2026-10-17 main 推送与 PR 各挂一次). 有界轮询到期望值
+/// 或超时; 断言语义不变 (池膨胀成 4 仍会以 actual=4 失败).
+fn wait_worker_count(expected: usize) -> usize {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = worker_thread_count();
+        if n == expected || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 // ===== 并行安全 =====
 
 /// 三个用例都断言进程级 worker 线程数, 并行执行会互相串数 (实测: 并行下
@@ -248,7 +263,7 @@ fn shared_worker_pool_resp_and_sql() {
     let env = PoolTestEnv::new(vec![server_a, server_b], shared, mgr);
 
     // 线程数 = 池大小 (2), 而非 2 server × 2 = 4
-    let workers = worker_thread_count();
+    let workers = wait_worker_count(2);
     assert_eq!(workers, 2, "共享池应只有 2 个 worker 线程, 实际 {workers}");
 
     // 功能: RESP + SQL 在同一批 worker 上正常
@@ -275,7 +290,7 @@ fn shared_worker_pool_per_conn_auth() {
     let env = PoolTestEnv::new(vec![server_a, server_b], shared, mgr);
 
     // 同一批 worker (2 个) 处理两个协议, 且 RESP 需 AUTH
-    let workers = worker_thread_count();
+    let workers = wait_worker_count(2);
     assert_eq!(workers, 2, "共享池应只有 2 个 worker, 实际 {workers}");
     resp_set_get(env.servers[0].local_addr(), Some("secret"));
     sql_ping(env.servers[1].local_addr());
