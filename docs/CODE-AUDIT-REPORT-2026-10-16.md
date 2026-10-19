@@ -3,7 +3,7 @@
 > 审查对象：`/home/wpp/nexus/NexusDB` @ `c4f9eaf`（main）+ 工作区未提交修复（约 +3865/−1570 行，含 2026-10-14 P0/C1-C6 修复）
 > 审查日期：2026-10-16　　审查方式：7 名分析员并行模块审计 + 交叉核对 [`CODE-AUDIT-REPORT.md`](./CODE-AUDIT-REPORT.md)（2026-10-13 版）条目现状 + 独立探针程序 release 模式实证
 > 本文档为审查产物，可随时移走或删除。**全程只读，未修改任何代码。**
-> **修复进度见 [§五](#五修复进度2026-10-17)**：截至 2026-10-17 已修 87 项条目 / 剩 6 项 + 文档化边界（§5.6）。
+> **修复进度见 [§五](#五修复进度2026-10-17)**：截至 2026-10-19 已修 89 项条目 / 剩 4 项 + 文档化边界（§5.6）。
 
 ---
 
@@ -46,7 +46,7 @@
 | P1-3 CHECK 约束静默丢弃 | `parser_ddl.rs:266-278`（表级）/ `:335-347`（列级）：`try_kw("CHECK")` 后括号深度计数直接吞掉表达式，注释 "v1 吞 (不强制约束)"，无警告无 AST |
 | P1-4 FK 父表缓存 miss 静默跳过 | `sql_fk.rs:53-56` 缓存 miss → `return false`（无日志）；`:61` 类型不匹配 → `return false`。**比原描述更严重**：FK 检查仅覆盖 INSERT，DELETE/UPDATE 完全无 RESTRICT 检查（`sql_dml.rs:181-198`） |
 | P1-6 `block_on_io` 自旋 | `manager.rs:1439-1455` 仍是 `Waker::noop` + spin（行号自 1436 漂移） |
-| P2-1 复合索引退化全表 | `sql_dispatch.rs:958-961`：`if idx.cols.len() != 1 { continue; }`——parser 把复合 UNIQUE 建成多列索引，执行层永远用不上 |
+| P2-1 复合索引退化全表 | ✅ 已修（见 5.9）：planner 复合首列等值计分 + storage 复合前缀扫；OR→IndexUnion 选中复合索引静默返空同批修复 |
 | P2-4 协程 worker TLS | 半修：epoll 写缓冲已做；协程 worker TLS 两处残缺（见 2.2 节 P1-5/P1-6） |
 | P2-5 SchedHandle | **比原描述更严重**：`Clone + pub Rc` 破坏唯一所有权前提，clone 跨线程是真正 UB（非仅 API 误用） |
 | P2-6 | 未修复 |
@@ -305,7 +305,7 @@
 | P1-3 | ❌ CHECK 静默丢弃 | ✅ 已修：保留既有迁移兼容（仍吞表达式）但每条 CHECK 打 WARN，"静默"→"显式" | `d104723` |
 | P1-4 | ❌ FK 缓存 miss 静默跳过 | ✅ 已修：父表 DELETE 前置 RESTRICT 预检 (sql_fk_restr.rs)；另修 cascade NoAction 永挂 | PR #12 (`4bb2127`) |
 | P1-6 | ❌ block_on_io 自旋 | ✅ 已修：核实为有界退避（64 轮 spin + yield），抽出 `BLOCK_ON_SPIN_ROUNDS` 常量并写明契约 | `be95b5e` |
-| P2-1 | ❌ 复合索引退化全表 | 🔴 **未修**（见 5.6） | — |
+| P2-1 | ❌ 复合索引退化全表 | ✅ 已修：planner 复合首列等值计分 + storage 复合前缀扫；附带修 OR→IndexUnion 选中复合索引静默返空 (见 5.9) | 本分支 |
 | P2-4 | ⚠️ 协程 worker TLS 半修 | ✅ 已修：协程分支补齐 TLS 升级处理 | `5ee4496` |
 | P2-5 | ❌ SchedHandle Clone+pub Rc | ✅ 已修：移除 `unsafe impl Send`，内层 `Rc` 改私有 | `7257868` |
 | P2-6 | ❌ 未修复 | 🔴 **未修**（见 5.6） | — |
@@ -345,7 +345,7 @@
 | P1-9 | JOIN finish 无 panic 隔离 | `9600ebf` | P1-19 | scanner 漏 internal 页 first_child | `6f90a10` |
 | P1-10 | parser 深递归栈溢出 | `2e6fc41` | P1-20 | fix-mate --auto 硬编码 slot | `d0116e4` |
 
-### 5.4 §2.3 P2 —— 性能 / 一致性 / 健壮性（表中 36 项：34 已修 / 2 未修）
+### 5.4 §2.3 P2 —— 性能 / 一致性 / 健壮性（表中 36 项：35 已修 / 1 未修）
 
 **page crate（10 项全修）**
 
@@ -372,7 +372,7 @@
 
 **存储层（3 项全修）**：meta_cache flush_dirty in-flight `a3f45c1`｜pid page_idx u16→u8 截断 `8e5169b`｜recover 固定共享临时文件 `5db295d`
 
-**工具链（1/2）**：`--strict/--tolerant` 无效 flag `fa46a8d`｜scanner 只处理第一个 shard 🔴 **未修**（见 5.6）
+**工具链（2/2）**：`--strict/--tolerant` 无效 flag `fa46a8d`｜scanner 只处理第一个 shard ✅ 已修：14 命令全 shard 遍历合并 (PR #13, `4a87b68`)
 
 ### 5.5 §2.4 P3 —— 低危 / 文档化建议（20 项，已修 17）
 
@@ -380,11 +380,10 @@
 
 未修：协议分派 match 重复两处（P3-3，见 5.6）、错误分类靠字符串匹配（P3-5/P3-6，见 5.6）。
 
-### 5.6 🔴 仍未解决（5 项 + 文档化边界）
+### 5.6 🔴 仍未解决（4 项 + 文档化边界）
 
 | # | 问题 | 位置 | 为什么还没修 |
 |---|---|---|---|
-| **P2-1** | 复合索引退化全表 | `sql_dispatch.rs:1101` `if idx.cols.len() != 1 { continue; }` | 需扩展 ScanPred 支持多列前缀匹配 |
 | **P2-6** | `JoinInner` UnsafeCell + `unsafe impl<T: Send> Send` | `scheduler/src/task.rs:62-71` | 跨线程 poll 竞争；需设计改 Arc/Mutex 或显式 `!Send`，牵涉 JoinHandle 公共 API |
 | **P2** | flush_uring 忙轮询 | `logging/src/lib.rs:344` `drive_until_idle(256)` 自旋等写盘完成 | 仅在写盘期间自旋（非空闲期），影响有限，需引入完成通知机制 |
 | **P3-3** | 协议分派 match 在 worker_epoll / worker_coro 重复两处 | `worker_epoll.rs:231,318` vs `worker_coro.rs:343` | 两处生命周期/借用结构不同，抽取公共层需重构 |
@@ -396,6 +395,7 @@
 |---|---|---|---|
 | P1-4 | FK 对 DELETE 无 RESTRICT 检查 | 新 `sql_fk_restr.rs` 预检状态机 (PkGet Redispatch / 两阶段 Phase2 双挂点); cascade_kickoff 只对 Cascade/SetNull 进延迟 (修 NoAction 永挂); 错误映射 1451/23503/409 | PR #12 (`4bb2127`) |
 | P2-新 | scanner 14 命令全部 `shards.first()` | 全命令遍历全部 shard 合并 (见 5.8); fix-mate 多 shard 必须 `--shard` | 本分支 |
+| P2-1 | 复合索引退化全表 (+ OR 混合算子命中复合索引静默返空) | planner 复合首列等值计分 + storage 复合前缀扫 + eq_enc/cover 护栏 (见 5.9) | 本分支 |
 | (附带) | scanner `decode_meta_page` 格式漂移 | MetaPage item 区起点 40 → 1064 (引擎 T12.14 resolver 段 1KiB); 旧实现在现代引擎目录上把 resolver 段当 item 解, dbs/export/lookup/verify 全不可用 | 本分支 |
 
 **文档化边界**（已在 `SQL-FEATURES.md` / `DESIGN.md` / `AGENTS.md` 显式标注，非缺陷）：JOIN gather 读不入 OCC 读集、跨 shard COMMIT best-effort、不防幻读、Binary 协议无认证、CPU 亲和未实现。
@@ -404,8 +404,10 @@
 
 1. ~~**P2-新 scanner 单 shard**~~ ✅ 已修 (本分支, 含附带 meta 解码漂移修复).
 2. ~~**P1-4 FK RESTRICT**~~ ✅ 已修 (PR #12).
-3. **P2-1 复合索引退化全表** — 正确性优先 (索引查不全 = 静默错数据); 需扩展 ScanPred 多列前缀匹配.
+3. ~~**P2-1 复合索引退化全表**~~ ✅ 已修 (本分支, 见 5.9).
 4. **P2-6 JoinInner Send 安全** — 跨线程 poll 竞争, 需设计决策 (Arc/Mutex vs !Send).
+5. **P3-5/6 错误分类结构化** — 收敛字符串匹配, 为后续所有错误路径打基础.
+6. **flush_uring 忙轮询 / P3-3 协议分派去重** — 需设计权衡, 排最后.
 
 ### 5.8 P2-新 修复明细 (scanner 多 shard, 2026-10-17)
 
@@ -420,10 +422,20 @@
 - wal-list/wal-dump 本就已遍历全部 shard 的 WAL 段, 无需改动.
 
 验证: `crates/scanner/tests/multishard_rescue.rs` — 真实引擎 3-shard 目录 (ShardManager 落盘 + close flush) 端到端跑 scanner 二进制: export-force/export 全 30 键、dbs/verify/header/map 三 shard 全覆盖、lookup 命中非 shard_0 的键、fix-mate 多 shard 拒猜、单 shard 目录行为不变; 反向验证 (stash src 后) 8/9 必败.
-3. **P2-1 复合索引** —— 影响面是性能，但复合 UNIQUE 建成却用不上属于功能失效。
-4. **P3-5/6 错误分类结构化** —— 收敛字符串匹配，为后续所有错误路径打基础。
-5. **P2-6 / P3-3 / flush_uring** —— 需设计权衡，排最后。
 
+### 5.9 P2-1 修复明细 (复合索引前缀扫, 2026-10-19)
+
+问题 (两层):
+1. **性能**: planner 计分循环 `sql_dispatch.rs` `if idx.cols.len() != 1 { continue; }` — parser 建的复合 UNIQUE 索引执行层永远用不上, `WHERE a=?` 退全表.
+2. **正确性 (比原报告更严重)**: `sql_plan_select` 的 OR→IndexUnion 路径按 `i.col == col_idx` 匹配索引, 无同首列单列索引时会选中**复合**索引; shard 端 `index_scan_raw` 按首列单列编码做界, 而复合 enc_val 头字节 `IVAL_COMPOSITE`(0x04) 恒大于单列界头 (0x01/0x02/0x03) → memcmp 一带上界立即 Break → **静默返空** (`WHERE a=1 OR a<0` 实测返 0 行). JOIN 的 `iid_of` 索引驱动同样可命中复合索引, 同病.
+
+修复:
+- **storage `index_scan_raw`**: 复合索引 (cols>1) 独立分支 — 首列等值 (lo==hi) 走**前缀扫**: 起点 `[I][iid][IVAL_COMPOSITE][nseg][u16 len][enc]`, enc_val 不再以该前缀开头即断裂 (键共享前缀 ⇒ B+Tree 中连续, 断裂点精确); 范围/单边界退整 iid 超集扫 (不漏行, 精确性由 worker 残余过滤兜底); bloom 只存完整复合编码 (row_put 喂 `index_vals_bytes` 全值), 前缀不可查 → 复合路径绕 bloom 短路 (查不到 = 假阴性返空).
+- **storage `decode_index_val`**: 补 `IVAL_COMPOSITE` 臂 (原样返回拼接字节) — 否则 `index_scan_entries_local` 经 `split_index_entry` 把复合条目当坏条目丢弃 (扫到了也收集不上来).
+- **planner `sql_plan_select`**: 复合索引参与计分, 但仅**首列等值**计分 (+3); 范围/IN 不计分 (复合编码段含变长, `(len,enc)` 字典序≠值序, 范围界不安全) → 回退全扫; OR 分支命中复合索引时仅允许等值分支, 否则整体回退全扫.
+- **护栏**: 复合索引 `eq_enc=None` (路由 bloom 只存完整复合编码, 前缀键查不到 → 零候选短路会静默返空); cover 覆盖索引禁复合 (`col_from_ordered_bytes` 解不出复合值段 → "bad covered index entry" 报错).
+
+验证: `crates/storage/tests/sql_rows_tests.rs::composite_index_first_col_eq_prefix_scan` (等值/单边/双边/miss/重开绕 bloom 五断言); `sql_dispatch.rs` planner 单测 5 个 (首列等值走 Index/次列组合/范围回退/非前缀回退/OR 范围分支回退); `sql_e2e.rs::mysql_composite_index_query_correctness` (等值/组合/OR 混合算子/COUNT 禁覆盖/投影禁覆盖); 修复前全部必败 (等值扫返空, OR 返空), 修复后全量 1168 passed / 0 failed (默认并行度), clippy/fmt 0.
 
 ## 附：审计方法与团队
 

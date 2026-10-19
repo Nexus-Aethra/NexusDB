@@ -95,7 +95,7 @@
 - **索引 key**：`index_vals_bytes` 多列拼接 `[IVAL_COMPOSITE][nseg][u16 len][enc]...`（长度前缀防碰撞 + 型别字节防 split 误判）；单列保持原编码（存量兼容）
 - **keyspace**：`split_index_val` 加 `IVAL_COMPOSITE` 分支（唯一检查/UPDATE 新旧比较正确切分）
 - **parser**：表级 `UNIQUE(a,b,...)` 不再截取首列 → 整组
-- **扫描**：复合索引 v1 不参与单列索引扫描（退化全表，正确性保底）
+- **扫描**：复合索引首列等值走前缀扫（P2-1 已修，2026-10-19）；范围/IN 界不安全（段含变长，(len,enc) 字典序≠值序）→ 回退全表 + 残余过滤
 - **验证**：Loom 完整迁移 + 同一用户两世界允许、重复世界名报 `duplicate key on unique columns (user_id, name)`；新增 e2e `mysql_composite_unique`
 
 ### 2026-08-03 完整性测试新增发现

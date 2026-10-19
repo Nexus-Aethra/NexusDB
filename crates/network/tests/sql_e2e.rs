@@ -1990,6 +1990,92 @@ fn mysql_composite_unique() {
     drop(mgr);
 }
 
+/// ⭐ P2-1 (审计 2026-10-16): 复合索引查询正确性.
+/// 修复前: (a) OR 混合算子命中复合索引 (无同首列单列索引) → IndexUnion 选中
+/// 复合 iid → shard 端单列界对复合 enc_val (0x04 头) memcmp 立即 Break →
+/// 静默返空; (b) 首列等值退全表 (功能性浪费).
+#[test]
+fn mysql_composite_index_query_correctness() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = ShardManagerOptions {
+        num_shards: 1,
+        block_root: tmp.path().to_path_buf(),
+        create_if_missing: true,
+        io_backend: IoBackend::StdFs,
+        io_config: IoBackendConfig::default(),
+        chunk_cache_size: 4,
+        reply_bus_count: Some(3),
+        wal_mode: Default::default(),
+    };
+    let mgr = Arc::new(ShardManager::open(opts).expect("open mgr"));
+    mgr.create_db("app").expect("create db");
+    mgr.create_table("app", "kv").expect("create table");
+    std::mem::forget(tmp);
+    let cfg = NetworkServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        shard_manager: mgr.clone(),
+        worker_count: 1,
+        default_db: "app".to_string(),
+        default_table: "kv".to_string(),
+        inbox_capacity: 64,
+        protocol: ProtocolKind::Sql,
+        limits: KvLimits::default(),
+        auth_password: None,
+        worker_id_base: 0,
+        sql_shared: network::new_sql_shared(),
+        tls_config: None,
+        shared_workers: None,
+    };
+    let server = NetworkServer::start(cfg).expect("start server");
+    let mut c = MyConn::handshake_login(&server, "");
+    c.query("CREATE TABLE uq (id INT PRIMARY KEY, a INT, b INT, UNIQUE(a, b))");
+    for (id, a, b) in [(1, 1, 1), (2, 1, 2), (3, 2, 1), (4, 3, 9)] {
+        c.query(&format!("INSERT INTO uq VALUES ({id}, {a}, {b})"));
+    }
+    // 首列等值 → 前缀扫 (修复前: 全表, 结果对但走不了索引)
+    assert_eq!(
+        c.query("SELECT id FROM uq WHERE a = 1 ORDER BY id"),
+        QueryResult::Rows(vec![vec![Some("1".into())], vec![Some("2".into())]]),
+        "复合索引首列等值必须查全"
+    );
+    // 首列等值 + 次列等值 → 前缀扫 + 残余过滤
+    assert_eq!(
+        c.query("SELECT id FROM uq WHERE a = 1 AND b = 2"),
+        QueryResult::Rows(vec![vec![Some("2".into())]]),
+        "a=1 AND b=2 必须只命中 (1,2)"
+    );
+    // ⭐ P2-1: 覆盖索引护栏 — 复合索引免回表路径解不出复合值段会丢行;
+    // COUNT/投影 ⊆ {首列, pk} 都必须回表拿正确结果
+    assert_eq!(
+        c.query("SELECT COUNT(*) FROM uq WHERE a = 1"),
+        QueryResult::Rows(vec![vec![Some("2".into())]]),
+        "复合索引 COUNT 必须回表计数 (禁覆盖)"
+    );
+    match c.query("SELECT a, id FROM uq WHERE a = 1 ORDER BY id") {
+        QueryResult::Rows(rows) => {
+            assert_eq!(rows.len(), 2, "复合索引投影查询必须回表: {rows:?}");
+            assert!(rows.iter().all(|r| r[0].as_deref() == Some("1")));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    // OR 混合算子 (Eq + Lt, 不可归一为 IN) → 修复前 IndexUnion 选复合索引返空
+    let r = c.query("SELECT id FROM uq WHERE a = 1 OR a < 0 ORDER BY id");
+    match &r {
+        QueryResult::Rows(rows) => {
+            let ids: Vec<&str> = rows.iter().map(|r| r[0].as_deref().unwrap()).collect();
+            assert_eq!(
+                ids,
+                vec!["1", "2"],
+                "OR 混合算子命中复合索引必须查全: {r:?}"
+            );
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    drop(c);
+    server.shutdown().unwrap();
+    drop(mgr);
+}
+
 /// ⭐ PG 兼容 (FMT_VER 8): 外键级联删除 — ON DELETE CASCADE 删引用行,
 /// SET NULL 置空引用列; 引用完整性 v1 不强制 (语法兼容层).
 #[test]

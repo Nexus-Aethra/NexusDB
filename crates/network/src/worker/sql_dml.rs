@@ -1126,11 +1126,11 @@ pub(crate) fn sql_run_dml(
                     pk: false,
                 }) => {
                     // ⭐ O1: 覆盖判定 — 投影∪条件∪排序列 ⊆ {索引列, pk 列} → 免回表
-                    let idx_col = schema
+                    let (idx_col, idx_single_col) = schema
                         .indexes
                         .iter()
                         .find(|i| i.iid == iid)
-                        .map(|i| i.col)
+                        .map(|i| (i.col, i.cols.len() == 1))
                         .expect("plan 产出的 iid 必在 schema");
                     // ⭐ M2b: 排序消排 — ORDER BY 单列 ASC 且 == 索引列 → 索引序
                     // (val,pk 升序) 即排序序, worker 端免 sql_order_cmp 全量排序.
@@ -1148,8 +1148,12 @@ pub(crate) fn sql_run_dml(
                     let pk_col = schema.pk_col;
                     let in_cover = |c: u16| c == idx_col || c == pk_col;
                     // ⭐ 审计 P2 (2026-10-17): 事务内禁用覆盖索引 (同上: 无 row 字节)
+                    // ⭐ P2-1: 复合索引禁覆盖 — shard 端免回表路径 (with_rows=false)
+                    // 用 decode_index_val 解索引值段, 复合段 (IVAL_COMPOSITE) 解不出
+                    // → 条目被丢 → 行静默丢失.
                     let cover = (count || proj.iter().all(|&c| in_cover(c)))
                         && conn.txn.is_none()
+                        && idx_single_col
                         && order_cols.iter().all(|&(c, _)| in_cover(c))
                         && conds
                             .leaves()

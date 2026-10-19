@@ -982,6 +982,13 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                     ok = false;
                     break;
                 };
+                // ⭐ P2-1: 复合索引仅支持等值分支 — 范围/IN 界对复合编码不安全
+                // (段含变长, (len,enc) 字典序≠值序) → 整体回退全扫 (正确性由
+                // 完成点残余过滤兜底). 纯等值 OR 已在归一层并成 IN, 走计分路径.
+                if schema.indexes[ipos].cols.len() > 1 && c.op != CmpOp::Eq {
+                    ok = false;
+                    break;
+                }
                 // 所有分支必须落在同一索引列 (并集可合并)
                 if let Some(prev) = branch_idx {
                     if prev != ipos {
@@ -1097,10 +1104,10 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
     let mut best: Option<(u32, usize, u32)> = None; // (score, idx_pos, iid)
     let mut best_bounds: (Option<ColValue>, Option<ColValue>) = (None, None);
     for (ipos, idx) in schema.indexes.iter().enumerate() {
-        // ⭐ PG 兼容 (FMT_VER 7): 复合索引 v1 不参与单列扫描 (退化全表, 正确性保底)
-        if idx.cols.len() != 1 {
-            continue;
-        }
+        // ⭐ P2-1 (审计 2026-10-16): 复合索引参与选择, 但仅**首列等值**计分 —
+        // 复合编码段含变长 (Str/Bytes), (len,enc) 字典序≠值序, 范围/IN 界
+        // 不安全 → 不计分 (留在全扫, 正确性由残余过滤兜底).
+        let composite = idx.cols.len() > 1;
         let col = &schema.columns[idx.col as usize];
         let mut lo: Option<ColValue> = None;
         let mut hi: Option<ColValue> = None;
@@ -1117,6 +1124,9 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                     hi = Some(cv);
                 }
                 CmpOp::Gt | CmpOp::Ge => {
+                    if composite {
+                        continue;
+                    }
                     score += 2;
                     hits.push(c);
                     if lo.is_none() {
@@ -1124,6 +1134,9 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                     }
                 }
                 CmpOp::Lt | CmpOp::Le => {
+                    if composite {
+                        continue;
+                    }
                     score += 2;
                     hits.push(c);
                     if hi.is_none() {
@@ -1135,7 +1148,7 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
                 CmpOp::In => {
                     // ⭐ M3-3 (代价): IN 界 = [min,max] 超集, 集合 ≥ IN_INDEX_MAX_SET 时
                     // 扫描接近全表且残余仍要全量 eval → 不选索引 (回退全扫 + 残余).
-                    if c.set.len() >= IN_INDEX_MAX_SET {
+                    if c.set.len() >= IN_INDEX_MAX_SET || composite {
                         continue;
                     }
                     score += 1;
@@ -1195,9 +1208,14 @@ pub(crate) fn sql_plan_select(schema: &TableSchema, pred: &Pred<Cond>) -> Result
         let limit_push = conds
             .iter()
             .all(|c| c.col == col.name && matches!(c.op, CmpOp::Eq | CmpOp::Ge | CmpOp::Le));
-        // ⭐ W2: 等值 (lo == hi) 时算路由缓存键 (与引擎索引值编码同源)
+        // ⭐ W2: 等值 (lo == hi) 时算路由缓存键 (与引擎索引值编码同源).
+        // ⭐ P2-1: 复合索引禁设 eq_enc — 路由 bloom 只存完整复合编码
+        // (row_put 喂 index_vals_bytes 全值), 首列前缀编码查不到 → 候选剪枝
+        // 零命中 → 静默返空. 复合一律广播 (无剪枝).
         let eq_enc = match (&lo, &hi) {
-            (Some(l), Some(h)) if l == h => storage::sql_rows::index_val_bytes(col.ty, l),
+            (Some(l), Some(h)) if l == h && idx.cols.len() == 1 => {
+                storage::sql_rows::index_val_bytes(col.ty, l)
+            }
             _ => None,
         };
         return Ok(SqlPlan::Index {
@@ -1269,6 +1287,39 @@ mod tests {
             val,
             set: vec![],
         })
+    }
+
+    /// ⭐ P2-1: (id pk, a, b) + 复合 UNIQUE(a, b) → iid 0 是复合索引.
+    fn composite_schema() -> TableSchema {
+        TableSchema::new(
+            vec![
+                Column {
+                    name: "id".into(),
+                    ty: ColType::I64,
+                    nullable: false,
+                    default: None,
+                },
+                Column {
+                    name: "a".into(),
+                    ty: ColType::I64,
+                    nullable: true,
+                    default: None,
+                },
+                Column {
+                    name: "b".into(),
+                    ty: ColType::I64,
+                    nullable: true,
+                    default: None,
+                },
+            ],
+            0,
+            &[],
+            &[],
+            &[],
+            &[vec![1, 2]],
+            &[],
+        )
+        .unwrap()
     }
 
     fn andc(preds: Vec<Pred<Cond>>) -> Pred<Cond> {
@@ -1427,6 +1478,99 @@ mod tests {
             SqlPlan::Index { iid, .. } => assert_eq!(iid, 0, "平局应取靠前索引 (确定性)"),
             other => panic!("expected Index, got {other:?}"),
         }
+    }
+
+    // =================================================================
+    // ⭐ P2-1 (审计 2026-10-16): 复合索引 (a, b) — 前缀等值走索引,
+    // 范围/非前缀列回退全表 (保序编码含变长段, 范围界不安全).
+    // =================================================================
+
+    #[test]
+    fn composite_index_first_col_eq_uses_prefix_scan() {
+        let schema = composite_schema();
+        let plan = sql_plan_select(&schema, &c("a", CmpOp::Eq, SqlValue::Int(7))).unwrap();
+        match plan {
+            SqlPlan::Index {
+                iid,
+                lo,
+                hi,
+                eq_enc,
+                pk,
+                ..
+            } => {
+                assert_eq!(iid, 0, "复合 UNIQUE(a,b) 是唯一索引 (iid 0)");
+                assert_eq!(lo, Some(ColValue::I64(7)));
+                assert_eq!(hi, Some(ColValue::I64(7)));
+                assert!(
+                    eq_enc.is_none(),
+                    "复合索引禁设 eq_enc: 路由 bloom 只存完整复合编码, \
+                     前缀编码查不到 → 零候选短路会静默返空"
+                );
+                assert!(!pk);
+            }
+            other => panic!("复合索引首列等值应走 Index 前缀扫, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn composite_index_eq_plus_second_col_still_index() {
+        // a=1 AND b=2 → 复合索引前缀扫 (界只到首列; b 由残余过滤精确)
+        let schema = composite_schema();
+        let p = andc(vec![
+            c("a", CmpOp::Eq, SqlValue::Int(1)),
+            c("b", CmpOp::Eq, SqlValue::Int(2)),
+        ]);
+        let plan = sql_plan_select(&schema, &p).unwrap();
+        match plan {
+            SqlPlan::Index { iid, lo, hi, .. } => {
+                assert_eq!(iid, 0);
+                assert_eq!(lo, Some(ColValue::I64(1)));
+                assert_eq!(hi, Some(ColValue::I64(1)));
+            }
+            other => panic!("a=1 AND b=2 应走复合索引前缀扫, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn composite_index_range_first_col_falls_back() {
+        // 首列范围: 复合编码段含变长 (Str/Bytes) → 字节序≠值序, 范围界不安全
+        let schema = composite_schema();
+        for op in [CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le] {
+            let plan = sql_plan_select(&schema, &c("a", op, SqlValue::Int(7))).unwrap();
+            assert!(
+                matches!(plan, SqlPlan::FullScan),
+                "复合索引首列范围 {op:?} 应回退全扫, got {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_index_non_prefix_col_falls_back() {
+        // 仅次列谓词 → 非前缀 → 全扫
+        let schema = composite_schema();
+        let plan = sql_plan_select(&schema, &c("b", CmpOp::Eq, SqlValue::Int(7))).unwrap();
+        assert!(
+            matches!(plan, SqlPlan::FullScan),
+            "非前缀列应回退全扫: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn composite_index_range_or_branch_falls_back() {
+        // OR 混合算子 (Eq + Lt) 命中复合索引 → 范围分支界不安全 → 整体回退全扫
+        // (修复前: IndexUnion 选中复合索引 → shard 端单列界对复合 enc_val
+        // memcmp 立即 Break → 静默返空)
+        let schema = composite_schema();
+        let p = Pred::Or(vec![
+            c("a", CmpOp::Eq, SqlValue::Int(1)),
+            c("a", CmpOp::Lt, SqlValue::Int(0)),
+        ]);
+        let (np, _) = sql::normalize_pred_cond(&p);
+        let plan = sql_plan_select(&schema, &np).unwrap();
+        assert!(
+            matches!(plan, SqlPlan::FullScan),
+            "复合索引 + 范围分支的 OR 应回退全扫, got {plan:?}"
+        );
     }
 
     #[test]
