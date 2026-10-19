@@ -2,7 +2,7 @@
 
 > **语言 / Language**: [English](./README.md) | **简体中文**
 
-[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-860%2B%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
+[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-1188%2B%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
 ## 这是什么
 
@@ -16,7 +16,7 @@
 | PostgreSQL wire | 5435 | `psql` / 驱动直连; 与 MySQL 门面**共内核同数据** |
 | Binary (内部) | 5433 | 仅测试 / 压测 |
 
-核心上它兼具**写密集友好的架构**(Share-Nothing + per-core thread + io_uring 异步 I/O + 自研协程调度器, 不依赖 tokio)、**完整的 SQL 子集**(JOIN / 子查询 / 聚合 / GROUP BY / 事务)与 **Redis 数据结构**并存, 以及**生产级可靠性**(崩溃恢复、WAL 持久、860+ 测试、clippy 0 警告)。
+核心上它兼具**写密集友好的架构**(Share-Nothing + per-core thread + io_uring 异步 I/O + 自研协程调度器, 不依赖 tokio)、**完整的 SQL 子集**(JOIN / 子查询 / 聚合 / GROUP BY / 事务)与 **Redis 数据结构**并存, 以及**生产级可靠性**(崩溃恢复、WAL 持久、1188+ 测试、clippy 0 警告)。
 
 > 设计架构见 [docs/DESIGN.md](./docs/DESIGN.md); 接手 / 进度 见 [docs/AGENTS.md](./docs/AGENTS.md); 修复历史 见 [docs/CHANGELOG.md](./docs/CHANGELOG.md).
 >
@@ -66,7 +66,7 @@
 - **大 value 溢出页 (≤ 1MB)** — 超 ~4KB 自动切 16KB 溢出页, 0 拷贝并入 GC
 
 ### 质量
-- **测试** — 860+ 单元/集成测试, `cargo clippy --all-targets` 0 警告
+- **测试** — 1188+ 单元/集成测试, `cargo clippy --all-targets` 0 警告
 - **代码模块化解耦 (2026-08)** — 大型单体按职责拆分, 全部源文件 ~1250 行以内
 - **大数据 SQL 端到端套件** — `sql_bigdata.rs` 2 万行负载验证 COUNT/过滤/聚合/GROUP BY/分页/JOIN/UPDATE/DELETE/重连持久化
 
@@ -129,7 +129,7 @@ cargo test --workspace --no-fail-fast    # ~30s, 0 failed 预期
 
 - MySQL / PostgreSQL / HTTP REST / TLS 门面仍是 Linux 路径, Windows 不启动。
 - IOCP / RIO 完成端口 runtime (后续 perf 阶段再上; 设计文档里有完整踩坑记录)。
-- `io_uring` IO 后端、memtier 压测、860+ 测试跨平台矩阵都只在 Linux 上跑。
+- `io_uring` IO 后端、memtier 压测、1188+ 测试跨平台矩阵都只在 Linux 上跑。
 
 ### 编译
 
@@ -231,6 +231,20 @@ Windows 上未测。M2 用每连接 `std::thread`, 适合开发 + 单机 demo。
 | 混合 1:9 (读多) | 315K | |
 | 混合 1:1 | 249K | 五大结构接入后 String 热路径无回退 |
 | HSET/SADD/ZADD/LPUSH (百万 key 分散) | 44-97K | 复合 op 多次 BTree 遍历 (类型检查+meta 维护), 优化方向已识别 |
+
+### 表 1c — 仓库脚本快照 (2026-10-19, `scripts/run_memtier_bench.sh` 默认参数)
+
+4 线程 × 8 客户端, pipeline 16, 64B value, 预载 10 万 key; 服务端 4 workers / 4 shards / io_uring / wal off。复现: `scripts/run_memtier_bench.sh`。
+
+| 场景 | 吞吐 | p50 | p99 |
+|---|---|---|---|
+| overwrite (1:0, 10 万 key 覆盖写) | 62-88K ops/s | 3.9-4.9ms | 70-86ms |
+| fresh-write (1:0, 新 key 写) | 15-17K ops/s | 30-33ms | 62-69ms |
+| mixed (1:1) | 19-21K ops/s | 25.6-26.5ms | 57-59ms |
+| read-heavy (1:9) | 21-23K ops/s | 25.3-25.6ms | 55-56ms |
+| hot-read (1:99, 1% 热 key) | 20-22K ops/s | 25.0-25.5ms | 51-52ms |
+
+> **读表须知**: 本表在**高负载开发桌面机**上测得 (浏览器/IM/IDE 常驻), 运行间波动可达数量级 — 同一二进制两次会话 fresh-write 分别测得 15-17K 与 73K ops/s。与修复前基线 (`fde67d8`, 即 2026-10 审计批次合并前的 main) 在相同条件下背靠背 A/B: **全部 workload 持平或更优**, 审计批次无吞吐回退 (见 [docs/CODE-AUDIT-REPORT-2026-10-16.md](./docs/CODE-AUDIT-REPORT-2026-10-16.md))。表 1/1b 为 7 月低负载快照; 所有表都只是快照, 不作为采购依据。
 
 ### 表 2 — 热路径延迟分布 (`NLOG_PROBE=1` 启动, SIGTERM dump)
 
@@ -578,7 +592,7 @@ stderr = true
 
 | crate | 职责 | 状态 |
 |---|---|---|
-| [`crates/scheduler`](./crates/scheduler) | 单线程协程调度器 + io_uring 桥 (`SchedHandle`/`drive_until_idle`/`io_ops`/`FdPool`/`spawn_on_low`) | ✅ |
+| [`crates/scheduler`](./crates/scheduler) | 单线程协程调度器 + io_uring 桥 (`SchedHandle`/`drive_until_idle`/`drive_blocking`/`io_ops`/`FdPool`/`spawn_on_low`) | ✅ |
 | [`crates/page`](./crates/page) | LCB-Tree 页 (leaf/insert/split/delete/checkpoint/前缀压缩/`ItemKind` 编码) | ✅ |
 | [`crates/storage`](./crates/storage) | 物理持久化层: `Pager`/`MetaCache` v3 全量平坦 + dirty window/`NowChunks` 数组化/`ChunkList` LRU/`ChunkLiveness` + GC`/overflow` 大值溢出/`recover` 主源 + 墓碑防复活 | ✅ |
 | [`crates/network`](./crates/network) | 五协议门面 (Binary + RESP2 + MySQL wire + PostgreSQL wire + HTTP REST) + **全局共享 worker 池** (线程数=配置, 不随协议数膨胀; 每 worker 协程 Scheduler 或 epoll) + `KvLimits` | ✅ |
@@ -593,7 +607,7 @@ stderr = true
 ## 开发命令
 
 ```bash
-# 全量回归 (700+ 测试, ~30s)
+# 全量回归 (1188+ 测试, ~5-8 分钟)
 cargo test --workspace --no-fail-fast
 
 # clippy (0 警告硬约束)

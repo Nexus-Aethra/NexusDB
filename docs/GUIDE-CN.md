@@ -139,7 +139,7 @@ precreate_dbs = 1
 Windows 上能用的: Binary (5433) + RESP (6380), `PING`/`AUTH`/`SET`/`GET`/`DEL`/`MGET`/`MSET`/等, WAL 持久化 + 崩溃恢复, Ctrl-C 优雅停止。
 
 Windows 上还不能用的: MySQL / PostgreSQL / HTTP REST / TLS 门面, IOCP/RIO 性能路径,
-memtier 压测, 860+ 测试矩阵。`INCR`/`HSET`/`LPUSH`/`SADD`/`ZADD`/`DBSIZE`/`INFO`/`CLIENT LIST`
+memtier 压测, 1188+ 测试矩阵。`INCR`/`HSET`/`LPUSH`/`SADD`/`ZADD`/`DBSIZE`/`INFO`/`CLIENT LIST`
 在 dispatch 树上还没接 (Linux `portable.rs` 上同样没接, 是协议层本身的工作, 跟
 Windows runtime 无关)。
 

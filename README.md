@@ -2,7 +2,7 @@
 
 > **语言 / Language**: **English** | [简体中文](./README-CN.md)
 
-[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-860%2B%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
+[![Linux](https://img.shields.io/badge/OS-Linux-blue)]() [![Rust](https://img.shields.io/badge/Rust-2024-orange)]() [![Tests](https://img.shields.io/badge/tests-1188%2B%20passed-success)]() [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-success)]() [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
 ## What is NexusDB?
 
@@ -16,7 +16,7 @@
 | PostgreSQL wire | 5435 | `psql` / drivers direct-connect; shares kernel & data with MySQL |
 | Binary (internal) | 5433 | testing / benchmarking only |
 
-At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + per-core thread + io_uring async I/O + a hand-written coroutine scheduler, no tokio), a **complete SQL subset** (JOIN / subqueries / aggregation / GROUP BY / transactions) coexisting with **Redis data structures**, and **production-grade reliability** (crash recovery, WAL durability, 860+ tests, clippy 0 warnings).
+At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + per-core thread + io_uring async I/O + a hand-written coroutine scheduler, no tokio), a **complete SQL subset** (JOIN / subqueries / aggregation / GROUP BY / transactions) coexisting with **Redis data structures**, and **production-grade reliability** (crash recovery, WAL durability, 1188+ tests, clippy 0 warnings).
 
 > Architecture: [docs/DESIGN.md](./docs/DESIGN.md) · handoff / progress: [docs/AGENTS.md](./docs/AGENTS.md) · fix history: [docs/CHANGELOG.md](./docs/CHANGELOG.md)
 >
@@ -68,7 +68,7 @@ At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + p
 - **Large-value overflow pages (≤ 1 MB)** — values over ~4 KB auto-split into 16 KB overflow pages, 0-copy into GC
 
 ### Quality
-- **Testing** — 860+ unit/integration tests; `cargo clippy --all-targets` 0 warnings
+- **Testing** — 1188+ unit/integration tests; `cargo clippy --all-targets` 0 warnings
 - **Codebase modularized (2026-08)** — large monoliths split by responsibility; every source file under ~1250 lines
 - **Big-data SQL e2e suite** — `sql_bigdata.rs` runs 20k-row workloads over COUNT/filter/aggregation/GROUP BY/pagination/JOIN/UPDATE/DELETE and post-reconnect durability
 
@@ -185,7 +185,7 @@ scans, type-aware reads, lifecycle rules, and Windows compatibility.
 - MySQL / PostgreSQL / HTTP REST / TLS facades are Linux-only paths.
 - IOCP / RIO completion port runtime (planned for a later perf pass; the
   blocker is documented in the design doc).
-- `io_uring` IO backend, perf benchmarks, and the 860-test matrix are
+- `io_uring` IO backend, perf benchmarks, and the 1188-test matrix are
   Linux-only.
 
 ### Build
@@ -298,6 +298,20 @@ memtier numbers in [Performance](#performance) do not apply.
 | Mixed 1:9 (read-heavy) | 315K | |
 | Mixed 1:1 | 249K | no String hot-path regression after adding all structures |
 | HSET/SADD/ZADD/LPUSH (million keys spread) | 44-97K | composite ops traverse the BTree multiple times (type check + meta maintenance); optimization direction identified |
+
+### Table 1c — Repo-script snapshot (2026-10-19, `scripts/run_memtier_bench.sh` defaults)
+
+4 threads × 8 clients, pipeline 16, 64 B values, 100 k preloaded keys; server side: 4 workers / 4 shards / io_uring / wal off. Reproduce with `scripts/run_memtier_bench.sh`.
+
+| Scenario | Throughput | p50 | p99 |
+|---|---|---|---|
+| overwrite (1:0 over 100 k keys) | 62-88K ops/s | 3.9-4.9ms | 70-86ms |
+| fresh-write (1:0, new keys) | 15-17K ops/s | 30-33ms | 62-69ms |
+| mixed (1:1) | 19-21K ops/s | 25.6-26.5ms | 57-59ms |
+| read-heavy (1:9) | 21-23K ops/s | 25.3-25.6ms | 55-56ms |
+| hot-read (1:99, 1 % hot keys) | 20-22K ops/s | 25.0-25.5ms | 51-52ms |
+
+> **Read this table with care**: it was taken on a **loaded dev desktop** (browser / IM / IDE resident), so run-to-run variance is order-of-magnitude — the *same binary* measured 15-17K vs 73K fresh-write ops/s in two sessions. An A/B against the pre-remediation baseline (`fde67d8`, i.e. main before the 2026-10 audit batch) under identical back-to-back conditions showed **parity or better on every workload** — no throughput regression from the audit batch ([docs/CODE-AUDIT-REPORT-2026-10-16.md](./docs/CODE-AUDIT-REPORT-2026-10-16.md)). Tables 1/1b are July snapshots under lighter machine load; treat all tables as snapshots, not procurement baselines.
 
 ### Table 2 — Hot-path latency distribution (`NLOG_PROBE=1`, dump on SIGTERM)
 
@@ -638,7 +652,7 @@ stderr = true
 
 | crate | Responsibility | Status |
 |---|---|---|
-| [`crates/scheduler`](./crates/scheduler) | single-thread coroutine scheduler + io_uring bridge (`SchedHandle`/`drive_until_idle`/`io_ops`/`FdPool`/`spawn_on_low`) | ✅ |
+| [`crates/scheduler`](./crates/scheduler) | single-thread coroutine scheduler + io_uring bridge (`SchedHandle`/`drive_until_idle`/`drive_blocking`/`io_ops`/`FdPool`/`spawn_on_low`) | ✅ |
 | [`crates/page`](./crates/page) | LCB-Tree pages (leaf/insert/split/delete/checkpoint/prefix compression/`ItemKind` encoding) | ✅ |
 | [`crates/storage`](./crates/storage) | physical persistence layer: `Pager`/`MetaCache` v3 fully flat + dirty window/`NowChunks` array-based/`ChunkList` LRU/`ChunkLiveness` + GC/`overflow` large values/`recover` primary source + tombstone resurrection prevention | ✅ |
 | [`crates/network`](./crates/network) | five-protocol facades (Binary + RESP2 + MySQL/PG wire + HTTP REST) + **global shared worker pool** (thread count = config, not multiplied by protocols; per-worker coroutine Scheduler or epoll) + `KvLimits` + `tls` | ✅ |
@@ -653,7 +667,7 @@ Active plans, incident reports, and archived implementation records: [docs index
 ## Dev Commands
 
 ```bash
-# Full regression (700+ tests, ~30s)
+# Full regression (1188+ tests, ~5-8 min)
 cargo test --workspace --no-fail-fast
 
 # clippy (0-warning hard constraint)
@@ -725,6 +739,7 @@ Start with `NLOG_PROBE=1` → on SIGTERM, a 16-bucket histogram is dumped to std
 | Architecture | [docs/DESIGN.md](./docs/DESIGN.md) (10 sections) |
 | Development handoff (progress / gotchas / TODO) | [docs/AGENTS.md](./docs/AGENTS.md) |
 | Fix history (F1-F…) | [docs/CHANGELOG.md](./docs/CHANGELOG.md) |
+| Audit remediation status (2026-10-16 report; 93 items fixed, 0 remaining) | [docs/CODE-AUDIT-REPORT-2026-10-16.md](./docs/CODE-AUDIT-REPORT-2026-10-16.md) |
 | Active plans, incident reports, and historical records | [docs index](./docs/README.md) |
 | Bug root-cause investigation example | [`docs/bug-report-btree-split-routing.md`](./docs/bug-report-btree-split-routing.md) |
 

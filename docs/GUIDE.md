@@ -143,7 +143,7 @@ Run + smoke:
 
 What works on Windows: Binary (5433) + RESP (6380), `PING`/`AUTH`/`SET`/`GET`/`DEL`/`MGET`/`MSET`/etc., WAL persistence + crash recovery, Ctrl-C graceful shutdown.
 
-What does not: MySQL / PostgreSQL / HTTP REST / TLS facades, IOCP/RIO perf path, memtier benchmarks, the 860-test matrix. `INCR`/`HSET`/`LPUSH`/`SADD`/`ZADD`/`DBSIZE`/`INFO`/`CLIENT LIST` are not yet wired in the dispatch tree (same gap on Linux's `portable.rs`; protocol-layer work tracked separately).
+What does not: MySQL / PostgreSQL / HTTP REST / TLS facades, IOCP/RIO perf path, memtier benchmarks, the 1188-test matrix. `INCR`/`HSET`/`LPUSH`/`SADD`/`ZADD`/`DBSIZE`/`INFO`/`CLIENT LIST` are not yet wired in the dispatch tree (same gap on Linux's `portable.rs`; protocol-layer work tracked separately).
 
 Gotchas:
 

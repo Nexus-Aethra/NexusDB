@@ -25,6 +25,9 @@
 - [SQL optimizer plan](./sql-optimizer-plan.md)
 - [PostgreSQL dialect and Loom integration plan](./pg-dialect-gap-loom.md)
 - [Scheduler audit](./scheduler-audit.md)
+- [Code audit report (2026-10-16)](./CODE-AUDIT-REPORT-2026-10-16.md) — 93 audit
+  items, all remediated as of 2026-10-19 (§5.6 "remaining: 0"); the older
+  `CODE-AUDIT-REPORT.md` is the pre-remediation snapshot kept for history.
 
 ## Incident reports
 
