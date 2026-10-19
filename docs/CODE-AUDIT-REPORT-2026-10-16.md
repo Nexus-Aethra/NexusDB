@@ -3,7 +3,7 @@
 > 审查对象：`/home/wpp/nexus/NexusDB` @ `c4f9eaf`（main）+ 工作区未提交修复（约 +3865/−1570 行，含 2026-10-14 P0/C1-C6 修复）
 > 审查日期：2026-10-16　　审查方式：7 名分析员并行模块审计 + 交叉核对 [`CODE-AUDIT-REPORT.md`](./CODE-AUDIT-REPORT.md)（2026-10-13 版）条目现状 + 独立探针程序 release 模式实证
 > 本文档为审查产物，可随时移走或删除。**全程只读，未修改任何代码。**
-> **修复进度见 [§五](#五修复进度2026-10-17)**：截至 2026-10-19 已修 90 项条目 / 剩 3 项 + 文档化边界（§5.6）。
+> **修复进度见 [§五](#五修复进度2026-10-17)**：截至 2026-10-19 已修 91 项条目 / 剩 2 项 + 文档化边界（§5.6）。
 
 ---
 
@@ -207,7 +207,7 @@
 | 问题 | 位置 | 说明 |
 |---|---|---|
 | SchedHandle Clone+pub Rc | `task.rs` | 破坏唯一所有权前提，clone 跨线程是真 UB（原审计 P2-5 升级确认） |
-| flush_uring 忙轮询 | `logging/src/lib.rs` | 烧 CPU |
+| flush_uring 忙轮询 | `logging/src/lib.rs` | 烧 CPU ✅ 已修（drive_blocking + has_awaiting_cqe 判据, 见 5.6 已解决表） |
 | 协程 panic 无隔离 | `scheduler.rs` | panic 穿透调度线程拖死同线程全部协程 |
 
 #### 存储层（3 项）
@@ -368,7 +368,7 @@
 
 **分片层（4 项全修）**：双 inbox 无全序 `8d86824`｜WAL strict barrier 失败仍回成功 `fd040fd`｜无 Drop RAII（退出路径根因）`922675b`｜DefaultHasher 三份拷贝 `6616b45`
 
-**调度层（2/3）**：SchedHandle Clone+pub Rc `7257868`｜协程 panic 无隔离 `9600ebf`｜flush_uring 忙轮询 🔴 未修（见 5.6）
+**调度层（3/3）**：SchedHandle Clone+pub Rc `7257868`｜协程 panic 无隔离 `9600ebf`｜flush_uring 忙轮询 ✅ 已修（见 5.6 已解决表: drive_blocking + 兜底排除等 CQE slot + has_awaiting_cqe 判据）
 
 **存储层（3 项全修）**：meta_cache flush_dirty in-flight `a3f45c1`｜pid page_idx u16→u8 截断 `8e5169b`｜recover 固定共享临时文件 `5db295d`
 
@@ -380,11 +380,10 @@
 
 未修：协议分派 match 重复两处（P3-3，见 5.6）、错误分类靠字符串匹配（P3-5/P3-6，见 5.6）。
 
-### 5.6 🔴 仍未解决（3 项 + 文档化边界）
+### 5.6 🔴 仍未解决（2 项 + 文档化边界）
 
 | # | 问题 | 位置 | 为什么还没修 |
 |---|---|---|---|
-| **P2** | flush_uring 忙轮询 | `logging/src/lib.rs:344` `drive_until_idle(256)` 自旋等写盘完成 | 仅在写盘期间自旋（非空闲期），影响有限，需引入完成通知机制 |
 | **P3-3** | 协议分派 match 在 worker_epoll / worker_coro 重复两处 | `worker_epoll.rs:231,318` vs `worker_coro.rs:343` | 两处生命周期/借用结构不同，抽取公共层需重构 |
 | **P3-5/6** | 错误分类 / SQLSTATE 靠字符串匹配 | `worker/protocol_io.rs:331-348`、`worker/sql_eval.rs:628-667` | 需引入结构化错误码类型，改动面覆盖全部错误产生点 |
 
@@ -396,6 +395,7 @@
 | P2-新 | scanner 14 命令全部 `shards.first()` | 全命令遍历全部 shard 合并 (见 5.8); fix-mate 多 shard 必须 `--shard` | 本分支 |
 | P2-1 | 复合索引退化全表 (+ OR 混合算子命中复合索引静默返空) | planner 复合首列等值计分 + storage 复合前缀扫 + eq_enc/cover 护栏 (见 5.9) | 本分支 (PR #14) |
 | P2-6 | `JoinInner` `UnsafeCell` + `unsafe impl<T: Send> Send` | 共享指针 `Arc`→`Rc` (`Rc` 本身 `!Send + !Sync`) → "spawn/drive/poll 同线程" 从调用方约定变成类型结构; 删除虚假 `unsafe impl Send` (其 SAFETY 注释声称 `Arc<JoinInner>: Send`，实际因 `UnsafeCell: !Sync` 从不成立); clippy `arc_with_non_send_sync` 清零, 原子计数开销一并消失 | 本分支 (PR #15) |
+| P2-flush | `flush_uring` 忙轮询 (`logging/src/lib.rs`) | 三处联动: ① `extract_pending` 兜底扫描跳过"已提交等 CQE"的 slot (旧实现把等 IO 的协程反复拉出来空 poll = 用户态自旋, 且让阻塞分支永远走不到); ② 新 `SchedHandle::drive_blocking` — ready 空 + 真 in-flight IO 时 `submit_and_wait(1)` 内核等 CQE; ③ `drain_completions_and_wait` 判据 `!registry.is_empty()` → `has_awaiting_cqe()` — CQE 已到未 take 的项也占 registry, 旧判据会把无 in-flight 的场景也拖进 `submit_and_wait` 死锁 (单协程必现, 多协程被其他 IO 掩盖) | 本分支 |
 | (附带) | scanner `decode_meta_page` 格式漂移 | MetaPage item 区起点 40 → 1064 (引擎 T12.14 resolver 段 1KiB); 旧实现在现代引擎目录上把 resolver 段当 item 解, dbs/export/lookup/verify 全不可用 | 本分支 |
 
 **文档化边界**（已在 `SQL-FEATURES.md` / `DESIGN.md` / `AGENTS.md` 显式标注，非缺陷）：JOIN gather 读不入 OCC 读集、跨 shard COMMIT best-effort、不防幻读、Binary 协议无认证、CPU 亲和未实现。
@@ -407,7 +407,7 @@
 3. ~~**P2-1 复合索引退化全表**~~ ✅ 已修 (本分支, 见 5.9).
 4. ~~**P2-6 JoinInner Send 安全**~~ ✅ 已修 (`Arc`→`Rc` + 删虚假 unsafe impl, 见 5.6 已解决表).
 5. **P3-5/6 错误分类结构化** — 收敛字符串匹配, 为后续所有错误路径打基础.
-6. **flush_uring 忙轮询 / P3-3 协议分派去重** — 需设计权衡, 排最后.
+6. ~~**flush_uring 忙轮询**~~ ✅ 已修 (`drive_blocking` 内核等 CQE, 见 5.6 已解决表). 剩 **P3-3 协议分派去重** — 需设计权衡, 排最后.
 
 ### 5.8 P2-新 修复明细 (scanner 多 shard, 2026-10-17)
 

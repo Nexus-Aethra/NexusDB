@@ -131,6 +131,33 @@ impl IoRegistry {
         self.inner.len()
     }
 
+    /// 是否有"已提交但 CQE 未到"的注册项 (真正的 in-flight IO).
+    ///
+    /// `!is_empty()` **不能**等价代替: CQE 已到 (result Some) 但 future 还没
+    /// take 的项也留在 registry 里 — 那时内核已无 in-flight 工作, 据此阻塞
+    /// (`submit_and_wait(1)`) 会永远等不到下一个 CQE → 死锁 (审计 P2 修复:
+    /// logging 单协程场景必现, 生产路径因常有其他 IO 兜底而被掩盖).
+    pub fn has_awaiting_cqe(&self) -> bool {
+        self.inner.values().any(|st| st.result.is_none())
+    }
+
+    /// 正在等内核 CQE 的 slot_id 集合 (注册了但结果未到).
+    ///
+    /// 用途: `extract_pending` 兜底扫描排除这些 slot — 它们的 future 重 poll
+    /// 只会在 `poll_cqe!` 里空扫一次 CQ 然后 Pending, 是纯用户态自旋
+    /// (审计 P2 `flush_uring` 忙轮询的根因), 且会让驱动循环的
+    /// "work 空 + 阻塞等 CQE" 分支永远走不到.
+    ///
+    /// CQE 已到 (result Some) 的 entry 不算: 那些 slot 已被 mark 路径 push
+    /// 进 ready, 由 ready 路径 poll, 不依赖兜底.
+    pub fn slots_awaiting_cqe(&self) -> Vec<usize> {
+        self.inner
+            .values()
+            .filter(|st| st.result.is_none())
+            .map(|st| st.slot_id)
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }

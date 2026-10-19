@@ -282,14 +282,20 @@ impl Scheduler {
     }
 
     /// 生产路径: 阻塞等待内核完成至少 1 个 IO. 调用于 `drive_once`.
-    /// 安全的前提: 有 in-flight SQE (registry 非空) 时才调用, 内核必然完成.
+    /// 安全的前提: 有"已提交但 CQE 未到"的注册项 (内核必然完成它).
+    ///
+    /// ⭐ 审计 P2 修复: 判据从 `!registry.is_empty()` 收紧为
+    /// `has_awaiting_cqe()` — CQE 已到但还没被 future take 的项也占着
+    /// registry, 那时内核已无 in-flight 工作, `submit_and_wait(1)` 会永远
+    /// 等不到下一个 CQE (单协程场景必现死锁; 多协程时被其他 IO 的 CQE
+    /// 掩盖). 没有真 in-flight 项时退回 ready 检查 + 短睡眠.
     fn drain_completions_and_wait(&mut self) {
         // ⭐ 批量提交: 先提交本轮攒下的 SQE, 否则内核不会执行 → CQE 永不出现.
         self.flush_sq();
         self.drain_completions();
-        if !self.registry.is_empty() {
+        if self.registry.has_awaiting_cqe() {
             // submit_and_wait(1) 阻塞直到 1 个 CQE 到达.
-            // io-uring 0.6 没有 timeout 参数; 但我们只在 registry 非空时调用,
+            // io-uring 0.6 没有 timeout 参数; 但只有真 in-flight 项才进来,
             // 内核会完成 SQE, 所以不会真正死锁.
             let _ = self.ring.submit_and_wait(1);
             self.drain_completions();
@@ -398,9 +404,19 @@ impl Scheduler {
             }
         }
         // 兜底: ready 为空时, 扫描 pool 里 future Some 的 slot.
+        // ⭐ 审计 P2 修复: 跳过正在等内核 CQE 的 slot. 旧实现把它们也拉出来
+        // 重 poll — poll_cqe! 只空扫一次 CQ 就 Pending, 纯用户态自旋
+        // (logging flush_uring 等写盘时 100% CPU 的根因), 还会让驱动循环的
+        // "work 空 → 阻塞等 CQE" 分支永远走不到. 等 CQE 的 slot 由
+        // drain_completions/poll_cqe! 的 mark→ready 路径唤醒, 不依赖兜底.
         if result.is_empty() {
+            let mut awaiting = self.registry.slots_awaiting_cqe();
+            awaiting.sort_unstable();
             let in_use = self.pool.in_use();
             for slot_id in 0..in_use.max(1024) {
+                if awaiting.binary_search(&slot_id).is_ok() {
+                    continue; // 在等内核 IO, 重 poll 无意义
+                }
                 if let Some(fut) = self.pool.slot(slot_id).future.take() {
                     result.push((slot_id, fut));
                 }
@@ -633,10 +649,27 @@ impl SchedHandle {
         self.0.borrow().stop_handle()
     }
 
-    /// 跨线程驱动. SchedHandle 是 Send, 可 move 到新线程.
+    /// 非阻塞驱动: 每轮临时 borrow_mut, drive 完成后释放 borrow, 让 wrapper poll 时无冲突.
     ///
-    /// 每次迭代**临时 borrow**, drive_once 完成后释放 borrow, 让 wrapper poll 时无冲突.
+    /// ready 空但有 in-flight IO 时只做**非阻塞** CQE 扫描 — 调用方循环重入
+    /// 时这是自旋 (CPU ≈ IO 延迟). 需要"等 IO 不烧 CPU"的场景用 `drive_blocking`.
     pub fn drive_until_idle(self, max_iters: usize) -> bool {
+        self.drive_inner(max_iters, false)
+    }
+
+    /// ⭐ 审计 P2 (logging flush_uring 忙轮询) 修复: 阻塞驱动.
+    ///
+    /// 与 `drive_until_idle` 同一循环, 唯一区别: ready 空但有 in-flight IO
+    /// (registry 非空) 时, 用 `submit_and_wait(1)` 在**内核里**等 CQE 到达,
+    /// 不空转烧 CPU. 无 in-flight IO 时行为与 drive_until_idle 一致 (立即返回).
+    ///
+    /// 用途: log flusher 等 io_uring 写盘/fsync 完成 (`flush_uring`).
+    /// 仅限 driver 线程 (bind_driver_thread 强制).
+    pub fn drive_blocking(self, max_iters: usize) -> bool {
+        self.drive_inner(max_iters, true)
+    }
+
+    fn drive_inner(self, max_iters: usize, block_on_inflight: bool) -> bool {
         self.0.borrow_mut().bind_driver_thread();
         let mut total_iters = 0usize;
         for _ in 0..max_iters {
@@ -676,7 +709,12 @@ impl SchedHandle {
                     s.registry.len()
                 );
                 if !s.registry.is_empty() {
-                    s.drain_completions_with_submit();
+                    if block_on_inflight {
+                        // 阻塞变体: 内核里等至少 1 个 CQE, 不空转 (审计 P2).
+                        s.drain_completions_and_wait();
+                    } else {
+                        s.drain_completions_with_submit();
+                    }
                 }
                 // 再判一次: 如果 has_work 还在 (CQE 唤醒的 slot 进 ready 了), 继续循环.
                 if s.has_work() {
