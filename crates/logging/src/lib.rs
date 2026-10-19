@@ -340,6 +340,10 @@ fn backend_main(
 
 /// 用 io_uring 协程把 buf 写入 fd (write_all + fsync).
 /// 写盘期间双缓冲: 继续 drain 新日志进 next_acc.
+///
+/// ⭐ 审计 P2 修复: 等待写盘用 `drive_blocking` — in-flight IO 期间在内核
+/// `submit_and_wait(1)` 等 CQE. 旧实现 `drive_until_idle` 在该场景只做非阻塞
+/// CQE 扫描, 外层 loop 立即重入 = 写盘延迟期间 100% CPU 自旋.
 #[cfg(target_os = "linux")]
 fn flush_uring(
     rt: &scheduler::SchedHandle,
@@ -374,7 +378,7 @@ fn flush_uring(
         if let Some(off) = *done.borrow() {
             return off;
         }
-        rt.clone().drive_until_idle(256);
+        rt.clone().drive_blocking(256);
         // 双缓冲: 写盘等待期间继续吸收新日志
         queue.drain_into(next_acc);
     }
@@ -733,5 +737,80 @@ mod tests {
         let content = std::fs::read_to_string(&file).unwrap();
         assert!(content.contains("first-run"));
         assert!(content.contains("second-run"));
+    }
+
+    /// 当前线程 CPU 时钟 tick 数 (utime+stime, /proc/self/task/<tid>/stat).
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_ticks() -> u64 {
+        let tid = unsafe { libc::gettid() };
+        let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap();
+        let rparen = stat.rfind(')').expect("stat 格式: comm 以 ) 结尾");
+        // ) 之后第 1 个字段是 state (field 3); utime=field14 → 索引 11, stime=field15 → 12
+        let fields: Vec<&str> = stat[rparen + 2..].split_whitespace().collect();
+        let utime: u64 = fields[11].parse().unwrap();
+        let stime: u64 = fields[12].parse().unwrap();
+        utime + stime
+    }
+
+    /// ⭐ 审计 P2 (flush_uring 忙轮询) 必败回归: 等 io_uring 写盘完成期间,
+    /// 驱动循环必须阻塞在内核 (submit_and_wait 等 CQE), 不得空转烧 CPU.
+    ///
+    /// 构造: 写满的管道 = 必然阻塞的慢 IO — io_uring write 要等读端缓慢
+    /// 排空才能推进. 旧实现 `drive_until_idle` 在 registry 非空时只做非阻塞
+    /// CQE 扫描, 外层 loop 立即重入 → 自旋, CPU ≈ 整个等待墙钟;
+    /// 阻塞实现 CPU ≈ 0.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn flush_uring_waits_for_write_without_spinning() {
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (rfd, wfd) = (fds[0], fds[1]);
+
+        // 读端慢速排空: 4KB / 10ms. flush 写 128KB: 前 64KB 立即进管道,
+        // 其余 64KB 必须等读端排空 → 墙钟 ~160ms 的慢 IO (不预填:
+        // 阻塞模式管道预填会先把测试线程自己挂死).
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !stop2.load(Ordering::Acquire) {
+                let n =
+                    unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let rt = scheduler::SchedHandle::new(scheduler::Scheduler::new());
+        rt.set_current();
+        let queue = LogQueue::with_capacity(16);
+        let mut next_acc = Vec::new();
+        let buf = vec![b'y'; 128 * 1024];
+
+        let cpu0 = thread_cpu_ticks();
+        let wall0 = Instant::now();
+        let off = flush_uring(&rt, wfd, 0, buf, &queue, &mut next_acc);
+        let wall = wall0.elapsed();
+        let cpu_ticks = thread_cpu_ticks().saturating_sub(cpu0);
+
+        stop.store(true, Ordering::Release);
+        let _ = reader.join();
+        unsafe {
+            libc::close(wfd);
+        }
+
+        assert_eq!(off, 128 * 1024, "io_uring write 应写完全部 128KB");
+        assert!(
+            wall >= Duration::from_millis(80),
+            "慢 IO 场景未构造成功 (墙钟 {wall:?}), 回归无鉴别力"
+        );
+        // _SC_CLK_TCK 通常 100 → 1 tick = 10ms. 自旋实现 ≈ 160 ticks, 阻塞实现 ≈ 0.
+        assert!(
+            cpu_ticks < 8,
+            "flush_uring 等待写盘期间空转烧 CPU: {cpu_ticks} ticks \
+             (墙钟 {wall:?}) — 应阻塞等 CQE"
+        );
     }
 }

@@ -340,81 +340,20 @@ async fn conn_coro(
             // socket 可读: 读数据 → 协议处理
             match conn.recv_async().await {
                 Ok(true) => {
-                    let should_close = match conn.proto {
-                        ProtocolKind::Sql => {
-                            process_sql_input(
-                                &mut conn,
-                                conn_id,
-                                worker_id,
-                                &sql_password,
-                                &db,
-                                &db_view,
-                                &shard_inboxes,
-                                num_shards,
-                                &tls_config,
-                                &limits,
-                            );
-                            conn.resp_should_close()
-                        }
-                        ProtocolKind::Pg => {
-                            process_pg_input(
-                                &mut conn,
-                                conn_id,
-                                worker_id,
-                                &sql_password,
-                                &db,
-                                &db_view,
-                                &shard_inboxes,
-                                num_shards,
-                                &tls_config,
-                                &limits,
-                            );
-                            conn.resp_should_close()
-                        }
-                        ProtocolKind::Resp => {
-                            process_resp_input(
-                                &mut conn,
-                                conn_id,
-                                worker_id,
-                                &db_view,
-                                &table,
-                                &limits,
-                                &sql_password,
-                                &shard_inboxes,
-                                num_shards,
-                            );
-                            conn.resp_should_close()
-                        }
-                        ProtocolKind::Http => {
-                            process_http_input(
-                                &mut conn,
-                                conn_id,
-                                worker_id,
-                                &sql_password,
-                                &db,
-                                &db_view,
-                                &limits,
-                                num_shards,
-                                &shard_inboxes,
-                                num_shards,
-                            );
-                            conn.resp_should_close()
-                        }
-                        ProtocolKind::Binary => {
-                            process_binary_input(
-                                &mut conn,
-                                conn_id,
-                                worker_id,
-                                &db,
-                                &table,
-                                &limits,
-                                &shard_inboxes,
-                                num_shards,
-                            );
-                            conn.resp_should_close()
-                        }
+                    // ⭐ 审计 P3-3: 协议分派收敛到公共层 (与 epoll worker 共用).
+                    let d = ConnDispatch {
+                        conn_id,
+                        worker_id,
+                        db: &db,
+                        table: &table,
+                        limits: &limits,
+                        auth_pw: &sql_password,
+                        tls: &tls_config,
+                        db_view: &db_view,
+                        shard_inboxes: &shard_inboxes,
+                        num_shards,
                     };
-                    if should_close {
+                    if dispatch_conn_input(&mut conn, &d) {
                         break;
                     }
                 }
@@ -430,25 +369,18 @@ async fn conn_coro(
                     reg.get_mut(&conn_id).and_then(|e| e.queue.pop_front())
                 };
                 let Some(r) = r else { break };
-                if conn.proto == ProtocolKind::Binary {
-                    // Binary 门面: 直发 batch 结果 (不聚合, 每 op 一回包).
-                    let resp = batch_result_to_response(&r.result);
-                    conn.send_binary_response(r.req_id, &resp);
-                } else {
-                    handle_resp_shard_result(
-                        &mut conn,
-                        conn_id,
-                        r.req_id,
-                        r.group,
-                        &r.result,
-                        worker_id,
-                        &db,
-                        &db_view,
-                        &shard_inboxes,
-                        num_shards,
-                    );
-                }
-                close = close || conn.resp_should_close();
+                close = dispatch_conn_reply(
+                    &mut conn,
+                    conn_id,
+                    r.req_id,
+                    r.group,
+                    &r.result,
+                    worker_id,
+                    &db,
+                    &db_view,
+                    &shard_inboxes,
+                    num_shards,
+                ) || close;
             }
             if close {
                 break;

@@ -623,61 +623,30 @@ pub(crate) fn sql_cmp(cv: &ColValue, sv: &SqlValue) -> Option<std::cmp::Ordering
 
 /// ⭐ S4: SQL 错误 → per-proto 字节 (PG 带 SQLSTATE + ReadyForQuery;
 /// ⭐ H3: HTTP 按消息映射 4xx/5xx JSON).
+///
+/// ⭐ 审计 P3-5/6: errno/SQLSTATE/status 由 `SqlErrorCode` 枚举映射 (穷尽
+/// match), 遗留 String 错误经 `SqlError::classified` 单点适配.
 pub(crate) fn sql_err_bytes(proto: ProtocolKind, msg: &str) -> Vec<u8> {
+    sql_err_bytes_e(proto, &SqlError::classified(msg))
+}
+
+/// 结构化入口: 调用方已知错误码时用 (不经过字符串分类).
+pub(crate) fn sql_err_bytes_e(proto: ProtocolKind, e: &SqlError) -> Vec<u8> {
     if proto == ProtocolKind::Http {
-        let status = if msg.contains("duplicate key") || msg.contains("foreign key violation") {
-            409
-        } else if msg.contains("unknown column")
-            || msg.contains("Unknown database")
-            || msg.contains("expected")
-            || msg.contains("unexpected")
-            || msg.contains("unterminated")
-            || msg.contains("unknown type")
-            || msg.contains("no schema")
-        {
-            400
-        } else {
-            500
-        };
         crate::metrics::HTTP_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return crate::protocol::http::build_response(
-            status,
-            &crate::protocol::http::error_body(msg),
+            e.code.http_status(),
+            &crate::protocol::http::error_body(&e.msg),
             crate::http_config::cors_origin(),
             true,
         );
     }
     if proto == ProtocolKind::Pg {
-        let code = if msg.contains("unknown column") {
-            "42703"
-        } else if msg.contains("duplicate key") {
-            "23505"
-        } else if msg.contains("foreign key violation") {
-            "23503" // foreign_key_violation — FK RESTRICT 拒删
-        } else if msg.contains("serialization failure") {
-            "40001"
-        } else if msg.contains("read-only transaction") {
-            "25006"
-        } else if msg.contains("transaction is aborted") {
-            "25P02"
-        } else if msg.contains("Unknown database") {
-            "3D000"
-        } else if msg.contains("Cross-database access is not supported") {
-            "0A000"
-        } else if msg.contains("expected")
-            || msg.contains("unexpected")
-            || msg.contains("unterminated")
-            || msg.contains("unknown type")
-        {
-            "42601"
-        } else {
-            "XX000"
-        };
-        let mut out = crate::protocol::pg::build_error(code, msg);
+        let mut out = crate::protocol::pg::build_error(e.code.pg_sqlstate(), &e.msg);
         out.extend_from_slice(&crate::protocol::pg::build_ready());
         out
     } else {
-        mysql_err_packet(msg)
+        mysql_err_packet_e(e)
     }
 }
 

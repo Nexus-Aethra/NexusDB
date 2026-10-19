@@ -3,7 +3,7 @@
 > 审查对象：`/home/wpp/nexus/NexusDB` @ `c4f9eaf`（main）+ 工作区未提交修复（约 +3865/−1570 行，含 2026-10-14 P0/C1-C6 修复）
 > 审查日期：2026-10-16　　审查方式：7 名分析员并行模块审计 + 交叉核对 [`CODE-AUDIT-REPORT.md`](./CODE-AUDIT-REPORT.md)（2026-10-13 版）条目现状 + 独立探针程序 release 模式实证
 > 本文档为审查产物，可随时移走或删除。**全程只读，未修改任何代码。**
-> **修复进度见 [§五](#五修复进度2026-10-17)**：截至 2026-10-19 已修 89 项条目 / 剩 4 项 + 文档化边界（§5.6）。
+> **修复进度见 [§五](#五修复进度2026-10-17)**：截至 2026-10-19 已修 93 项条目 / 剩 0 项 + 文档化边界（§5.6）。
 
 ---
 
@@ -49,10 +49,10 @@
 | P2-1 复合索引退化全表 | ✅ 已修（见 5.9）：planner 复合首列等值计分 + storage 复合前缀扫；OR→IndexUnion 选中复合索引静默返空同批修复 |
 | P2-4 协程 worker TLS | 半修：epoll 写缓冲已做；协程 worker TLS 两处残缺（见 2.2 节 P1-5/P1-6） |
 | P2-5 SchedHandle | **比原描述更严重**：`Clone + pub Rc` 破坏唯一所有权前提，clone 跨线程是真正 UB（非仅 API 误用） |
-| P2-6 | 未修复 |
+| P2-6 | ✅ 已修（见 5.6 已解决表）：共享指针 `Arc`→`Rc` 把"单线程"写成类型结构，删除虚假 `unsafe impl Send` |
 | P2-12 | `chunk_lock`/`travel_trees` 仍是死代码 |
 | P3-13 / P3-14 | 未修 |
-| P3-2/3/5/6/8/9/10/11 | 未修 |
+| P3-2/3/5/6/8/9/10/11 | ✅ 全部已修（P3-3 协议分派公共层、P3-5/6 结构化错误码均为本分支；其余见 §5.5） |
 
 ### 1.4 🚫 误报 / 描述需修正
 
@@ -207,7 +207,7 @@
 | 问题 | 位置 | 说明 |
 |---|---|---|
 | SchedHandle Clone+pub Rc | `task.rs` | 破坏唯一所有权前提，clone 跨线程是真 UB（原审计 P2-5 升级确认） |
-| flush_uring 忙轮询 | `logging/src/lib.rs` | 烧 CPU |
+| flush_uring 忙轮询 | `logging/src/lib.rs` | 烧 CPU ✅ 已修（drive_blocking + has_awaiting_cqe 判据, 见 5.6 已解决表） |
 | 协程 panic 无隔离 | `scheduler.rs` | panic 穿透调度线程拖死同线程全部协程 |
 
 #### 存储层（3 项）
@@ -308,14 +308,14 @@
 | P2-1 | ❌ 复合索引退化全表 | ✅ 已修：planner 复合首列等值计分 + storage 复合前缀扫；附带修 OR→IndexUnion 选中复合索引静默返空 (见 5.9) | 本分支 |
 | P2-4 | ⚠️ 协程 worker TLS 半修 | ✅ 已修：协程分支补齐 TLS 升级处理 | `5ee4496` |
 | P2-5 | ❌ SchedHandle Clone+pub Rc | ✅ 已修：移除 `unsafe impl Send`，内层 `Rc` 改私有 | `7257868` |
-| P2-6 | ❌ 未修复 | 🔴 **未修**（见 5.6） | — |
+| P2-6 | ❌ 未修复 | ✅ 已修：`JoinInner` 共享指针 `Arc`→`Rc`，单线程不变量改为类型结构；删除做了虚假声明的 `unsafe impl Send` (本分支) | 本分支 |
 | P2-12 | ❌ chunk_lock/travel_trees 死代码 | ✅ 已修：清理死代码 + 文档失准标注 | `0df5401` |
 | P3-13 | ❌ 未修 | ✅ 已修 | `0df5401` |
 | P3-14 | ❌ 未修 | ✅ 已修：WAL 名长 `as u16` 截断改 `Result` 显式报错 | `d104723` |
 | P3-2 | ❌ 未修 | ✅ 已修：连接建立重复代码抽 `accept_one_conn` | `7b6b271` |
-| P3-3 | ❌ 未修 | 🔴 **未修**（见 5.6） | — |
-| P3-5 | ❌ 未修 | 🔴 **未修**（见 5.6） | — |
-| P3-6 | ❌ 未修 | 🔴 **未修**（见 5.6） | — |
+| P3-3 | ❌ 未修 | ✅ 已修：协议分派双 match 收敛到 `worker/dispatch.rs` 公共层 (`dispatch_conn_input`/`dispatch_conn_reply` + `ConnDispatch` ctx); 双 worker 模式 parity 测试 (`worker_modes_parity.rs`, `NEXUS_CORO_WORKER=1` 自 set) 防漂移 (本分支) | 本分支 |
+| P3-5 | ❌ 未修 | ✅ 已修：`SqlErrorCode` 封闭枚举 + 三协议穷尽映射；`SqlError` 结构化错误 (新代码直报码)；遗留 String 错误经 `classify` 单点适配 + 模板钉死测试 (本分支) | 本分支 |
+| P3-6 | ❌ 未修 | ✅ 已修：同上 (PG SQLSTATE/HTTP status 同属 `SqlErrorCode` 映射) | 本分支 |
 | P3-8 | ❌ 未修 | ✅ 已修：RESP 重排缓冲设上限 | `c949ec7` |
 | P3-9 | ❌ 未修 | ✅ 已修：HTTP `find_head_end` O(n²)→增量 `scanned` | `d104723` |
 | P3-10 | ❌ 未修 | ✅ 已修：死代码与文档失准标注 | `0df5401` |
@@ -368,26 +368,21 @@
 
 **分片层（4 项全修）**：双 inbox 无全序 `8d86824`｜WAL strict barrier 失败仍回成功 `fd040fd`｜无 Drop RAII（退出路径根因）`922675b`｜DefaultHasher 三份拷贝 `6616b45`
 
-**调度层（2/3）**：SchedHandle Clone+pub Rc `7257868`｜协程 panic 无隔离 `9600ebf`｜flush_uring 忙轮询 🔴 未修（见 5.6）
+**调度层（3/3）**：SchedHandle Clone+pub Rc `7257868`｜协程 panic 无隔离 `9600ebf`｜flush_uring 忙轮询 ✅ 已修（见 5.6 已解决表: drive_blocking + 兜底排除等 CQE slot + has_awaiting_cqe 判据）
 
 **存储层（3 项全修）**：meta_cache flush_dirty in-flight `a3f45c1`｜pid page_idx u16→u8 截断 `8e5169b`｜recover 固定共享临时文件 `5db295d`
 
 **工具链（2/2）**：`--strict/--tolerant` 无效 flag `fa46a8d`｜scanner 只处理第一个 shard ✅ 已修：14 命令全 shard 遍历合并 (PR #13, `4a87b68`)
 
-### 5.5 §2.4 P3 —— 低危 / 文档化建议（20 项，已修 17）
+### 5.5 §2.4 P3 —— 低危 / 文档化建议（20 项，已修 20）
 
 已修：LIKE `_` 通配符报错、RETURNING 报错、非 UUID 列 uuid 默认值报错、CURRENT_DATE/TIME 语义修正、无括号关键字识别、SysVarStub transaction_isolation 按实际级别回答（`5e6e9ac`）；`SELECT 1` 顶层字面量投影（`4e9b1f7`）；varint 第 5 字节非规范编码拒绝、`encode_leaf/internal_item` buf 前置边界检查、AGENTS.md crossbeam 契约澄清（`37e3f0a`）；16KB 栈缓冲改堆分配、dump free_off 越界回归测试、空串主键错误信息、page crate `#![allow(dead_code)]` 改 6 处定点 allow（`eac1486`）；SQL 语法缺口集中标注 → 新增 `docs/SQL-FEATURES.md` 语法支持矩阵（`3806824`）。
 
-未修：协议分派 match 重复两处（P3-3，见 5.6）、错误分类靠字符串匹配（P3-5/P3-6，见 5.6）。
+已修：~~错误分类靠字符串匹配（P3-5/P3-6）~~ ✅ 已修（结构化 `SqlErrorCode` + `classify` 单点适配 + 模板钉死测试，见 5.6 已解决表）。**§2 审计条目已全部修复。**
 
-### 5.6 🔴 仍未解决（4 项 + 文档化边界）
+### 5.6 ✅ 仍未解决：0 项（审计条目全部修复；余下为文档化边界）
 
-| # | 问题 | 位置 | 为什么还没修 |
-|---|---|---|---|
-| **P2-6** | `JoinInner` UnsafeCell + `unsafe impl<T: Send> Send` | `scheduler/src/task.rs:62-71` | 跨线程 poll 竞争；需设计改 Arc/Mutex 或显式 `!Send`，牵涉 JoinHandle 公共 API |
-| **P2** | flush_uring 忙轮询 | `logging/src/lib.rs:344` `drive_until_idle(256)` 自旋等写盘完成 | 仅在写盘期间自旋（非空闲期），影响有限，需引入完成通知机制 |
-| **P3-3** | 协议分派 match 在 worker_epoll / worker_coro 重复两处 | `worker_epoll.rs:231,318` vs `worker_coro.rs:343` | 两处生命周期/借用结构不同，抽取公共层需重构 |
-| **P3-5/6** | 错误分类 / SQLSTATE 靠字符串匹配 | `worker/protocol_io.rs:331-348`、`worker/sql_eval.rs:628-667` | 需引入结构化错误码类型，改动面覆盖全部错误产生点 |
+（原 4 项未决 — flush_uring 忙轮询 / P3-3 协议分派双实现 / P3-5/6 字符串匹配错误分类 — 均已修复, 见下方已解决表.）
 
 **已解决（2026-10-17 晚，PR #12 与本分支）**：
 
@@ -395,7 +390,11 @@
 |---|---|---|---|
 | P1-4 | FK 对 DELETE 无 RESTRICT 检查 | 新 `sql_fk_restr.rs` 预检状态机 (PkGet Redispatch / 两阶段 Phase2 双挂点); cascade_kickoff 只对 Cascade/SetNull 进延迟 (修 NoAction 永挂); 错误映射 1451/23503/409 | PR #12 (`4bb2127`) |
 | P2-新 | scanner 14 命令全部 `shards.first()` | 全命令遍历全部 shard 合并 (见 5.8); fix-mate 多 shard 必须 `--shard` | 本分支 |
-| P2-1 | 复合索引退化全表 (+ OR 混合算子命中复合索引静默返空) | planner 复合首列等值计分 + storage 复合前缀扫 + eq_enc/cover 护栏 (见 5.9) | 本分支 |
+| P2-1 | 复合索引退化全表 (+ OR 混合算子命中复合索引静默返空) | planner 复合首列等值计分 + storage 复合前缀扫 + eq_enc/cover 护栏 (见 5.9) | 本分支 (PR #14) |
+| P2-6 | `JoinInner` `UnsafeCell` + `unsafe impl<T: Send> Send` | 共享指针 `Arc`→`Rc` (`Rc` 本身 `!Send + !Sync`) → "spawn/drive/poll 同线程" 从调用方约定变成类型结构; 删除虚假 `unsafe impl Send` (其 SAFETY 注释声称 `Arc<JoinInner>: Send`，实际因 `UnsafeCell: !Sync` 从不成立); clippy `arc_with_non_send_sync` 清零, 原子计数开销一并消失 | 本分支 (PR #15) |
+| P2-flush | `flush_uring` 忙轮询 (`logging/src/lib.rs`) | 三处联动: ① `extract_pending` 兜底扫描跳过"已提交等 CQE"的 slot (旧实现把等 IO 的协程反复拉出来空 poll = 用户态自旋, 且让阻塞分支永远走不到); ② 新 `SchedHandle::drive_blocking` — ready 空 + 真 in-flight IO 时 `submit_and_wait(1)` 内核等 CQE; ③ `drain_completions_and_wait` 判据 `!registry.is_empty()` → `has_awaiting_cqe()` — CQE 已到未 take 的项也占 registry, 旧判据会把无 in-flight 的场景也拖进 `submit_and_wait` 死锁 (单协程必现, 多协程被其他 IO 掩盖) | 本分支 |
+| P3-3 | 协议分派 match 在 worker_epoll / worker_coro 重复两处 | 收敛到 `worker/dispatch.rs` 公共层: `ConnDispatch` ctx + `dispatch_conn_input`/`dispatch_conn_reply` 单份实现, 两 worker 各自构 ctx 调用; 关闭语义统一为"一律 resp_should_close" (Binary 旧 epoll 路径不查该标志, 但其仅在 TLS 写卡死/空闲回收时置位, 关闭即预期); `tests/worker_modes_parity.rs` 双模式 5 协议对拍 (含 `NEXUS_CORO_WORKER=1` 自 set) 防再漂移 | 本分支 |
+| P3-5/6 | 错误分类 / SQLSTATE 靠字符串匹配 | 新 `worker/sql_error.rs`: `SqlErrorCode` 封闭枚举 + 三协议 (MySQL errno / PG SQLSTATE / HTTP status) **穷尽 match** 映射 (漏映射编译期报错); `SqlError { code, msg }` 结构化错误, 新代码 `SqlError::new(code, msg)` 直报码 (FK 违例 / unknown column 等 ORM 关键路径已迁移); 遗留 `Result<_, String>` 深管线的错误经 `SqlError::classified` **单点**适配 — 字符串匹配从三条协议链收敛到一处, 且 `classify_pins_legacy_messages` 钉死全部消息模板 (措辞漂移即红); e2e (FK 1451/23503/409, dup 1062 等) 继续端到端钉码 | 本分支 |
 | (附带) | scanner `decode_meta_page` 格式漂移 | MetaPage item 区起点 40 → 1064 (引擎 T12.14 resolver 段 1KiB); 旧实现在现代引擎目录上把 resolver 段当 item 解, dbs/export/lookup/verify 全不可用 | 本分支 |
 
 **文档化边界**（已在 `SQL-FEATURES.md` / `DESIGN.md` / `AGENTS.md` 显式标注，非缺陷）：JOIN gather 读不入 OCC 读集、跨 shard COMMIT best-effort、不防幻读、Binary 协议无认证、CPU 亲和未实现。
@@ -405,9 +404,9 @@
 1. ~~**P2-新 scanner 单 shard**~~ ✅ 已修 (本分支, 含附带 meta 解码漂移修复).
 2. ~~**P1-4 FK RESTRICT**~~ ✅ 已修 (PR #12).
 3. ~~**P2-1 复合索引退化全表**~~ ✅ 已修 (本分支, 见 5.9).
-4. **P2-6 JoinInner Send 安全** — 跨线程 poll 竞争, 需设计决策 (Arc/Mutex vs !Send).
-5. **P3-5/6 错误分类结构化** — 收敛字符串匹配, 为后续所有错误路径打基础.
-6. **flush_uring 忙轮询 / P3-3 协议分派去重** — 需设计权衡, 排最后.
+4. ~~**P2-6 JoinInner Send 安全**~~ ✅ 已修 (`Arc`→`Rc` + 删虚假 unsafe impl, 见 5.6 已解决表).
+5. ~~**P3-5/6 错误分类结构化**~~ ✅ 已修 (`SqlErrorCode` 枚举 + 穷尽映射 + classify 单点适配, 见 5.6 已解决表).
+6. ~~**flush_uring 忙轮询**~~ ✅ 已修 (`drive_blocking` 内核等 CQE, 见 5.6 已解决表). ~~**P3-3 协议分派去重**~~ ✅ 已修 (公共层 + 双模式 parity 测试). **审计条目全部修复完毕.**
 
 ### 5.8 P2-新 修复明细 (scanner 多 shard, 2026-10-17)
 

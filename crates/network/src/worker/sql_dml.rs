@@ -323,7 +323,13 @@ pub(crate) fn sql_run_dml(
                         let Some(i) = schema.col_by_name(name) else {
                             conn.resp_complete(
                                 seq,
-                                sql_err_bytes(conn.proto, &format!("unknown column '{name}'")),
+                                sql_err_bytes_e(
+                                    conn.proto,
+                                    &SqlError::new(
+                                        SqlErrorCode::UnknownColumn,
+                                        format!("unknown column '{name}'"),
+                                    ),
+                                ),
                             );
                             return;
                         };
@@ -687,7 +693,13 @@ pub(crate) fn sql_run_dml(
                     None => {
                         conn.resp_complete(
                             seq,
-                            sql_err_bytes(conn.proto, &format!("unknown column '{name}'")),
+                            sql_err_bytes_e(
+                                conn.proto,
+                                &SqlError::new(
+                                    SqlErrorCode::UnknownColumn,
+                                    format!("unknown column '{name}'"),
+                                ),
+                            ),
                         );
                         return;
                     }
@@ -1270,7 +1282,13 @@ pub(crate) fn sql_run_dml(
                 let Some(col_idx) = schema.col_by_name(&drop_col) else {
                     conn.resp_complete(
                         seq,
-                        sql_err_bytes(conn.proto, &format!("unknown column '{drop_col}'")),
+                        sql_err_bytes_e(
+                            conn.proto,
+                            &SqlError::new(
+                                SqlErrorCode::UnknownColumn,
+                                format!("unknown column '{drop_col}'"),
+                            ),
+                        ),
                     );
                     return;
                 };

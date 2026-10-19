@@ -85,7 +85,7 @@ pub(crate) use resp_shard::{handle_resp_shard_result, run_dml_phase2};
 /// ⭐ 解耦 2026-08: 协议 wire 入口 (HTTP 处理).
 mod protocol_io;
 pub(crate) use protocol_io::{
-    mysql_err_packet, process_http_input, process_pg_input, process_sql_input,
+    mysql_err_packet_e, process_http_input, process_pg_input, process_sql_input,
 };
 pub(crate) use sql_state::{
     DerivedCtx, EST_SKIP_STATS_ROWS, MatResult, MultiStmt, PendingRespSqlDelete,
@@ -116,8 +116,8 @@ pub(crate) use sql_dml::sql_run_dml;
 pub(crate) use sql_eval::{
     HIDDEN_ROWID, col_from_ordered_bytes, collect_dml_pks, eval_pred, eval_pred_sysq,
     project_output_row, render_sql_count, render_sql_rows, scalar_fn_const_row, sql_build_row,
-    sql_cmp, sql_dml_op, sql_err_bytes, sql_ok_bytes, sql_order_cmp, sql_pk_bytes, sql_rows_bytes,
-    sql_to_col, visible_cols,
+    sql_cmp, sql_dml_op, sql_err_bytes, sql_err_bytes_e, sql_ok_bytes, sql_order_cmp, sql_pk_bytes,
+    sql_rows_bytes, sql_to_col, visible_cols,
 };
 pub(crate) use sql_join::{sql_join_drive, sql_join_kickoff};
 pub(crate) use sql_sysquery::{SysQuerySpec, coltype_sql_name, sysq_render_catalog};
@@ -146,6 +146,12 @@ pub(crate) use worker_epoll::{
 /// ⭐ 协程化 2026-08: 协程 worker (每连接一协程 + io_uring, 替代 epoll).
 mod worker_coro;
 pub(crate) use worker_coro::worker_main_coro;
+/// ⭐ 审计 P3-3: 协议分派公共层 (epoll worker 与协程 worker 共用, 消除双份 match).
+mod dispatch;
+pub(crate) use dispatch::{ConnDispatch, dispatch_conn_input, dispatch_conn_reply};
+/// ⭐ 审计 P3-5/6: 结构化 SQL 错误码 (替代按消息文本猜 errno/SQLSTATE/status).
+mod sql_error;
+pub(crate) use sql_error::{SqlError, SqlErrorCode};
 
 /// 特殊 epoll token: reply bus eventfd.
 const REPLY_TOKEN: u64 = u64::MAX;
@@ -664,7 +670,7 @@ fn request_to_batch_op(
 /// BatchResult → Binary Response. ⭐ Get 命中时剥 value type tag.
 /// (注: payload.to_vec 是 Response::Get(Option<Vec>) 结构所需;
 /// Binary 非 benchmark 主路径, 借用化需改 Protocol trait, 收益不值 — 记录保留.)
-fn batch_result_to_response(result: &BatchResult) -> Response {
+pub(crate) fn batch_result_to_response(result: &BatchResult) -> Response {
     match result {
         BatchResult::PutOk => Response::PutOk,
         BatchResult::TxnApplied(_) => Response::PutOk, // 事务批不走 Binary 门面
