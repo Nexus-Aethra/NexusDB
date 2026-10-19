@@ -228,31 +228,18 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                 for r in reply_results.drain(..) {
                     let mut close_conn = false;
                     if let Some(conn) = conn_map.get_mut(&r.conn_id) {
-                        match conn.proto {
-                            ProtocolKind::Binary => {
-                                let resp = batch_result_to_response(&r.result);
-                                conn.send_binary_response(r.req_id, &resp);
-                            }
-                            ProtocolKind::Resp
-                            | ProtocolKind::Sql
-                            | ProtocolKind::Pg
-                            | ProtocolKind::Http => {
-                                // ⭐ Y2/S4/H1: SQL/HTTP conn 复用 seq 重排 + 聚合钩子
-                                handle_resp_shard_result(
-                                    conn,
-                                    r.conn_id,
-                                    r.req_id,
-                                    r.group,
-                                    &r.result,
-                                    worker_id,
-                                    &db,
-                                    &db_view,
-                                    &shard_inboxes,
-                                    num_shards,
-                                );
-                                close_conn = conn.resp_should_close();
-                            }
-                        }
+                        close_conn = dispatch_conn_reply(
+                            conn,
+                            r.conn_id,
+                            r.req_id,
+                            r.group,
+                            &r.result,
+                            worker_id,
+                            &db,
+                            &db_view,
+                            &shard_inboxes,
+                            num_shards,
+                        );
                         if conn.output_overflowed {
                             close_conn = true;
                         } else {
@@ -315,82 +302,20 @@ pub(crate) fn worker_main_epoll(cfg: WorkerConfig) {
                                     conn.limits,
                                     conn.tls_config.clone(),
                                 );
-                                match conn.proto {
-                                    ProtocolKind::Binary => {
-                                        process_binary_input(
-                                            conn,
-                                            conn_id,
-                                            worker_id,
-                                            &d_db,
-                                            &d_tbl,
-                                            &lim,
-                                            &shard_inboxes,
-                                            num_shards,
-                                        );
-                                    }
-                                    ProtocolKind::Resp => {
-                                        process_resp_input(
-                                            conn,
-                                            conn_id,
-                                            worker_id,
-                                            &db_view,
-                                            &d_tbl,
-                                            &lim,
-                                            &auth_pw,
-                                            &shard_inboxes,
-                                            num_shards,
-                                        );
-                                        should_remove = conn.resp_should_close();
-                                    }
-                                    ProtocolKind::Sql => {
-                                        // ⭐ Z2: MySQL wire 帧循环
-                                        process_sql_input(
-                                            conn,
-                                            conn_id,
-                                            worker_id,
-                                            &auth_pw,
-                                            &d_db,
-                                            &db_view,
-                                            &shard_inboxes,
-                                            num_shards,
-                                            &tls,
-                                            &lim,
-                                        );
-                                        should_remove = conn.resp_should_close();
-                                    }
-                                    ProtocolKind::Pg => {
-                                        // ⭐ S4: PostgreSQL wire 帧循环
-                                        process_pg_input(
-                                            conn,
-                                            conn_id,
-                                            worker_id,
-                                            &auth_pw,
-                                            &d_db,
-                                            &db_view,
-                                            &shard_inboxes,
-                                            num_shards,
-                                            &tls,
-                                            &lim,
-                                        );
-                                        should_remove = conn.resp_should_close();
-                                    }
-                                    ProtocolKind::Http => {
-                                        // ⭐ H1: HTTP/1.1 REST 帧循环 (token = auth_password)
-                                        process_http_input(
-                                            conn,
-                                            conn_id,
-                                            worker_id,
-                                            &auth_pw,
-                                            &d_db,
-                                            &db_view,
-                                            &lim,
-                                            num_shards,
-                                            &shard_inboxes,
-                                            num_shards,
-                                        );
-                                        should_remove = conn.resp_should_close();
-                                    }
-                                }
+                                // ⭐ 审计 P3-3: 协议分派收敛到公共层 (与协程 worker 共用).
+                                let d = ConnDispatch {
+                                    conn_id,
+                                    worker_id,
+                                    db: &d_db,
+                                    table: &d_tbl,
+                                    limits: &lim,
+                                    auth_pw: &auth_pw,
+                                    tls: &tls,
+                                    db_view: &db_view,
+                                    shard_inboxes: &shard_inboxes,
+                                    num_shards,
+                                };
+                                should_remove = dispatch_conn_input(conn, &d);
                             }
                             Ok(false) => should_remove = true, // EOF
                             Err(_) => should_remove = true,

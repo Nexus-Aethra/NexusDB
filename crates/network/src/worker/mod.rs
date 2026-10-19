@@ -146,6 +146,9 @@ pub(crate) use worker_epoll::{
 /// ⭐ 协程化 2026-08: 协程 worker (每连接一协程 + io_uring, 替代 epoll).
 mod worker_coro;
 pub(crate) use worker_coro::worker_main_coro;
+/// ⭐ 审计 P3-3: 协议分派公共层 (epoll worker 与协程 worker 共用, 消除双份 match).
+mod dispatch;
+pub(crate) use dispatch::{ConnDispatch, dispatch_conn_input, dispatch_conn_reply};
 
 /// 特殊 epoll token: reply bus eventfd.
 const REPLY_TOKEN: u64 = u64::MAX;
@@ -664,7 +667,7 @@ fn request_to_batch_op(
 /// BatchResult → Binary Response. ⭐ Get 命中时剥 value type tag.
 /// (注: payload.to_vec 是 Response::Get(Option<Vec>) 结构所需;
 /// Binary 非 benchmark 主路径, 借用化需改 Protocol trait, 收益不值 — 记录保留.)
-fn batch_result_to_response(result: &BatchResult) -> Response {
+pub(crate) fn batch_result_to_response(result: &BatchResult) -> Response {
     match result {
         BatchResult::PutOk => Response::PutOk,
         BatchResult::TxnApplied(_) => Response::PutOk, // 事务批不走 Binary 门面

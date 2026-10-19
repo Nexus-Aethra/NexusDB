@@ -3,7 +3,7 @@
 > 审查对象：`/home/wpp/nexus/NexusDB` @ `c4f9eaf`（main）+ 工作区未提交修复（约 +3865/−1570 行，含 2026-10-14 P0/C1-C6 修复）
 > 审查日期：2026-10-16　　审查方式：7 名分析员并行模块审计 + 交叉核对 [`CODE-AUDIT-REPORT.md`](./CODE-AUDIT-REPORT.md)（2026-10-13 版）条目现状 + 独立探针程序 release 模式实证
 > 本文档为审查产物，可随时移走或删除。**全程只读，未修改任何代码。**
-> **修复进度见 [§五](#五修复进度2026-10-17)**：截至 2026-10-19 已修 91 项条目 / 剩 2 项 + 文档化边界（§5.6）。
+> **修复进度见 [§五](#五修复进度2026-10-17)**：截至 2026-10-19 已修 92 项条目 / 剩 1 项 + 文档化边界（§5.6）。
 
 ---
 
@@ -313,7 +313,7 @@
 | P3-13 | ❌ 未修 | ✅ 已修 | `0df5401` |
 | P3-14 | ❌ 未修 | ✅ 已修：WAL 名长 `as u16` 截断改 `Result` 显式报错 | `d104723` |
 | P3-2 | ❌ 未修 | ✅ 已修：连接建立重复代码抽 `accept_one_conn` | `7b6b271` |
-| P3-3 | ❌ 未修 | 🔴 **未修**（见 5.6） | — |
+| P3-3 | ❌ 未修 | ✅ 已修：协议分派双 match 收敛到 `worker/dispatch.rs` 公共层 (`dispatch_conn_input`/`dispatch_conn_reply` + `ConnDispatch` ctx); 双 worker 模式 parity 测试 (`worker_modes_parity.rs`, `NEXUS_CORO_WORKER=1` 自 set) 防漂移 (本分支) | 本分支 |
 | P3-5 | ❌ 未修 | 🔴 **未修**（见 5.6） | — |
 | P3-6 | ❌ 未修 | 🔴 **未修**（见 5.6） | — |
 | P3-8 | ❌ 未修 | ✅ 已修：RESP 重排缓冲设上限 | `c949ec7` |
@@ -378,13 +378,12 @@
 
 已修：LIKE `_` 通配符报错、RETURNING 报错、非 UUID 列 uuid 默认值报错、CURRENT_DATE/TIME 语义修正、无括号关键字识别、SysVarStub transaction_isolation 按实际级别回答（`5e6e9ac`）；`SELECT 1` 顶层字面量投影（`4e9b1f7`）；varint 第 5 字节非规范编码拒绝、`encode_leaf/internal_item` buf 前置边界检查、AGENTS.md crossbeam 契约澄清（`37e3f0a`）；16KB 栈缓冲改堆分配、dump free_off 越界回归测试、空串主键错误信息、page crate `#![allow(dead_code)]` 改 6 处定点 allow（`eac1486`）；SQL 语法缺口集中标注 → 新增 `docs/SQL-FEATURES.md` 语法支持矩阵（`3806824`）。
 
-未修：协议分派 match 重复两处（P3-3，见 5.6）、错误分类靠字符串匹配（P3-5/P3-6，见 5.6）。
+未修：错误分类靠字符串匹配（P3-5/P3-6，见 5.6）。
 
-### 5.6 🔴 仍未解决（2 项 + 文档化边界）
+### 5.6 🔴 仍未解决（1 项 + 文档化边界）
 
 | # | 问题 | 位置 | 为什么还没修 |
 |---|---|---|---|
-| **P3-3** | 协议分派 match 在 worker_epoll / worker_coro 重复两处 | `worker_epoll.rs:231,318` vs `worker_coro.rs:343` | 两处生命周期/借用结构不同，抽取公共层需重构 |
 | **P3-5/6** | 错误分类 / SQLSTATE 靠字符串匹配 | `worker/protocol_io.rs:331-348`、`worker/sql_eval.rs:628-667` | 需引入结构化错误码类型，改动面覆盖全部错误产生点 |
 
 **已解决（2026-10-17 晚，PR #12 与本分支）**：
@@ -396,6 +395,7 @@
 | P2-1 | 复合索引退化全表 (+ OR 混合算子命中复合索引静默返空) | planner 复合首列等值计分 + storage 复合前缀扫 + eq_enc/cover 护栏 (见 5.9) | 本分支 (PR #14) |
 | P2-6 | `JoinInner` `UnsafeCell` + `unsafe impl<T: Send> Send` | 共享指针 `Arc`→`Rc` (`Rc` 本身 `!Send + !Sync`) → "spawn/drive/poll 同线程" 从调用方约定变成类型结构; 删除虚假 `unsafe impl Send` (其 SAFETY 注释声称 `Arc<JoinInner>: Send`，实际因 `UnsafeCell: !Sync` 从不成立); clippy `arc_with_non_send_sync` 清零, 原子计数开销一并消失 | 本分支 (PR #15) |
 | P2-flush | `flush_uring` 忙轮询 (`logging/src/lib.rs`) | 三处联动: ① `extract_pending` 兜底扫描跳过"已提交等 CQE"的 slot (旧实现把等 IO 的协程反复拉出来空 poll = 用户态自旋, 且让阻塞分支永远走不到); ② 新 `SchedHandle::drive_blocking` — ready 空 + 真 in-flight IO 时 `submit_and_wait(1)` 内核等 CQE; ③ `drain_completions_and_wait` 判据 `!registry.is_empty()` → `has_awaiting_cqe()` — CQE 已到未 take 的项也占 registry, 旧判据会把无 in-flight 的场景也拖进 `submit_and_wait` 死锁 (单协程必现, 多协程被其他 IO 掩盖) | 本分支 |
+| P3-3 | 协议分派 match 在 worker_epoll / worker_coro 重复两处 | 收敛到 `worker/dispatch.rs` 公共层: `ConnDispatch` ctx + `dispatch_conn_input`/`dispatch_conn_reply` 单份实现, 两 worker 各自构 ctx 调用; 关闭语义统一为"一律 resp_should_close" (Binary 旧 epoll 路径不查该标志, 但其仅在 TLS 写卡死/空闲回收时置位, 关闭即预期); `tests/worker_modes_parity.rs` 双模式 5 协议对拍 (含 `NEXUS_CORO_WORKER=1` 自 set) 防再漂移 | 本分支 |
 | (附带) | scanner `decode_meta_page` 格式漂移 | MetaPage item 区起点 40 → 1064 (引擎 T12.14 resolver 段 1KiB); 旧实现在现代引擎目录上把 resolver 段当 item 解, dbs/export/lookup/verify 全不可用 | 本分支 |
 
 **文档化边界**（已在 `SQL-FEATURES.md` / `DESIGN.md` / `AGENTS.md` 显式标注，非缺陷）：JOIN gather 读不入 OCC 读集、跨 shard COMMIT best-effort、不防幻读、Binary 协议无认证、CPU 亲和未实现。
@@ -407,7 +407,7 @@
 3. ~~**P2-1 复合索引退化全表**~~ ✅ 已修 (本分支, 见 5.9).
 4. ~~**P2-6 JoinInner Send 安全**~~ ✅ 已修 (`Arc`→`Rc` + 删虚假 unsafe impl, 见 5.6 已解决表).
 5. **P3-5/6 错误分类结构化** — 收敛字符串匹配, 为后续所有错误路径打基础.
-6. ~~**flush_uring 忙轮询**~~ ✅ 已修 (`drive_blocking` 内核等 CQE, 见 5.6 已解决表). 剩 **P3-3 协议分派去重** — 需设计权衡, 排最后.
+6. ~~**flush_uring 忙轮询**~~ ✅ 已修 (`drive_blocking` 内核等 CQE, 见 5.6 已解决表). ~~**P3-3 协议分派去重**~~ ✅ 已修 (公共层 + 双模式 parity 测试). 剩 **P3-5/6 错误分类结构化**.
 
 ### 5.8 P2-新 修复明细 (scanner 多 shard, 2026-10-17)
 
