@@ -466,7 +466,9 @@ Workspace: ~549 passed, 0 failed (不含慢 repro 测试).
   1. 每个 shard 线程自己 NEW 一个 Scheduler (独立 io_uring), 永久 run() loop
   2. spawn / drive / JoinHandle::poll 全在同一线程
   3. 跨 shard 通信用 mpsc channel (不用 JoinHandle 跨线程)
-  4. 违反任一条 → JoinInner::UnsafeCell 跨线程 race → 永久 hang
+  4. 违反任一条 → 跨线程 race → 永久 hang。其中"JoinHandle 跨线程"这一类现已
+     **编译期即被拒** (审计 P2-6 修复: `JoinHandle` 内含 `Rc<JoinInner>`，`Rc` 本身
+     `!Send + !Sync`；`SchedHandle` 亦 `!Send` — P2-5)，其余仍是行为契约
 
 - **协程 = Rust `async fn` + Future** (不是栈式协程)
 - **Waker 全部自实现**, 不依赖 monoio 的 Reactor

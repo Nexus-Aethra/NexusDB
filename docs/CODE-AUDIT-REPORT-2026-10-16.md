@@ -49,7 +49,7 @@
 | P2-1 复合索引退化全表 | `sql_dispatch.rs:958-961`：`if idx.cols.len() != 1 { continue; }`——parser 把复合 UNIQUE 建成多列索引，执行层永远用不上 |
 | P2-4 协程 worker TLS | 半修：epoll 写缓冲已做；协程 worker TLS 两处残缺（见 2.2 节 P1-5/P1-6） |
 | P2-5 SchedHandle | **比原描述更严重**：`Clone + pub Rc` 破坏唯一所有权前提，clone 跨线程是真正 UB（非仅 API 误用） |
-| P2-6 | 未修复 |
+| P2-6 | ✅ 已修（见 5.6 已解决表）：共享指针 `Arc`→`Rc` 把"单线程"写成类型结构，删除虚假 `unsafe impl Send` |
 | P2-12 | `chunk_lock`/`travel_trees` 仍是死代码 |
 | P3-13 / P3-14 | 未修 |
 | P3-2/3/5/6/8/9/10/11 | 未修 |
@@ -308,7 +308,7 @@
 | P2-1 | ❌ 复合索引退化全表 | 🔴 **未修**（见 5.6） | — |
 | P2-4 | ⚠️ 协程 worker TLS 半修 | ✅ 已修：协程分支补齐 TLS 升级处理 | `5ee4496` |
 | P2-5 | ❌ SchedHandle Clone+pub Rc | ✅ 已修：移除 `unsafe impl Send`，内层 `Rc` 改私有 | `7257868` |
-| P2-6 | ❌ 未修复 | 🔴 **未修**（见 5.6） | — |
+| P2-6 | ❌ 未修复 | ✅ 已修：`JoinInner` 共享指针 `Arc`→`Rc`，单线程不变量改为类型结构；删除做了虚假声明的 `unsafe impl Send` (本分支) | 本分支 |
 | P2-12 | ❌ chunk_lock/travel_trees 死代码 | ✅ 已修：清理死代码 + 文档失准标注 | `0df5401` |
 | P3-13 | ❌ 未修 | ✅ 已修 | `0df5401` |
 | P3-14 | ❌ 未修 | ✅ 已修：WAL 名长 `as u16` 截断改 `Result` 显式报错 | `d104723` |
@@ -380,12 +380,11 @@
 
 未修：协议分派 match 重复两处（P3-3，见 5.6）、错误分类靠字符串匹配（P3-5/P3-6，见 5.6）。
 
-### 5.6 🔴 仍未解决（5 项 + 文档化边界）
+### 5.6 🔴 仍未解决（4 项 + 文档化边界）
 
 | # | 问题 | 位置 | 为什么还没修 |
 |---|---|---|---|
 | **P2-1** | 复合索引退化全表 | `sql_dispatch.rs:1101` `if idx.cols.len() != 1 { continue; }` | 需扩展 ScanPred 支持多列前缀匹配 |
-| **P2-6** | `JoinInner` UnsafeCell + `unsafe impl<T: Send> Send` | `scheduler/src/task.rs:62-71` | 跨线程 poll 竞争；需设计改 Arc/Mutex 或显式 `!Send`，牵涉 JoinHandle 公共 API |
 | **P2** | flush_uring 忙轮询 | `logging/src/lib.rs:344` `drive_until_idle(256)` 自旋等写盘完成 | 仅在写盘期间自旋（非空闲期），影响有限，需引入完成通知机制 |
 | **P3-3** | 协议分派 match 在 worker_epoll / worker_coro 重复两处 | `worker_epoll.rs:231,318` vs `worker_coro.rs:343` | 两处生命周期/借用结构不同，抽取公共层需重构 |
 | **P3-5/6** | 错误分类 / SQLSTATE 靠字符串匹配 | `worker/protocol_io.rs:331-348`、`worker/sql_eval.rs:628-667` | 需引入结构化错误码类型，改动面覆盖全部错误产生点 |
@@ -396,6 +395,7 @@
 |---|---|---|---|
 | P1-4 | FK 对 DELETE 无 RESTRICT 检查 | 新 `sql_fk_restr.rs` 预检状态机 (PkGet Redispatch / 两阶段 Phase2 双挂点); cascade_kickoff 只对 Cascade/SetNull 进延迟 (修 NoAction 永挂); 错误映射 1451/23503/409 | PR #12 (`4bb2127`) |
 | P2-新 | scanner 14 命令全部 `shards.first()` | 全命令遍历全部 shard 合并 (见 5.8); fix-mate 多 shard 必须 `--shard` | 本分支 |
+| P2-6 | `JoinInner` `UnsafeCell` + `unsafe impl<T: Send> Send` | 共享指针 `Arc`→`Rc` (`Rc` 本身 `!Send + !Sync`) → "spawn/drive/poll 同线程" 从调用方约定变成类型结构; 删除虚假 `unsafe impl Send` (其 SAFETY 注释声称 `Arc<JoinInner>: Send`，实际因 `UnsafeCell: !Sync` 从不成立); clippy `arc_with_non_send_sync` 清零, 原子计数开销一并消失 | 本分支 |
 | (附带) | scanner `decode_meta_page` 格式漂移 | MetaPage item 区起点 40 → 1064 (引擎 T12.14 resolver 段 1KiB); 旧实现在现代引擎目录上把 resolver 段当 item 解, dbs/export/lookup/verify 全不可用 | 本分支 |
 
 **文档化边界**（已在 `SQL-FEATURES.md` / `DESIGN.md` / `AGENTS.md` 显式标注，非缺陷）：JOIN gather 读不入 OCC 读集、跨 shard COMMIT best-effort、不防幻读、Binary 协议无认证、CPU 亲和未实现。
@@ -405,7 +405,7 @@
 1. ~~**P2-新 scanner 单 shard**~~ ✅ 已修 (本分支, 含附带 meta 解码漂移修复).
 2. ~~**P1-4 FK RESTRICT**~~ ✅ 已修 (PR #12).
 3. **P2-1 复合索引退化全表** — 正确性优先 (索引查不全 = 静默错数据); 需扩展 ScanPred 多列前缀匹配.
-4. **P2-6 JoinInner Send 安全** — 跨线程 poll 竞争, 需设计决策 (Arc/Mutex vs !Send).
+4. ~~**P2-6 JoinInner Send 安全**~~ ✅ 已修 (`Arc`→`Rc` + 删虚假 unsafe impl, 见 5.6 已解决表).
 
 ### 5.8 P2-新 修复明细 (scanner 多 shard, 2026-10-17)
 

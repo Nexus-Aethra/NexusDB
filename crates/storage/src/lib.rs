@@ -62,7 +62,9 @@ pub mod wal;
 // 1. 每个 shard 线程自己 NEW 一个 Scheduler (独立 io_uring), 永久 run() loop
 // 2. spawn / drive / JoinHandle::poll 全在同一线程
 // 3. 跨 shard 通信用 mpsc channel (不用 JoinHandle 跨线程)
-// 4. 违反任一条 → JoinInner::UnsafeCell 跨线程 race → 永久 hang
+// 4. 违反 2/3 中"JoinHandle 跨线程"这一类现在**编译期即被拒** — JoinHandle 内含
+//    `Rc<JoinInner>` (`!Send + !Sync`), 移不出创建线程 (审计 P2-6 修复); 其余各条
+//    仍是行为契约, 违反 → 永久 hang.
 // 详细见: docs/superpowers/plans/2026-07-18-storage-crate.md 顶部 "Scheduler 多线程使用契约" 段.
 
 pub use alloc::{FreePageQueue, PidAllocator, VpidAllocator};
