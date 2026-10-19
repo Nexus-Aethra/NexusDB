@@ -3,6 +3,10 @@
 > 对象: `crates/scheduler/`
 > 状态: **全部任务完成 (T1–T11)**, 22/22 测试通过 (默认 + `--features scheduler-trace`).
 > 最后更新: 2026-07-17.
+>
+> **2026-10-19 后续更新**: 本文为当时快照. `JoinInner` 已按审计 P2-6 改为
+> `Rc<JoinInner>` 并删除 `unsafe impl Send` (见 CODE-AUDIT-REPORT-2026-10-16.md §5.6);
+> 调度器另新增 `drive_blocking` (内核等 CQE, 修 flush_uring 忙轮询). 其余结论仍有效.
 
 ## 1. 整体数据流
 

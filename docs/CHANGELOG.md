@@ -10,6 +10,29 @@
 
 ---
 
+## 2026-10-19 审计批次收口 (PR #14 + #15; 审计报告剩余项清零)
+
+`docs/CODE-AUDIT-REPORT-2026-10-16.md` 93 条审计条目的最后一批修复合并入 main, §5.6 更新为"仍未解决: 0 项". P0/P1/P2 前期批次的完整历史见审计报告 §5.4/§5.5 与 git log, 本节只记录最后两个 PR.
+
+### 1. PR #14 — P2-1 复合索引退化全表 (`fde67d8`)
+- planner 复合首列等值计分 + storage 复合前缀扫 (`index_scan_raw`) + eq_enc/cover 护栏; 顺带修 OR 混合算子命中复合索引静默返空
+- 回归: planner 单测 + storage e2e + 全量通过
+
+### 2. PR #15 — P2-6 + P2 flush_uring + P3-3 + P3-5/6 (`b34d9ba`)
+- **P2-6 JoinInner Send 安全**: `Arc<JoinInner>` → `Rc<JoinInner>`; 删除虚假 `unsafe impl Send` (其 SAFETY 注释被 `UnsafeCell: !Sync` 证伪 — `Arc<JoinInner>` 从来不是 Send, 竞争从未可达; 真正缺陷是"单线程约束"仅靠调用方纪律维系). 现在"spawn/drive/poll 同线程"是类型结构; clippy `arc_with_non_send_sync` 清零, spawn/join 原子计数开销消失
+- **P2 flush_uring 忙轮询**: 三处联动 — ① `extract_pending` 兜底扫描跳过"已提交等 CQE"的 slot (旧实现把等 IO 协程反复拉出来空 poll = 用户态自旋, strace 实证 io_uring_enter 仅 18 次); ② 新 `SchedHandle::drive_blocking` — ready 空 + 真 in-flight IO 时 `submit_and_wait(1)` 内核等 CQE; ③ `drain_completions_and_wait` 判据 `!registry.is_empty()` → `has_awaiting_cqe()` (CQE 已到未 take 的项也占 registry, 旧判据把无 in-flight 场景拖进死锁, 单协程必现/多协程被掩盖). 回归 `flush_uring_waits_for_write_without_spinning` (管道慢读者: 墙钟 ≥80ms + CPU <8 ticks); 反向验证 revert → 15 ticks 自旋失败
+- **P3-3 协议分派双实现**: epoll/coro 两 worker 各一份 5 协议 match 收敛到 `worker/dispatch.rs` (`ConnDispatch` ctx + `dispatch_conn_input`/`dispatch_conn_reply` 单份实现); 关闭语义统一为"一律 resp_should_close"; 新增 `tests/worker_modes_parity.rs` 双模式 5 协议对拍 (含 `NEXUS_CORO_WORKER=1` 自 set) 防再漂移; 反向验证 (SQL 误接 PG → 红)
+- **P3-5/6 错误分类字符串匹配**: 新 `worker/sql_error.rs` — `SqlErrorCode` 封闭枚举 + 三协议 (MySQL errno / PG SQLSTATE / HTTP status) **穷尽 match** 映射 (漏映射编译期报错); 新代码 `SqlError::new(code, msg)` 直报码 (FK 违例 / unknown column 等 ORM 关键路径已迁移); 遗留 `Result<_, String>` 深管线经 `SqlError::classified` **单点**适配 — 字符串匹配从三条协议链收敛到一处; `classify_pins_legacy_messages` 钉死全部消息模板 (措辞漂移即红)
+
+### 3. 验证
+- `cargo test --workspace` 默认并行度 **1188 passed / 0 failed**; clippy `-D warnings` 0; fmt 0 差异
+- 每项修复均有必败回归测试 + git stash 反向验证 (改前必败 / 改后必过)
+- 合并后 benchmark (`scripts/run_memtier_bench.sh`): 与修复前基线 `fde67d8` 背靠背 A/B, 5 workload 全部持平或更优, 无吞吐回归 (数据与噪声说明见 README 表 1c)
+
+> 分支处理注记: PR #15 远端分支曾停在 rebase 前旧 tip; 为免 force-push 将旧 tip merge 入分支 (merge commit 树与 rebase 后逐字节一致), squash 合并后 main 历史不受影响.
+
+---
+
 ## 2026-08-13 会话二十四 (F84 嵌入式 API 扩展 — 类型感知 + 列表/范围扫描 + 完整 async 对齐)
 
 嵌入式 KV API 第二阶段, 在 P1/P2 落地的基础上 (`NexusDb`/`Database`/`Table` + 同步/异步 `set/get/del` + 批量) 补齐生产场景真正常用的三类能力, 并把现有方法的 async 对齐补全。**零新外部依赖, 零存储引擎改动** — 全部基于 storage 已有的 `table_scan_prefix` / `table_scan_range` (BTree 范围扫描) + `value_num` 类型 tag 体系。
