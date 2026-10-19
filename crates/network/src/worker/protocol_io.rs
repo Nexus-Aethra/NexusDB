@@ -326,33 +326,17 @@ pub(crate) fn conn_default(default_db: &std::sync::Arc<str>) -> std::sync::Arc<s
     default_db.clone()
 }
 
-/// SQL 错误 → MySQL ERR 包 (seq 1; 错误码按消息粗分类).
+/// SQL 错误 → MySQL ERR 包 (seq 1).
+///
+/// ⭐ 审计 P3-5/6: 错误码来自 `SqlError` 结构化码 (遗留 String 错误经
+/// `SqlError::classified` 适配), 不再在本函数内按消息文本猜.
 pub(crate) fn mysql_err_packet(msg: &str) -> Vec<u8> {
-    let code = if msg.contains("unknown column") {
-        1054
-    } else if msg.contains("duplicate key") {
-        1062 // ER_DUP_ENTRY — UNIQUE 冲突 (ORM 据此识别 IntegrityError)
-    } else if msg.contains("serialization failure") {
-        1213 // MySQL deadlock/serialization 惯用重试码
-    } else if msg.contains("read-only transaction") {
-        1792
-    } else if msg.contains("Unknown database") {
-        1049
-    } else if msg.contains("Cross-database access is not supported") {
-        1235 // ER_NOT_SUPPORTED_YET — 跨库访问 v1 不支持 (显式报错, 非静默错数据)
-    } else if msg.contains("has no schema") || msg.contains("doesn't exist") {
-        1146 // ER_NO_SUCH_TABLE — ORM has_table 据此判表不存在后发 CREATE
-    } else if msg.contains("foreign key violation") {
-        1451 // ER_ROW_IS_REFERENCED_2 — FK RESTRICT 拒删 (ORM 据此识别 IntegrityError)
-    } else if msg.contains("expected") || msg.contains("unexpected") || msg.contains("unterminated")
-    {
-        1064
-    } else if msg.contains("Access denied") {
-        1045
-    } else {
-        1105
-    };
-    crate::protocol::mysql::build_err(1, code, msg)
+    mysql_err_packet_e(&SqlError::classified(msg))
+}
+
+/// 结构化入口: 调用方已知错误码时用 (不经过字符串分类).
+pub(crate) fn mysql_err_packet_e(e: &SqlError) -> Vec<u8> {
+    crate::protocol::mysql::build_err(1, e.code.mysql_errno(), &e.msg)
 }
 
 // SQL wire parsing keeps authentication, database, TLS, and shard state explicit.

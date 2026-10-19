@@ -22,8 +22,8 @@
 use std::sync::Arc;
 
 use super::{
-    ConnState, SqlDmlAction, col_from_ordered_bytes, push_task, push_task_grouped, run_dml_phase2,
-    sql_dispatch_stmt,
+    ConnState, SqlDmlAction, SqlError, SqlErrorCode, col_from_ordered_bytes, push_task,
+    push_task_grouped, run_dml_phase2, sql_dispatch_stmt,
 };
 use crate::protocol::sql::SqlStmt;
 use shard_manager::{BatchOp, BatchResult, PredOp, ScanPred, SharedTaskInbox};
@@ -583,10 +583,14 @@ pub(crate) fn fk_restr_on_reply(
                 conn.fk_restr.remove(&seq);
                 conn.resp_complete(
                     seq,
-                    super::sql_err_bytes(
+                    super::sql_err_bytes_e(
                         conn.proto,
-                        &format!(
-                            "foreign key violation: {child}.{col} still references the deleted row(s)"
+                        // ⭐ 审计 P3-5/6: 结构化错误码 — 不依赖消息文本被分类器认出.
+                        &SqlError::new(
+                            SqlErrorCode::FkViolation,
+                            format!(
+                                "foreign key violation: {child}.{col} still references the deleted row(s)"
+                            ),
                         ),
                     ),
                 );
