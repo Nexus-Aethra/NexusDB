@@ -3,7 +3,8 @@
 //! 设计 (用户敲定 2026-07-18):
 //! - **单线程使用** (per-shard thread, 与 scheduler crate 同约束)
 //! - 用 `Cell<u64>` / `Cell<u32>` / `Cell<u8>` / 内部 `Vec` 即可, 无需 Atomic / Mutex
-//! - 调用方保证不跨线程使用 (违反会触发 UB, 与 `JoinInner::UnsafeCell` 同契约)
+//! - 调用方保证**同一时刻只有一个线程**使用 (内部 `Cell` 是 `!Sync`, 跨线程共享
+//!   引用编译期即被拒; 但独占移动不会报错 — 语义上的 per-shard 所有权靠约定)
 //!
 //! 设计原则 (来自 plan §3.3):
 //! - **Vpid 永不重用**: 一旦分配永不回收. free list 仅复用"曾经分配过"的 vpid, 不让 next_vpid 自减.
