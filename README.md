@@ -16,7 +16,31 @@
 | PostgreSQL wire | 5435 | `psql` / drivers direct-connect; shares kernel & data with MySQL |
 | Binary (internal) | 5433 | testing / benchmarking only |
 
-At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + per-core thread + io_uring async I/O + a hand-written coroutine scheduler, no tokio), a **complete SQL subset** (JOIN / subqueries / aggregation / GROUP BY / transactions) coexisting with **Redis data structures**, and **production-grade reliability** (crash recovery, WAL durability, 1188+ tests, clippy 0 warnings).
+One process, five ways in, **one copy of every byte** — and no async runtime: io_uring plus a hand-written coroutine scheduler underneath.
+
+```mermaid
+flowchart LR
+    subgraph C["clients"]
+        direction TB
+        c1["redis-cli"]
+        c2["mysql / psql"]
+        c3["curl / AI tools"]
+    end
+    subgraph P["5 ports · 1 process"]
+        direction TB
+        p1["RESP 6379"]
+        p2["MySQL 5434"]
+        p3["PostgreSQL 5435"]
+        p4["HTTP 6778"]
+        p5["Binary 5433"]
+    end
+    C --> P
+    P --> W["shared worker pool<br/>parse · auth · KvLimits · routing"]
+    W --> S["shard threads<br/>one per core · single-threaded · Share-Nothing"]
+    S --> K[("one storage kernel<br/>LCB-Tree · WAL · GC · overflow pages")]
+```
+
+> The five facades are not five engines: they share one worker pool, one set of shard threads, and one copy of the data.
 
 > Architecture: [docs/DESIGN.md](./docs/DESIGN.md) · handoff / progress: [docs/AGENTS.md](./docs/AGENTS.md) · fix history: [docs/CHANGELOG.md](./docs/CHANGELOG.md)
 >
@@ -62,10 +86,26 @@ At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + p
 - **Fully flat meta cache** — `meta : data = 1 : 2048`; full read on open + async flush
 - **data → meta → pid.state flush ordering** — guarantees crash consistency
 
+```mermaid
+flowchart LR
+    D["1 · data chunk<br/>1 MB = 64 × 16 KB pages"] --> M["2 · meta window<br/>vpid → PidLocation"]
+    M --> S["3 · pid.state<br/>last confirmed flush"]
+    D -.-> R["crash anywhere → recover<br/>replays the newest complete prefix"]
+    M -.-> R
+    S -.-> R
+```
+
 ### Space & reclamation
 - **GC compact** — in-place fill of chunk dead slots + active reclamation of half-empty blocks
 - **Tombstone + resurrection prevention** — overwrites free the old chain; recover never refills dead pages
 - **Large-value overflow pages (≤ 1 MB)** — values over ~4 KB auto-split into 16 KB overflow pages, 0-copy into GC
+
+```mermaid
+flowchart LR
+    V["victim chunk B<br/>few live pages"] -->|"live pages → dead slots"| A["host chunk A"]
+    A -->|"fsync + meta CAS<br/>vpid B → A"| M["meta committed"]
+    M -->|"B fully dead"| F["pending_free → block unlink"]
+```
 
 ### Quality
 - **Testing** — 1188+ unit/integration tests; `cargo clippy --all-targets` 0 warnings

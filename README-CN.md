@@ -16,7 +16,31 @@
 | PostgreSQL wire | 5435 | `psql` / 驱动直连; 与 MySQL 门面**共内核同数据** |
 | Binary (内部) | 5433 | 仅测试 / 压测 |
 
-核心上它兼具**写密集友好的架构**(Share-Nothing + per-core thread + io_uring 异步 I/O + 自研协程调度器, 不依赖 tokio)、**完整的 SQL 子集**(JOIN / 子查询 / 聚合 / GROUP BY / 事务)与 **Redis 数据结构**并存, 以及**生产级可靠性**(崩溃恢复、WAL 持久、1188+ 测试、clippy 0 警告)。
+一个进程, 五种接入口, **同一份数据** — 且没有异步运行时: 底下是 io_uring + 自研协程调度器.
+
+```mermaid
+flowchart LR
+    subgraph C["客户端"]
+        direction TB
+        c1["redis-cli"]
+        c2["mysql / psql"]
+        c3["curl / AI 工具"]
+    end
+    subgraph P["5 个端口 · 1 个进程"]
+        direction TB
+        p1["RESP 6379"]
+        p2["MySQL 5434"]
+        p3["PostgreSQL 5435"]
+        p4["HTTP 6778"]
+        p5["Binary 5433"]
+    end
+    C --> P
+    P --> W["共享 worker 池<br/>解析 · 认证 · KvLimits · 路由"]
+    W --> S["shard 线程组<br/>每核一线程 · 单线程独占 · Share-Nothing"]
+    S --> K[("同一存储内核<br/>LCB-Tree · WAL · GC · 溢出页")]
+```
+
+> 五个门面不是五套引擎: 它们共享同一个 worker 池、同一批 shard 线程和同一份数据.
 
 > 设计架构见 [docs/DESIGN.md](./docs/DESIGN.md); 接手 / 进度 见 [docs/AGENTS.md](./docs/AGENTS.md); 修复历史 见 [docs/CHANGELOG.md](./docs/CHANGELOG.md).
 >
@@ -60,10 +84,26 @@
 - **平坦 meta 缓存** — `meta : data = 1 : 2048`, open 整读 + 异步刷盘
 - **刷盘顺序不变量** — data → meta → pid.state, 崩溃一致性有保证
 
+```mermaid
+flowchart LR
+    D["1 · data chunk<br/>1 MB = 64 × 16 KB 页"] --> M["2 · meta window<br/>vpid → PidLocation"]
+    M --> S["3 · pid.state<br/>最后确认的刷盘点"]
+    D -.-> R["任意点崩溃 → recover<br/>取最新完整前缀重放"]
+    M -.-> R
+    S -.-> R
+```
+
 ### 空间与回收
 - **GC compact** — chunk 死槽原位填充 + 半空 block 主动排空回收
 - **墓碑 + 防复活** — 覆盖写释放旧链, 恢复时不回填死页
 - **大 value 溢出页 (≤ 1MB)** — 超 ~4KB 自动切 16KB 溢出页, 0 拷贝并入 GC
+
+```mermaid
+flowchart LR
+    V["受害 chunk B<br/>少量活页"] -->|"活页写入死槽"| A["宿主 chunk A"]
+    A -->|"fsync + meta CAS<br/>vpid B → A"| M["meta 已提交"]
+    M -->|"B 全死"| F["pending_free → block unlink"]
+```
 
 ### 质量
 - **测试** — 1188+ 单元/集成测试, `cargo clippy --all-targets` 0 警告
