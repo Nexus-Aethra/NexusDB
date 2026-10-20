@@ -457,7 +457,7 @@ fn flush_dirty_rejects_inflight_snapshots() {
         },
     );
     // 取快照 → window 0 进入 in-flight (模拟异步刷盘协程还握着旧快照)
-    let snaps = cache.take_dirty_window_snapshots();
+    let snaps = cache.take_dirty_subrange_snapshots();
     assert!(!snaps.is_empty(), "应有 in-flight 快照");
 
     let r = cache.flush_dirty();
@@ -474,7 +474,7 @@ fn varied_pid(i: u64) -> storage::PidLocation {
         chunk_idx: (i % 251) as u8,
         page_idx: (i % 65536) as u16,
         // 混入 flags=0 未分配槽, 覆盖零值布局
-        flags: if i % 13 == 0 { 0 } else { storage::PID_ALIVE },
+        flags: if i.is_multiple_of(13) { 0 } else { storage::PID_ALIVE },
     }
 }
 
@@ -484,8 +484,7 @@ fn varied_pid(i: u64) -> storage::PidLocation {
 /// 速度断言取**自校准相对值**（memcpy ≥ 3× 标量）而非绝对毫秒, 排除机器噪声.
 #[test]
 fn window_snapshot_is_memcpy_fast_and_byte_exact() {
-    let path =
-        std::env::temp_dir().join(format!("nexus_meta_memcpy_{}.mate", std::process::id()));
+    let path = std::env::temp_dir().join(format!("nexus_meta_memcpy_{}.mate", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut cache = MetaCache::open(&path).unwrap();
 
@@ -496,9 +495,13 @@ fn window_snapshot_is_memcpy_fast_and_byte_exact() {
     }
 
     let t0 = std::time::Instant::now();
-    let snaps = cache.take_dirty_window_snapshots();
+    let snaps = cache.take_dirty_subrange_snapshots();
     let prod = t0.elapsed();
-    assert_eq!(snaps.len() as u64, WINDOWS, "应有 {WINDOWS} 个窗口快照");
+    assert_eq!(
+        snaps.len() as u64,
+        WINDOWS,
+        "应有 {WINDOWS} 个子区批 (满窗=1 合并批)"
+    );
 
     // 标量参考 (旧实现语义 = 磁盘格式): 逐槽 to_bytes 拼接
     let slots: Vec<storage::PidLocation> = (0..WINDOWS * SPW).map(varied_pid).collect();
@@ -515,25 +518,152 @@ fn window_snapshot_is_memcpy_fast_and_byte_exact() {
     }
     let scalar = t1.elapsed();
 
-    for (w, bytes) in &snaps {
+    for it in &snaps {
         assert_eq!(
-            bytes,
-            &ref_bytes[*w as usize],
+            &it.bytes, &ref_bytes[it.window as usize],
             "window {} 快照字节必须与标量参考逐字节相同",
-            w
+            it.window
         );
     }
-    for (w, _) in &snaps {
-        cache.complete_window_flush(*w, true);
+    for it in &snaps {
+        cache.complete_subrange_flush(it.window, it.sub_start, it.sub_len, true);
     }
 
     let ratio = scalar.as_secs_f64() / prod.as_secs_f64().max(1e-9);
-    println!(
-        "[window_snapshot] memcpy {prod:?} vs scalar {scalar:?} — {ratio:.1}x (要求 ≥3x)"
-    );
+    println!("[window_snapshot] memcpy {prod:?} vs scalar {scalar:?} — {ratio:.1}x (要求 ≥3x)");
     assert!(
         prod <= scalar / 3,
         "memcpy 路径应至少比逐槽标量快 3x: memcpy {prod:?} vs scalar {scalar:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+// ===== O2 子窗脏粒度 (8KB) — 行为级必败回归 =====
+
+use storage::meta_cache::MetaWindowItem;
+use storage::meta_cache::SUB_SLOTS;
+
+fn fill_window(cache: &mut MetaCache, w: u64) {
+    let spw = storage::meta_cache::SLOTS_PER_WINDOW as u64;
+    for i in (w * spw)..((w + 1) * spw) {
+        cache.write(i, varied_pid(i));
+    }
+}
+
+/// 标量参考: window 内 [sub_start, sub_start+sub_len) 子区的槽字节.
+/// 注意: 必须复刻测试里对 3 个 hot 槽的覆写 (sub 5/6/9 各覆写第 0/1/2 槽).
+fn scalar_subrange_bytes(w: u64, sub_start: usize, sub_len: usize) -> Vec<u8> {
+    let spw = storage::meta_cache::SLOTS_PER_WINDOW;
+    let s = w as usize * spw + sub_start * SUB_SLOTS;
+    let e = s + sub_len * SUB_SLOTS;
+    let slot_at = |vpid: usize| -> storage::PidLocation {
+        if vpid == 5 * SUB_SLOTS {
+            varied_pid(77_000)
+        } else if vpid == 6 * SUB_SLOTS + 1 {
+            varied_pid(77_001)
+        } else if vpid == 9 * SUB_SLOTS + 2 {
+            varied_pid(77_002)
+        } else {
+            varied_pid(vpid as u64)
+        }
+    };
+    (s..e).flat_map(|vpid| slot_at(vpid).to_bytes()).collect()
+}
+
+/// O2 必败: 满窗刷完后单槽写 → 快照应只含 1 个子区 (≤8KB).
+/// 旧全窗实现给出整窗 1MB — 用 (window, sub_start, sub_len) 结构断言.
+#[test]
+fn subrange_snapshot_isolates_hot_slot() {
+    let path = std::env::temp_dir().join(format!("nexus_meta_sub_{}.mate", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut cache = MetaCache::open(&path).unwrap();
+
+    fill_window(&mut cache, 0);
+    cache.flush_dirty().unwrap(); // 满窗先整体刷完, 清干净
+
+    let sub = 7usize;
+    let vpid = (sub * SUB_SLOTS) as u64;
+    cache.write(vpid, varied_pid(999_999));
+    let items: Vec<MetaWindowItem> = cache.take_dirty_subrange_snapshots();
+    assert_eq!(items.len(), 1, "单槽写只应产生 1 个子区快照");
+    assert_eq!(items[0].window, 0);
+    assert_eq!(items[0].sub_start as usize, sub);
+    assert_eq!(items[0].sub_len, 1, "只覆盖 1 个子区");
+    assert_eq!(
+        items[0].bytes.len(),
+        SUB_SLOTS * 8,
+        "快照应为 8KB (1 子区), 而非整窗 1MB"
+    );
+    for it in &items {
+        cache.complete_subrange_flush(it.window, it.sub_start, it.sub_len, true);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// O2: 多子区散写 → 快照按连续脏区合并; 字节与标量参考逐字节一致.
+#[test]
+fn subrange_snapshot_coalesces_and_byte_exact() {
+    let path = std::env::temp_dir().join(format!("nexus_meta_sub2_{}.mate", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut cache = MetaCache::open(&path).unwrap();
+
+    fill_window(&mut cache, 0);
+    cache.flush_dirty().unwrap();
+    for (i, &sub) in [5usize, 6, 9].iter().enumerate() {
+        cache.write((sub * SUB_SLOTS + i) as u64, varied_pid(77_000 + i as u64));
+    }
+    let items: Vec<MetaWindowItem> = cache.take_dirty_subrange_snapshots();
+    assert_eq!(items.len(), 2, "5,6 相邻合并; 9 单独");
+    assert_eq!((items[0].sub_start, items[0].sub_len), (5, 2));
+    assert_eq!((items[1].sub_start, items[1].sub_len), (9, 1));
+    assert_eq!(items[0].bytes.len(), 2 * SUB_SLOTS * 8);
+    let expect = scalar_subrange_bytes(0, 5, 2);
+    assert_eq!(items[0].bytes, expect, "item 字节须与标量参考一致");
+    for it in &items {
+        cache.complete_subrange_flush(it.window, it.sub_start, it.sub_len, true);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// O2: in-flight 期间同子区重写 → dirty 存活下轮重取; 失败重试同理.
+#[test]
+fn subrange_inflight_retake_and_retry() {
+    let path = std::env::temp_dir().join(format!("nexus_meta_sub3_{}.mate", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut cache = MetaCache::open(&path).unwrap();
+
+    fill_window(&mut cache, 0);
+    cache.flush_dirty().unwrap();
+
+    // 子区 3 写入 → 取快照 (3 在飞)
+    cache.write(3 * SUB_SLOTS as u64, varied_pid(1));
+    let items = cache.take_dirty_subrange_snapshots();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].sub_start, 3);
+
+    // 在飞期间写子区 3 与新子区 9
+    cache.write(3 * SUB_SLOTS as u64, varied_pid(2));
+    cache.write(9 * SUB_SLOTS as u64, varied_pid(3));
+    let more = cache.take_dirty_subrange_snapshots();
+    assert_eq!(more.len(), 1, "3 在飞跳过; 只有 9 可取");
+    assert_eq!(more[0].sub_start, 9);
+
+    // 失败重试: 9 快照失败 → 9 重新脏
+    cache.complete_subrange_flush(0, 9, 1, false);
+    let retry = cache.take_dirty_subrange_snapshots();
+    assert_eq!(retry.len(), 1, "失败快照的子区应重取");
+    assert_eq!(retry[0].sub_start, 9);
+    cache.complete_subrange_flush(0, 9, 1, true);
+
+    // 3 在飞完成, 清 in-flight (期间重写的值留下 dirty)
+    cache.complete_subrange_flush(0, 3, 1, true);
+    let last = cache.take_dirty_subrange_snapshots();
+    assert_eq!(last.len(), 1, "在飞期间对子区 3 的重写应保留脏位");
+    assert_eq!(last[0].sub_start, 3);
+    cache.complete_subrange_flush(0, 3, 1, true);
+    assert!(
+        cache.take_dirty_subrange_snapshots().is_empty(),
+        "全部完成后无剩余脏子区"
     );
     let _ = std::fs::remove_file(&path);
 }

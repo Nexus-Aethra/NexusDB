@@ -1562,10 +1562,11 @@ pub(crate) fn block_on_io<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-/// ⭐ 异步落盘完成事件: data chunk / meta window / compact 两阶段 (G2).
+/// ⭐ 异步落盘完成事件: data chunk / meta 子区 (O2) / compact 两阶段 (G2).
 pub(crate) enum FlushDone {
     Data(storage::PageKey, std::io::Result<()>),
-    Meta(u32, std::io::Result<()>),
+    /// meta 子区快照写盘结果: (window, sub_start, sub_len, 写盘结果)
+    Meta(u32, u16, u16, std::io::Result<()>),
     /// G2 阶段 1 完成: (dst, src, dst_fresh, 读结果 (dst_bytes, src_bytes))
     CompactRead(
         storage::PageKey,

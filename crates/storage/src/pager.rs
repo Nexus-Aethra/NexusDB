@@ -25,7 +25,7 @@ use crate::chunk_liveness::ChunkLiveness;
 use crate::chunk_lock::{AcquireResult, ChunkLockMap};
 use crate::chunk_lru::{ChunkKey, ChunkList};
 use crate::chunk_writer::{ChunkWriter, NowChunks, WriteQueue};
-use crate::meta_cache::MetaCache;
+use crate::meta_cache::{MetaCache, MetaWindowItem};
 use crate::page_pool;
 pub use crate::pager_tree::{TravelTree, TravelTreeGuard};
 pub use crate::pager_write::{MAX_BATCH_PAGES, PageWriteBatch};
@@ -138,10 +138,10 @@ pub struct FlushBatch {
     pub io: Rc<PagerIo>,
 }
 
-/// ⭐ Phase M3: meta window 异步落盘作业: 零 Pager 借用.
-/// dirty window 的 copy 快照, 协程内 write ×N + fsync ×1.
+/// ⭐ Phase M3: meta 子区异步落盘作业: 零 Pager 借用.
+/// 连续脏子区的 copy 快照 (O2: 8KB 粒度), 协程内 write ×N + fsync ×1.
 pub struct MetaFlushBatch {
-    pub windows: Vec<(u32, Vec<u8>)>,
+    pub items: Vec<MetaWindowItem>,
     pub mate_path: PathBuf,
     pub io: Rc<PagerIo>,
 }
