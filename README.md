@@ -26,7 +26,7 @@ At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + p
 
 ---
 
-**[Core Features](#core-features) · [Quick Start](#quick-start) · [Embedded Library](#embedded-library) · [Windows (Beta)](#windows-beta) · [Performance](#performance) · [Architecture](#architecture) · [GC & Space Reclamation](#gc--space-reclamation) · [Large-Value Overflow Pages](#large-value-overflow-pages) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [Dev Commands](#dev-commands) · [Troubleshooting](#troubleshooting)**
+**[Core Features](#core-features) · [Quick Start](#quick-start) · [Embedded Library](#embedded-library) · [Windows (Beta)](#windows-beta) · [Performance](#performance) · [Request Lifecycle](#request-lifecycle) · [Architecture](#architecture) · [GC & Space Reclamation](#gc--space-reclamation) · [Large-Value Overflow Pages](#large-value-overflow-pages) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [Dev Commands](#dev-commands) · [Troubleshooting](#troubleshooting)**
 
 ---
 
@@ -55,7 +55,7 @@ At its core it delivers **write-heavy-friendly architecture** (Share-Nothing + p
 - **io_uring async persistence** — submits SQEs directly on the production path; StdFs fallback
 - **Zero-copy** — `IOSQE_FIXED_FILE` + `RegisteredBufPool`, no hot-path memcpy
 - **Hand-written coroutine scheduler** — single-thread park/unpark + priority partitioning (GC/drain yield to the foreground)
-- **Bounded backpressure** — batched per-file writes (write ×N + fsync ×1); degrades to sync only when the in-flight cap is hit
+- **Bounded backpressure** — batched per-file writes (write ×N + fsync ×1); degrades to sync only when the in-flight cap (8 chunks) is hit
 
 ### Storage engine
 - **Array-based NowChunks + pure COW** — no dirty flag; full-chunk swap makes changes naturally recoverable
@@ -355,6 +355,37 @@ memtier numbers in [Performance](#performance) do not apply.
 
 ---
 
+## Request Lifecycle
+
+Every facade funnels into the same path. Follow one `SET user:1000 x` end-to-end:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as redis-cli
+    participant W as Worker thread
+    participant R as Router
+    participant S as shard_k thread
+    participant P as LCB-Tree
+    C->>W: SET user:1000 x
+    W->>W: parse first ':' → table "user", key "1000"<br/>KvLimits: key ≤ 1 KB, value ≤ 1 MB
+    W->>R: route(db, table, key)
+    R->>S: Inbox task (hash(key) → shard k)
+    S->>P: COW write (copy leaf → modify → swap pointer)
+    S-->>W: reply via TaskReplyBus (after commit point)
+    W-->>C: +OK
+    S-->>S: async flush coroutine (data → meta → pid.state)
+```
+
+What this path guarantees:
+
+- **One key = one shard** — the router hashes the key, so `SET` / `INCR` are single-shard and need no distributed lock.
+- **Reply after commit** — the worker thread never touches storage; the `+OK` it forwards is only emitted after the shard's commit point.
+- **Flush is not on this path** — the last step runs in a separate coroutine; the shard loop keeps serving while data is written.
+- **Crash order is fixed** — chunks are written before the meta window, which is written before `pid.state`; recovery replays the newest complete prefix.
+
+---
+
 ## Architecture
 
 **Share-Nothing = each shard is one OS thread exclusively owning all data structures + one io_uring instance + one Scheduler instance.** Cross-shard communication is only via mpsc / Inbox / TaskReplyBus — lock-free, race-free.
@@ -390,6 +421,17 @@ Key design points:
 - **Async flush never blocks the main loop**: `complete_flush` only sets `due=true`; fsync runs in a coroutine; the reaping path is ≈ 1.5μs.
 - **Ordering invariant**: data chunk write confirmed → meta window write → pid.state, a three-stage closed loop; any stage can be retried on failure.
 - **GC & large values**: see the two sections below.
+
+**Concrete numbers** (the whole engine in one table):
+
+| Quantity | Value | Where it shows up |
+|---|---|---|
+| Page | 16 KB | LCB-Tree node; overflow-page payload unit |
+| Chunk | 1 MB = 64 pages | write / flush / GC unit; resident means pending-write |
+| Meta entry | 8 B `PidLocation` per vpid | meta : data = 1 : 2048 |
+| Hot chunk cache | 16 chunks = 16 MB (`chunk_cache_size`) | ChunkList LRU |
+| Async flush depth | ≤ 8 chunks (`MAX_INFLIGHT_CHUNKS`) | beyond the cap → backpressure degrades to sync write |
+| Key / value caps | 1 KB / 1 MB | protocol layer; values > ~4 KB split into 16 KB overflow pages |
 
 Full breakdown: [docs/DESIGN.md](./docs/DESIGN.md) (10 sections).
 
@@ -649,6 +691,41 @@ stderr = true
 ---
 
 ## Crate Responsibilities
+
+Who depends on whom at compile time (arrows point to dependencies):
+
+```mermaid
+flowchart BT
+    main["src/main.rs<br/>server entry"]
+    network["network<br/>5 protocol facades + worker pool"]
+    shard_manager["shard_manager<br/>Router · Inbox · TaskReplyBus"]
+    storage["storage<br/>Pager · MetaCache · NowChunks · GC"]
+    page["page<br/>LCB-Tree pages"]
+    scheduler["scheduler<br/>coroutines + io_uring"]
+    platform["platform<br/>syscalls / fd"]
+    config["config<br/>TOML"]
+    nlog["nlog<br/>async logging"]
+    scanner["nexusdb-scanner<br/>offline CLI"]
+    main --> network
+    main --> config
+    main --> shard_manager
+    main --> storage
+    main --> nlog
+    network --> shard_manager
+    network --> storage
+    network --> scheduler
+    network --> nlog
+    shard_manager --> storage
+    shard_manager --> scheduler
+    shard_manager --> page
+    shard_manager --> nlog
+    storage --> page
+    storage --> scheduler
+    config --> storage
+    config --> platform
+    nlog --> scheduler
+    scanner -.-> page
+```
 
 | crate | Responsibility | Status |
 |---|---|---|

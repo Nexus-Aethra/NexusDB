@@ -24,7 +24,7 @@
 
 ---
 
-**[核心特性](#核心特性) · [快速开始](#快速开始) · [Windows (Beta)](#windows-beta) · [性能](#性能) · [架构总览](#架构总览) · [GC 与空间回收](#gc-与空间回收) · [大 value 溢出页](#大-value-溢出页) · [支持的协议](#支持的协议) · [配置](#配置) · [开发命令](#开发命令) · [故障排查](#故障排查)**
+**[核心特性](#核心特性) · [快速开始](#快速开始) · [Windows (Beta)](#windows-beta) · [性能](#性能) · [请求生命周期](#请求生命周期) · [架构总览](#架构总览) · [GC 与空间回收](#gc-与空间回收) · [大 value 溢出页](#大-value-溢出页) · [支持的协议](#支持的协议) · [配置](#配置) · [开发命令](#开发命令) · [故障排查](#故障排查)**
 
 ---
 
@@ -53,7 +53,7 @@
 - **io_uring 异步落盘** — 生产路径直提交 SQE, StdFs 兜底
 - **零拷贝** — `IOSQE_FIXED_FILE` + `RegisteredBufPool`, 移除热路径 memcpy
 - **自研协程调度** — 单线程 park/unpark + 优先级分区 (GC/drain 让出前台)
-- **有界背压** — 按 file 分组批写 (write ×N + fsync ×1), 并发上限超限退化同步
+- **有界背压** — 按 file 分组批写 (write ×N + fsync ×1), 并发上限 (8 chunk) 超限退化同步
 
 ### 存储引擎
 - **NowChunks + 纯 COW** — 无 dirty 标记, 满 chunk swap, 数据变更天然可恢复
@@ -288,6 +288,37 @@ Windows 上未测。M2 用每连接 `std::thread`, 适合开发 + 单机 demo。
 
 ---
 
+## 请求生命周期
+
+所有门面最终走同一条路径。以 `SET user:1000 x` 为例从上到下走一遍:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as redis-cli
+    participant W as Worker 线程
+    participant R as Router
+    participant S as shard_k 线程
+    participant P as LCB-Tree
+    C->>W: SET user:1000 x
+    W->>W: 拆第一个 ':' → 表 "user", key "1000"<br/>KvLimits: key ≤ 1 KB, value ≤ 1 MB
+    W->>R: route(db, table, key)
+    R->>S: Inbox 任务 (hash(key) → shard k)
+    S->>P: COW 写 (复制 leaf → 修改 → 换指针)
+    S-->>W: 经 TaskReplyBus 回包 (提交点之后)
+    W-->>C: +OK
+    S-->>S: 异步刷盘协程 (data → meta → pid.state)
+```
+
+这条路径上的四条硬保证:
+
+- **一个 key 只落一个 shard** — 路由按 key 哈希, `SET` / `INCR` 天然单 shard, 无需分布式锁
+- **先提交后回包** — worker 线程不碰存储; 它转发的 `+OK` 只在 shard 提交点之后产生
+- **刷盘不在这条路径上** — 最后一步是独立协程, shard 主循环继续服务
+- **崩溃顺序固定** — chunk 先于 meta window 先于 `pid.state`; 恢复取最新的完整前缀
+
+---
+
 ## 架构总览
 
 **Share-Nothing = 每个 shard 一个 OS 线程独占所有数据结构 + 一个 io_uring 实例 + 一个 Scheduler 实例.** 跨 shard 仅走 mpsc / Inbox / TaskReplyBus, 无锁无 race.
@@ -323,6 +354,17 @@ Windows 上未测。M2 用每连接 `std::thread`, 适合开发 + 单机 demo。
 - **异步落盘零阻塞主循环**: `complete_flush` 只置 `due=true`, fsync 由协程执行; 收割路径 ≈ 1.5μs
 - **顺序不变量**: data chunk 写盘确认 → meta window 写盘 → pid.state 三段闭环, 任何一段失败均可重试
 - **GC 与大 value**: 见下两节
+
+**一面数字表看清全局**:
+
+| 量 | 数值 | 出现位置 |
+|---|---|---|
+| 页 | 16 KB | LCB-Tree 节点; 溢出页载荷单元 |
+| chunk | 1 MB = 64 页 | 写 / 刷盘 / GC 的单元; 驻留即待写 |
+| meta 条目 | 每 vpid 8 B `PidLocation` | meta : data = 1 : 2048 |
+| 热 chunk 缓存 | 16 chunk = 16 MB (`chunk_cache_size`) | ChunkList LRU |
+| 异步刷盘深度 | ≤ 8 chunk (`MAX_INFLIGHT_CHUNKS`) | 超限 → 背压退化为同步写 |
+| key / value 上限 | 1 KB / 1 MB | 协议层; value > ~4 KB 自动切 16 KB 溢出页 |
 
 完整分节: [docs/DESIGN.md](./docs/DESIGN.md) (10 节).
 
@@ -589,6 +631,41 @@ stderr = true
 ---
 
 ## crate 职责
+
+编译期依赖关系 (箭头指向被依赖方):
+
+```mermaid
+flowchart BT
+    main["src/main.rs<br/>服务器入口"]
+    network["network<br/>五协议门面 + worker 池"]
+    shard_manager["shard_manager<br/>Router · Inbox · TaskReplyBus"]
+    storage["storage<br/>Pager · MetaCache · NowChunks · GC"]
+    page["page<br/>LCB-Tree 页"]
+    scheduler["scheduler<br/>协程 + io_uring"]
+    platform["platform<br/>系统调用 / fd"]
+    config["config<br/>TOML"]
+    nlog["nlog<br/>异步日志"]
+    scanner["nexusdb-scanner<br/>离线 CLI"]
+    main --> network
+    main --> config
+    main --> shard_manager
+    main --> storage
+    main --> nlog
+    network --> shard_manager
+    network --> storage
+    network --> scheduler
+    network --> nlog
+    shard_manager --> storage
+    shard_manager --> scheduler
+    shard_manager --> page
+    shard_manager --> nlog
+    storage --> page
+    storage --> scheduler
+    config --> storage
+    config --> platform
+    nlog --> scheduler
+    scanner -.-> page
+```
 
 | crate | 职责 | 状态 |
 |---|---|---|
