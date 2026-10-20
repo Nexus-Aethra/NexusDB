@@ -298,12 +298,31 @@ impl MetaCache {
     }
 
     /// 序列化第 w 个 window 的字节 (末窗截断到 slots 实际水位).
+    ///
+    /// ⭐ O1: LE 目标上整段 memcpy — `PidLocation` 是 `repr(C, packed)` 8B 无
+    /// padding, `to_bytes()` = 逐字段 `to_le_bytes` 拼接, 故 LE 内存布局即磁盘
+    /// 字节序; 128K 槽的逐槽 append 循环 (~3.3ms/窗) 退化为一次 memcpy.
+    /// BE 目标保留标量回退, 交叉验证由
+    /// `window_snapshot_is_memcpy_fast_and_byte_exact` 钉死.
     fn window_bytes(&self, w: usize) -> Vec<u8> {
         let start = w * SLOTS_PER_WINDOW;
         let end = (start + SLOTS_PER_WINDOW).min(self.slots.len());
         let mut bytes = Vec::with_capacity((end - start) * 8);
-        for slot in &self.slots[start..end] {
-            bytes.extend_from_slice(&slot.to_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            let src = &self.slots[start..end];
+            // SAFETY: src 是连续排布的 [PidLocation; N], repr(C, packed) 且
+            // 大小恰 8B (编译期断言), 无填充字节; 以 u8 视图读 N*8 字节全部
+            // 落在该 Vec 分配内, 无对齐/越界/未初始化读.
+            bytes.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len() * 8)
+            });
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            for slot in &self.slots[start..end] {
+                bytes.extend_from_slice(&slot.to_bytes());
+            }
         }
         bytes
     }

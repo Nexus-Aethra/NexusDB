@@ -467,3 +467,73 @@ fn flush_dirty_rejects_inflight_snapshots() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+fn varied_pid(i: u64) -> storage::PidLocation {
+    storage::PidLocation {
+        file_id: (i % 7) as u32,
+        chunk_idx: (i % 251) as u8,
+        page_idx: (i % 65536) as u16,
+        // 混入 flags=0 未分配槽, 覆盖零值布局
+        flags: if i % 13 == 0 { 0 } else { storage::PID_ALIVE },
+    }
+}
+
+/// O1 必败回归: window 快照序列化应走 memcpy（LE 目标）, 且字节与逐槽
+/// to_bytes 标量参考逐字节相同 (布局假设若被破坏则红).
+///
+/// 速度断言取**自校准相对值**（memcpy ≥ 3× 标量）而非绝对毫秒, 排除机器噪声.
+#[test]
+fn window_snapshot_is_memcpy_fast_and_byte_exact() {
+    let path =
+        std::env::temp_dir().join(format!("nexus_meta_memcpy_{}.mate", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut cache = MetaCache::open(&path).unwrap();
+
+    const WINDOWS: u64 = 4;
+    const SPW: u64 = storage::meta_cache::SLOTS_PER_WINDOW as u64;
+    for i in 0..WINDOWS * SPW {
+        cache.write(i, varied_pid(i));
+    }
+
+    let t0 = std::time::Instant::now();
+    let snaps = cache.take_dirty_window_snapshots();
+    let prod = t0.elapsed();
+    assert_eq!(snaps.len() as u64, WINDOWS, "应有 {WINDOWS} 个窗口快照");
+
+    // 标量参考 (旧实现语义 = 磁盘格式): 逐槽 to_bytes 拼接
+    let slots: Vec<storage::PidLocation> = (0..WINDOWS * SPW).map(varied_pid).collect();
+    let t1 = std::time::Instant::now();
+    let mut ref_bytes: Vec<Vec<u8>> = Vec::with_capacity(WINDOWS as usize);
+    for w in 0..WINDOWS {
+        let s = (w * SPW) as usize;
+        let e = ((w + 1) * SPW) as usize;
+        let mut v = Vec::with_capacity((e - s) * 8);
+        for slot in &slots[s..e] {
+            v.extend_from_slice(&slot.to_bytes());
+        }
+        ref_bytes.push(v);
+    }
+    let scalar = t1.elapsed();
+
+    for (w, bytes) in &snaps {
+        assert_eq!(
+            bytes,
+            &ref_bytes[*w as usize],
+            "window {} 快照字节必须与标量参考逐字节相同",
+            w
+        );
+    }
+    for (w, _) in &snaps {
+        cache.complete_window_flush(*w, true);
+    }
+
+    let ratio = scalar.as_secs_f64() / prod.as_secs_f64().max(1e-9);
+    println!(
+        "[window_snapshot] memcpy {prod:?} vs scalar {scalar:?} — {ratio:.1}x (要求 ≥3x)"
+    );
+    assert!(
+        prod <= scalar / 3,
+        "memcpy 路径应至少比逐槽标量快 3x: memcpy {prod:?} vs scalar {scalar:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
