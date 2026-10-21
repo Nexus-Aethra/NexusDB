@@ -474,7 +474,11 @@ fn varied_pid(i: u64) -> storage::PidLocation {
         chunk_idx: (i % 251) as u8,
         page_idx: (i % 65536) as u16,
         // 混入 flags=0 未分配槽, 覆盖零值布局
-        flags: if i.is_multiple_of(13) { 0 } else { storage::PID_ALIVE },
+        flags: if i.is_multiple_of(13) {
+            0
+        } else {
+            storage::PID_ALIVE
+        },
     }
 }
 
