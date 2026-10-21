@@ -262,15 +262,18 @@ fn dead_block_is_unlinked_and_reopen_survives() {
 
         // meta 确认链路 → promote → maybe_drop_free_blocks
         if let Some(mb) = pager.take_meta_flush_batch() {
-            let witems: Vec<(u32, &[u8])> =
-                mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
+            let witems: Vec<(u64, &[u8])> = mb
+                .items
+                .iter()
+                .map(|it| (it.offset(), it.bytes.as_slice()))
+                .collect();
             mb.io
                 .write_mate_windows(&mb.mate_path, &witems)
                 .await
                 .unwrap();
             drop(witems);
-            for (w, _) in &mb.windows {
-                pager.complete_meta_flush(*w, Ok(()));
+            for it in &mb.items {
+                pager.complete_meta_flush(it.window, it.sub_start, it.sub_len, Ok(()));
             }
         } else {
             // 无脏 window (flush 已同步刷过): 手动走确认点语义 —
@@ -281,15 +284,18 @@ fn dead_block_is_unlinked_and_reopen_survives() {
             pager.flush().await.unwrap();
             let mb = pager.take_meta_flush_batch();
             if let Some(mb) = mb {
-                let witems: Vec<(u32, &[u8])> =
-                    mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
+                let witems: Vec<(u64, &[u8])> = mb
+                    .items
+                    .iter()
+                    .map(|it| (it.offset(), it.bytes.as_slice()))
+                    .collect();
                 mb.io
                     .write_mate_windows(&mb.mate_path, &witems)
                     .await
                     .unwrap();
                 drop(witems);
-                for (w, _) in &mb.windows {
-                    pager.complete_meta_flush(*w, Ok(()));
+                for it in &mb.items {
+                    pager.complete_meta_flush(it.window, it.sub_start, it.sub_len, Ok(()));
                 }
             }
         }
@@ -362,15 +368,18 @@ fn compact_freed_chunk_is_reused_and_survives_reopen() {
         let mb = pager
             .take_meta_flush_batch()
             .expect("meta 批 (compact 后 due)");
-        let witems: Vec<(u32, &[u8])> =
-            mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
+        let witems: Vec<(u64, &[u8])> = mb
+            .items
+            .iter()
+            .map(|it| (it.offset(), it.bytes.as_slice()))
+            .collect();
         mb.io
             .write_mate_windows(&mb.mate_path, &witems)
             .await
             .unwrap();
         drop(witems);
-        for (w, _) in &mb.windows {
-            pager.complete_meta_flush(*w, Ok(()));
+        for it in &mb.items {
+            pager.complete_meta_flush(it.window, it.sub_start, it.sub_len, Ok(()));
         }
         assert_eq!(pager.liveness().pending_free_count(), 0, "确认后 promote");
         assert_eq!(pager.liveness().free_count(), 1, "src 可复用");
@@ -484,15 +493,18 @@ fn block_drain_evicts_mid_live_chunks_and_unlinks() {
 
         // meta 确认 → promote → unlink file1
         if let Some(mb) = pager.take_meta_flush_batch() {
-            let witems: Vec<(u32, &[u8])> =
-                mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
+            let witems: Vec<(u64, &[u8])> = mb
+                .items
+                .iter()
+                .map(|it| (it.offset(), it.bytes.as_slice()))
+                .collect();
             mb.io
                 .write_mate_windows(&mb.mate_path, &witems)
                 .await
                 .unwrap();
             drop(witems);
-            for (w, _) in &mb.windows {
-                pager.complete_meta_flush(*w, Ok(()));
+            for it in &mb.items {
+                pager.complete_meta_flush(it.window, it.sub_start, it.sub_len, Ok(()));
             }
         }
         assert!(

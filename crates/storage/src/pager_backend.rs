@@ -129,22 +129,22 @@ impl Pager {
     /// 全部排空才算真正空闲.
     pub fn total_async_backlog(&self) -> usize {
         self.flush_backlog()
-            + self.meta.in_flight_window_count()
+            + self.meta.in_flight_subrange_count()
             + (self.meta_flush_due && self.meta.has_unflushed()) as usize
             + self.compact_inflight as usize
     }
 
-    /// ⭐ Phase M3: 取 meta window 异步刷盘批.
+    /// ⭐ Phase M3: 取 meta 子区异步刷盘批.
     ///
     /// **保序关键**: 仅在 meta_flush_due 且 data backlog 为空时取快照
     /// (有 in-flight data chunk 时绝不发 meta, data→meta 顺序不变);
-    /// 同 window 有在飞快照时由 MetaCache 去重 (防同 offset 乱序).
+    /// 同子区有在飞快照时由 MetaCache 去重 (防同 offset 乱序).
     pub fn take_meta_flush_batch(&mut self) -> Option<MetaFlushBatch> {
         if !self.meta_flush_due || self.flush_backlog() > 0 {
             return None;
         }
         self.meta_flush_due = false;
-        let windows = self.meta.take_dirty_window_snapshots();
+        let windows = self.meta.take_dirty_subrange_snapshots();
         // 有 dirty 因 in-flight 去重被跳过 → 保持 due, 收割后下轮再取
         if self.meta.dirty_count() > 0 {
             self.meta_flush_due = true;
@@ -160,7 +160,7 @@ impl Pager {
             return None; // 不发空批
         }
         Some(MetaFlushBatch {
-            windows,
+            items: windows,
             mate_path: self.block_dir.join("page.mate"),
             io: self.io.clone(),
         })
@@ -172,13 +172,20 @@ impl Pager {
         !self.meta.has_unflushed()
     }
 
-    /// ⭐ Phase M3: 收割 meta window 写盘结果.
+    /// ⭐ Phase M3: 收割 meta 子区写盘结果.
     ///
-    /// 全部 window 确认后才 persist_pid_state (data→meta→pid.state 顺序闭环);
+    /// 全部子区确认后才 persist_pid_state (data→meta→pid.state 顺序闭环);
     /// 失败重标 dirty + 重新置位 due (下轮重试).
-    pub fn complete_meta_flush(&mut self, window_idx: u32, result: io::Result<()>) {
+    pub fn complete_meta_flush(
+        &mut self,
+        window: u32,
+        sub_start: u16,
+        sub_len: u16,
+        result: io::Result<()>,
+    ) {
         let ok = result.is_ok();
-        self.meta.complete_window_flush(window_idx, ok);
+        self.meta
+            .complete_subrange_flush(window, sub_start, sub_len, ok);
         if !ok {
             self.meta_flush_due = true;
             return;

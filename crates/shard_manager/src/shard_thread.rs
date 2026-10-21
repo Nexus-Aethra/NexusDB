@@ -160,14 +160,15 @@ pub(crate) fn drive_async_flush(
                             nlog::error!("shard", "chunk flush failed (requeued): {err}");
                         }
                     }
-                    FlushDone::Meta(window_idx, result) => {
+                    FlushDone::Meta(window, sub_start, sub_len, result) => {
                         if let Err(ref err) = result {
                             nlog::error!(
                                 "shard",
-                                "meta window {window_idx} flush failed (will retry): {err}"
+                                "meta subrange (w{window},s{sub_start},n{sub_len}) flush failed (will retry): {err}"
                             );
                         }
-                        e.pager_mut().complete_meta_flush(window_idx, result);
+                        e.pager_mut()
+                            .complete_meta_flush(window, sub_start, sub_len, result);
                         // ⭐ WAL (F60): meta 全部持久化 → sealed 段可删
                         e.wal_drop_sealed_if_meta_flushed();
                     }
@@ -267,22 +268,32 @@ pub(crate) fn drive_async_flush(
                 scheduler::spawn_on(
                     rt,
                     Box::pin(async move {
-                        let items: Vec<(u32, &[u8])> =
-                            mb.windows.iter().map(|(w, b)| (*w, b.as_slice())).collect();
+                        let items: Vec<(u64, &[u8])> = mb
+                            .items
+                            .iter()
+                            .map(|it| (it.offset(), it.bytes.as_slice()))
+                            .collect();
                         let r = mb.io.write_mate_windows(&mb.mate_path, &items).await;
                         drop(items);
                         let mut slot = done.borrow_mut();
                         match r {
                             Ok(()) => {
-                                for (w, _) in &mb.windows {
-                                    slot.push(FlushDone::Meta(*w, Ok(())));
+                                for it in &mb.items {
+                                    slot.push(FlushDone::Meta(
+                                        it.window,
+                                        it.sub_start,
+                                        it.sub_len,
+                                        Ok(()),
+                                    ));
                                 }
                             }
                             Err(err) => {
                                 let msg = err.to_string();
-                                for (w, _) in &mb.windows {
+                                for it in &mb.items {
                                     slot.push(FlushDone::Meta(
-                                        *w,
+                                        it.window,
+                                        it.sub_start,
+                                        it.sub_len,
                                         Err(std::io::Error::other(msg.clone())),
                                     ));
                                 }

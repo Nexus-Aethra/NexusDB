@@ -4,17 +4,22 @@
 //! - **全量缓存**: `Vec<PidLocation>` 按 vpid 直接索引 (meta:data = 1:2048,
 //!   1TB 数据 → 512MB/shard-db, 平坦数组无 HashMap 3-4× 膨胀).
 //!   open 时整读 page.mate, read 纯内存索引, **不再有 pread miss 路径**.
-//! - **dirty window**: 1MB/window = 128K slot, write 按 window 粒度标脏.
-//! - **异步刷盘支持**: `take_dirty_window_snapshots` copy 脏 window 快照
+//! - **dirty window**: 1MB/window = 128K slot, 写按 **8KB 子区** (128 子区/窗)
+//!   标脏 (O2, 2026-10-20): 快照/写/确认的粒度从整窗收窄到连续脏子区,
+//!   热窗单槽重写的落盘放大从 1MB 降到 ≤8KB.
+//! - **异步刷盘支持**: `take_dirty_subrange_snapshots` 取连续脏子区快照
 //!   (清 dirty + 标 in-flight 去重), 由 Pager/协程走 io_uring 批量写 + 单次 fsync;
-//!   `complete_window_flush` 收割 (失败重标 dirty 下轮重试).
+//!   `complete_subrange_flush` 收割 (失败重标 dirty 下轮重试).
 //! - `flush_dirty` 保留为**同步全量路径** (flush()/close 契约):
-//!   整 window `write_at` + 单次 `sync_all`. **前提: 无 in-flight 快照**
+//!   逐脏子区 `write_at` + 单次 `sync_all`. **前提: 无 in-flight 快照**
 //!   (caller 先 drain 异步 backlog, 否则旧快照可能乱序覆盖新数据).
 //!
 //! **vpid 单空间**: 持久化 off = vpid×8 从 v1 起就不区分 db (Pager 已按
 //! db 目录物理隔离, 每 db 独立 mate 文件), v3 的 db-aware API 仅保留签名
 //! (db 参数忽略), 内存语义与持久化语义一致.
+//!
+//! **磁盘格式零变化**: 子区只是窗口 1MB 区间内的偏移段 (write_at),
+//! 与整窗重写字节级兼容.
 //!
 //! **多线程契约**: 所有方法 `&mut self`/`&self`, 单线程使用.
 
@@ -30,6 +35,12 @@ use crate::types::{DbId, META_PID, PidLocation};
 pub const META_WINDOW_SIZE: usize = 1 << 20;
 /// 每 window 的 slot 数: 1MB / 8B = 128K.
 pub const SLOTS_PER_WINDOW: usize = META_WINDOW_SIZE / 8;
+/// ⭐ O2: 脏区跟踪的子区大小: 8KB = 1024 槽, 128 子区/窗.
+pub const SUB_SLOTS: usize = 1024;
+/// 子区字节大小 (8KB) — 落盘偏移与写长单位.
+pub const SUB_SIZE: usize = SUB_SLOTS * 8;
+/// 每 window 的子区数.
+pub const SUBRANGES_PER_WINDOW: usize = SLOTS_PER_WINDOW / SUB_SLOTS;
 
 /// 未分配 slot 哨兵 (flags=0 = 未分配, 与磁盘全零 slot 一致).
 const ZERO_PID: PidLocation = PidLocation {
@@ -38,6 +49,48 @@ const ZERO_PID: PidLocation = PidLocation {
     page_idx: 0,
     flags: 0,
 };
+
+// ===== O2: 子区脏位图 (128 位 = 2×u64 per window) =====
+
+fn bit_get(bits: &[u64; 2], i: usize) -> bool {
+    (bits[i / 64] >> (i % 64)) & 1 == 1
+}
+fn bit_set(bits: &mut [u64; 2], i: usize) {
+    bits[i / 64] |= 1 << (i % 64);
+}
+fn bit_clear(bits: &mut [u64; 2], i: usize) {
+    bits[i / 64] &= !(1 << (i % 64));
+}
+fn bit_range_set(bits: &mut [u64; 2], start: usize, len: usize) {
+    for i in start..start + len {
+        bit_set(bits, i);
+    }
+}
+fn bit_range_clear(bits: &mut [u64; 2], start: usize, len: usize) {
+    for i in start..start + len {
+        bit_clear(bits, i);
+    }
+}
+fn bit_popcount(bits: &[u64; 2]) -> usize {
+    (bits[0].count_ones() + bits[1].count_ones()) as usize
+}
+
+/// ⭐ O2: 一次子区快照条目 — window 内 [sub_start, sub_start+sub_len) 连续脏子区
+/// (单条最大 128 子区 = 整窗, 与整窗语义等价).
+#[derive(Debug)]
+pub struct MetaWindowItem {
+    pub window: u32,
+    pub sub_start: u16,
+    pub sub_len: u16,
+    pub bytes: Vec<u8>,
+}
+
+impl MetaWindowItem {
+    /// page.mate 内的写入偏移 (byte).
+    pub fn offset(&self) -> u64 {
+        self.window as u64 * META_WINDOW_SIZE as u64 + self.sub_start as u64 * SUB_SIZE as u64
+    }
+}
 
 // =====================================================================
 // MetaCache v3
@@ -49,15 +102,16 @@ const ZERO_PID: PidLocation = PidLocation {
 /// `contains` / `dirty_count` / `len`; db-aware 变体保留签名 (db 忽略).
 ///
 /// - read 纯内存索引 (越界 / flags==0 → None)
-/// - write 懒扩容 + 标对应 1MB window dirty
+/// - write 懒扩容 + 标对应 1MB window 的 8KB 子区 dirty
 /// - 无容量上限: 内存由 vpid 水位天然决定
 pub struct MetaCache {
     /// 平坦 slot 数组, 索引 = vpid. 懒扩容 (write 越界时 resize).
     slots: Vec<PidLocation>,
-    /// dirty 标记, 索引 = vpid / SLOTS_PER_WINDOW. 与 slots 同步扩容.
-    dirty_windows: Vec<bool>,
+    /// 脏区标记, 索引 = (vpid / SLOTS_PER_WINDOW), 每窗 128 位
+    /// (第 i 位 = 子区 i). 与 slots 同步扩容.
+    dirty_sub: Vec<[u64; 2]>,
     /// 快照已入队未确认 (去重: 防两个协程乱序写同 offset).
-    in_flight_windows: Vec<bool>,
+    in_flight_sub: Vec<[u64; 2]>,
     /// page.mate fd (同步 flush 路径用).
     mate_file: File,
 }
@@ -87,8 +141,8 @@ impl MetaCache {
 
         Ok(Self {
             slots,
-            dirty_windows: vec![false; window_count],
-            in_flight_windows: vec![false; window_count],
+            dirty_sub: vec![[0u64; 2]; window_count],
+            in_flight_sub: vec![[0u64; 2]; window_count],
             mate_file,
         })
     }
@@ -137,7 +191,8 @@ impl MetaCache {
             flags: crate::types::PID_FREED,
         };
         self.slots[idx] = tomb;
-        self.dirty_windows[idx / SLOTS_PER_WINDOW] = true;
+        let sub = (idx % SLOTS_PER_WINDOW) / SUB_SLOTS;
+        bit_set(&mut self.dirty_sub[idx / SLOTS_PER_WINDOW], sub);
     }
 
     /// ⭐ G2: 遍历全部已分配 slot (vpid, pid). compact 判活等全扫场景用
@@ -150,12 +205,13 @@ impl MetaCache {
             .map(|(i, s)| (i as u64, *s))
     }
 
-    /// ⭐ vpid-only API: 写 vpid → PidLocation. 懒扩容 + 标 window dirty.
+    /// ⭐ vpid-only API: 写 vpid → PidLocation. 懒扩容 + 标 8KB 子区 dirty.
     pub fn write(&mut self, vpid: u64, pid: PidLocation) {
         let idx = vpid as usize;
         self.ensure_capacity(idx + 1);
         self.slots[idx] = pid;
-        self.dirty_windows[idx / SLOTS_PER_WINDOW] = true;
+        let sub = (idx % SLOTS_PER_WINDOW) / SUB_SLOTS;
+        bit_set(&mut self.dirty_sub[idx / SLOTS_PER_WINDOW], sub);
     }
 
     /// ⭐ db-aware 签名兼容 (db 忽略, vpid 单空间与持久化一致).
@@ -184,7 +240,7 @@ impl MetaCache {
 
     /// ⭐ 同步全量刷盘 (flush()/close 契约: 返回即持久).
     ///
-    /// 逐 dirty window 整块 `write_at` + 单次 `sync_all`.
+    /// 逐脏子区 `write_at` (O2: 8KB 粒度) + 单次 `sync_all`.
     /// **前提**: 无 in-flight 快照 (caller 先 drain 异步 backlog);
     /// 否则协程稍后写入的旧快照会乱序覆盖这里的新数据.
     pub fn flush_dirty(&mut self) -> io::Result<()> {
@@ -193,21 +249,18 @@ impl MetaCache {
         // 协程还握着旧快照), 这里写的"新数据"会被协程稍后写出的旧快照**乱序
         // 覆盖** → page.mate 留下陈旧映射 (指向已释放/已复用的 chunk), 重启后
         // 读到错页. 宁可让 flush 失败 (调用方可见), 也不静默损坏.
-        if self.in_flight_windows.iter().any(|&b| b) {
+        if self.in_flight_sub.iter().any(|b| b[0] | b[1] != 0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "flush_dirty requires no in-flight meta snapshots (drain the async backlog first)",
             ));
         }
         let mut wrote_any = false;
-        for w in 0..self.dirty_windows.len() {
-            if !self.dirty_windows[w] {
-                continue;
-            }
-            let bytes = self.window_bytes(w);
-            self.mate_file
-                .write_at(&bytes, (w * META_WINDOW_SIZE) as u64)?;
-            self.dirty_windows[w] = false;
+        for (w, sub_start, sub_len) in self.dirty_runs() {
+            let bytes = self.window_bytes_range(w, sub_start, sub_len);
+            let offset = w as u64 * META_WINDOW_SIZE as u64 + sub_start as u64 * SUB_SIZE as u64;
+            self.mate_file.write_at(&bytes, offset)?;
+            bit_range_clear(&mut self.dirty_sub[w], sub_start, sub_len);
             wrote_any = true;
         }
         if wrote_any {
@@ -220,42 +273,49 @@ impl MetaCache {
     // ⭐ 异步刷盘支持 (Phase M3: Pager/manager 接线用)
     // ---------------------------------------------------------------
 
-    /// 取 dirty ∧ ¬in-flight 的 window 快照: copy 字节 (末窗截断到实际水位),
-    /// 清 dirty、标 in-flight (去重: 同 window 有快照在飞时跳过, 下轮再取).
-    pub fn take_dirty_window_snapshots(&mut self) -> Vec<(u32, Vec<u8>)> {
+    /// 取 dirty ∧ ¬in-flight 的连续子区快照: copy 字节 (末窗截断到实际水位),
+    /// 清 dirty、标 in-flight (去重: 同子区有快照在飞时跳过, 下轮再取).
+    pub fn take_dirty_subrange_snapshots(&mut self) -> Vec<MetaWindowItem> {
         let mut out = Vec::new();
-        for w in 0..self.dirty_windows.len() {
-            if !self.dirty_windows[w] || self.in_flight_windows[w] {
-                continue;
-            }
-            out.push((w as u32, self.window_bytes(w)));
-            self.dirty_windows[w] = false;
-            self.in_flight_windows[w] = true;
+        for (w, sub_start, sub_len) in self.dirty_runs() {
+            let bytes = self.window_bytes_range(w, sub_start, sub_len);
+            bit_range_clear(&mut self.dirty_sub[w], sub_start, sub_len);
+            bit_range_set(&mut self.in_flight_sub[w], sub_start, sub_len);
+            out.push(MetaWindowItem {
+                window: w as u32,
+                sub_start: sub_start as u16,
+                sub_len: sub_len as u16,
+                bytes,
+            });
         }
         out
     }
 
-    /// 收割 window 快照写盘结果: Ok 清 in-flight; Err 清 in-flight + 重标
+    /// 收割子区快照写盘结果: Ok 清 in-flight; Err 清 in-flight + 重标
     /// dirty (下轮重试, 内存 slot 是最新值, 重取快照 ⊇ 失败快照).
-    pub fn complete_window_flush(&mut self, window_idx: u32, ok: bool) {
-        let w = window_idx as usize;
-        if w >= self.in_flight_windows.len() {
+    pub fn complete_subrange_flush(&mut self, window: u32, sub_start: u16, sub_len: u16, ok: bool) {
+        let w = window as usize;
+        if w >= self.in_flight_sub.len() {
             return; // 防御: 未知 window
         }
-        self.in_flight_windows[w] = false;
+        let (start, len) = (sub_start as usize, sub_len as usize);
+        bit_range_clear(&mut self.in_flight_sub[w], start, len);
         if !ok {
-            self.dirty_windows[w] = true;
+            bit_range_set(&mut self.dirty_sub[w], start, len);
         }
     }
 
     /// 是否还有未确认落盘的 meta (dirty ∪ in-flight 非空).
     pub fn has_unflushed(&self) -> bool {
-        self.dirty_windows.iter().any(|&b| b) || self.in_flight_windows.iter().any(|&b| b)
+        self.dirty_sub
+            .iter()
+            .chain(self.in_flight_sub.iter())
+            .any(|b| b[0] | b[1] != 0)
     }
 
-    /// in-flight 快照 window 数 (Pager backlog 判空用).
-    pub fn in_flight_window_count(&self) -> usize {
-        self.in_flight_windows.iter().filter(|&&b| b).count()
+    /// in-flight 快照子区总数 (Pager backlog 判空用).
+    pub fn in_flight_subrange_count(&self) -> usize {
+        self.in_flight_sub.iter().map(bit_popcount).sum()
     }
 
     // ---------------------------------------------------------------
@@ -271,9 +331,9 @@ impl MetaCache {
         self.slots.is_empty()
     }
 
-    /// dirty window 数 (v3 语义变化: v2 是 dirty entry 数).
+    /// 剩余脏子区数 (take 后 > 0 ⟺ 有子区因 in-flight 被延后).
     pub fn dirty_count(&self) -> usize {
-        self.dirty_windows.iter().filter(|&&b| b).count()
+        self.dirty_sub.iter().map(bit_popcount).sum()
     }
 
     /// ⭐ T12.6 stub: 写默认 db 的 MetaPage pid.
@@ -285,25 +345,72 @@ impl MetaCache {
     // 内部 helpers
     // ---------------------------------------------------------------
 
+    /// 连续脏子区段扫描: (window, sub_start, sub_len), dirty ∧ ¬in-flight,
+    /// 升序 (flush_dirty / take 共用判据).
+    fn dirty_runs(&self) -> Vec<(usize, usize, usize)> {
+        let mut runs = Vec::new();
+        for w in 0..self.dirty_sub.len() {
+            let mut i = 0usize;
+            while i < SUBRANGES_PER_WINDOW {
+                if !bit_get(&self.dirty_sub[w], i) || bit_get(&self.in_flight_sub[w], i) {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < SUBRANGES_PER_WINDOW
+                    && bit_get(&self.dirty_sub[w], i)
+                    && !bit_get(&self.in_flight_sub[w], i)
+                {
+                    i += 1;
+                }
+                runs.push((w, start, i - start));
+            }
+        }
+        runs
+    }
+
     /// 懒扩容 slots 到至少 n 个, 并同步 window 标记数组.
     fn ensure_capacity(&mut self, n: usize) {
         if n > self.slots.len() {
             self.slots.resize(n, ZERO_PID);
         }
         let windows = self.slots.len().div_ceil(SLOTS_PER_WINDOW);
-        if windows > self.dirty_windows.len() {
-            self.dirty_windows.resize(windows, false);
-            self.in_flight_windows.resize(windows, false);
+        if windows > self.dirty_sub.len() {
+            self.dirty_sub.resize(windows, [0u64; 2]);
+            self.in_flight_sub.resize(windows, [0u64; 2]);
         }
     }
 
-    /// 序列化第 w 个 window 的字节 (末窗截断到 slots 实际水位).
-    fn window_bytes(&self, w: usize) -> Vec<u8> {
-        let start = w * SLOTS_PER_WINDOW;
-        let end = (start + SLOTS_PER_WINDOW).min(self.slots.len());
+    /// 序列化第 w 个 window 内 [sub_start, sub_start+sub_len) 子区的字节
+    /// (末窗截断到 slots 实际水位).
+    ///
+    /// ⭐ O1: LE 目标上整段 memcpy — `PidLocation` 是 `repr(C, packed)` 8B 无
+    /// padding, `to_bytes()` = 逐字段 `to_le_bytes` 拼接, 故 LE 内存布局即磁盘
+    /// 字节序; 128K 槽的逐槽 append 循环 (~3.3ms/窗) 退化为一次 memcpy.
+    /// BE 目标保留标量回退, 交叉验证由
+    /// `window_snapshot_is_memcpy_fast_and_byte_exact` 钉死.
+    fn window_bytes_range(&self, w: usize, sub_start: usize, sub_len: usize) -> Vec<u8> {
+        let start = w * SLOTS_PER_WINDOW + sub_start * SUB_SLOTS;
+        let end = (start + sub_len * SUB_SLOTS).min(self.slots.len());
+        if end <= start {
+            return Vec::new();
+        }
         let mut bytes = Vec::with_capacity((end - start) * 8);
-        for slot in &self.slots[start..end] {
-            bytes.extend_from_slice(&slot.to_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            let src = &self.slots[start..end];
+            // SAFETY: src 是连续排布的 [PidLocation; N], repr(C, packed) 且
+            // 大小恰 8B (编译期断言), 无填充字节; 以 u8 视图读 N*8 字节全部
+            // 落在该 Vec 分配内, 无对齐/越界/未初始化读.
+            bytes.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len() * 8)
+            });
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            for slot in &self.slots[start..end] {
+                bytes.extend_from_slice(&slot.to_bytes());
+            }
         }
         bytes
     }
@@ -366,17 +473,17 @@ mod tests {
         cache.write(3, pid(7));
         assert_eq!(cache.dirty_count(), 1);
 
-        let snaps = cache.take_dirty_window_snapshots();
+        let snaps = cache.take_dirty_subrange_snapshots();
         assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].0, 0);
-        assert_eq!(snaps[0].1.len(), 4 * 8, "末窗截断到水位 (vpid 0..=3)");
+        assert_eq!(snaps[0].window, 0);
+        assert_eq!(snaps[0].bytes.len(), 4 * 8, "末窗截断到水位 (vpid 0..=3)");
         assert_eq!(cache.dirty_count(), 0, "take 清 dirty");
         assert!(cache.has_unflushed(), "in-flight 计入未确认");
 
         // in-flight 期间再 take 应为空 (去重)
-        assert!(cache.take_dirty_window_snapshots().is_empty());
+        assert!(cache.take_dirty_subrange_snapshots().is_empty());
 
-        cache.complete_window_flush(0, true);
+        cache.complete_subrange_flush(0, 0, 1, true);
         assert!(!cache.has_unflushed());
     }
 
@@ -388,12 +495,12 @@ mod tests {
         let mut cache = MetaCache::open(&path).unwrap();
 
         cache.write(0, pid(1));
-        let snaps = cache.take_dirty_window_snapshots();
+        let snaps = cache.take_dirty_subrange_snapshots();
         assert_eq!(snaps.len(), 1);
 
-        cache.complete_window_flush(0, false);
+        cache.complete_subrange_flush(0, 0, 1, false);
         assert_eq!(cache.dirty_count(), 1, "失败重标 dirty");
-        assert!(!cache.take_dirty_window_snapshots().is_empty(), "可重取");
+        assert!(!cache.take_dirty_subrange_snapshots().is_empty(), "可重取");
     }
 
     /// in-flight 期间新 write 重标 dirty, complete 后还能取到新快照.
@@ -404,18 +511,18 @@ mod tests {
         let mut cache = MetaCache::open(&path).unwrap();
 
         cache.write(0, pid(1));
-        let _ = cache.take_dirty_window_snapshots();
+        let _ = cache.take_dirty_subrange_snapshots();
         cache.write(1, pid(2)); // 同 window, in-flight 中
         assert_eq!(cache.dirty_count(), 1);
         assert!(
-            cache.take_dirty_window_snapshots().is_empty(),
+            cache.take_dirty_subrange_snapshots().is_empty(),
             "in-flight 去重"
         );
 
-        cache.complete_window_flush(0, true);
-        let snaps = cache.take_dirty_window_snapshots();
+        cache.complete_subrange_flush(0, 0, 1, true);
+        let snaps = cache.take_dirty_subrange_snapshots();
         assert_eq!(snaps.len(), 1, "complete 后可取新快照");
-        assert_eq!(snaps[0].1.len(), 2 * 8);
+        assert_eq!(snaps[0].bytes.len(), 2 * 8);
     }
 
     /// 跨 window 边界懒扩容: vpid = SLOTS_PER_WINDOW 落在 window 1.
@@ -427,9 +534,9 @@ mod tests {
 
         cache.write(SLOTS_PER_WINDOW as u64, pid(9));
         assert_eq!(cache.dirty_count(), 1);
-        let snaps = cache.take_dirty_window_snapshots();
+        let snaps = cache.take_dirty_subrange_snapshots();
         assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].0, 1, "vpid=128K 落在 window 1");
-        assert_eq!(snaps[0].1.len(), 8, "window 1 只有 1 个 slot");
+        assert_eq!(snaps[0].window, 1, "vpid=128K 落在 window 1");
+        assert_eq!(snaps[0].bytes.len(), 8, "window 1 只有 1 个 slot");
     }
 }

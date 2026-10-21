@@ -750,20 +750,18 @@ impl PagerIo {
         Ok(())
     }
 
-    /// ⭐ Phase M2: page.mate dirty window 批量写 — N 个 window 逐个 write +
-    /// 单次 fsync. off = window_idx × 1MB, 末窗长度可小于 1MB (截断到水位).
+    /// ⭐ Phase M2/O2: page.mate 批量写 — (字节偏移, 数据) 逐个 write +
+    /// 单次 fsync. O2 后粒度是 8KB 子区 (偏移 = window×1MB + sub×8KB),
+    /// 末段长度可小于 8KB (截断到水位).
     pub async fn write_mate_windows(
         &self,
         mate_path: &Path,
-        items: &[(u32, &[u8])],
+        items: &[(u64, &[u8])],
     ) -> io::Result<()> {
         if items.is_empty() {
             return Ok(());
         }
-        let group: Vec<(u64, &[u8])> = items
-            .iter()
-            .map(|(w, d)| ((*w as u64) * crate::meta_cache::META_WINDOW_SIZE as u64, *d))
-            .collect();
+        let group: Vec<(u64, &[u8])> = items.iter().map(|(off, d)| (*off, *d)).collect();
         match self {
             PagerIo::StdFs(b) => b.write_chunks_file_batch(mate_path, &group).await,
             // mate 末窗非 512B 对齐, 走 plain fd 批路径 (不受 o_direct 影响)
