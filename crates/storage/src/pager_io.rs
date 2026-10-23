@@ -573,6 +573,28 @@ impl IoUringBackend {
         scheduler::io_ops::fsync(fd).await
     }
 
+    /// ⭐ meta log: 一次性追加写 (open → write → fsync → close).
+    /// 不进入 fd 缓存: 段文件会被合并删除, 缓存会指向已删除 inode.
+    async fn write_plain_file_once(&self, path: &Path, off: u64, data: &[u8]) -> io::Result<()> {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let fd = f.as_raw_fd();
+        let n = scheduler::io_ops::write(fd, data, off).await?;
+        scheduler::io_ops::fsync(fd).await?;
+        drop(f);
+        if n != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("meta log append short: {} of {}", n, data.len()),
+            ));
+        }
+        Ok(())
+    }
+
     fn evict_path(&self, path: &Path) {
         self.fd_cache.borrow_mut().remove(path);
         let _ = scheduler::with_current(|s| {
@@ -599,6 +621,10 @@ impl IoUringBackend {
 
     async fn write_plain_file_batch(&self, path: &Path, items: &[(u64, &[u8])]) -> io::Result<()> {
         self.0.write_chunks_file_batch(path, items).await
+    }
+
+    async fn write_plain_file_once(&self, path: &Path, off: u64, data: &[u8]) -> io::Result<()> {
+        self.0.write_chunks_file_batch(path, &[(off, data)]).await
     }
 
     fn evict_path(&self, _path: &Path) {}
@@ -766,6 +792,15 @@ impl PagerIo {
             PagerIo::StdFs(b) => b.write_chunks_file_batch(mate_path, &group).await,
             // mate 末窗非 512B 对齐, 走 plain fd 批路径 (不受 o_direct 影响)
             PagerIo::IoUring(b) => b.write_plain_file_batch(mate_path, &group).await,
+        }
+    }
+
+    /// ⭐ meta log: 追加写 + fsync. **不走 fd 缓存** — 段文件会被合并删除,
+    /// 缓存 fd 会指向已删除 inode (写入"进空洞") 且长期运行泄漏 fd.
+    pub async fn write_log_append(&self, path: &Path, off: u64, data: &[u8]) -> io::Result<()> {
+        match self {
+            PagerIo::StdFs(b) => b.write_chunks_file_batch(path, &[(off, data)]).await,
+            PagerIo::IoUring(b) => b.write_plain_file_once(path, off, data).await,
         }
     }
 

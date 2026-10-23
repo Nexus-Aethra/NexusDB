@@ -17,6 +17,7 @@ leaf_cache=1
 probe=0
 workload=all
 log_level=warn
+meta_log=0
 
 usage() {
     cat <<'EOF'
@@ -35,6 +36,7 @@ Usage: scripts/run_memtier_bench.sh [options]
   --disable-leaf-cache
                     run with NEXUS_LEAF_CACHE=0 for cache A/B comparison
   --probe           enable NLOG_PROBE=1 and retain stage histograms in server.log
+  --meta-log        enable experimental append-only meta log (NEXUSDB_META_LOG=1)
   --workload NAME   overwrite, fresh-write, mixed, read-heavy, hot-read, or all (default: all)
   --keep-data       preserve the generated temporary directory
 EOF
@@ -52,6 +54,7 @@ while (($#)); do
         --enable-put-batch) put_batch=1; shift ;;
         --disable-leaf-cache) leaf_cache=0; shift ;;
         --probe) probe=1; shift ;;
+        --meta-log) meta_log=1; shift ;;
         --workload) workload=$2; shift 2 ;;
         --keep-data) keep_data=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -122,9 +125,9 @@ stderr = false
 EOF
 
 if ((put_batch)); then
-    NEXUS_PUT_BATCH=1 NEXUS_LEAF_CACHE="$leaf_cache" NLOG_PROBE="$probe" "$binary" --config "$config" >"$server_log" 2>&1 &
+    NEXUS_PUT_BATCH=1 NEXUS_LEAF_CACHE="$leaf_cache" NLOG_PROBE="$probe" NEXUSDB_META_LOG="$meta_log" "$binary" --config "$config" >"$server_log" 2>&1 &
 else
-    NEXUS_LEAF_CACHE="$leaf_cache" NLOG_PROBE="$probe" "$binary" --config "$config" >"$server_log" 2>&1 &
+    NEXUS_LEAF_CACHE="$leaf_cache" NLOG_PROBE="$probe" NEXUSDB_META_LOG="$meta_log" "$binary" --config "$config" >"$server_log" 2>&1 &
 fi
 server_pid=$!
 for _ in $(seq 1 100); do

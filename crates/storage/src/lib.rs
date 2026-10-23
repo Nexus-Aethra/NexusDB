@@ -41,6 +41,7 @@ pub mod index_bloom;
 pub mod keyspace;
 pub mod leaf_cache;
 pub mod meta_cache;
+pub mod meta_log;
 pub mod meta_page;
 pub mod overflow;
 pub mod page_pool;

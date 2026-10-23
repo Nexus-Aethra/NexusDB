@@ -25,7 +25,7 @@ use crate::chunk_liveness::ChunkLiveness;
 use crate::chunk_lock::{AcquireResult, ChunkLockMap};
 use crate::chunk_lru::{ChunkKey, ChunkList};
 use crate::chunk_writer::{ChunkWriter, NowChunks, WriteQueue};
-use crate::meta_cache::{MetaCache, MetaWindowItem};
+use crate::meta_cache::{MetaCache, MetaLogBatch, MetaLogDone, MetaMergeDone, MetaWindowItem};
 use crate::page_pool;
 pub use crate::pager_tree::{TravelTree, TravelTreeGuard};
 pub use crate::pager_write::{MAX_BATCH_PAGES, PageWriteBatch};
@@ -97,6 +97,10 @@ pub struct Pager {
     /// ⭐ Phase M3: data backlog 排空后置位, 下轮 drive 取 meta window 快照
     /// 异步写盘 (不再在收割路径同步 fsync page.mate).
     pub(crate) meta_flush_due: bool,
+    /// ⭐ meta log: 上次 pending → log 追加时间 (节奏控制).
+    pub(crate) last_meta_log_drain: std::time::Instant,
+    /// ⭐ meta log: 上次日志 → mate 合并时间 (节奏控制).
+    pub(crate) last_meta_log_merge: std::time::Instant,
     /// ⭐ G1: chunk/block 活性统计 (GC 基础, 纯内存, 重启从 meta 反推).
     pub(crate) liveness: ChunkLiveness,
     /// ⭐ G2: compact 在飞标志 (同时至多 1 个).
@@ -260,6 +264,39 @@ pub(crate) fn count_valid_pages(chunk_bytes: &[u8]) -> u32 {
 /// 超出后 chunk 满 swap 退化为同步落盘, 写入降速到磁盘速度.
 pub(crate) const MAX_INFLIGHT_CHUNKS: usize = 8;
 
+// ===== ⭐ meta log (实验): 节奏与阈值 =====
+
+/// pending 缓冲 → 日志的追加间隔. 与 WAL periodic fsync 对齐 (1s):
+/// meta 持久性窗口不变, 热 key 跨轮改写可在缓冲内合并.
+pub(crate) const META_LOG_DRAIN_INTERVAL_MS: u64 = 1000;
+/// 未合并日志超过该字节数 → 提前合并.
+pub(crate) const META_LOG_MERGE_BYTES: u64 = 32 << 20;
+/// 合并最小间隔: 让合并区间内脏子区并集饱和, 摊薄 mate 随机写.
+pub(crate) const META_LOG_MERGE_INTERVAL_MS: u64 = 10_000;
+
+/// ⭐ meta log 异步作业: 零 Pager 借用, 由 shard 线程 spawn 成协程执行.
+///
+/// - `log`: 待追加日志批 (可选)
+/// - `merge`: Some = 合并作业 (先 append 日志, 再写 mate 子区; 完成后删段)
+pub struct MetaLogJob {
+    pub log: Option<MetaLogBatch>,
+    pub merge: Option<MetaMergePart>,
+    pub io: Rc<PagerIo>,
+}
+
+/// 合并作业的 mate 侧载荷.
+pub struct MetaMergePart {
+    pub items: Vec<MetaWindowItem>,
+    pub segments: Vec<PathBuf>,
+    pub mate_path: PathBuf,
+}
+
+/// 作业完成回执 (协程 → shard 主循环).
+pub struct MetaLogDoneBundle {
+    pub log: Option<MetaLogDone>,
+    pub merge: Option<MetaMergeDone>,
+}
+
 /// 写 page header 到 disk page 字节.
 ///
 /// **disk page layout (DESIGN §4.2.3, 40B header)**:
@@ -351,6 +388,11 @@ impl Pager {
             last_flush_time: std::time::Instant::now(),
             in_flight: HashMap::new(),
             meta_flush_due: false,
+            // 首次 drain 立即触发 (缓冲非空时); 合并等满一个间隔或超字节阈值
+            last_meta_log_drain: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(META_LOG_DRAIN_INTERVAL_MS))
+                .unwrap_or_else(std::time::Instant::now),
+            last_meta_log_merge: std::time::Instant::now(),
             liveness: ChunkLiveness::new(),
             compact_inflight: false,
             pid_bump_next,
@@ -439,6 +481,11 @@ impl Pager {
             last_flush_time: std::time::Instant::now(),
             in_flight: HashMap::new(),
             meta_flush_due: false,
+            // 首次 drain 立即触发 (缓冲非空时); 合并等满一个间隔或超字节阈值
+            last_meta_log_drain: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(META_LOG_DRAIN_INTERVAL_MS))
+                .unwrap_or_else(std::time::Instant::now),
+            last_meta_log_merge: std::time::Instant::now(),
             liveness: ChunkLiveness::new(),
             compact_inflight: false,
             pid_bump_next,

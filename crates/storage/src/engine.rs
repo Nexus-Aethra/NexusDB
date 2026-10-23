@@ -35,7 +35,7 @@ type DistinctCounts = std::collections::HashMap<StatsKey, u64>;
 type RangeCounts = std::collections::HashMap<StatsKey, (Vec<u8>, Vec<u8>)>;
 use crate::pager::Pager;
 use crate::pager_io::PagerIo;
-use crate::recover::{recover, recover_for_shard, shard_dir_path};
+use crate::recover::{recover_for_shard_with_log, recover_with_log, shard_dir_path};
 use crate::registry::{DbHandle, DbRegistry, RegistryError};
 use crate::table_directory::TableDirectory;
 use crate::types::{
@@ -103,6 +103,15 @@ impl Default for OpenOptions {
             wal_mode: crate::wal::WalMode::default(),
         }
     }
+}
+
+/// ⭐ meta log (实验): 环境变量开关.
+///
+/// 分支实验用 (`NEXUSDB_META_LOG=1`), 稳定后转为 `[storage]` 配置字段.
+/// 关闭但目录已有日志尾巴时, open 会先合并进 mate 再删段 (数据安全).
+fn meta_log_enabled() -> bool {
+    std::env::var("NEXUSDB_META_LOG")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
 }
 
 // =====================================================================
@@ -286,10 +295,13 @@ impl StorageEngine {
         }
 
         // 2. recover (compat / shard 模式自动选择)
+        // ⭐ meta log (实验): NEXUSDB_META_LOG=1 开启 (分支实验开关; 关闭时
+        // 若目录已有日志尾巴, open 会先合并进 mate 再删段, 数据不丢).
+        let meta_log = meta_log_enabled();
         let mut recovered = if opts.block_dir.is_some() {
-            recover(&block_dir_for_io)?
+            recover_with_log(&block_dir_for_io, meta_log)?
         } else {
-            recover_for_shard(&block_root, &db_name, shard_id)?
+            recover_for_shard_with_log(&block_root, &db_name, shard_id, meta_log)?
         };
 
         // 2.5 ⭐ 初始化 MetaPage (T9 集成):
