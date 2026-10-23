@@ -101,6 +101,8 @@ pub struct Pager {
     pub(crate) last_meta_log_drain: std::time::Instant,
     /// ⭐ meta log: 上次日志 → mate 合并时间 (节奏控制).
     pub(crate) last_meta_log_merge: std::time::Instant,
+    /// ⭐ meta log: 上次空闲回收 tick (promote_pending_free + 空 block 回收).
+    pub(crate) last_idle_reclaim: std::time::Instant,
     /// ⭐ G1: chunk/block 活性统计 (GC 基础, 纯内存, 重启从 meta 反推).
     pub(crate) liveness: ChunkLiveness,
     /// ⭐ G2: compact 在飞标志 (同时至多 1 个).
@@ -289,6 +291,7 @@ pub struct MetaMergePart {
     pub items: Vec<MetaWindowItem>,
     pub segments: Vec<PathBuf>,
     pub mate_path: PathBuf,
+    pub promote_prefix: usize,
 }
 
 /// 作业完成回执 (协程 → shard 主循环).
@@ -393,6 +396,10 @@ impl Pager {
                 .checked_sub(std::time::Duration::from_millis(META_LOG_DRAIN_INTERVAL_MS))
                 .unwrap_or_else(std::time::Instant::now),
             last_meta_log_merge: std::time::Instant::now(),
+            // 空闲回收 tick: 首次可立即触发 (有延迟释放时)
+            last_idle_reclaim: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(500))
+                .unwrap_or_else(std::time::Instant::now),
             liveness: ChunkLiveness::new(),
             compact_inflight: false,
             pid_bump_next,
@@ -486,6 +493,10 @@ impl Pager {
                 .checked_sub(std::time::Duration::from_millis(META_LOG_DRAIN_INTERVAL_MS))
                 .unwrap_or_else(std::time::Instant::now),
             last_meta_log_merge: std::time::Instant::now(),
+            // 空闲回收 tick: 首次可立即触发 (有延迟释放时)
+            last_idle_reclaim: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(500))
+                .unwrap_or_else(std::time::Instant::now),
             liveness: ChunkLiveness::new(),
             compact_inflight: false,
             pid_bump_next,
@@ -928,6 +939,12 @@ impl Pager {
         // 5. ⭐ chunk data 全部确认写完之后, 才 flush meta
         // 保证: meta 永远不会指向还没写完的 chunk data
         self.meta.flush_dirty()?;
+        // ⭐ meta log: 同步 flush 后 meta 已全部进 mate (段已删) →
+        // 延迟释放可立即 promote, 全空 block 立刻回收.
+        if self.meta.log_enabled() {
+            self.liveness.promote_pending_free();
+            self.maybe_drop_free_blocks();
+        }
         self.persist_pid_state();
 
         self.write_count_since_flush = 0;

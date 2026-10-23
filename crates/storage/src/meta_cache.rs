@@ -163,6 +163,8 @@ pub struct MetaLogBatch {
     pub prev_seq: Option<u64>,
     pub prev_off: u64,
     pub bytes_len: u64,
+    /// 本批覆盖的延迟释放前缀长度 (0 = 队列未全取走, 不可 promote).
+    pub promote_prefix: usize,
 }
 
 impl MetaLogBatch {
@@ -175,6 +177,7 @@ impl MetaLogBatch {
             new_segment: self.new_segment,
             prev_seq: self.prev_seq,
             prev_off: self.prev_off,
+            promote_prefix: self.promote_prefix,
         }
     }
 }
@@ -188,6 +191,7 @@ pub struct MetaLogDone {
     pub new_segment: bool,
     pub prev_seq: Option<u64>,
     pub prev_off: u64,
+    pub promote_prefix: usize,
 }
 
 /// 合并作业: (可选) 先把 pending 追加进 log, 再把脏子区写进 mate, 成功后删段.
@@ -196,6 +200,7 @@ pub struct MetaMergeBatch {
     pub items: Vec<MetaWindowItem>,
     pub segments: Vec<PathBuf>,
     pub mate_path: PathBuf,
+    pub promote_prefix: usize,
 }
 
 impl MetaMergeBatch {
@@ -208,6 +213,7 @@ impl MetaMergeBatch {
                 .map(|it| (it.window, it.sub_start, it.sub_len))
                 .collect(),
             segments: self.segments.clone(),
+            promote_prefix: self.promote_prefix,
         }
     }
 }
@@ -217,6 +223,7 @@ pub struct MetaMergeDone {
     pub log: Option<MetaLogDone>,
     pub items: Vec<(u32, u16, u16)>,
     pub segments: Vec<PathBuf>,
+    pub promote_prefix: usize,
 }
 
 // =====================================================================
@@ -557,7 +564,11 @@ impl MetaCache {
     ///
     /// 同时给这批 vpid 所在子区标 dirty — 供后续 `take_merge_batch` 生成
     /// mate 快照. 返回 None: 无 pending / 已有在飞作业.
-    pub fn take_log_batch(&mut self) -> Option<MetaLogBatch> {
+    ///
+    /// `promote_prefix_at_take`: 调用方在取批前的延迟释放队列长度.
+    /// 只有本批**把 pending 队列全取走**时, 这些释放的映射才确定被覆盖,
+    /// 回执才携带可 promote 的前缀; 否则为 0 (保守等待下一批).
+    pub fn take_log_batch(&mut self, promote_prefix_at_take: usize) -> Option<MetaLogBatch> {
         {
             let log = self.log.as_ref()?;
             if log.in_flight > 0 || log.merge_in_flight || self.pending.is_empty() {
@@ -583,6 +594,8 @@ impl MetaCache {
         if entries.is_empty() {
             return None;
         }
+        let covered = self.pending.is_empty();
+        let promote_prefix = if covered { promote_prefix_at_take } else { 0 };
         let mut bytes = Vec::with_capacity(
             entries.len() * meta_log::RECORD_SIZE + meta_log::HEADER_SIZE as usize,
         );
@@ -627,6 +640,7 @@ impl MetaCache {
             prev_seq,
             prev_off,
             bytes_len,
+            promote_prefix,
         })
     }
 
@@ -670,7 +684,11 @@ impl MetaCache {
     ///
     /// **不变式**: 快照在调用线程同步完成; 此刻内存值 = "已 append 的日志前缀
     /// + 本批 pending" (本批先 append 后写 mate), 新写入不会进入本批快照.
-    pub fn take_merge_batch(&mut self, mate_path: PathBuf) -> Option<MetaMergeBatch> {
+    pub fn take_merge_batch(
+        &mut self,
+        mate_path: PathBuf,
+        promote_prefix_at_take: usize,
+    ) -> Option<MetaMergeBatch> {
         {
             let log = self.log.as_ref()?;
             if log.in_flight > 0 || log.merge_in_flight {
@@ -680,7 +698,12 @@ impl MetaCache {
                 return None;
             }
         }
-        let log_batch = self.take_log_batch();
+        let log_batch = self.take_log_batch(promote_prefix_at_take);
+        let promote_prefix = match &log_batch {
+            Some(b) => b.promote_prefix,
+            // pending 本来就空: 全部映射已在日志里, 合并写 mate 后前缀可释放.
+            None => promote_prefix_at_take,
+        };
         if self.dirty_count() == 0 {
             // 防御: 没有可合并内容 — 已取的批退回 pending (按失败回滚).
             if let Some(b) = log_batch {
@@ -712,6 +735,7 @@ impl MetaCache {
             items,
             segments,
             mate_path,
+            promote_prefix,
         })
     }
 
@@ -744,7 +768,11 @@ impl MetaCache {
                 "flush_dirty requires no in-flight meta log append/merge",
             ));
         }
-        if let Some(b) = self.take_log_batch() {
+        // 单批上限 32K 条: 循环 drain 直到 pending 清空 (同步路径必须全量).
+        while !self.pending.is_empty() {
+            let Some(b) = self.take_log_batch(0) else {
+                break;
+            };
             let r = meta_log::append_sync(&b.path, b.offset, &b.bytes);
             let done = b.done_info();
             let ok = r.is_ok();

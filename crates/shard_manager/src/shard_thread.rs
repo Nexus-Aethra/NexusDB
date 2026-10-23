@@ -373,6 +373,10 @@ pub(crate) fn drive_async_flush(
                                     log: log_done,
                                     items: merge_items,
                                     segments: merge_segments,
+                                    promote_prefix: job
+                                        .merge
+                                        .as_ref()
+                                        .map_or(0, |m| m.promote_prefix),
                                 }),
                             }
                         } else {

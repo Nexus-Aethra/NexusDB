@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use storage::PidLocation;
-use storage::meta_cache::{MetaCache, MetaLogBatch, MetaMergeBatch};
+use storage::meta_cache::{META_LOG_BATCH_ENTRIES, MetaCache, MetaLogBatch, MetaMergeBatch};
 
 fn pid(n: u64) -> PidLocation {
     PidLocation {
@@ -79,7 +79,7 @@ fn buffer_dedups_same_vpid_across_rounds() {
     meta.write(8, pid(99));
     assert_eq!(meta.pending_len(), 2, "同 vpid 多轮写只占一个缓冲位");
 
-    let b = meta.take_log_batch().expect("batch");
+    let b = meta.take_log_batch(0).expect("batch");
     assert_eq!(b.offset, 0);
     assert!(b.new_segment);
     assert_eq!(b.entries, vec![7, 8]);
@@ -101,7 +101,7 @@ fn append_failure_requeues_and_rolls_back() {
 
     meta.write(3, pid(1));
     meta.write(4, pid(2));
-    let b = meta.take_log_batch().unwrap();
+    let b = meta.take_log_batch(0).unwrap();
     assert!(b.new_segment);
     let done = b.done_info();
     meta.complete_log_append(done, false);
@@ -110,7 +110,7 @@ fn append_failure_requeues_and_rolls_back() {
     assert!(!meta.log_busy());
 
     // 重试: 仍从 offset 0 开新段, 字节一致.
-    let b2 = meta.take_log_batch().unwrap();
+    let b2 = meta.take_log_batch(0).unwrap();
     assert_eq!(b2.offset, 0);
     assert!(b2.new_segment);
     commit_log(&mut meta, b2);
@@ -124,12 +124,12 @@ fn append_failure_truncates_existing_segment() {
     let mut meta = MetaCache::open_with_log(&mate_path(tmp.path()), true).unwrap();
 
     meta.write(1, pid(1));
-    let b = meta.take_log_batch().unwrap();
+    let b = meta.take_log_batch(0).unwrap();
     let first_len = b.bytes.len() as u64;
     commit_log(&mut meta, b);
 
     meta.write(2, pid(2));
-    let b2 = meta.take_log_batch().unwrap();
+    let b2 = meta.take_log_batch(0).unwrap();
     assert!(!b2.new_segment, "追加到同段");
     assert_eq!(b2.offset, first_len);
     meta.complete_log_append(b2.done_info(), false);
@@ -142,7 +142,7 @@ fn append_failure_truncates_existing_segment() {
     );
     assert_eq!(meta.pending_len(), 1);
 
-    let b3 = meta.take_log_batch().unwrap();
+    let b3 = meta.take_log_batch(0).unwrap();
     assert_eq!(b3.offset, first_len, "重试偏移不变");
     commit_log(&mut meta, b3);
     assert_eq!(std::fs::metadata(&seg).unwrap().len(), first_len + 20);
@@ -156,7 +156,7 @@ fn reopen_replays_unmerged_log() {
         let mut meta = MetaCache::open_with_log(&mate_path(tmp.path()), true).unwrap();
         meta.write(10, pid(100));
         meta.write(11, pid(101));
-        let b = meta.take_log_batch().unwrap();
+        let b = meta.take_log_batch(0).unwrap();
         commit_log(&mut meta, b);
         assert_eq!(segments(tmp.path()).len(), 1);
         // 模拟崩溃: 不合并、不 flush, 直接 drop
@@ -184,11 +184,11 @@ fn merge_makes_mate_authoritative_and_deletes_segments() {
     for v in 0..3u64 {
         meta.write(v, pid(v + 10));
     }
-    let b = meta.take_log_batch().unwrap();
+    let b = meta.take_log_batch(0).unwrap();
     commit_log(&mut meta, b);
     assert_eq!(meta.dirty_count(), 1, "append 标记了子区脏");
 
-    let mb = meta.take_merge_batch(mate_path(tmp.path())).unwrap();
+    let mb = meta.take_merge_batch(mate_path(tmp.path()), 0).unwrap();
     assert!(mb.log.is_none(), "pending 已空, 纯 mate 合并");
     assert_eq!(mb.items.len(), 1);
     assert_eq!(mb.segments.len(), 1);
@@ -212,13 +212,13 @@ fn merge_drains_pending_before_snapshot() {
     let mut meta = MetaCache::open_with_log(&mate_path(tmp.path()), true).unwrap();
 
     meta.write(5, pid(1));
-    let b = meta.take_log_batch().unwrap();
+    let b = meta.take_log_batch(0).unwrap();
     commit_log(&mut meta, b);
     // 同一 vpid 又写一次 (pending, 尚未 append)
     meta.write(5, pid(2));
     meta.write(6, pid(3));
 
-    let mb = meta.take_merge_batch(mate_path(tmp.path())).unwrap();
+    let mb = meta.take_merge_batch(mate_path(tmp.path()), 0).unwrap();
     assert!(mb.log.is_some(), "合并必须带上 pending 追加");
     commit_merge(&mut meta, mb);
 
@@ -234,17 +234,17 @@ fn merge_failure_keeps_segments_and_retries() {
     let tmp = tempfile::tempdir().unwrap();
     let mut meta = MetaCache::open_with_log(&mate_path(tmp.path()), true).unwrap();
     meta.write(1, pid(7));
-    let b = meta.take_log_batch().unwrap();
+    let b = meta.take_log_batch(0).unwrap();
     commit_log(&mut meta, b);
 
-    let mb = meta.take_merge_batch(mate_path(tmp.path())).unwrap();
+    let mb = meta.take_merge_batch(mate_path(tmp.path()), 0).unwrap();
     let done = mb.done_info();
     meta.complete_merge(done, true, false); // mate 写失败 (不写 mate)
     assert_eq!(segments(tmp.path()).len(), 1, "失败保留段");
     assert_eq!(meta.dirty_count(), 1, "脏位重标");
     assert!(!meta.log_busy());
 
-    let mb2 = meta.take_merge_batch(mate_path(tmp.path())).unwrap();
+    let mb2 = meta.take_merge_batch(mate_path(tmp.path()), 0).unwrap();
     commit_merge(&mut meta, mb2);
     assert!(segments(tmp.path()).is_empty());
     let mut reopened = MetaCache::open(&mate_path(tmp.path())).unwrap();
@@ -273,7 +273,28 @@ fn flush_dirty_refuses_with_inflight_append() {
     let tmp = tempfile::tempdir().unwrap();
     let mut meta = MetaCache::open_with_log(&mate_path(tmp.path()), true).unwrap();
     meta.write(1, pid(1));
-    let _b = meta.take_log_batch().unwrap();
+    let _b = meta.take_log_batch(0).unwrap();
     let err = meta.flush_dirty().unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+/// 延迟释放前缀: 队列全取走才可 promote; 有截断/剩余时保守返回 0.
+#[test]
+fn promote_prefix_requires_full_queue_drain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut meta = MetaCache::open_with_log(&mate_path(tmp.path()), true).unwrap();
+    meta.write(1, pid(1));
+    meta.write(2, pid(2));
+
+    let b = meta.take_log_batch(7).unwrap();
+    assert_eq!(b.promote_prefix, 7, "队列全取走 → 本批覆盖前缀");
+    commit_log(&mut meta, b);
+
+    // 超过单批上限: pending 剩余 → 前缀保守为 0
+    for v in 0..(META_LOG_BATCH_ENTRIES as u64 + 100) {
+        meta.write(v, pid(v + 1));
+    }
+    let b2 = meta.take_log_batch(9).unwrap();
+    assert_eq!(b2.promote_prefix, 0, "队列未取完 → 不 promote");
+    commit_log(&mut meta, b2);
 }
