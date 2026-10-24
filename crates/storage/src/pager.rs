@@ -103,6 +103,10 @@ pub struct Pager {
     pub(crate) last_meta_log_merge: std::time::Instant,
     /// ⭐ meta log: 上次空闲回收 tick (promote_pending_free + 空 block 回收).
     pub(crate) last_idle_reclaim: std::time::Instant,
+    /// ⭐ P1: 本批 meta flush 快照时已暂存的延迟释放前缀 (完成时精确 promote).
+    pub(crate) meta_flush_promote_prefix: usize,
+    /// 本批 meta flush 是否有子区失败 (失败不 promote 前缀).
+    pub(crate) meta_flush_failed: bool,
     /// ⭐ G1: chunk/block 活性统计 (GC 基础, 纯内存, 重启从 meta 反推).
     pub(crate) liveness: ChunkLiveness,
     /// ⭐ G2: compact 在飞标志 (同时至多 1 个).
@@ -424,6 +428,8 @@ impl Pager {
             last_flush_time: std::time::Instant::now(),
             in_flight: HashMap::new(),
             meta_flush_due: false,
+            meta_flush_promote_prefix: 0,
+            meta_flush_failed: false,
             // 首次 drain 立即触发 (缓冲非空时); 合并等满一个间隔或超字节阈值
             last_meta_log_drain: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_millis(META_LOG_DRAIN_INTERVAL_MS))
@@ -521,6 +527,8 @@ impl Pager {
             last_flush_time: std::time::Instant::now(),
             in_flight: HashMap::new(),
             meta_flush_due: false,
+            meta_flush_promote_prefix: 0,
+            meta_flush_failed: false,
             // 首次 drain 立即触发 (缓冲非空时); 合并等满一个间隔或超字节阈值
             last_meta_log_drain: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_millis(META_LOG_DRAIN_INTERVAL_MS))
@@ -972,12 +980,10 @@ impl Pager {
         // 5. ⭐ chunk data 全部确认写完之后, 才 flush meta
         // 保证: meta 永远不会指向还没写完的 chunk data
         self.meta.flush_dirty()?;
-        // ⭐ meta log: 同步 flush 后 meta 已全部进 mate (段已删) →
+        // ⭐ 同步 flush 后 meta 已全部持久 (原地: mate 全量写; log: 段已删) →
         // 延迟释放可立即 promote, 全空 block 立刻回收.
-        if self.meta.log_enabled() {
-            self.liveness.promote_pending_free();
-            self.maybe_drop_free_blocks();
-        }
+        self.liveness.promote_pending_free();
+        self.maybe_drop_free_blocks();
         self.persist_pid_state();
 
         self.write_count_since_flush = 0;
