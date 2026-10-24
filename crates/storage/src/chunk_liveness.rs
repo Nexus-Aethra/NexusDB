@@ -10,7 +10,7 @@
 //!   可复用 — 封死 "meta 落后窗口内 chunk 被复用" 的 recover 窗口.
 //! - 维护点在写路径 (COW/delete/compact); 读 page 不影响活性.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::meta_cache::MetaCache;
 use crate::types::{CHUNKS_PER_BLOCK, PAGES_PER_CHUNK, PageKey, PidLocation};
@@ -29,6 +29,10 @@ pub struct ChunkLiveness {
     block_active: Vec<u16>,
     /// 活跃 chunk 总数 (live > 0), O(1) 查询 (GC 债务判据).
     live_chunk_count: usize,
+    /// per-chunk vpid 槽索引: 槽 → vpid (EMPTY_VPID = 空).
+    /// 只对"有活页的 chunk"建表 (live 归零即移除), 避免稀疏 file_id 下
+    /// 512B/chunk 的稠密数组膨胀. 供 compact 判活布局点查, 不再全扫 meta.
+    vpid_slots: HashMap<usize, [u64; PAGES_PER_CHUNK]>,
     /// 全死且 meta 已确认落盘的 chunk (可复用).
     free_chunks: Vec<PageKey>,
     /// free_chunks 的成员索引 (避免 O(k²) Vec::contains).
@@ -40,14 +44,25 @@ pub struct ChunkLiveness {
 }
 
 impl ChunkLiveness {
+    /// vpid_slots 空槽哨兵.
+    pub const EMPTY_VPID: u64 = u64::MAX;
+
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 写路径: 新 pid 分配 (page 存活 +1).
-    pub fn on_page_alloc(&mut self, pid: PidLocation) {
+    /// 写路径: 新 pid 分配 (page 存活 +1), 并把 vpid 写入槽索引.
+    pub fn on_page_alloc(&mut self, pid: PidLocation, vpid: u64) {
         let idx = chunk_index(pid.file_id(), pid.chunk_idx());
         self.ensure_capacity(idx + 1);
+        let slot = pid.page_idx() as usize;
+        if slot < PAGES_PER_CHUNK {
+            let slots = self
+                .vpid_slots
+                .entry(idx)
+                .or_insert([Self::EMPTY_VPID; PAGES_PER_CHUNK]);
+            slots[slot] = vpid;
+        }
         if self.live[idx] == 0 {
             self.block_active[pid.file_id() as usize] += 1;
             self.live_chunk_count += 1;
@@ -65,11 +80,18 @@ impl ChunkLiveness {
             debug_assert!(false, "on_page_dead on untracked chunk {:?}", pid);
             return; // 防御: 统计缺失时宁可少回收
         }
+        let slot = pid.page_idx() as usize;
+        if let Some(slots) = self.vpid_slots.get_mut(&idx)
+            && slot < PAGES_PER_CHUNK
+        {
+            slots[slot] = Self::EMPTY_VPID;
+        }
         self.live[idx] -= 1;
         if self.live[idx] == 0 {
             let f = pid.file_id() as usize;
             self.block_active[f] = self.block_active[f].saturating_sub(1);
             self.live_chunk_count = self.live_chunk_count.saturating_sub(1);
+            self.vpid_slots.remove(&idx); // 无活页 → 索引不再需要
         }
     }
 
@@ -79,13 +101,14 @@ impl ChunkLiveness {
         self.live.clear();
         self.block_active.clear();
         self.live_chunk_count = 0;
+        self.vpid_slots.clear();
         self.free_chunks.clear();
         self.free_set.clear();
         self.pending_free.clear();
         self.pending_set.clear();
         for vpid in 0..meta.len() as u64 {
             if let Some(pid) = meta.peek(vpid) {
-                self.on_page_alloc(pid);
+                self.on_page_alloc(pid, vpid);
             }
         }
     }
@@ -316,10 +339,17 @@ impl ChunkLiveness {
         let start = file_id as usize * CHUNKS_PER_BLOCK;
         for idx in start..(start + CHUNKS_PER_BLOCK).min(self.live.len()) {
             self.live[idx] = 0;
+            self.vpid_slots.remove(&idx);
         }
         if let Some(a) = self.block_active.get_mut(file_id as usize) {
             *a = 0;
         }
+    }
+
+    /// 指定 chunk 的 vpid 槽索引 (槽 → vpid; EMPTY_VPID = 空). 越界 → None.
+    pub fn vpid_slots(&self, key: PageKey) -> Option<&[u64; PAGES_PER_CHUNK]> {
+        self.vpid_slots
+            .get(&chunk_index(key.file_id, key.chunk_idx))
     }
 
     /// 活跃 chunk 数 (live > 0), O(1).
@@ -378,9 +408,9 @@ mod tests {
     #[test]
     fn alloc_dead_roundtrip() {
         let mut lv = ChunkLiveness::new();
-        lv.on_page_alloc(pid(0, 0, 0));
-        lv.on_page_alloc(pid(0, 0, 1));
-        lv.on_page_alloc(pid(0, 1, 0));
+        lv.on_page_alloc(pid(0, 0, 0), 1);
+        lv.on_page_alloc(pid(0, 0, 1), 1);
+        lv.on_page_alloc(pid(0, 1, 0), 1);
         assert_eq!(
             lv.live_pages(PageKey {
                 file_id: 0,
@@ -413,18 +443,37 @@ mod tests {
         assert_eq!(lv.live_chunks(), 0);
     }
 
+    /// per-chunk vpid 槽索引: alloc 写入、dead 清空、forget_block 全清.
+    #[test]
+    fn vpid_slots_track_alloc_and_dead() {
+        let mut lv = ChunkLiveness::new();
+        let key = PageKey {
+            file_id: 0,
+            chunk_idx: 1,
+        };
+        lv.on_page_alloc(pid(0, 1, 3), 42);
+        assert_eq!(lv.vpid_slots(key).expect("chunk indexed")[3], 42);
+        assert_eq!(lv.vpid_slots(key).unwrap()[0], ChunkLiveness::EMPTY_VPID);
+        lv.on_page_dead(pid(0, 1, 3));
+        assert!(lv.vpid_slots(key).is_none(), "活页归零移除索引");
+        lv.on_page_alloc(pid(0, 1, 0), 7);
+        assert_eq!(lv.vpid_slots(key).unwrap()[0], 7);
+        lv.forget_block(0);
+        assert!(lv.vpid_slots(key).is_none(), "forget_block 移除索引");
+    }
+
     #[test]
     fn pick_victims_smallest_two_with_cap() {
         let mut lv = ChunkLiveness::new();
         // chunk (0,0): 2 活页; (0,1): 5 活页; (0,2): 40 活页 (超阈值)
         for i in 0..2 {
-            lv.on_page_alloc(pid(0, 0, i));
+            lv.on_page_alloc(pid(0, 0, i), 1);
         }
         for i in 0..5 {
-            lv.on_page_alloc(pid(0, 1, i));
+            lv.on_page_alloc(pid(0, 1, i), 1);
         }
         for i in 0..40 {
-            lv.on_page_alloc(pid(0, 2, i));
+            lv.on_page_alloc(pid(0, 2, i), 1);
         }
         let (dst, src) = lv.pick_compact_victims(32, &|_| false).expect("victims");
         // src = live 最小 (0,0), dst = 次小 (0,1)
@@ -448,10 +497,10 @@ mod tests {
     fn pick_victims_respects_exclude_and_sum_cap() {
         let mut lv = ChunkLiveness::new();
         for i in 0..30 {
-            lv.on_page_alloc(pid(0, 0, i));
+            lv.on_page_alloc(pid(0, 0, i), 1);
         }
         for i in 0..31 {
-            lv.on_page_alloc(pid(0, 1, i));
+            lv.on_page_alloc(pid(0, 1, i), 1);
         }
         // 30 + 31 <= 64: 可 compact
         assert!(lv.pick_compact_victims(32, &|_| false).is_some());
@@ -464,10 +513,10 @@ mod tests {
         // 再加活页让 sum 超 64 → None
         let mut lv2 = ChunkLiveness::new();
         for i in 0..33 {
-            lv2.on_page_alloc(pid(0, 0, i));
+            lv2.on_page_alloc(pid(0, 0, i), 1);
         }
         for i in 0..33 {
-            lv2.on_page_alloc(pid(0, 1, i));
+            lv2.on_page_alloc(pid(0, 1, i), 1);
         }
         assert!(
             lv2.pick_compact_victims(64, &|_| false).is_none(),
@@ -480,13 +529,13 @@ mod tests {
         let mut lv = ChunkLiveness::new();
         // file0: 2 个活 chunk; file1: 1 个活 chunk (更少 → 候选)
         for i in 0..10 {
-            lv.on_page_alloc(pid(0, 0, i));
+            lv.on_page_alloc(pid(0, 0, i), 1);
         }
         for i in 0..5 {
-            lv.on_page_alloc(pid(0, 3, i));
+            lv.on_page_alloc(pid(0, 3, i), 1);
         }
         for i in 0..40 {
-            lv.on_page_alloc(pid(1, 2, i));
+            lv.on_page_alloc(pid(1, 2, i), 1);
         }
 
         // 候选 = file1 (active=1 < file0 的 2)
@@ -537,7 +586,7 @@ mod tests {
     #[test]
     fn drain_free_of_file_and_forget_block() {
         let mut lv = ChunkLiveness::new();
-        lv.on_page_alloc(pid(1, 0, 0));
+        lv.on_page_alloc(pid(1, 0, 0), 1);
         lv.stage_pending_free(PageKey {
             file_id: 0,
             chunk_idx: 0,
@@ -581,9 +630,9 @@ mod tests {
             chunk_idx: 4,
         };
         // 让两个 chunk 出现在 live 数组里 (collect_dead_chunks 会遍历)
-        lv.on_page_alloc(pid(0, 3, 0));
+        lv.on_page_alloc(pid(0, 3, 0), 1);
         lv.on_page_dead(pid(0, 3, 0));
-        lv.on_page_alloc(pid(0, 4, 0));
+        lv.on_page_alloc(pid(0, 4, 0), 1);
         lv.on_page_dead(pid(0, 4, 0));
 
         lv.stage_pending_free(a);
