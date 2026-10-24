@@ -255,7 +255,11 @@ pub struct GcStats {
 
 /// ⭐ B-drain: block 排空触发阈值 — 活跃 chunk 数 <= 阈值的 block
 /// 值得主动搬空 (腾出整个 10MB block 文件).
-pub(crate) const BLOCK_DRAIN_ACTIVE_THRESHOLD: u16 = 3;
+/// 2026-10-24 实测 (1M 键, 20s 覆写 + 20s 空闲, 两对正反):
+///   阈值 3: 负载后 722/738 → 空闲 450/452 blocks
+///   阈值 8: 负载后 636/664 → 空闲 328/328 blocks (-27%)
+/// 吞吐持平 (49-59K); 空闲收敛显著改善. 保留 8.
+pub(crate) const BLOCK_DRAIN_ACTIVE_THRESHOLD: u16 = 8;
 
 /// ⭐ G3: bump 区 chunk 推进 (跨 block 进位).
 pub(crate) fn next_bump_chunk(file_id: u32, chunk_idx: u8) -> (u32, u8) {
