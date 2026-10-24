@@ -467,6 +467,17 @@ pub(crate) fn drive_async_flush(
             if let Err(err) = block_on_io(e.wal_periodic_tick()) {
                 nlog::error!("shard", "WAL periodic sync failed: {err}");
             }
+            // ⭐ P0: nowchunks 驻留页阻止删 sealed WAL; 超过保留上限时
+            // 强制一次全量 flush (nowchunks+meta) 再删段, 避免 WAL 无限增长.
+            if e.wal_sealed_bytes() >= storage::wal::WAL_SEALED_RETAIN_CAP_BYTES
+                && e.pager_mut().flush_backlog() == 0
+                && e.pager_mut().meta_all_flushed()
+            {
+                if let Err(err) = block_on_io(e.flush()) {
+                    nlog::error!("shard", "WAL retention cap flush failed: {err}");
+                }
+                e.wal_drop_sealed_if_meta_flushed();
+            }
             if crate::PROBE.is_enabled() {
                 crate::PROBE
                     .block_on_io_ns

@@ -20,6 +20,10 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// ⭐ P0: sealed 段保留上限 — nowchunks 驻留页阻止删段时, 超过该值强制
+/// 一次全量 flush (chunk+meta) 后删段, 避免 WAL 无限增长.
+pub const WAL_SEALED_RETAIN_CAP_BYTES: u64 = 128 << 20;
+
 /// WAL 持久化档位.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum WalMode {
@@ -338,6 +342,15 @@ impl WalWriter {
         }
     }
 
+    /// sealed 段总字节数 (WAL 保留上限判据).
+    pub fn sealed_bytes(&self) -> u64 {
+        self.sealed
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
     /// 正常关闭时调用: 全量已落盘, 删除全部段 (含 cur, 重启免重放).
     pub fn purge_all(&mut self) {
         self.buf.clear();
@@ -396,6 +409,7 @@ mod tests {
         let mut w = WalWriter::open(tmp.path(), 0, WalMode::Periodic, false).unwrap();
         w.append_put("d", "t", b"k1", b"v1").unwrap();
         w.seal().unwrap(); // k1 落入段 1
+        assert!(w.sealed_bytes() > 0, "sealed segment bytes");
         w.append_put("d", "t", b"k2", b"v2").unwrap();
         // buf 未 flush 时 crash 模拟: 段 2 空, 段 1 含 k1
         let segs = WalWriter::existing_segments(tmp.path(), 0);
@@ -405,6 +419,7 @@ mod tests {
         assert_eq!(recs[0].pkey, b"k1");
         // drop_sealed 只删 sealed 段
         w.drop_sealed();
+        assert_eq!(w.sealed_bytes(), 0, "dropped sealed segments");
         let segs = WalWriter::existing_segments(tmp.path(), 0);
         assert_eq!(segs.len(), 1);
         // 重开: 新段号递增, 不覆盖旧段

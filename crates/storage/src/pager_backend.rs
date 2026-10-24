@@ -243,6 +243,12 @@ impl Pager {
         !self.meta.has_unflushed()
     }
 
+    /// ⭐ P0: nowchunks 是否还有驻留页 (未落盘). WAL 删段必须同时满足
+    /// meta 持久 + 无驻留页, 否则 meta 可能领先数据页 (crash 丢已确认写).
+    pub fn has_dirty_nowchunks(&self) -> bool {
+        !self.nowchunks.is_empty()
+    }
+
     // ---------------------------------------------------------------
     // ⭐ meta log (实验): 异步 append / 合并
     // ---------------------------------------------------------------
