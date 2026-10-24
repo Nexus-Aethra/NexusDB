@@ -569,13 +569,15 @@ impl Pager {
         dst: PageKey,
         src: PageKey,
         dst_fresh: bool,
-        read_result: io::Result<(Vec<u8>, Vec<u8>)>, // (dst_bytes, src_bytes)
+        // 只读 src chunk: dst 侧判活/死槽完全以 meta 为 SoT, 旧实现对
+        // dst 的 1MB 读纯属浪费 (占每次 compact 读 IO 的一半).
+        read_result: io::Result<Vec<u8>>, // src_bytes
     ) -> Option<CompactWriteJob> {
-        let Ok((dst_bytes, src_bytes)) = read_result else {
+        let Ok(src_bytes) = read_result else {
             self.compact_inflight = false;
             return None; // 读失败: 无副作用, 下轮重试
         };
-        if src_bytes.len() != CHUNK_SIZE || dst_bytes.len() != CHUNK_SIZE {
+        if src_bytes.len() != CHUNK_SIZE {
             self.compact_inflight = false;
             return None;
         }

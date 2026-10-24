@@ -402,21 +402,9 @@ pub(crate) fn drive_async_flush(
                 scheduler::spawn_on_low(
                     rt,
                     Box::pin(async move {
-                        // ⭐ B-drain: fresh dst (全新 bump chunk) 磁盘无内容,
-                        // 跳过读直接传全零 (analyze 判 64 槽全死槽)
-                        let dst_r = if rj.dst_fresh {
-                            Ok(vec![0u8; storage::CHUNK_SIZE])
-                        } else {
-                            rj.io.read_page_chunk(&rj.dir, rj.dst).await
-                        };
-                        let r = match dst_r {
-                            Ok(dst_bytes) => rj
-                                .io
-                                .read_page_chunk(&rj.dir, rj.src)
-                                .await
-                                .map(|src_bytes| (dst_bytes, src_bytes)),
-                            Err(e) => Err(e),
-                        };
+                        // ⭐ 只读 src: dst 判活/死槽以 meta 为 SoT,
+                        // 不再白读 1MB dst chunk.
+                        let r = rj.io.read_page_chunk(&rj.dir, rj.src).await;
                         done.borrow_mut().push(FlushDone::CompactRead(
                             rj.dst,
                             rj.src,
