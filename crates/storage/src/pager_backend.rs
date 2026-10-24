@@ -7,11 +7,41 @@
 use std::io;
 use std::rc::Rc;
 
+use crate::meta_cache::{META_LOG_BATCH_ENTRIES, MetaLogDone, MetaMergeDone};
 use crate::pager::{
     BLOCK_DRAIN_ACTIVE_THRESHOLD, COMPACT_LIVE_THRESHOLD, COMPACT_MIN_INTERVAL_MS, CompactReadJob,
-    CompactWriteJob, FlushBatch, MetaFlushBatch, Pager, count_valid_pages, gc_debug,
-    next_bump_chunk, parse_page_vpid,
+    CompactWriteJob, FlushBatch, META_LOG_DRAIN_INTERVAL_MS, META_LOG_MERGE_BYTES,
+    META_LOG_MERGE_INTERVAL_MS, MetaFlushBatch, MetaLogJob, MetaMergePart, Pager,
+    count_valid_pages, gc_debug, next_bump_chunk, parse_page_vpid,
 };
+
+/// 环境变量覆盖 (测试/调优): `NEXUSDB_META_LOG_DRAIN_MS` /
+/// `NEXUSDB_META_LOG_MERGE_MS` / `NEXUSDB_META_LOG_MERGE_BYTES`.
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn meta_log_drain_interval_ms() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| env_u64("NEXUSDB_META_LOG_DRAIN_MS", META_LOG_DRAIN_INTERVAL_MS))
+}
+
+fn meta_log_merge_interval_ms() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| env_u64("NEXUSDB_META_LOG_MERGE_MS", META_LOG_MERGE_INTERVAL_MS))
+}
+
+fn meta_log_merge_bytes() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| env_u64("NEXUSDB_META_LOG_MERGE_BYTES", META_LOG_MERGE_BYTES))
+}
 use crate::types::{CHUNK_SIZE, PAGE_SIZE, PAGES_PER_CHUNK, PageKey, PidLocation};
 
 impl Pager {
@@ -129,8 +159,14 @@ impl Pager {
     /// 全部排空才算真正空闲.
     pub fn total_async_backlog(&self) -> usize {
         self.flush_backlog()
-            + self.meta.in_flight_subrange_count()
-            + (self.meta_flush_due && self.meta.has_unflushed()) as usize
+            + if self.meta.log_enabled() {
+                // log 模式: 在飞 append/merge (pending 缓冲不算 backlog —
+                // flush()/close 可同步 drain, 避免关停空转 1s)
+                self.meta.log_inflight_count() + self.meta.in_flight_subrange_count()
+            } else {
+                self.meta.in_flight_subrange_count()
+                    + (self.meta_flush_due && self.meta.has_unflushed()) as usize
+            }
             + self.compact_inflight as usize
     }
 
@@ -140,6 +176,9 @@ impl Pager {
     /// (有 in-flight data chunk 时绝不发 meta, data→meta 顺序不变);
     /// 同子区有在飞快照时由 MetaCache 去重 (防同 offset 乱序).
     pub fn take_meta_flush_batch(&mut self) -> Option<MetaFlushBatch> {
+        if self.meta.log_enabled() {
+            return None; // log 模式走 take_meta_log_job
+        }
         if !self.meta_flush_due || self.flush_backlog() > 0 {
             return None;
         }
@@ -170,6 +209,147 @@ impl Pager {
     /// sealed WAL 段可安全删除).
     pub fn meta_all_flushed(&self) -> bool {
         !self.meta.has_unflushed()
+    }
+
+    // ---------------------------------------------------------------
+    // ⭐ meta log (实验): 异步 append / 合并
+    // ---------------------------------------------------------------
+
+    /// ⭐ meta log (实验): 本 Pager 是否运行在日志模式 (测试/诊断).
+    pub fn meta_log_enabled(&self) -> bool {
+        self.meta.log_enabled()
+    }
+
+    /// 取 meta log 异步作业. 两种作业共用同一在飞槽 (append 或 merge):
+    /// - `Append`: pending 缓冲 → 日志追加 (1s 节奏, 对齐 WAL periodic)
+    /// - `Merge`: 先 append pending, 再把脏子区写进 page.mate, 成功后删段
+    ///
+    /// **保序**: data backlog 非空不取 (data→meta 顺序不变); 单在飞作业
+    /// 保证日志写入顺序 = 文件顺序 (append 乱序会让重放读到旧值).
+    pub fn take_meta_log_job(&mut self) -> Option<MetaLogJob> {
+        if !self.meta.log_enabled() {
+            return None;
+        }
+        // ⭐ 空闲回收 tick: 负载结束后没有新作业触发完成回调, 最后一批
+        // "延迟释放" 会永远等不到 promote → block 不回收. 这里在没有在飞
+        // 作业且 pending 已清空时周期性补一次 (500ms 节流).
+        self.maybe_idle_reclaim();
+        if self.meta.log_busy() {
+            return None;
+        }
+        if self.flush_backlog() > 0 {
+            return None;
+        }
+        let pending = self.meta.pending_len();
+        let promote_prefix = self.liveness.pending_free_len();
+        let merge_wanted = self.meta.dirty_count() > 0
+            && (self.meta.log_unmerged_bytes() >= meta_log_merge_bytes()
+                || self.last_meta_log_merge.elapsed().as_millis()
+                    >= meta_log_merge_interval_ms() as u128);
+        if merge_wanted {
+            let mate_path = self.block_dir.join("page.mate");
+            if let Some(mb) = self.meta.take_merge_batch(mate_path, promote_prefix) {
+                self.last_meta_log_merge = std::time::Instant::now();
+                self.last_meta_log_drain = std::time::Instant::now();
+                return Some(MetaLogJob {
+                    log: mb.log,
+                    merge: Some(MetaMergePart {
+                        items: mb.items,
+                        segments: mb.segments,
+                        mate_path: mb.mate_path,
+                        promote_prefix: mb.promote_prefix,
+                    }),
+                    io: self.io.clone(),
+                });
+            }
+        }
+        let drain_wanted = pending > 0
+            && (self.last_meta_log_drain.elapsed().as_millis()
+                >= meta_log_drain_interval_ms() as u128
+                || pending >= META_LOG_BATCH_ENTRIES);
+        if drain_wanted && let Some(b) = self.meta.take_log_batch(promote_prefix) {
+            self.last_meta_log_drain = std::time::Instant::now();
+            return Some(MetaLogJob {
+                log: Some(b),
+                merge: None,
+                io: self.io.clone(),
+            });
+        }
+        None
+    }
+
+    /// 收割 append 作业.
+    pub fn complete_meta_log_append(&mut self, done: MetaLogDone, result: io::Result<()>) {
+        let ok = result.is_ok();
+        let promote_prefix = done.promote_prefix;
+        self.meta.complete_log_append(done, ok);
+        if ok && promote_prefix > 0 {
+            // ⭐ 本批已覆盖这些延迟释放所依赖的映射 → 立即复用 (无需等全清空)
+            self.liveness.promote_pending_free_prefix(promote_prefix);
+            self.maybe_drop_free_blocks();
+        }
+        self.after_meta_log_progress();
+    }
+
+    /// 收割合并作业 (日志追加 + mate 子区写).
+    pub fn complete_meta_merge(
+        &mut self,
+        done: MetaMergeDone,
+        log_ok: bool,
+        mate_result: io::Result<()>,
+    ) {
+        let mate_ok = mate_result.is_ok();
+        let promote_prefix = done.promote_prefix;
+        self.meta.complete_merge(done, log_ok, mate_ok);
+        if mate_ok && log_ok && promote_prefix > 0 {
+            self.liveness.promote_pending_free_prefix(promote_prefix);
+            self.maybe_drop_free_blocks();
+        }
+        self.after_meta_log_progress();
+    }
+
+    /// meta 全部持久 (含 pending 清空) → 推进 pid.state + 释放延迟复用.
+    fn after_meta_log_progress(&mut self) {
+        if !self.meta.has_unflushed() {
+            self.persist_pid_state();
+            self.liveness.promote_pending_free();
+            self.maybe_drop_free_blocks();
+        }
+    }
+
+    /// ⭐ meta log: 空闲回收 tick (500ms 节流).
+    ///
+    /// 仅当无在飞日志作业且 pending 已清空 (= 全部变更已在日志/mate 中持久)
+    /// 时执行; 解决负载结束后最后一批 delayed-free 无人 promote 的问题.
+    fn maybe_idle_reclaim(&mut self) {
+        let debug = std::env::var("NEXUSDB_META_LOG_DEBUG").is_ok_and(|v| v == "1");
+        if self.meta.log_busy() || self.meta.has_unflushed() {
+            if debug && self.last_idle_reclaim.elapsed().as_millis() >= 1000 {
+                self.last_idle_reclaim = std::time::Instant::now();
+                eprintln!(
+                    "[meta_log] reclaim skip: busy={} unflushed={} pending={} dirty={} unmerged={}",
+                    self.meta.log_busy(),
+                    self.meta.has_unflushed(),
+                    self.meta.pending_len(),
+                    self.meta.dirty_count(),
+                    self.meta.log_unmerged_bytes()
+                );
+            }
+            return;
+        }
+        if self.last_idle_reclaim.elapsed().as_millis() < 500 {
+            return;
+        }
+        self.last_idle_reclaim = std::time::Instant::now();
+        if debug {
+            eprintln!(
+                "[meta_log] reclaim run: free_files={} pending_free={}",
+                self.liveness.free_files().len(),
+                self.liveness.pending_free_len()
+            );
+        }
+        self.liveness.promote_pending_free();
+        self.maybe_drop_free_blocks();
     }
 
     /// ⭐ Phase M3: 收割 meta 子区写盘结果.
@@ -206,7 +386,7 @@ impl Pager {
     /// 排除当前写入 file 与 bump 预定 file. 顺序: 清 free list → 逐出 fd
     /// (fd_cache + FdPool 固定槽) → unlink → 清活性位.
     /// unlink 失败仅 warn (下轮重试); META block (file 0) 因 MetaPage 永活天然不会全空.
-    fn maybe_drop_free_blocks(&mut self) {
+    pub(crate) fn maybe_drop_free_blocks(&mut self) {
         let (cur_file, _, _) = self.pid_alloc.current();
         for file_id in self.liveness.free_files() {
             if file_id == cur_file || file_id == self.pid_bump_next.0 {

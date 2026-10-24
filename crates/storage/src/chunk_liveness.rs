@@ -242,6 +242,24 @@ impl ChunkLiveness {
         }
     }
 
+    /// ⭐ meta log: 只 promote 前 n 个 pending_free.
+    ///
+    /// 语义: 这 n 个 chunk 的释放所依赖的映射已被"本批日志 append"覆盖
+    /// (调用方保证), 因此可以立即复用; 其余留在 pending 等下一批.
+    pub fn promote_pending_free_prefix(&mut self, n: usize) {
+        let n = n.min(self.pending_free.len());
+        for key in self.pending_free.drain(..n) {
+            if !self.free_chunks.contains(&key) {
+                self.free_chunks.push(key);
+            }
+        }
+    }
+
+    /// 延迟释放队列长度 (诊断/回收 tick 用).
+    pub fn pending_free_len(&self) -> usize {
+        self.pending_free.len()
+    }
+
     /// 取一个可复用 chunk (G3: pid_alloc rotate 时优先用).
     pub fn pop_free_chunk(&mut self) -> Option<PageKey> {
         self.free_chunks.pop()

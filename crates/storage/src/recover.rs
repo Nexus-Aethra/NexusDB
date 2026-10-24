@@ -87,8 +87,12 @@ pub struct RecoveredState {
 /// **新代码推荐用**: `recover_for_shard(block_root, shard_id)` 走
 /// `block_root/default/shard_{N}/` 路径, 跟 T12.13 多 db 命名空间统一.
 pub fn recover(block_dir: &Path) -> io::Result<RecoveredState> {
-    let recovered = recover_for_shard(block_dir, DEFAULT_DB_NAME, DEFAULT_SHARD_ID)?;
-    Ok(recovered)
+    recover_with_log(block_dir, false)
+}
+
+/// ⭐ meta log (实验): 指定是否启用日志继续追加.
+pub fn recover_with_log(block_dir: &Path, meta_log: bool) -> io::Result<RecoveredState> {
+    recover_for_shard_with_log(block_dir, DEFAULT_DB_NAME, DEFAULT_SHARD_ID, meta_log)
 }
 
 /// ⭐ T12.12 公开 API: 按 `(block_root, db_name, shard_id)` 定位单 db 单 shard 目录
@@ -116,6 +120,19 @@ pub fn recover_for_shard(
     db_name: &str,
     shard_id: u32,
 ) -> io::Result<RecoveredState> {
+    recover_for_shard_with_log(block_root, db_name, shard_id, false)
+}
+
+/// ⭐ meta log (实验): recover + 日志开关.
+///
+/// `meta_log=false` 且目录存在 `page.metlog.*` 时, `MetaCache::open_with_log`
+/// 会先把日志尾巴合并进 mate 再删段 (数据安全 + 旧路径兼容).
+pub fn recover_for_shard_with_log(
+    block_root: &Path,
+    db_name: &str,
+    shard_id: u32,
+    meta_log: bool,
+) -> io::Result<RecoveredState> {
     let shard_dir = shard_dir_path(block_root, db_name, shard_id);
 
     // 优先用 shard_dir; 如果不存在, 但 block_root 直接是旧 block_dir, fallback.
@@ -141,7 +158,7 @@ pub fn recover_for_shard(
     // 元数据落点与异步刷盘一致; 只有库目录本身不存在 (调用方未
     // create_if_missing 的全新路径, 无 .block 可扫) 时才回退到本实例唯一的
     // 匿名临时文件 (见 `open_ephemeral_mate`).
-    let mut meta = match MetaCache::open(&mate_path) {
+    let mut meta = match MetaCache::open_with_log(&mate_path, meta_log) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // 库目录都不存在 → 无 .block 可扫, 返回空状态 (保持旧契约).

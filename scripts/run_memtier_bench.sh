@@ -17,6 +17,8 @@ leaf_cache=1
 probe=0
 workload=all
 log_level=warn
+meta_log=0
+keys=100000
 
 usage() {
     cat <<'EOF'
@@ -35,6 +37,9 @@ Usage: scripts/run_memtier_bench.sh [options]
   --disable-leaf-cache
                     run with NEXUS_LEAF_CACHE=0 for cache A/B comparison
   --probe           enable NLOG_PROBE=1 and retain stage histograms in server.log
+  --meta-log        enable experimental append-only meta log (NEXUSDB_META_LOG=1)
+  --keys N          preloaded keyspace size (default: 100000); also sets the
+                    overwrite/mixed/read-heavy key range
   --workload NAME   overwrite, fresh-write, mixed, read-heavy, hot-read, or all (default: all)
   --keep-data       preserve the generated temporary directory
 EOF
@@ -52,6 +57,8 @@ while (($#)); do
         --enable-put-batch) put_batch=1; shift ;;
         --disable-leaf-cache) leaf_cache=0; shift ;;
         --probe) probe=1; shift ;;
+        --meta-log) meta_log=1; shift ;;
+        --keys) keys=$2; shift 2 ;;
         --workload) workload=$2; shift 2 ;;
         --keep-data) keep_data=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -65,6 +72,7 @@ fi
 
 case "$wal_mode" in off|periodic|strict) ;; *) echo "invalid --wal-mode: $wal_mode" >&2; exit 2 ;; esac
 case "$workload" in overwrite|fresh-write|mixed|read-heavy|hot-read|all) ;; *) echo "invalid --workload: $workload" >&2; exit 2 ;; esac
+[[ "$keys" =~ ^[0-9]+$ ]] && ((keys > 0)) || { echo "invalid --keys: $keys" >&2; exit 2; }
 [[ -x "$binary" ]] || { echo "NexusDB binary not found: $binary" >&2; exit 2; }
 command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark is required" >&2; exit 2; }
 command -v redis-cli >/dev/null || { echo "redis-cli is required" >&2; exit 2; }
@@ -122,9 +130,9 @@ stderr = false
 EOF
 
 if ((put_batch)); then
-    NEXUS_PUT_BATCH=1 NEXUS_LEAF_CACHE="$leaf_cache" NLOG_PROBE="$probe" "$binary" --config "$config" >"$server_log" 2>&1 &
+    NEXUS_PUT_BATCH=1 NEXUS_LEAF_CACHE="$leaf_cache" NLOG_PROBE="$probe" NEXUSDB_META_LOG="$meta_log" "$binary" --config "$config" >"$server_log" 2>&1 &
 else
-    NEXUS_LEAF_CACHE="$leaf_cache" NLOG_PROBE="$probe" "$binary" --config "$config" >"$server_log" 2>&1 &
+    NEXUS_LEAF_CACHE="$leaf_cache" NLOG_PROBE="$probe" NEXUSDB_META_LOG="$meta_log" "$binary" --config "$config" >"$server_log" 2>&1 &
 fi
 server_pid=$!
 for _ in $(seq 1 100); do
@@ -142,13 +150,13 @@ redis-cli -h 127.0.0.1 -p "$port" ping >/dev/null
 threads=4
 clients_per_thread=8
 total_clients=$((threads * clients_per_thread))
-preload_total=100000
+preload_total=$keys
 # memtier's --requests is per client, not global.  Round up so preload stays
 # close to the documented 100k-key warmup instead of silently issuing 3.2M.
 preload_per_client=$(((preload_total + total_clients - 1) / total_clients))
 common=(--server=127.0.0.1 --port="$port" --protocol=redis --pipeline=16
         --threads="$threads" --clients="$clients_per_thread" --data-size=64
-        --key-maximum=100000 --hide-histogram)
+        --key-maximum="$keys" --hide-histogram)
 
 echo "[preload] $((preload_per_client * total_clients)) parallel-sequential SETs"
 # P assigns each client a disjoint sequential slice, so the preload covers the
@@ -158,15 +166,15 @@ memtier_benchmark "${common[@]}" --key-pattern=P:P --ratio=1:0 \
 sleep 5
 
 workloads=(
-    'overwrite|1:0|1|100000'
+    "overwrite|1:0|1|$keys"
     # Keep fresh writes outside the preloaded range. The 100M range makes
     # collisions negligible during short runs while preserving random routing.
     'fresh-write|1:0|100001|100000000'
-    'mixed|1:1|1|100000'
-    'read-heavy|1:9|1|100000'
+    "mixed|1:1|1|$keys"
+    "read-heavy|1:9|1|$keys"
     # A 1% subset of the preloaded keyspace. This isolates the intended
     # repeated-leaf traversal workload from the random-key read baseline.
-    'hot-read|1:99|1|1000'
+    "hot-read|1:99|1|$((keys / 100))"
 )
 for workload_spec in "${workloads[@]}"; do
     IFS='|' read -r name ratio key_min key_max <<<"$workload_spec"

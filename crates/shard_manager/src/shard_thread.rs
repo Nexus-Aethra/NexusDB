@@ -172,6 +172,24 @@ pub(crate) fn drive_async_flush(
                         // ⭐ WAL (F60): meta 全部持久化 → sealed 段可删
                         e.wal_drop_sealed_if_meta_flushed();
                     }
+                    // ⭐ meta log (实验): append / merge 收割
+                    FlushDone::MetaLog(bundle, log_result, mate_result) => {
+                        if let Err(ref err) = log_result {
+                            nlog::error!("shard", "meta log append failed (will retry): {err}");
+                        }
+                        if let Err(ref err) = mate_result {
+                            nlog::warn!("shard", "meta log merge failed (will retry): {err}");
+                        }
+                        let log_ok = log_result.is_ok();
+                        let bundle = *bundle;
+                        if let Some(m) = bundle.merge {
+                            e.pager_mut().complete_meta_merge(m, log_ok, mate_result);
+                        } else if let Some(l) = bundle.log {
+                            e.pager_mut().complete_meta_log_append(l, log_result);
+                        }
+                        // ⭐ WAL (F60): pending 全部进日志 → sealed 段可删
+                        e.wal_drop_sealed_if_meta_flushed();
+                    }
                     // ⭐ G2 阶段 2 (同步): meta 判活 → 组装写作业 → 低优先级协程写盘
                     FlushDone::CompactRead(dst, src, dst_fresh, read_result) => {
                         if let Some(wj) =
@@ -306,6 +324,71 @@ pub(crate) fn drive_async_flush(
                 crate::PROBE
                     .flush_meta_admission_ns
                     .record(start.elapsed().as_nanos() as u64);
+            }
+            // b2b. ⭐ meta log (实验): pending → 日志追加 (1s 节奏) 或
+            // 日志 + mate 合并 (10s / 32MB). 单在飞作业保证追加顺序 = 文件顺序.
+            if let Some(job) = e.pager_mut().take_meta_log_job() {
+                let done = flush_done.clone();
+                scheduler::spawn_on(
+                    rt,
+                    Box::pin(async move {
+                        let log_done = job.log.as_ref().map(|b| b.done_info());
+                        let is_merge = job.merge.is_some();
+                        let (merge_items, merge_segments) = match &job.merge {
+                            Some(m) => (
+                                m.items
+                                    .iter()
+                                    .map(|it| (it.window, it.sub_start, it.sub_len))
+                                    .collect::<Vec<_>>(),
+                                m.segments.clone(),
+                            ),
+                            None => (Vec::new(), Vec::new()),
+                        };
+                        let log_r = if let Some(b) = &job.log {
+                            job.io.write_log_append(&b.path, b.offset, &b.bytes).await
+                        } else {
+                            Ok(())
+                        };
+                        let mate_r = if let Some(m) = &job.merge {
+                            if log_r.is_ok() {
+                                let items: Vec<(u64, &[u8])> = m
+                                    .items
+                                    .iter()
+                                    .map(|it| (it.offset(), it.bytes.as_slice()))
+                                    .collect();
+                                job.io.write_mate_windows(&m.mate_path, &items).await
+                            } else {
+                                // 日志没落盘时 mate 绝不能前进 (否则 mate 领先 log)
+                                Err(std::io::Error::other(
+                                    "meta log append failed; mate merge skipped",
+                                ))
+                            }
+                        } else {
+                            Ok(())
+                        };
+                        let bundle = if is_merge {
+                            storage::pager::MetaLogDoneBundle {
+                                log: None,
+                                merge: Some(storage::meta_cache::MetaMergeDone {
+                                    log: log_done,
+                                    items: merge_items,
+                                    segments: merge_segments,
+                                    promote_prefix: job
+                                        .merge
+                                        .as_ref()
+                                        .map_or(0, |m| m.promote_prefix),
+                                }),
+                            }
+                        } else {
+                            storage::pager::MetaLogDoneBundle {
+                                log: log_done,
+                                merge: None,
+                            }
+                        };
+                        done.borrow_mut()
+                            .push(FlushDone::MetaLog(Box::new(bundle), log_r, mate_r));
+                    }),
+                );
             }
             // b3. ⭐ G2: 空闲段发起 chunk compact (低优先级协程读 dst+src 字节;
             // 判活用 header 候选 + meta 点查, 零全扫).

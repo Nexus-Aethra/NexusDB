@@ -1567,6 +1567,13 @@ pub(crate) enum FlushDone {
     Data(storage::PageKey, std::io::Result<()>),
     /// meta 子区快照写盘结果: (window, sub_start, sub_len, 写盘结果)
     Meta(u32, u16, u16, std::io::Result<()>),
+    /// ⭐ meta log (实验): (完成回执, 日志追加结果, mate 合并结果).
+    /// merge=None 时第 3 项恒为 Ok (纯 append 作业).
+    MetaLog(
+        Box<storage::pager::MetaLogDoneBundle>,
+        std::io::Result<()>,
+        std::io::Result<()>,
+    ),
     /// G2 阶段 1 完成: (dst, src, dst_fresh, 读结果 (dst_bytes, src_bytes))
     CompactRead(
         storage::PageKey,

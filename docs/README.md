@@ -10,6 +10,8 @@
 - [DESIGN](./DESIGN.md): architecture and persistent-data invariants.
 - [AGENTS](./AGENTS.md): current development handoff, verified status, and
   operational gotchas.
+- [EXPERIMENTAL](./EXPERIMENTAL.md): registry of experimental features,
+  default-on rollback switches, tuning knobs, and diagnostics.
 - [CHANGELOG](./CHANGELOG.md): chronological fixes and validation evidence.
 
 ## Active plans and audits
