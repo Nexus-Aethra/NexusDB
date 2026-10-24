@@ -595,12 +595,22 @@ impl StorageEngine {
     }
 
     /// meta 全部持久化后调用: 删除 sealed 段 (其记录已由 chunk+meta 覆盖).
+    ///
+    /// ⭐ P0: 还必须无 nowchunks 驻留页 — meta 持久 ≠ 数据页持久; 若页面仅
+    /// 在 RAM, 删段后 crash 会丢已确认写. 驻留页由 128MB 上限触发的全量
+    /// flush 清理 (见 shard 主循环).
     pub fn wal_drop_sealed_if_meta_flushed(&mut self) {
         if self.pager.meta_all_flushed()
+            && !self.pager.has_dirty_nowchunks()
             && let Some(w) = self.wal.as_mut()
         {
             w.drop_sealed();
         }
+    }
+
+    /// sealed WAL 段总字节数 (保留上限判据).
+    pub fn wal_sealed_bytes(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.sealed_bytes())
     }
 
     /// chunk_list 缓存大小 (测试 helper).
