@@ -1822,6 +1822,11 @@ pub(crate) fn shard_thread_main(
                 // Completion harvest and WAL checks still run every round.  Only
                 // new data-write admission is capped, and compact waits for an
                 // idle turn so it cannot extend a client-facing service cycle.
+                //
+                // 2026-10-24 实验: 负载期债务驱动 compact (100ms 闸门) 在 1M 键
+                // 随机覆写下空间无改善 (768→760 blocks) 且 p99 65→124ms,
+                // 已回退. 空间放大主因是 COW 分配速率 / 页级不可复用, 不能靠
+                // 调度频率解决; 后续需页级 free list 或降低 compact 单次成本.
                 (
                     task_window.busy_drive_budget(),
                     FOREGROUND_DATA_ADMISSION,

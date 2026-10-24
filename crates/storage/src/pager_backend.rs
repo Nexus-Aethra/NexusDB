@@ -10,9 +10,10 @@ use std::rc::Rc;
 use crate::meta_cache::{META_LOG_BATCH_ENTRIES, MetaLogDone, MetaMergeDone};
 use crate::pager::{
     BLOCK_DRAIN_ACTIVE_THRESHOLD, COMPACT_LIVE_THRESHOLD, COMPACT_MIN_INTERVAL_MS, CompactReadJob,
-    CompactWriteJob, FlushBatch, META_LOG_DRAIN_INTERVAL_MS, META_LOG_MERGE_BYTES,
-    META_LOG_MERGE_INTERVAL_MS, MetaFlushBatch, MetaLogJob, MetaMergePart, Pager,
-    count_valid_pages, gc_debug, next_bump_chunk, parse_page_vpid,
+    CompactWriteJob, FlushBatch, GC_DEBT_MIN_EXTRA_CHUNKS, GC_DEBT_RATIO, GcStats,
+    META_LOG_DRAIN_INTERVAL_MS, META_LOG_MERGE_BYTES, META_LOG_MERGE_INTERVAL_MS, MetaFlushBatch,
+    MetaLogJob, MetaMergePart, Pager, count_valid_pages, gc_debug, next_bump_chunk,
+    parse_page_vpid,
 };
 
 /// 环境变量覆盖 (测试/调优): `NEXUSDB_META_LOG_DRAIN_MS` /
@@ -146,6 +147,28 @@ impl Pager {
     /// 异步落盘: 是否有写盘中的 chunk.
     pub fn has_inflight(&self) -> bool {
         !self.in_flight.is_empty()
+    }
+
+    /// GC 观测快照 (诊断/测试).
+    pub fn gc_stats(&self) -> GcStats {
+        GcStats {
+            allocated_chunks: self.liveness.allocated_chunks(),
+            live_chunks: self.liveness.live_chunks(),
+            free_chunks: self.liveness.free_count(),
+            pending_free: self.liveness.pending_free_len(),
+        }
+    }
+
+    /// ⭐ P1: 空间债务是否超阈值 — 负载期允许低频 compact 的判据.
+    ///
+    /// allocated ≥ max(live*2, live+8): 死/空 chunk 占比足够高, 回收有净收益.
+    pub fn gc_debt_exceeded(&self) -> bool {
+        let allocated = self.liveness.allocated_chunks();
+        let live = self.liveness.live_chunks();
+        allocated
+            >= live
+                .saturating_mul(GC_DEBT_RATIO)
+                .max(live + GC_DEBT_MIN_EXTRA_CHUNKS)
     }
 
     /// 异步落盘: 写盘中 + 待提交的 chunk 总数 (测试/背压观察).
@@ -383,9 +406,11 @@ impl Pager {
     ///
     /// 候选 = free_chunks 中出现过的 file 且 block_active == 0 (无任何活页,
     /// 隐含无 nowchunks/pending/in_flight 项 — 驻留页在 alloc 时已计活);
-    /// 排除当前写入 file 与 bump 预定 file. 顺序: 清 free list → 逐出 fd
-    /// (fd_cache + FdPool 固定槽) → unlink → 清活性位.
-    /// unlink 失败仅 warn (下轮重试); META block (file 0) 因 MetaPage 永活天然不会全空.
+    /// 排除当前写入 file 与 bump 预定 file. 顺序: 逐出 fd → unlink →
+    /// **成功后才清 free list/活性位**.
+    /// unlink 失败保留候选 (下轮重试); 旧实现先清 free list 再 unlink,
+    /// 失败后该 file 不再是候选 → 永久泄漏.
+    /// META block (file 0) 因 MetaPage 永活天然不会全空.
     pub(crate) fn maybe_drop_free_blocks(&mut self) {
         let (cur_file, _, _) = self.pid_alloc.current();
         for file_id in self.liveness.free_files() {
@@ -402,16 +427,22 @@ impl Pager {
                 self.liveness.forget_block(file_id);
                 continue;
             }
-            // 不再复用该 file 的 chunk → 逐出 fd → unlink
-            self.liveness.drain_free_chunks_of_file(file_id);
+            // 不再复用该 file 的 chunk → 逐出 fd (必须在 unlink 前,
+            // 防后续写打到已删除 inode) → unlink
             self.io.evict_path(&path);
             match std::fs::remove_file(&path) {
                 Ok(()) => {
+                    self.liveness.drain_free_chunks_of_file(file_id);
+                    self.liveness.forget_block(file_id);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    self.liveness.drain_free_chunks_of_file(file_id);
                     self.liveness.forget_block(file_id);
                 }
                 Err(e) => {
+                    // 保留 free list / 活性位 = 保留候选, 下轮重试
                     eprintln!(
-                        "[pager] drop block {} failed (retry next round): {e}",
+                        "[pager] drop block {} failed (will retry next round): {e}",
                         path.display()
                     );
                 }

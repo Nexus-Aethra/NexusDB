@@ -10,6 +10,8 @@
 //!   可复用 — 封死 "meta 落后窗口内 chunk 被复用" 的 recover 窗口.
 //! - 维护点在写路径 (COW/delete/compact); 读 page 不影响活性.
 
+use std::collections::HashSet;
+
 use crate::meta_cache::MetaCache;
 use crate::types::{CHUNKS_PER_BLOCK, PAGES_PER_CHUNK, PageKey, PidLocation};
 
@@ -25,10 +27,16 @@ pub struct ChunkLiveness {
     live: Vec<u8>,
     /// 按 file_id 聚合: 活跃 (live > 0) chunk 数.
     block_active: Vec<u16>,
+    /// 活跃 chunk 总数 (live > 0), O(1) 查询 (GC 债务判据).
+    live_chunk_count: usize,
     /// 全死且 meta 已确认落盘的 chunk (可复用).
     free_chunks: Vec<PageKey>,
+    /// free_chunks 的成员索引 (避免 O(k²) Vec::contains).
+    free_set: HashSet<PageKey>,
     /// 已提交 compact、等 meta 落盘确认的 chunk (延迟释放暂存).
     pending_free: Vec<PageKey>,
+    /// pending_free 的成员索引 (去重 O(1)).
+    pending_set: HashSet<PageKey>,
 }
 
 impl ChunkLiveness {
@@ -42,6 +50,7 @@ impl ChunkLiveness {
         self.ensure_capacity(idx + 1);
         if self.live[idx] == 0 {
             self.block_active[pid.file_id() as usize] += 1;
+            self.live_chunk_count += 1;
         }
         debug_assert!((self.live[idx] as usize) < PAGES_PER_CHUNK);
         self.live[idx] = self.live[idx].saturating_add(1);
@@ -60,6 +69,7 @@ impl ChunkLiveness {
         if self.live[idx] == 0 {
             let f = pid.file_id() as usize;
             self.block_active[f] = self.block_active[f].saturating_sub(1);
+            self.live_chunk_count = self.live_chunk_count.saturating_sub(1);
         }
     }
 
@@ -68,8 +78,11 @@ impl ChunkLiveness {
     pub fn rebuild_from_meta(&mut self, meta: &MetaCache) {
         self.live.clear();
         self.block_active.clear();
+        self.live_chunk_count = 0;
         self.free_chunks.clear();
+        self.free_set.clear();
         self.pending_free.clear();
+        self.pending_set.clear();
         for vpid in 0..meta.len() as u64 {
             if let Some(pid) = meta.peek(vpid) {
                 self.on_page_alloc(pid);
@@ -126,7 +139,7 @@ impl ChunkLiveness {
 
     /// compact 提交: src chunk 进延迟释放暂存 (等 meta 确认).
     pub fn stage_pending_free(&mut self, key: PageKey) {
-        if !self.pending_free.contains(&key) {
+        if self.pending_set.insert(key) {
             self.pending_free.push(key);
         }
     }
@@ -225,7 +238,7 @@ impl ChunkLiveness {
                 file_id: (idx / CHUNKS_PER_BLOCK) as u32,
                 chunk_idx: (idx % CHUNKS_PER_BLOCK) as u8,
             };
-            if exclude(key) || self.pending_free.contains(&key) || self.free_chunks.contains(&key) {
+            if exclude(key) || self.pending_set.contains(&key) || self.free_set.contains(&key) {
                 continue;
             }
             out.push(key);
@@ -236,7 +249,8 @@ impl ChunkLiveness {
     /// ⭐ meta window 全部确认落盘后调用: pending → free (可复用).
     pub fn promote_pending_free(&mut self) {
         for key in self.pending_free.drain(..) {
-            if !self.free_chunks.contains(&key) {
+            self.pending_set.remove(&key);
+            if self.free_set.insert(key) {
                 self.free_chunks.push(key);
             }
         }
@@ -249,7 +263,8 @@ impl ChunkLiveness {
     pub fn promote_pending_free_prefix(&mut self, n: usize) {
         let n = n.min(self.pending_free.len());
         for key in self.pending_free.drain(..n) {
-            if !self.free_chunks.contains(&key) {
+            self.pending_set.remove(&key);
+            if self.free_set.insert(key) {
                 self.free_chunks.push(key);
             }
         }
@@ -262,7 +277,9 @@ impl ChunkLiveness {
 
     /// 取一个可复用 chunk (G3: pid_alloc rotate 时优先用).
     pub fn pop_free_chunk(&mut self) -> Option<PageKey> {
-        self.free_chunks.pop()
+        let key = self.free_chunks.pop()?;
+        self.free_set.remove(&key);
+        Some(key)
     }
 
     /// G4: 移除并返回属于 file_id 的全部 free chunk (block unlink 前调用).
@@ -271,6 +288,9 @@ impl ChunkLiveness {
             .free_chunks
             .drain(..)
             .partition(|k| k.file_id == file_id);
+        for k in &of_file {
+            self.free_set.remove(k);
+        }
         self.free_chunks = rest;
         of_file
     }
@@ -300,6 +320,16 @@ impl ChunkLiveness {
         if let Some(a) = self.block_active.get_mut(file_id as usize) {
             *a = 0;
         }
+    }
+
+    /// 活跃 chunk 数 (live > 0), O(1).
+    pub fn live_chunks(&self) -> usize {
+        self.live_chunk_count
+    }
+
+    /// 曾分配过的 chunk 数 (水位; 含 free/pending/部分空).
+    pub fn allocated_chunks(&self) -> usize {
+        self.live.len()
     }
 
     /// 查询: 指定 chunk 的活页数 (越界 = 0).
@@ -366,6 +396,8 @@ mod tests {
             1
         );
         assert!(!lv.block_fully_free(0));
+        assert_eq!(lv.live_chunks(), 2, "chunk (0,0)/(0,1) 活跃");
+        assert_eq!(lv.allocated_chunks(), 2);
 
         lv.on_page_dead(pid(0, 0, 0));
         lv.on_page_dead(pid(0, 0, 1));
@@ -378,6 +410,7 @@ mod tests {
             0
         );
         assert!(lv.block_fully_free(0), "全部死光后 block 无活跃 chunk");
+        assert_eq!(lv.live_chunks(), 0);
     }
 
     #[test]
@@ -532,6 +565,60 @@ mod tests {
                 chunk_idx: 0
             }),
             0
+        );
+    }
+
+    /// 成员索引与 Vec 保持一致: 去重/前缀 promote/pop/drain 后不漂移.
+    #[test]
+    fn membership_sets_stay_consistent() {
+        let mut lv = ChunkLiveness::new();
+        let a = PageKey {
+            file_id: 0,
+            chunk_idx: 3,
+        };
+        let b = PageKey {
+            file_id: 0,
+            chunk_idx: 4,
+        };
+        // 让两个 chunk 出现在 live 数组里 (collect_dead_chunks 会遍历)
+        lv.on_page_alloc(pid(0, 3, 0));
+        lv.on_page_dead(pid(0, 3, 0));
+        lv.on_page_alloc(pid(0, 4, 0));
+        lv.on_page_dead(pid(0, 4, 0));
+
+        lv.stage_pending_free(a);
+        lv.stage_pending_free(a);
+        lv.stage_pending_free(b);
+        assert_eq!(lv.pending_free_len(), 2, "去重");
+        assert!(
+            !lv.collect_dead_chunks(&|_| false).contains(&a),
+            "pending 成员被排除"
+        );
+
+        lv.promote_pending_free_prefix(1);
+        assert_eq!(lv.pending_free_len(), 1);
+        assert_eq!(lv.free_count(), 1);
+
+        lv.promote_pending_free();
+        assert_eq!(lv.free_count(), 2);
+        assert!(
+            !lv.collect_dead_chunks(&|_| false).contains(&a),
+            "free 成员被排除"
+        );
+
+        let popped = lv.pop_free_chunk().expect("free chunk");
+        assert_eq!(lv.free_count(), 1);
+        assert!(
+            lv.collect_dead_chunks(&|_| false).contains(&popped),
+            "pop 后成员索引已清除"
+        );
+
+        let drained = lv.drain_free_chunks_of_file(0);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(lv.free_count(), 0);
+        assert!(
+            lv.collect_dead_chunks(&|_| false).contains(&a),
+            "drain 后成员索引已清除"
         );
     }
 }
