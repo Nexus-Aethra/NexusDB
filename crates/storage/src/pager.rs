@@ -152,15 +152,35 @@ pub struct MetaFlushBatch {
     pub io: Rc<PagerIo>,
 }
 
-/// ⭐ G2: compact 读作业 (阶段 1 → 2): 协程只读 src chunk 字节
-/// (dst 判活/死槽以 meta 为 SoT, 不再读 dst 的 1MB).
+/// ⭐ G2: compact 判活布局 — `start_compact` 时一次 meta 扫描得到.
+/// 读协程只按 `src_live` 读 16KB 活页; 不再读整 1MB src, `analyze` 也不再扫 meta.
+#[derive(Debug, Clone)]
+pub struct CompactLayout {
+    /// src 活页: (vpid, 原 pid, 页槽)
+    pub src_live: Vec<(u64, PidLocation, u8)>,
+    /// dst 各槽是否已被活页占用 (fresh dst 全 false)
+    pub dst_alive: [bool; PAGES_PER_CHUNK],
+}
+
+/// ⭐ G2: compact 读作业 (阶段 1 → 2): 协程只读 src 活页 (16KB/页).
 pub struct CompactReadJob {
     pub dst: PageKey,
     pub src: PageKey,
     /// ⭐ B-drain: dst 是全新 bump chunk (写侧整 chunk 写; 无需读旧字节).
     pub dst_fresh: bool,
+    pub layout: CompactLayout,
     pub dir: PathBuf,
     pub io: Rc<PagerIo>,
+}
+
+/// ⭐ G2: compact 读完成回执 — 布局 + 按布局顺序读回的活页字节.
+pub struct CompactReadDone {
+    pub dst: PageKey,
+    pub src: PageKey,
+    pub dst_fresh: bool,
+    pub layout: CompactLayout,
+    /// (page_idx, 16KB 页字节), 顺序与 `layout.src_live` 一致
+    pub items: io::Result<Vec<(u8, Vec<u8>)>>,
 }
 
 /// Low-priority read-ahead for a chunk that has accumulated page misses.  It

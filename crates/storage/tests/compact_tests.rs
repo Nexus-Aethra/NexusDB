@@ -9,7 +9,7 @@ use std::io::Write;
 use storage::alloc::{PidAllocator, VpidAllocator};
 use storage::chunk_lru::ChunkList;
 use storage::chunk_writer::{ChunkWriter, NowChunks};
-use storage::pager::{PageWriteBatch, Pager};
+use storage::pager::{CompactReadDone, CompactReadJob, CompactWriteJob, PageWriteBatch, Pager};
 use storage::{MetaCache, PAGE_SIZE};
 
 mod common;
@@ -45,6 +45,25 @@ fn setup_pager(tmp: &tempfile::TempDir) -> Pager {
         NowChunks::new(),
         ChunkWriter::new(&block_path).unwrap(),
     )
+}
+
+/// 按 start_compact 布局读 live 页 → analyze (与生产协程同路径).
+async fn read_and_analyze(pager: &mut Pager, rj: CompactReadJob) -> Option<CompactWriteJob> {
+    let mut items = Vec::with_capacity(rj.layout.src_live.len());
+    for (_, pid, slot) in &rj.layout.src_live {
+        let key = storage::PageKey {
+            file_id: pid.file_id(),
+            chunk_idx: pid.chunk_idx(),
+        };
+        items.push((*slot, rj.io.read_page(&rj.dir, key, *slot).await.unwrap()));
+    }
+    pager.analyze_compact_read(CompactReadDone {
+        dst: rj.dst,
+        src: rj.src,
+        dst_fresh: rj.dst_fresh,
+        layout: rj.layout,
+        items: Ok(items),
+    })
 }
 
 /// 造场景: 创建 n 页 → flush 落盘 → COW 更新 stale 集合让旧 chunk 稀疏.
@@ -97,12 +116,9 @@ fn compact_fill_dead_slots_roundtrip() {
         assert_ne!(dst, src);
         assert_ne!(src.chunk_idx, 0, "META chunk 不可为 src");
 
-        // 阶段 1 IO: 读 dst+src chunk (测试内直接 await)
-        let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
-
-        // 阶段 2: 判活 + 组装写作业
-        let wj = pager
-            .analyze_compact_read(dst, src, false, Ok(src_bytes))
+        // 阶段 1 IO + 阶段 2: 按布局读 live 页并组装写作业
+        let wj = read_and_analyze(&mut pager, rj)
+            .await
             .expect("有活页应产出写作业");
         assert!(!wj.moves.is_empty());
         let moved_vpids: Vec<u64> = wj.moves.iter().map(|(v, _, _)| *v).collect();
@@ -148,11 +164,7 @@ fn compact_cas_skips_concurrently_updated_page() {
         let _ = fill_and_sparsify(&mut pager, 192, &keep).await;
 
         let rj = pager.start_compact().expect("victims");
-        let (dst, src) = (rj.dst, rj.src);
-        let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
-        let wj = pager
-            .analyze_compact_read(dst, src, false, Ok(src_bytes))
-            .expect("write job");
+        let wj = read_and_analyze(&mut pager, rj).await.expect("write job");
 
         // 挑一个被搬运的 vpid, 在写盘期间被用户 COW 更新
         let raced_vpid = wj.moves[0].0;
@@ -187,11 +199,8 @@ fn compact_write_failure_is_side_effect_free() {
         let _ = fill_and_sparsify(&mut pager, 192, &keep).await;
 
         let rj = pager.start_compact().expect("victims");
-        let (dst, src) = (rj.dst, rj.src);
-        let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
-        let wj = pager
-            .analyze_compact_read(dst, src, false, Ok(src_bytes))
-            .expect("write job");
+        let src = rj.src;
+        let wj = read_and_analyze(&mut pager, rj).await.expect("write job");
         let moved: Vec<u64> = wj.moves.iter().map(|(v, _, _)| *v).collect();
         let live_before = pager.liveness().live_pages(src);
 
@@ -322,12 +331,13 @@ fn compact_read_failure_clears_inflight() {
 
         let rj = pager.start_compact().expect("victims");
         assert!(pager.compact_inflight());
-        let r = pager.analyze_compact_read(
-            rj.dst,
-            rj.src,
-            false,
-            Err(std::io::Error::other("simulated read failure")),
-        );
+        let r = pager.analyze_compact_read(CompactReadDone {
+            dst: rj.dst,
+            src: rj.src,
+            dst_fresh: rj.dst_fresh,
+            layout: rj.layout,
+            items: Err(std::io::Error::other("simulated read failure")),
+        });
         assert!(r.is_none());
         assert!(!pager.compact_inflight(), "读失败清 inflight");
     });
@@ -346,11 +356,7 @@ fn compact_freed_chunk_is_reused_and_survives_reopen() {
 
         // 完整 compact 流程
         let rj = pager.start_compact().expect("victims");
-        let (dst, src) = (rj.dst, rj.src);
-        let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
-        let wj = pager
-            .analyze_compact_read(dst, src, false, Ok(src_bytes))
-            .expect("write job");
+        let wj = read_and_analyze(&mut pager, rj).await.expect("write job");
         let items: Vec<(u8, &[u8])> = wj.items.iter().map(|(p, d)| (*p, d.as_slice())).collect();
         wj.io
             .write_pages_batch(&wj.dir, wj.dst, &items)
@@ -458,18 +464,16 @@ fn block_drain_evicts_mid_live_chunks_and_unlinks() {
             };
             if rj.src.file_id != 1 {
                 // drain 达成后落到普通 pick 的作业: 直接放弃本轮
-                pager.analyze_compact_read(
-                    rj.dst,
-                    rj.src,
-                    rj.dst_fresh,
-                    Err(std::io::Error::other("skip")),
-                );
+                pager.analyze_compact_read(CompactReadDone {
+                    dst: rj.dst,
+                    src: rj.src,
+                    dst_fresh: rj.dst_fresh,
+                    layout: rj.layout,
+                    items: Err(std::io::Error::other("skip")),
+                });
                 break;
             }
-            // 协程 IO 段 (只读 src; fresh dst 由写侧整 chunk 写)
-            let src_bytes = rj.io.read_page_chunk(&rj.dir, rj.src).await.unwrap();
-            let Some(wj) = pager.analyze_compact_read(rj.dst, rj.src, rj.dst_fresh, Ok(src_bytes))
-            else {
+            let Some(wj) = read_and_analyze(&mut pager, rj).await else {
                 continue; // src 全死分支 (已入延迟释放)
             };
             wj.execute().await.unwrap(); // fresh dst 整 chunk 写 / 常规死槽批写
@@ -549,10 +553,7 @@ fn compact_must_migrate_internal_pages() {
             let Some(rj) = pager.start_compact() else {
                 break;
             };
-            let (dst, src) = (rj.dst, rj.src);
-            // 协程 IO 段 (只读 src)
-            let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
-            let Some(wj) = pager.analyze_compact_read(dst, src, rj.dst_fresh, Ok(src_bytes)) else {
+            let Some(wj) = read_and_analyze(&mut pager, rj).await else {
                 continue;
             };
             if wj.moves.iter().any(|(v, _, _)| *v == internal_vpid) {

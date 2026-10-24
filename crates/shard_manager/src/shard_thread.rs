@@ -191,11 +191,8 @@ pub(crate) fn drive_async_flush(
                         e.wal_drop_sealed_if_meta_flushed();
                     }
                     // ⭐ G2 阶段 2 (同步): meta 判活 → 组装写作业 → 低优先级协程写盘
-                    FlushDone::CompactRead(dst, src, dst_fresh, read_result) => {
-                        if let Some(wj) =
-                            e.pager_mut()
-                                .analyze_compact_read(dst, src, dst_fresh, read_result)
-                        {
+                    FlushDone::CompactRead(done) => {
+                        if let Some(wj) = e.pager_mut().analyze_compact_read(done) {
                             let done = flush_done.clone();
                             scheduler::spawn_on_low(
                                 rt,
@@ -402,14 +399,35 @@ pub(crate) fn drive_async_flush(
                 scheduler::spawn_on_low(
                     rt,
                     Box::pin(async move {
-                        // ⭐ 只读 src: dst 判活/死槽以 meta 为 SoT,
-                        // 不再白读 1MB dst chunk.
-                        let r = rj.io.read_page_chunk(&rj.dir, rj.src).await;
+                        // ⭐ 只读 src 活页 (16KB/页): 布局已在 start_compact
+                        // 扫描 meta 得到, 不再读整 1MB chunk.
+                        let mut pages = Vec::with_capacity(rj.layout.src_live.len());
+                        let mut err = None;
+                        for (_, pid, slot) in &rj.layout.src_live {
+                            let key = storage::PageKey {
+                                file_id: pid.file_id(),
+                                chunk_idx: pid.chunk_idx(),
+                            };
+                            match rj.io.read_page(&rj.dir, key, *slot).await {
+                                Ok(bytes) => pages.push((*slot, bytes)),
+                                Err(e) => {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        let r = match err {
+                            Some(e) => Err(e),
+                            None => Ok(pages),
+                        };
                         done.borrow_mut().push(FlushDone::CompactRead(
-                            rj.dst,
-                            rj.src,
-                            rj.dst_fresh,
-                            r,
+                            storage::pager::CompactReadDone {
+                                dst: rj.dst,
+                                src: rj.src,
+                                dst_fresh: rj.dst_fresh,
+                                layout: rj.layout,
+                                items: r,
+                            },
                         ));
                     }),
                 );

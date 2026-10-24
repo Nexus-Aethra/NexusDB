@@ -9,11 +9,11 @@ use std::rc::Rc;
 
 use crate::meta_cache::{META_LOG_BATCH_ENTRIES, MetaLogDone, MetaMergeDone};
 use crate::pager::{
-    BLOCK_DRAIN_ACTIVE_THRESHOLD, COMPACT_LIVE_THRESHOLD, COMPACT_MIN_INTERVAL_MS, CompactReadJob,
-    CompactWriteJob, FlushBatch, GC_DEBT_MIN_EXTRA_CHUNKS, GC_DEBT_RATIO, GcStats,
-    META_LOG_DRAIN_INTERVAL_MS, META_LOG_MERGE_BYTES, META_LOG_MERGE_INTERVAL_MS, MetaFlushBatch,
-    MetaLogJob, MetaMergePart, Pager, count_valid_pages, gc_debug, next_bump_chunk,
-    parse_page_vpid,
+    BLOCK_DRAIN_ACTIVE_THRESHOLD, COMPACT_LIVE_THRESHOLD, COMPACT_MIN_INTERVAL_MS, CompactLayout,
+    CompactReadDone, CompactReadJob, CompactWriteJob, FlushBatch, GC_DEBT_MIN_EXTRA_CHUNKS,
+    GC_DEBT_RATIO, GcStats, META_LOG_DRAIN_INTERVAL_MS, META_LOG_MERGE_BYTES,
+    META_LOG_MERGE_INTERVAL_MS, MetaFlushBatch, MetaLogJob, MetaMergePart, Pager,
+    count_valid_pages, gc_debug, next_bump_chunk, parse_page_vpid,
 };
 
 /// 环境变量覆盖 (测试/调优): `NEXUSDB_META_LOG_DRAIN_MS` /
@@ -43,7 +43,7 @@ fn meta_log_merge_bytes() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| env_u64("NEXUSDB_META_LOG_MERGE_BYTES", META_LOG_MERGE_BYTES))
 }
-use crate::types::{CHUNK_SIZE, PAGE_SIZE, PAGES_PER_CHUNK, PageKey, PidLocation};
+use crate::types::{PAGE_SIZE, PAGES_PER_CHUNK, PageKey, PidLocation};
 
 impl Pager {
     pub fn take_flush_batches(&mut self) -> Vec<FlushBatch> {
@@ -528,11 +528,13 @@ impl Pager {
                         )
                     }
                 };
+                let layout = self.scan_compact_layout(src, dst);
                 self.compact_inflight = true;
                 return Some(CompactReadJob {
                     dst,
                     src,
                     dst_fresh,
+                    layout,
                     dir: self.block_dir.clone(),
                     io: self.io.clone(),
                 });
@@ -543,54 +545,23 @@ impl Pager {
         let (dst, src) = self
             .liveness
             .pick_compact_victims(COMPACT_LIVE_THRESHOLD, &|k| excluded.contains(&k))?;
+        let layout = self.scan_compact_layout(src, dst);
         self.compact_inflight = true;
         Some(CompactReadJob {
             dst,
             src,
             dst_fresh: false,
+            layout,
             dir: self.block_dir.clone(),
             io: self.io.clone(),
         })
     }
 
-    /// ⭐ G2 阶段 2 (同步, 收割读完成后): meta 判活, 组装写作业.
-    ///
-    /// **判活 = header vpid 候选 + meta 点查确认** (O(128) 点查, 零 meta
-    /// 全扫 — 全扫在 1TB/512MB meta 规模下每次 compact 扫数十 ms 不可接受):
-    /// - src 活页 = header vpid 在 meta 中仍指向该槽
-    /// - dst 死槽 = 非活槽 (含无 magic 的从未写槽)
-    /// - 无 magic 页 = 未写 (与 recover 扫描同约定)
-    /// - src 已全死 → 无需搬运, 直接入延迟释放
-    /// - 读失败 / 死槽不足 → 放弃本轮 (无副作用)
-    ///
-    /// 页字节原样搬运 (header 内只有 vpid 无 pid, 位置变更不需改写).
-    pub fn analyze_compact_read(
-        &mut self,
-        dst: PageKey,
-        src: PageKey,
-        dst_fresh: bool,
-        // 只读 src chunk: dst 侧判活/死槽完全以 meta 为 SoT, 旧实现对
-        // dst 的 1MB 读纯属浪费 (占每次 compact 读 IO 的一半).
-        read_result: io::Result<Vec<u8>>, // src_bytes
-    ) -> Option<CompactWriteJob> {
-        let Ok(src_bytes) = read_result else {
-            self.compact_inflight = false;
-            return None; // 读失败: 无副作用, 下轮重试
-        };
-        if src_bytes.len() != CHUNK_SIZE {
-            self.compact_inflight = false;
-            return None;
-        }
-        // ⭐ 判活以 **meta 全扫为 SoT** (修复数据丢失 bug, 2026-07-24):
-        // 旧实现用 page header vpid 自描述 (parse_page_vpid + meta 点查),
-        // 但 **Internal 页的 header vpid 字段是 first_child** (page crate
-        // 约定, 见 chunk_writer::write_page_with_header) —— header 候选法
-        // 会把 Internal 页误判为死页:
-        // - 作为 src: 不搬运 → chunk 释放复用后 Internal 页物理销毁
-        // - 作为 dst: 活 Internal 页被当死槽直接覆盖
-        // 两者都导致子树路由断, travel 落到错误 leaf → GET 返回 nil (静默丢数据).
-        // meta 平坦数组全扫微秒~毫秒级, compact 低频 (空闲段 + 10ms 节流) 可接受.
-        let mut src_live: Vec<(u64, PidLocation, usize)> = Vec::new();
+    /// ⭐ compact 判活布局: 一次 meta 全扫得到 src 活页 (vpid,pid,slot) 与
+    /// dst 占用槽. 扫描从 analyze 前移到 start_compact, 让读协程只读活页.
+    /// meta 平坦数组全扫在 1M 键为 ~1-3ms, 与旧 analyze 扫描成本相同.
+    fn scan_compact_layout(&self, src: PageKey, dst: PageKey) -> CompactLayout {
+        let mut src_live: Vec<(u64, PidLocation, u8)> = Vec::new();
         let mut dst_alive = [false; PAGES_PER_CHUNK];
         for (vpid, pid) in self.meta.iter_allocated() {
             if pid.flags() & crate::types::PID_ALIVE == 0 {
@@ -601,24 +572,53 @@ impl Pager {
                 continue;
             }
             if pid.file_id() == src.file_id && pid.chunk_idx() == src.chunk_idx {
-                src_live.push((vpid, pid, slot));
+                src_live.push((vpid, pid, slot as u8));
             } else if pid.file_id() == dst.file_id && pid.chunk_idx() == dst.chunk_idx {
                 dst_alive[slot] = true;
             }
         }
-        // ⭐ 排查日志 (NLOG_GC_DEBUG=1): header 候选法与 meta SoT 的差异 —
-        // 差异槽即旧逻辑会误判/误伤的页 (典型: Internal 页)
+        CompactLayout {
+            src_live,
+            dst_alive,
+        }
+    }
+
+    /// ⭐ G2 阶段 2 (同步, 收割读完成后): 组装写作业.
+    ///
+    /// 判活布局 (`CompactLayout`) 已在 `start_compact` 时由一次 meta 扫描得到;
+    /// 读协程只读 `layout.src_live` 的 16KB 活页. 这里不再扫 meta、不再读
+    /// 整 1MB src chunk. CAS 仍在阶段 3 逐 vpid 复核.
+    pub fn analyze_compact_read(&mut self, done: CompactReadDone) -> Option<CompactWriteJob> {
+        let CompactReadDone {
+            dst,
+            src,
+            dst_fresh,
+            layout,
+            items,
+        } = done;
+        let src_pages = match items {
+            Ok(v) => v,
+            Err(_) => {
+                self.compact_inflight = false;
+                return None; // 读失败: 无副作用, 下轮重试
+            }
+        };
+        let CompactLayout {
+            src_live,
+            dst_alive,
+        } = layout;
+        if src_pages.len() != src_live.len() {
+            self.compact_inflight = false;
+            return None; // 防御: 读回页数与布局不一致
+        }
+        // ⭐ 排查日志 (NLOG_GC_DEBUG=1): header 候选法与 meta SoT 的差异.
         if gc_debug() {
-            for (vpid, _, slot) in &src_live {
-                let header_says_alive =
-                    parse_page_vpid(&src_bytes, *slot).is_some_and(|hv| hv == *vpid);
+            for ((vpid, _, slot), (_, bytes)) in src_live.iter().zip(&src_pages) {
+                let header_says_alive = parse_page_vpid(bytes, 0).is_some_and(|hv| hv == *vpid);
                 if !header_says_alive {
                     eprintln!(
                         "[GC_DEBUG] src {:?} slot {} vpid {} alive-in-meta but header disagrees (page_type={}) — old logic would DROP it",
-                        src,
-                        slot,
-                        vpid,
-                        src_bytes[slot * PAGE_SIZE + 4]
+                        src, slot, vpid, bytes[4]
                     );
                 }
             }
@@ -631,7 +631,7 @@ impl Pager {
             self.meta_flush_due = true; // 推动 meta 确认 → promote
             return None;
         }
-        // dst 死槽 = meta 无活页指向的槽 (SoT 同上; fresh dst 天然全死槽)
+        // dst 死槽 = 布局中未被活页占用的槽 (fresh dst 天然全死槽)
         let mut dead_slots: Vec<u8> = Vec::new();
         for (i, alive) in dst_alive.iter().enumerate() {
             if !alive {
@@ -639,22 +639,27 @@ impl Pager {
             }
         }
         if dead_slots.len() < src_live.len() {
-            // liveness 阈值下不该发生; 防御性放弃
             self.compact_inflight = false;
             return None;
         }
-        let mut moves: Vec<(u64, PidLocation, u8)> = Vec::new();
-        let mut items: Vec<(u8, Vec<u8>)> = Vec::new();
-        for ((vpid, src_pid, src_slot), dst_slot) in src_live.into_iter().zip(dead_slots) {
-            let off = src_slot * PAGE_SIZE;
-            items.push((dst_slot, src_bytes[off..off + PAGE_SIZE].to_vec()));
+        let mut moves: Vec<(u64, PidLocation, u8)> = Vec::with_capacity(src_live.len());
+        let mut out_items: Vec<(u8, Vec<u8>)> = Vec::with_capacity(src_live.len());
+        for (((vpid, src_pid, src_slot), dst_slot), (read_slot, bytes)) in
+            src_live.into_iter().zip(dead_slots).zip(src_pages)
+        {
+            debug_assert_eq!(read_slot, src_slot);
+            if bytes.len() != PAGE_SIZE {
+                self.compact_inflight = false;
+                return None;
+            }
+            out_items.push((dst_slot, bytes));
             moves.push((vpid, src_pid, dst_slot));
         }
         Some(CompactWriteJob {
             dst,
             src,
             dst_fresh,
-            items,
+            items: out_items,
             moves,
             dir: self.block_dir.clone(),
             io: self.io.clone(),
