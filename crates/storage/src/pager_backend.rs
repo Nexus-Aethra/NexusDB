@@ -205,7 +205,16 @@ impl Pager {
         if !self.meta_flush_due || self.flush_backlog() > 0 {
             return None;
         }
+        // 串行化 meta 批次: 有在飞快照时不取新批 (前缀 promote 语义依赖
+        // "快照覆盖 take 时刻的全部脏子区").
+        if self.meta.in_flight_subrange_count() > 0 {
+            return None;
+        }
         self.meta_flush_due = false;
+        // ⭐ P1: 记录 take 时刻的延迟释放前缀 — 快照成功后即使有新写入
+        // (has_unflushed=true) 也可推进这些 free 的复用, 不再被全局清空门卡住.
+        self.meta_flush_promote_prefix = self.liveness.pending_free_len();
+        self.meta_flush_failed = false;
         let windows = self.meta.take_dirty_subrange_snapshots();
         // 有 dirty 因 in-flight 去重被跳过 → 保持 due, 收割后下轮再取
         if self.meta.dirty_count() > 0 {
@@ -390,9 +399,24 @@ impl Pager {
         self.meta
             .complete_subrange_flush(window, sub_start, sub_len, ok);
         if !ok {
+            self.meta_flush_failed = true;
             self.meta_flush_due = true;
             return;
         }
+        if self.meta.in_flight_subrange_count() > 0 {
+            return; // 本批还有其它子区在飞, 等最后一块
+        }
+        // ⭐ P1: 本批快照已全部确认 → take 时刻的延迟释放前缀可复用
+        // (即使期间有新写入让 has_unflushed 仍为 true).
+        if !self.meta_flush_failed {
+            let prefix = self.meta_flush_promote_prefix;
+            if prefix > 0 {
+                self.liveness.promote_pending_free_prefix(prefix);
+            }
+            self.maybe_drop_free_blocks();
+        }
+        self.meta_flush_promote_prefix = 0;
+        self.meta_flush_failed = false;
         if !self.meta.has_unflushed() {
             self.persist_pid_state();
             // ⭐ G2: meta 已全部持久 → compact 延迟释放的 src chunk 可复用

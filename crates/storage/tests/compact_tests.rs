@@ -145,10 +145,9 @@ fn compact_fill_dead_slots_roundtrip() {
 
         // meta 确认落盘后 promote → free 可复用
         pager.flush().await.unwrap(); // 同步路径刷 meta
-        // 同步 flush 不走 complete_meta_flush; 手动模拟异步确认点语义:
-        // take_meta_flush_batch 后无 dirty → 但同步 flush 已清 dirty,
-        // promote 由异步路径触发. 这里直接验证 pending 仍在 (未确认不复用).
-        assert_eq!(pager.liveness().pending_free_count(), 1);
+        // P1 修复: 同步 flush 后 meta 已全部持久 → 延迟释放立即 promote.
+        assert_eq!(pager.liveness().pending_free_count(), 0);
+        assert!(pager.liveness().free_count() >= 1, "src 可复用");
     });
 }
 
