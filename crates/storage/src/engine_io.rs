@@ -292,6 +292,15 @@ impl StorageEngine {
         let new_root =
             crate::registry::table_put_many(&mut self.pager, table_vpid, &encoded).await?;
 
+        // ⭐ P0 (2026-10-24): 批量写必须追加 WAL — 与 put_physical_many 同一
+        // 插入点. 旧实现只写 BTree/row_counts, strict 档回复 OK 后 crash 时
+        // nowchunks 驻留页丢失且 WAL 无记录 → 整批已确认数据不可恢复.
+        if let Some(w) = self.wal.as_mut() {
+            for (pkey, value) in &encoded {
+                w.append_put(db, table, pkey, value)?;
+            }
+        }
+
         // ⭐ M3-1: 批量写近似 +N (覆盖会高估; 近似基数对驱动选择足够)
         *self
             .row_counts
