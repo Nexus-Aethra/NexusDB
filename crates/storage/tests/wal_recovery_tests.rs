@@ -210,3 +210,64 @@ fn wal_append_rejects_overlong_names() {
     assert!(w.append_put("db", "t", b"k", b"v").is_ok());
     assert!(w.append_del("db", "t", b"k").is_ok());
 }
+
+/// P3 回归: B 树分裂 + 大 value 溢出页 + strict WAL → crash → 重放零丢失.
+///
+/// 覆盖 recover 的 internal 页/溢出页边界: 2000 key 触发多次 split,
+/// 5×64KB 触发 overflow chain; strict barrier 后不 flush 直接 crash,
+/// 重开仅靠 WAL 重放必须恢复全部 key 与完整大 value.
+#[test]
+fn wal_replay_after_crash_with_splits_and_overflow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    run_async(async move {
+        let mut e = StorageEngine::open(opts(&root, WalMode::Strict))
+            .await
+            .unwrap();
+        e.create_db("default").await.unwrap();
+        e.create_table("default", "t").await.unwrap();
+        // DDL 不进 WAL: 生产路径建表后强制 flush (与 manager 同语义).
+        e.flush().await.unwrap();
+
+        let big = vec![0x5A; 64 * 1024];
+        for i in 0..2000u32 {
+            let k = format!("k{i:05}");
+            let v = format!("v{i:05}");
+            e.table_put("default", "t", k.as_bytes(), v.as_bytes())
+                .await
+                .unwrap();
+        }
+        for i in 0..5u32 {
+            let k = format!("big{i:02}");
+            e.table_put("default", "t", k.as_bytes(), &big)
+                .await
+                .unwrap();
+        }
+        e.wal_barrier().await.unwrap();
+        simulate_crash(e);
+
+        let mut e2 = StorageEngine::open(opts(&root, WalMode::Strict))
+            .await
+            .unwrap();
+        for i in 0..2000u32 {
+            let k = format!("k{i:05}");
+            let got = e2.table_get("default", "t", k.as_bytes()).await.unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("v{i:05}").as_bytes()),
+                "key {k} lost after crash"
+            );
+        }
+        for i in 0..5u32 {
+            let k = format!("big{i:02}");
+            let got = e2
+                .table_get("default", "t", k.as_bytes())
+                .await
+                .unwrap()
+                .expect("big value missing");
+            assert_eq!(got.len(), big.len(), "overflow value truncated");
+            assert!(got.iter().all(|b| *b == 0x5A), "overflow value corrupted");
+        }
+        e2.close().await.unwrap();
+    });
+}
