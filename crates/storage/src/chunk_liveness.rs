@@ -27,6 +27,8 @@ pub struct ChunkLiveness {
     live: Vec<u8>,
     /// 按 file_id 聚合: 活跃 (live > 0) chunk 数.
     block_active: Vec<u16>,
+    /// 活跃 chunk 总数 (live > 0), O(1) 查询 (GC 债务判据).
+    live_chunk_count: usize,
     /// 全死且 meta 已确认落盘的 chunk (可复用).
     free_chunks: Vec<PageKey>,
     /// free_chunks 的成员索引 (避免 O(k²) Vec::contains).
@@ -48,6 +50,7 @@ impl ChunkLiveness {
         self.ensure_capacity(idx + 1);
         if self.live[idx] == 0 {
             self.block_active[pid.file_id() as usize] += 1;
+            self.live_chunk_count += 1;
         }
         debug_assert!((self.live[idx] as usize) < PAGES_PER_CHUNK);
         self.live[idx] = self.live[idx].saturating_add(1);
@@ -66,6 +69,7 @@ impl ChunkLiveness {
         if self.live[idx] == 0 {
             let f = pid.file_id() as usize;
             self.block_active[f] = self.block_active[f].saturating_sub(1);
+            self.live_chunk_count = self.live_chunk_count.saturating_sub(1);
         }
     }
 
@@ -74,6 +78,7 @@ impl ChunkLiveness {
     pub fn rebuild_from_meta(&mut self, meta: &MetaCache) {
         self.live.clear();
         self.block_active.clear();
+        self.live_chunk_count = 0;
         self.free_chunks.clear();
         self.free_set.clear();
         self.pending_free.clear();
@@ -317,6 +322,16 @@ impl ChunkLiveness {
         }
     }
 
+    /// 活跃 chunk 数 (live > 0), O(1).
+    pub fn live_chunks(&self) -> usize {
+        self.live_chunk_count
+    }
+
+    /// 曾分配过的 chunk 数 (水位; 含 free/pending/部分空).
+    pub fn allocated_chunks(&self) -> usize {
+        self.live.len()
+    }
+
     /// 查询: 指定 chunk 的活页数 (越界 = 0).
     pub fn live_pages(&self, key: PageKey) -> u8 {
         self.live
@@ -381,6 +396,8 @@ mod tests {
             1
         );
         assert!(!lv.block_fully_free(0));
+        assert_eq!(lv.live_chunks(), 2, "chunk (0,0)/(0,1) 活跃");
+        assert_eq!(lv.allocated_chunks(), 2);
 
         lv.on_page_dead(pid(0, 0, 0));
         lv.on_page_dead(pid(0, 0, 1));
@@ -393,6 +410,7 @@ mod tests {
             0
         );
         assert!(lv.block_fully_free(0), "全部死光后 block 无活跃 chunk");
+        assert_eq!(lv.live_chunks(), 0);
     }
 
     #[test]

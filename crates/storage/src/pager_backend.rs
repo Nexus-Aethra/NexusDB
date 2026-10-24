@@ -10,9 +10,10 @@ use std::rc::Rc;
 use crate::meta_cache::{META_LOG_BATCH_ENTRIES, MetaLogDone, MetaMergeDone};
 use crate::pager::{
     BLOCK_DRAIN_ACTIVE_THRESHOLD, COMPACT_LIVE_THRESHOLD, COMPACT_MIN_INTERVAL_MS, CompactReadJob,
-    CompactWriteJob, FlushBatch, META_LOG_DRAIN_INTERVAL_MS, META_LOG_MERGE_BYTES,
-    META_LOG_MERGE_INTERVAL_MS, MetaFlushBatch, MetaLogJob, MetaMergePart, Pager,
-    count_valid_pages, gc_debug, next_bump_chunk, parse_page_vpid,
+    CompactWriteJob, FlushBatch, GC_DEBT_MIN_EXTRA_CHUNKS, GC_DEBT_RATIO, GcStats,
+    META_LOG_DRAIN_INTERVAL_MS, META_LOG_MERGE_BYTES, META_LOG_MERGE_INTERVAL_MS, MetaFlushBatch,
+    MetaLogJob, MetaMergePart, Pager, count_valid_pages, gc_debug, next_bump_chunk,
+    parse_page_vpid,
 };
 
 /// 环境变量覆盖 (测试/调优): `NEXUSDB_META_LOG_DRAIN_MS` /
@@ -146,6 +147,28 @@ impl Pager {
     /// 异步落盘: 是否有写盘中的 chunk.
     pub fn has_inflight(&self) -> bool {
         !self.in_flight.is_empty()
+    }
+
+    /// GC 观测快照 (诊断/测试).
+    pub fn gc_stats(&self) -> GcStats {
+        GcStats {
+            allocated_chunks: self.liveness.allocated_chunks(),
+            live_chunks: self.liveness.live_chunks(),
+            free_chunks: self.liveness.free_count(),
+            pending_free: self.liveness.pending_free_len(),
+        }
+    }
+
+    /// ⭐ P1: 空间债务是否超阈值 — 负载期允许低频 compact 的判据.
+    ///
+    /// allocated ≥ max(live*2, live+8): 死/空 chunk 占比足够高, 回收有净收益.
+    pub fn gc_debt_exceeded(&self) -> bool {
+        let allocated = self.liveness.allocated_chunks();
+        let live = self.liveness.live_chunks();
+        allocated
+            >= live
+                .saturating_mul(GC_DEBT_RATIO)
+                .max(live + GC_DEBT_MIN_EXTRA_CHUNKS)
     }
 
     /// 异步落盘: 写盘中 + 待提交的 chunk 总数 (测试/背压观察).

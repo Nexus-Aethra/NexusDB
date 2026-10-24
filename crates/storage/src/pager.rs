@@ -216,6 +216,19 @@ pub(crate) const COMPACT_LIVE_THRESHOLD: u8 = 32;
 /// 垃圾生成速率; 更长间隔 (200ms) 实测回收积压 (block 文件数 ×26).
 pub(crate) const COMPACT_MIN_INTERVAL_MS: u64 = 10;
 
+/// P1: 负载期债务驱动 compact 阈值 — allocated ≥ max(live*2, live+8) 才允许.
+pub(crate) const GC_DEBT_RATIO: usize = 2;
+pub(crate) const GC_DEBT_MIN_EXTRA_CHUNKS: usize = 8;
+
+/// GC 观测快照 (诊断/测试).
+#[derive(Debug, Clone, Copy)]
+pub struct GcStats {
+    pub allocated_chunks: usize,
+    pub live_chunks: usize,
+    pub free_chunks: usize,
+    pub pending_free: usize,
+}
+
 /// ⭐ B-drain: block 排空触发阈值 — 活跃 chunk 数 <= 阈值的 block
 /// 值得主动搬空 (腾出整个 10MB block 文件).
 pub(crate) const BLOCK_DRAIN_ACTIVE_THRESHOLD: u16 = 3;
