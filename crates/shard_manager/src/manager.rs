@@ -1574,12 +1574,12 @@ pub(crate) enum FlushDone {
         std::io::Result<()>,
         std::io::Result<()>,
     ),
-    /// G2 阶段 1 完成: (dst, src, dst_fresh, 读结果 (dst_bytes, src_bytes))
+    /// G2 阶段 1 完成: (dst, src, dst_fresh, src 字节读结果)
     CompactRead(
         storage::PageKey,
         storage::PageKey,
         bool,
-        std::io::Result<(Vec<u8>, Vec<u8>)>,
+        std::io::Result<Vec<u8>>,
     ),
     /// G2 阶段 2 完成: (dst, src, moves, 写结果)
     CompactWrite(

@@ -98,12 +98,11 @@ fn compact_fill_dead_slots_roundtrip() {
         assert_ne!(src.chunk_idx, 0, "META chunk 不可为 src");
 
         // 阶段 1 IO: 读 dst+src chunk (测试内直接 await)
-        let dst_bytes = rj.io.read_page_chunk(&rj.dir, dst).await.unwrap();
         let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
 
         // 阶段 2: 判活 + 组装写作业
         let wj = pager
-            .analyze_compact_read(dst, src, false, Ok((dst_bytes, src_bytes)))
+            .analyze_compact_read(dst, src, false, Ok(src_bytes))
             .expect("有活页应产出写作业");
         assert!(!wj.moves.is_empty());
         let moved_vpids: Vec<u64> = wj.moves.iter().map(|(v, _, _)| *v).collect();
@@ -150,10 +149,9 @@ fn compact_cas_skips_concurrently_updated_page() {
 
         let rj = pager.start_compact().expect("victims");
         let (dst, src) = (rj.dst, rj.src);
-        let dst_bytes = rj.io.read_page_chunk(&rj.dir, dst).await.unwrap();
         let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
         let wj = pager
-            .analyze_compact_read(dst, src, false, Ok((dst_bytes, src_bytes)))
+            .analyze_compact_read(dst, src, false, Ok(src_bytes))
             .expect("write job");
 
         // 挑一个被搬运的 vpid, 在写盘期间被用户 COW 更新
@@ -190,10 +188,9 @@ fn compact_write_failure_is_side_effect_free() {
 
         let rj = pager.start_compact().expect("victims");
         let (dst, src) = (rj.dst, rj.src);
-        let dst_bytes = rj.io.read_page_chunk(&rj.dir, dst).await.unwrap();
         let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
         let wj = pager
-            .analyze_compact_read(dst, src, false, Ok((dst_bytes, src_bytes)))
+            .analyze_compact_read(dst, src, false, Ok(src_bytes))
             .expect("write job");
         let moved: Vec<u64> = wj.moves.iter().map(|(v, _, _)| *v).collect();
         let live_before = pager.liveness().live_pages(src);
@@ -350,10 +347,9 @@ fn compact_freed_chunk_is_reused_and_survives_reopen() {
         // 完整 compact 流程
         let rj = pager.start_compact().expect("victims");
         let (dst, src) = (rj.dst, rj.src);
-        let dst_bytes = rj.io.read_page_chunk(&rj.dir, dst).await.unwrap();
         let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
         let wj = pager
-            .analyze_compact_read(dst, src, false, Ok((dst_bytes, src_bytes)))
+            .analyze_compact_read(dst, src, false, Ok(src_bytes))
             .expect("write job");
         let items: Vec<(u8, &[u8])> = wj.items.iter().map(|(p, d)| (*p, d.as_slice())).collect();
         wj.io
@@ -470,19 +466,10 @@ fn block_drain_evicts_mid_live_chunks_and_unlinks() {
                 );
                 break;
             }
-            // 协程 IO 段 (fresh dst 传全零, 与 manager 分支一致)
-            let dst_bytes = if rj.dst_fresh {
-                vec![0u8; storage::CHUNK_SIZE]
-            } else {
-                rj.io.read_page_chunk(&rj.dir, rj.dst).await.unwrap()
-            };
+            // 协程 IO 段 (只读 src; fresh dst 由写侧整 chunk 写)
             let src_bytes = rj.io.read_page_chunk(&rj.dir, rj.src).await.unwrap();
-            let Some(wj) = pager.analyze_compact_read(
-                rj.dst,
-                rj.src,
-                rj.dst_fresh,
-                Ok((dst_bytes, src_bytes)),
-            ) else {
+            let Some(wj) = pager.analyze_compact_read(rj.dst, rj.src, rj.dst_fresh, Ok(src_bytes))
+            else {
                 continue; // src 全死分支 (已入延迟释放)
             };
             wj.execute().await.unwrap(); // fresh dst 整 chunk 写 / 常规死槽批写
@@ -563,15 +550,9 @@ fn compact_must_migrate_internal_pages() {
                 break;
             };
             let (dst, src) = (rj.dst, rj.src);
-            let dst_bytes = if rj.dst_fresh {
-                vec![0u8; storage::CHUNK_SIZE]
-            } else {
-                rj.io.read_page_chunk(&rj.dir, dst).await.unwrap()
-            };
+            // 协程 IO 段 (只读 src)
             let src_bytes = rj.io.read_page_chunk(&rj.dir, src).await.unwrap();
-            let Some(wj) =
-                pager.analyze_compact_read(dst, src, rj.dst_fresh, Ok((dst_bytes, src_bytes)))
-            else {
+            let Some(wj) = pager.analyze_compact_read(dst, src, rj.dst_fresh, Ok(src_bytes)) else {
                 continue;
             };
             if wj.moves.iter().any(|(v, _, _)| *v == internal_vpid) {

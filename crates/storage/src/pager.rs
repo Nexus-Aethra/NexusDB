@@ -152,12 +152,12 @@ pub struct MetaFlushBatch {
     pub io: Rc<PagerIo>,
 }
 
-/// ⭐ G2: compact 读作业 (阶段 1 → 2): 协程读 dst+src 两个 chunk 字节.
+/// ⭐ G2: compact 读作业 (阶段 1 → 2): 协程只读 src chunk 字节
+/// (dst 判活/死槽以 meta 为 SoT, 不再读 dst 的 1MB).
 pub struct CompactReadJob {
     pub dst: PageKey,
     pub src: PageKey,
-    /// ⭐ B-drain: dst 是全新 bump chunk (磁盘无内容, 协程跳过读 dst
-    /// 传全零字节 — 全零无 magic → analyze 判全部 64 槽为死槽).
+    /// ⭐ B-drain: dst 是全新 bump chunk (写侧整 chunk 写; 无需读旧字节).
     pub dst_fresh: bool,
     pub dir: PathBuf,
     pub io: Rc<PagerIo>,
