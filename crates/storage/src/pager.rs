@@ -559,7 +559,27 @@ impl Pager {
 
     /// ⭐ G1: 从全量平坦 meta 反推重建活性统计 (open/recover 后调一次).
     pub fn rebuild_liveness(&mut self) {
+        self.rebuild_liveness_with_restart_free(false);
+    }
+
+    /// ⭐ P3: 重建活性 + 重启 free list.
+    ///
+    /// `allow_restart_free`: 仅当 recover 前的 mate 已有 MetaPage (可信
+    /// checkpoint) 时为 true; mate 丢失/初始化场景不回收, 避免把未知页
+    /// 当作死页复用. 水位内 live==0 的 chunk 直接可复用; META/当前 chunk
+    /// 排除; 全空 block 由 maybe_drop_free_blocks 回收.
+    pub fn rebuild_liveness_with_restart_free(&mut self, allow_restart_free: bool) {
         self.liveness.rebuild_from_meta(&self.meta);
+        if !allow_restart_free {
+            return;
+        }
+        let (cur_file, cur_chunk, _) = self.pid_alloc.current();
+        let cur_idx = cur_file as usize * CHUNKS_PER_BLOCK + cur_chunk as usize;
+        let bump_idx =
+            self.pid_bump_next.0 as usize * CHUNKS_PER_BLOCK + self.pid_bump_next.1 as usize;
+        self.liveness
+            .recover_free_chunks_below(bump_idx, |idx| idx == 0 || idx == cur_idx);
+        self.maybe_drop_free_blocks();
     }
 
     pub fn begin_path_trace(&mut self) {

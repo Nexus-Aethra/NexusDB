@@ -148,6 +148,13 @@ fn compact_fill_dead_slots_roundtrip() {
         // P1 修复: 同步 flush 后 meta 已全部持久 → 延迟释放立即 promote.
         assert_eq!(pager.liveness().pending_free_count(), 0);
         assert!(pager.liveness().free_count() >= 1, "src 可复用");
+
+        // P3: 重启重建 free list — src chunk (live==0) 应被恢复为 free.
+        pager.rebuild_liveness_with_restart_free(true);
+        assert!(
+            pager.liveness().free_count() >= 1,
+            "restart free rebuild should recover the dead src chunk"
+        );
     });
 }
 

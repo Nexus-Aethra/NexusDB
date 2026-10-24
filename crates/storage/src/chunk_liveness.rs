@@ -293,6 +293,33 @@ impl ChunkLiveness {
         }
     }
 
+    /// ⭐ P3 重启恢复: 已分配水位内 live==0 的 chunk 直接标记 free
+    /// (排除 META chunk / 当前写入 chunk; 调用方保证 mate 是可信 checkpoint).
+    pub fn recover_free_chunks_below(
+        &mut self,
+        high_water: usize,
+        exclude: impl Fn(usize) -> bool,
+    ) {
+        self.ensure_capacity(high_water);
+        for idx in 0..high_water.min(self.live.len()) {
+            if self.live[idx] != 0 || exclude(idx) {
+                continue;
+            }
+            let key = PageKey {
+                file_id: (idx / CHUNKS_PER_BLOCK) as u32,
+                chunk_idx: (idx % CHUNKS_PER_BLOCK) as u8,
+            };
+            if self.free_set.insert(key) {
+                self.free_chunks.push(key);
+            }
+        }
+    }
+
+    /// 是否在 free list 中 (测试/诊断).
+    pub fn is_free(&self, key: PageKey) -> bool {
+        self.free_set.contains(&key)
+    }
+
     /// 延迟释放队列长度 (诊断/回收 tick 用).
     pub fn pending_free_len(&self) -> usize {
         self.pending_free.len()
@@ -441,6 +468,41 @@ mod tests {
         );
         assert!(lv.block_fully_free(0), "全部死光后 block 无活跃 chunk");
         assert_eq!(lv.live_chunks(), 0);
+    }
+
+    /// P3: 重启水位内 dead chunk 恢复为 free; META/当前 chunk 排除.
+    #[test]
+    fn restart_rebuild_recovers_dead_chunks_below_high_water() {
+        let mut lv = ChunkLiveness::new();
+        lv.on_page_alloc(pid(0, 0, 0), 1); // chunk 0 (META) live
+        lv.on_page_alloc(pid(0, 1, 0), 2); // chunk 1 live then dead
+        lv.on_page_alloc(pid(0, 1, 1), 3);
+        lv.on_page_dead(pid(0, 1, 0));
+        lv.on_page_dead(pid(0, 1, 1));
+        lv.on_page_alloc(pid(0, 2, 0), 4); // chunk 2 current
+        lv.recover_free_chunks_below(3, |idx| idx == 0 || idx == 2);
+        assert_eq!(lv.free_count(), 1);
+        assert!(
+            lv.is_free(PageKey {
+                file_id: 0,
+                chunk_idx: 1
+            }),
+            "dead chunk recovered"
+        );
+        assert!(
+            !lv.is_free(PageKey {
+                file_id: 0,
+                chunk_idx: 0
+            }),
+            "META excluded"
+        );
+        assert!(
+            !lv.is_free(PageKey {
+                file_id: 0,
+                chunk_idx: 2
+            }),
+            "current excluded"
+        );
     }
 
     /// per-chunk vpid 槽索引: alloc 写入、dead 清空、forget_block 全清.

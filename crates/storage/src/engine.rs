@@ -304,11 +304,16 @@ impl StorageEngine {
             recover_for_shard_with_log(&block_root, &db_name, shard_id, meta_log)?
         };
 
+        // ⭐ P3: 记录 init 前 mate 是否已有 MetaPage — 只有可信 checkpoint
+        // 才允许重启 free-list 回收 (mate 丢失时扫描无法识别 internal 页,
+        // 回收未知 chunk 可能销毁仅存副本).
+        let mate_had_meta = recovered.meta.read(META_VPID).is_some();
+
         // 2.5 ⭐ 初始化 MetaPage (T9 集成):
         //     - 如果 vpid 0 未在 MetaCache 中 (全新库), 写空 MetaPage 到 chunk 0 page 0,
         //       并在 MetaCache 中记录 vpid 0 → META_PID
         //     - 调整 vpid_alloc / pid_alloc, 使 vpid 0 / page 0 永远保留给 MetaPage
-        if recovered.meta.read(META_VPID).is_none() {
+        if !mate_had_meta {
             init_meta_page(&block_dir_for_io, &mut recovered.meta)?;
             // pid_alloc 推进到 page_idx=1 (跳过 MetaPage 占用的 page 0)
             recovered.pid_alloc = crate::alloc::PidAllocator::new(0, 0, 1);
@@ -377,7 +382,7 @@ impl StorageEngine {
         // 5. ⭐ 加载 DbRegistry
         let mut pager_for_registry = pager;
         // ⭐ G1: 从全量平坦 meta 反推重建 chunk/block 活性统计 (GC 基础)
-        pager_for_registry.rebuild_liveness();
+        pager_for_registry.rebuild_liveness_with_restart_free(mate_had_meta);
         let registry = DbRegistry::load(&mut pager_for_registry)
             .await
             .map_err(|e| {
