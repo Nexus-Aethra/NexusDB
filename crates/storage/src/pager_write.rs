@@ -69,12 +69,12 @@ impl PageWriteBatch {
             //    **语义修正**: 旧代码用 meta.is_dirty(vpid) 判定, 但 swap 后 meta 仍
             //    dirty 而 chunk 已不在内存 (旧版靠 reinsert_clean 兜底)。去掉 reinsert
             //    后 dirty 不再等价"chunk 驻留", 必须直接问 nowchunks (meta 是 SoT)。
-            let pid = if vpid == META_VPID {
-                // ⭐ G1 liveness: MetaPage 首写计一次活 (固定位置覆盖不重复计)
-                if pager.meta.read(META_VPID).is_none() {
-                    pager.liveness.on_page_alloc(META_PID);
-                }
-                META_PID
+            // ⭐ P3: liveness 更新延后到页数据成功写入 nowchunks 之后 —
+            // 旧实现先记旧页死/新页活, 若驻留兜底读盘失败提前返回, meta 仍
+            // 指向旧页而活性已减到 0 → 仍被引用的 chunk 可能被回收复用.
+            let (pid, replaced, new_page) = if vpid == META_VPID {
+                // MetaPage 固定位置覆盖, 首写计一次活 (延后到写入成功)
+                (META_PID, None, pager.meta.read(META_VPID).is_none())
             } else if let Some(old_pid) = pager.meta.read(vpid)
                 && pager
                     .nowchunks
@@ -85,7 +85,7 @@ impl PageWriteBatch {
                     .is_some()
             {
                 // 复用原 pid (chunk 还在内存, 原位覆盖同一 page_idx)
-                old_pid
+                (old_pid, None, false)
             } else {
                 // COW: alloc 新 pid
                 let old_pid_opt = pager.meta.read(vpid);
@@ -110,13 +110,8 @@ impl PageWriteBatch {
                         };
                     pager.pid_alloc.rotate_to(next_file, next_chunk);
                 };
-                // ⭐ G1 liveness: COW 路径 — 旧页死 (若存在), 新页活.
-                // 复用分支 pid 不变不计; 读路径不影响活性.
-                if let Some(old) = old_pid_opt {
-                    pager.liveness.on_page_dead(old);
-                }
-                pager.liveness.on_page_alloc(new_pid);
-                new_pid
+                // 新 vpid 或覆盖旧页: 都是分配到新 pid, 需要计新页活
+                (new_pid, old_pid_opt, true)
             };
 
             // 2. memcpy 到 nowchunks (user data 完整保留, 不构造 header)
@@ -192,6 +187,13 @@ impl PageWriteBatch {
             // ⭐ 热路径优化: page 字节已 memcpy 进 nowchunks, Box 归还页池
             // (闭合 page_pool 循环: read alloc → submit 消费 → recycle).
             page_pool::recycle(data);
+            // ⭐ P3: 页数据已成功写入 nowchunks → 此时才更新活性 (见上方注释).
+            if let Some(old) = replaced {
+                pager.liveness.on_page_dead(old);
+            }
+            if new_page {
+                pager.liveness.on_page_alloc(pid);
+            }
             // 3. 写回 meta_cache (标 dirty, 持久化在 flush 时).
             pager.meta.write(vpid, pid);
 
