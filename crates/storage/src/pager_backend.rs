@@ -581,24 +581,36 @@ impl Pager {
         })
     }
 
-    /// ⭐ compact 判活布局: 一次 meta 全扫得到 src 活页 (vpid,pid,slot) 与
-    /// dst 占用槽. 扫描从 analyze 前移到 start_compact, 让读协程只读活页.
-    /// meta 平坦数组全扫在 1M 键为 ~1-3ms, 与旧 analyze 扫描成本相同.
+    /// ⭐ compact 判活布局: 按 per-chunk vpid 槽索引只扫 src/dst 各 64 槽,
+    /// 每个 vpid 点查 meta 复核 (防索引滞后/墓碑); 不再全扫整张 meta.
     fn scan_compact_layout(&self, src: PageKey, dst: PageKey) -> CompactLayout {
         let mut src_live: Vec<(u64, PidLocation, u8)> = Vec::new();
         let mut dst_alive = [false; PAGES_PER_CHUNK];
-        for (vpid, pid) in self.meta.iter_allocated() {
-            if pid.flags() & crate::types::PID_ALIVE == 0 {
-                continue; // 墓碑 (已释放溢出页) 不算活
-            }
-            let slot = pid.page_idx() as usize;
-            if slot >= PAGES_PER_CHUNK {
+        for (key, is_src) in [(src, true), (dst, false)] {
+            let Some(slots) = self.liveness.vpid_slots(key) else {
                 continue;
-            }
-            if pid.file_id() == src.file_id && pid.chunk_idx() == src.chunk_idx {
-                src_live.push((vpid, pid, slot as u8));
-            } else if pid.file_id() == dst.file_id && pid.chunk_idx() == dst.chunk_idx {
-                dst_alive[slot] = true;
+            };
+            for (slot, &vpid) in slots.iter().enumerate() {
+                if vpid == crate::chunk_liveness::ChunkLiveness::EMPTY_VPID {
+                    continue;
+                }
+                let Some(cur) = self.meta.peek(vpid) else {
+                    continue; // 墓碑/已释放
+                };
+                if cur.flags() & crate::types::PID_ALIVE == 0 {
+                    continue;
+                }
+                if cur.file_id() != key.file_id
+                    || cur.chunk_idx != key.chunk_idx
+                    || cur.page_idx() as usize != slot
+                {
+                    continue; // 索引滞后: 当前映射已不指向该槽
+                }
+                if is_src {
+                    src_live.push((vpid, cur, slot as u8));
+                } else {
+                    dst_alive[slot] = true;
+                }
             }
         }
         CompactLayout {
@@ -720,7 +732,7 @@ impl Pager {
             };
             self.meta.write(vpid, dst_pid);
             self.liveness.on_page_dead(src_pid);
-            self.liveness.on_page_alloc(dst_pid);
+            self.liveness.on_page_alloc(dst_pid, vpid);
             migrated += 1;
         }
         // 旧缓存副本失效: dst 缺迁入页, src 即将释放

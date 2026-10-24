@@ -192,7 +192,7 @@ impl PageWriteBatch {
                 pager.liveness.on_page_dead(old);
             }
             if new_page {
-                pager.liveness.on_page_alloc(pid);
+                pager.liveness.on_page_alloc(pid, vpid);
             }
             // 3. 写回 meta_cache (标 dirty, 持久化在 flush 时).
             pager.meta.write(vpid, pid);
