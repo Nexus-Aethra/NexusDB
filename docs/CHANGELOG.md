@@ -10,6 +10,36 @@
 
 ---
 
+## 2026-10-24 P0 修复: 批量写未进 WAL (MSET strict 档 crash 全丢)
+
+### 问题
+`StorageEngine::table_put_many` 直接调用 `registry::table_put_many`, **没有**追加 WAL
+(`put_physical_many` 才有 `append_put`)。strict 档下 `MSET` 返回 `OK` 后进程被
+`kill -9`: nowchunks 里的页只在 RAM, WAL 无记录 → 整批已确认写不可恢复。
+
+### 复现 (真实进程, 修复前)
+- strict + 1 shard + io_uring; `MSET` 500 键 (返回 OK, 崩溃前 `GET k0500 = v0500`)
+- 崩溃前 WAL 段 **0 字节**; `page.mate` 仅 3 个映射; block 仅 3 个旧页
+- `kill -9` 后在副本恢复: **500/500 丢失**
+- 对照: 干净关闭 0 丢失; 200 键突发也 200/200 丢失; 400 次单键 `SET` (走 WAL) 0 丢失
+
+### 修复
+- `table_put_many` 在 BTree 批量写成功后, 按编码 key 逐条 `wal.append_put`
+  (与 `put_physical_many` 同一插入点); 复合类型 purge 的 `delete_physical` 本就走 WAL
+- 新增必败回归 `crates/storage/tests/wal_batch_durability.rs`: 批量写后
+  `wal_needs_sync()` 必须为 true → barrier 后 WAL 段非空 → 模拟 crash (不 flush)
+  → 重开 WAL 重放必须恢复全部 key (修复前首断言即红)
+
+### 验证
+- 修复后真实崩溃矩阵: MSET 500/200 + `kill -9`、500 + 0.3s 早杀、干净关闭 —
+  **全部 0 丢失**, WAL 段 9.6-24KB; block 仍只有 3 个旧页, 证明数据由 WAL 重放恢复
+- 全量 `cargo test --workspace` 通过; clippy `-D warnings` 0; fmt 0 差异
+
+> 遗留: agent 审计提出的"meta 已全持久但 nowchunks 驻留页未落盘就删 sealed 段"
+> 是另一条代码路径风险; 本轮复现由批量写缺 WAL 解释, 该窗口仍需独立 crash 测试。
+
+---
+
 ## 2026-10-19 审计批次收口 (PR #14 + #15; 审计报告剩余项清零)
 
 `docs/CODE-AUDIT-REPORT-2026-10-16.md` 93 条审计条目的最后一批修复合并入 main, §5.6 更新为"仍未解决: 0 项". P0/P1/P2 前期批次的完整历史见审计报告 §5.4/§5.5 与 git log, 本节只记录最后两个 PR.
