@@ -21,6 +21,17 @@
 - [Windows IOCP runtime design](./plans/2026-08-13-windows-iocp.md) — full
   M1–M7 design; M1/M2 written and reverted to P1 due to `AcceptEx` /
   `OVERLAPPED` quirks documented inline.
+- [Storage refactoring index (2026-11)](./plans/2026-11-06-README.md) — entry
+  point for the write-amplification work; links the framework and leaf-item
+  pointer designs and tracks the open decisions.
+- [Storage write-amplification framework (phased)](./plans/2026-11-06-storage-write-amplification.md)
+  — Phase 1: keep COW + vpid→pid mapping, add a bounded memtable to batch random
+  writes so each affected leaf page is COW'd once per batch instead of once per
+  write. GC and crash recovery unchanged by design.
+- [Leaf item pointer design (Phase 1-B)](./plans/2026-11-06-leaf-item-pointer.md)
+  — leaf items store `key → (vpid, offset, len)` pointers instead of inline values;
+  values move to a packed data arena. Keeps COW, the `vpid→pid` mapping and
+  page-granular GC untouched.
 - [RESP write-path performance plan](./plans/2026-08-05-resp-write-path-performance.md)
 - [RESP ↔ SQL schema adapter plan](./plans/2026-08-09-resp-sql-schema-adapter.md)
 - [Coroutine scheduler hardening plan](./plans/2026-08-13-coroutine-scheduler-hardening.md)
